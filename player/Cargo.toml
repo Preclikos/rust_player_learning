@@ -1,0 +1,13 @@
+[package]
+name = "player"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "player"
+path = "src/player.rs"
+
+[dependencies]
+reqwest = { version = "0.12.12", features = ["blocking"] }
+quick-xml = {version ="0.37.2", features = [ "serialize" ]}
+serde = { version = "1.0", features = ["derive"] }

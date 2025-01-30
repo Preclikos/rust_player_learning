@@ -20,34 +20,39 @@ impl Manifest {
     pub fn download(&mut self) -> Result<(), Error> {
         let response = get(&self.url);
 
-        match response {
-            Ok(success) => {
-                let body: String = success.text()?;
-                self.body = Some(body);
-                Ok(())
-            }
+        let manifest_content = match response {
+            Ok(success) => success.text()?,
             Err(e) => {
                 println!("Manifest download failed: {}", e);
                 return Err(e);
             }
-        }
+        };
+
+        self.body = Some(manifest_content);
+        Ok(())
     }
 
-    pub fn parse(&mut self) {
-        match &self.body {
-            Some(body) => match from_str::<MPD>(body.as_str()) {
-                Ok(mpd) => {
-                    println!("Parsed MPD: {:#?}", mpd);
-                    self.manifest = Some(mpd)
-                }
-                Err(e) => {
-                    eprintln!("Failed to parse MPD: {}", e);
-                }
-            },
+    pub fn parse(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let manifest = match &self.body {
+            Some(body) => body.as_str(),
             None => {
                 eprintln!("Failed to parse empty Manifest");
+                return Err("".into());
             }
-        }
+        };
+
+        let mpd = match from_str::<MPD>(manifest) {
+            Ok(mpd) => mpd,
+            Err(e) => {
+                eprintln!("Failed to parse MPD: {}", e);
+                return Err("Failed to parse MPD:".into());
+            }
+        };
+
+        println!("Parsed MPD: {:#?}", mpd);
+        self.manifest = Some(mpd);
+
+        Ok(())
     }
 }
 

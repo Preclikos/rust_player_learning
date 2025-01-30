@@ -37,7 +37,7 @@ impl Manifest {
             Some(body) => body.as_str(),
             None => {
                 eprintln!("Failed to parse empty Manifest");
-                return Err("".into());
+                return Err("Failed to parse empty Manifest".into());
             }
         };
 

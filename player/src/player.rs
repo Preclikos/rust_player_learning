@@ -1,4 +1,6 @@
 mod manifest;
+use std::error::Error;
+
 use crate::manifest::Manifest;
 
 pub struct Player {
@@ -11,22 +13,29 @@ impl Player {
         Player { manifest: None }
     }
 
-    pub fn open_url(&mut self, url: &str) {
+    pub fn open_url(&mut self, url: &str) -> Result<(), Box<dyn Error>> {
         let url = url.to_string();
         let mut manifest = Manifest::new(url);
 
         let download = manifest.download();
-        match download {
+        let parse = match download {
+            Ok(_) => manifest.parse(),
+            Err(e) => {
+                eprintln!("Manifest download failed: {}", e);
+                return Err("Manifest download failed".into());
+            }
+        };
+
+        match parse {
             Ok(_) => {
-                manifest.parse();
+                self.manifest = Some(manifest);
             }
-            Err(_) => {
-                eprintln!("Manifest download failed");
+            Err(e) => {
+                eprintln!("Manifest parsing failed");
+                return Err(e);
             }
-        }
+        };
 
-        self.manifest = Some(manifest);
+        Ok(())
     }
-
-    
 }

@@ -1,6 +1,5 @@
 mod manifest;
-
-use manifest::manifest::Manifest;
+use crate::manifest::Manifest;
 
 pub struct Player {
     manifest: Option<Manifest>,
@@ -21,9 +20,13 @@ impl Player {
             Ok(_) => {
                 manifest.parse();
             }
-            Err(_) => {}
+            Err(_) => {
+                eprintln!("Manifest download failed");
+            }
         }
 
         self.manifest = Some(manifest);
     }
+
+    
 }

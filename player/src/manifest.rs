@@ -1,1 +1,2 @@
-pub mod manifest;
+mod manifest;
+pub use manifest::Manifest;

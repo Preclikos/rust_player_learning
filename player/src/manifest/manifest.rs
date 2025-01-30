@@ -52,28 +52,32 @@ impl Manifest {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct MPD {
     #[serde(rename = "Period")]
     periods: Vec<Period>,
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct Period {
+    #[serde(rename = "@duration")]
+    duration: String,
+
     #[serde(rename = "AdaptationSet")]
     adaptation_sets: Vec<AdaptationSet>,
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct AdaptationSet {
+    #[serde(rename = "@maxWidth")]
+    max_width: Option<i32>,
+    #[serde(rename = "@maxHeight")]
+    max_height: Option<i32>,
+
     #[serde(rename = "Representation")]
     representations: Vec<Representation>,
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct Representation {
     #[serde(rename = "@id")]
     id: String,
@@ -81,4 +85,42 @@ struct Representation {
     bandwidth: u64,
     #[serde(rename = "@mimeType")]
     mime_type: String,
+
+    #[serde(rename = "@codecs")]
+    codecs: Option<String>,
+
+    #[serde(rename = "@width")]
+    width: Option<i32>,
+    #[serde(rename = "@height")]
+    height: Option<i32>,
+    #[serde(rename = "@frameRate")]
+    frameRate: Option<i32>,
+
+    #[serde(rename = "BaseURL")]
+    base_url: BaseURL,
+    #[serde(rename = "SegmentBase")]
+    segment_base: SegmentBase,
+}
+
+#[derive(Debug, Deserialize)]
+struct BaseURL {
+    #[serde(rename = "$text")]
+    value: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SegmentBase {
+    #[serde(rename = "@indexRangeExact")]
+    indexRangeExact: bool,
+    #[serde(rename = "@indexRange")]
+    indexRange: String,
+
+    #[serde(rename = "Initialization")]
+    initialization: Initialization,
+}
+
+#[derive(Debug, Deserialize)]
+struct Initialization {
+    #[serde(rename = "@range")]
+    range: String,
 }

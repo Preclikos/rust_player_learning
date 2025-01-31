@@ -56,76 +56,76 @@ impl Manifest {
     }
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Deserialize, Clone)]
 pub struct MPD {
     #[serde(rename = "Period")]
-    periods: Vec<Period>,
+    pub periods: Vec<Period>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
-struct Period {
+#[derive(Deserialize, Clone)]
+pub struct Period {
     #[serde(rename = "@duration")]
-    duration: String,
+    pub duration: String,
 
     #[serde(rename = "AdaptationSet")]
-    adaptation_sets: Vec<AdaptationSet>,
+    pub adaptation_sets: Vec<AdaptationSet>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Deserialize, Clone)]
 struct AdaptationSet {
     #[serde(rename = "@maxWidth")]
-    max_width: Option<i32>,
+    pub max_width: Option<i32>,
     #[serde(rename = "@maxHeight")]
-    max_height: Option<i32>,
+    pub max_height: Option<i32>,
 
     #[serde(rename = "Representation")]
-    representations: Vec<Representation>,
+    pub representations: Vec<Representation>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Deserialize, Clone)]
 struct Representation {
     #[serde(rename = "@id")]
-    id: String,
+    pub id: String,
     #[serde(rename = "@bandwidth")]
-    bandwidth: u64,
+    pub bandwidth: u64,
     #[serde(rename = "@mimeType")]
-    mime_type: String,
+    pub mime_type: String,
 
     #[serde(rename = "@codecs")]
-    codecs: Option<String>,
+    pub codecs: Option<String>,
 
     #[serde(rename = "@width")]
-    width: Option<i32>,
+    pub width: Option<i32>,
     #[serde(rename = "@height")]
-    height: Option<i32>,
+    pub height: Option<i32>,
     #[serde(rename = "@frameRate")]
-    frame_rate: Option<i32>,
+    pub frame_rate: Option<i32>,
 
     #[serde(rename = "BaseURL")]
-    base_url: BaseURL,
+    pub base_url: BaseURL,
     #[serde(rename = "SegmentBase")]
-    segment_base: SegmentBase,
+    pub segment_base: SegmentBase,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Deserialize, Clone)]
 struct BaseURL {
     #[serde(rename = "$text")]
-    value: String,
+    pub value: String,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Deserialize, Clone)]
 struct SegmentBase {
     #[serde(rename = "@indexRangeExact")]
-    index_range_exact: bool,
+    pub index_range_exact: bool,
     #[serde(rename = "@indexRange")]
-    index_range: String,
+    pub index_range: String,
 
     #[serde(rename = "Initialization")]
-    initialization: Initialization,
+    pub initialization: Initialization,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Deserialize, Clone)]
 struct Initialization {
     #[serde(rename = "@range")]
-    range: String,
+    pub range: String,
 }

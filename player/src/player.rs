@@ -62,8 +62,15 @@ impl<'a> Player<'a> {
             }
         };
 
-        let track_manager = TrackManager::new(&mpd);
-        self.track_manager = Some(track_manager);
+        let mut track_manager = TrackManager::new(&mpd);
+
+        match track_manager.parse_tracks() {
+            Ok(_) => self.track_manager = Some(track_manager),
+            Err(e) => {
+                eprintln!("TrackManager cannot parse tracks: {}", e);
+                return Err("TrackManager cannot parse tracks".into());
+            }
+        }
 
         Ok(())
     }

@@ -2,7 +2,7 @@ pub mod audio;
 pub mod text;
 pub mod video;
 
-use crate::manifest::{AdaptationSet, MPD};
+use crate::manifest::{AdaptationSet, Representation, MPD};
 use crate::tracks::audio::{AudioAdaptation, AudioRepresentation};
 use crate::tracks::text::{TextAdaptation, TextRepresenation};
 use crate::tracks::video::{VideoAdaptation, VideoRepresenation};
@@ -56,13 +56,73 @@ impl Tracks {
         }
     }
 
+    fn parse_video_representation(
+        representation: &Representation,
+    ) -> Result<VideoRepresenation, Box<dyn Error>> {
+        let codecs = match &representation.codecs {
+            Some(value) => value.to_string(),
+            None => {
+                return Err(format!(
+                    "Cannot get codecs from Representation Id: {}",
+                    representation.id
+                )
+                .into())
+            }
+        };
+
+        let width = match &representation.width {
+            Some(value) => value,
+            None => {
+                return Err(format!(
+                    "Cannot get width from Representation Id: {}",
+                    representation.id
+                )
+                .into())
+            }
+        };
+
+        let height = match &representation.height {
+            Some(value) => value,
+            None => {
+                return Err(format!(
+                    "Cannot get height from Representation Id: {}",
+                    representation.id
+                )
+                .into())
+            }
+        };
+
+        let sar = match &representation.sar {
+            Some(value) => value.to_string(),
+            None => {
+                return Err(format!(
+                    "Cannot get height from Representation Id: {}",
+                    representation.id
+                )
+                .into())
+            }
+        };
+
+        let video_representation = VideoRepresenation {
+            id: representation.id,
+            bandwidth: representation.bandwidth,
+            codecs: codecs,
+            mime_type: representation.mime_type.to_string(),
+            width: *width,
+            height: *height,
+            sar: sar,
+        };
+
+        Ok(video_representation)
+    }
+
     fn parse_video_adaptation(
         adaptation: &AdaptationSet,
     ) -> Result<VideoAdaptation, Box<dyn Error>> {
         let mut video_representations: Vec<VideoRepresenation> = vec![];
 
         let frame_rate = match &adaptation.frame_rate {
-            Some(value) => value,
+            Some(value) => value.to_string(),
             None => {
                 return Err(format!(
                     "Cannot get frameRate from AdaptationSet Id: {}",
@@ -72,14 +132,55 @@ impl Tracks {
             }
         };
 
+        let max_width = match &adaptation.max_width {
+            Some(value) => value,
+            None => {
+                return Err(format!(
+                    "Cannot get maxWidth from AdaptationSet Id: {}",
+                    adaptation.id
+                )
+                .into())
+            }
+        };
+
+        let max_height = match &adaptation.max_height {
+            Some(value) => value,
+            None => {
+                return Err(format!(
+                    "Cannot get maxHeight from AdaptationSet Id: {}",
+                    adaptation.id
+                )
+                .into())
+            }
+        };
+
+        let par = match &adaptation.par {
+            Some(value) => value.to_string(),
+            None => {
+                return Err(
+                    format!("Cannot get PAR from AdaptationSet Id: {}", adaptation.id).into(),
+                )
+            }
+        };
+
+        let subsegment_alignment = match &adaptation.subsegment_alignment {
+            Some(value) => value.clone(),
+            None => false,
+        };
+
         let representations = &adaptation.representations;
         for representation in representations {
-            let video_representation = VideoRepresenation {};
+            let video_representation = Self::parse_video_representation(representation)?;
             video_representations.push(video_representation);
         }
 
         let video_adaptation = VideoAdaptation {
-            frame_rate: frame_rate.to_string(),
+            id: adaptation.id,
+            subsegment_alignment: subsegment_alignment,
+            frame_rate: frame_rate,
+            max_width: *max_width,
+            max_height: *max_height,
+            par: par,
             representations: video_representations,
         };
 

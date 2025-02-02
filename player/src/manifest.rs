@@ -67,6 +67,8 @@ pub struct AdaptationSet {
     pub id: u32,
     #[serde(rename = "@contentType")]
     pub content_type: String,
+    #[serde(rename = "@subsegmentAlignment")]
+    pub subsegment_alignment: Option<bool>,
 
     #[serde(rename = "@maxWidth")]
     pub max_width: Option<u32>,
@@ -74,6 +76,8 @@ pub struct AdaptationSet {
     pub max_height: Option<u32>,
     #[serde(rename = "@frameRate")]
     pub frame_rate: Option<String>,
+    #[serde(rename = "@par")]
+    pub par: Option<String>,
 
     #[serde(rename = "@lang")]
     pub lang: Option<String>,
@@ -85,7 +89,7 @@ pub struct AdaptationSet {
 #[derive(Deserialize, Clone)]
 pub struct Representation {
     #[serde(rename = "@id")]
-    pub id: String,
+    pub id: u32,
     #[serde(rename = "@bandwidth")]
     pub bandwidth: u64,
     #[serde(rename = "@mimeType")]
@@ -100,6 +104,8 @@ pub struct Representation {
     pub height: Option<u32>,
     #[serde(rename = "@frameRate")]
     pub frame_rate: Option<u32>,
+    #[serde(rename = "@sar")]
+    pub sar: Option<String>,
 
     #[serde(rename = "BaseURL")]
     pub base_url: BaseURL,

@@ -52,8 +52,8 @@ impl Player {
             }
         };
 
-        let track_manager = Tracks::new(&manifest.mpd)?;
-        self.tracks = Some(track_manager);
+        let tracks = Tracks::new(&manifest.mpd)?;
+        self.tracks = Some(tracks);
 
         Ok(())
     }

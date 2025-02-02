@@ -18,6 +18,7 @@ pub struct TrackManager<'a> {
 impl<'a> TrackManager<'a> {
     pub fn new(mpd: &'a MPD) -> Result<Self, Box<dyn Error>> {
         let duration = Self::parse_duration(mpd)?;
+        let tracks = Self::parse_tracks(mpd)?;
         Ok(TrackManager { mpd, duration })
     }
 
@@ -34,16 +35,31 @@ impl<'a> TrackManager<'a> {
         }
     }
 
-    fn parse_tracks(&mut self) -> Result<(), Box<dyn Error>> {
-        let period_first = self.mpd.periods.first();
-
-        let period = match period_first {
+    fn parse_tracks(mpd: &MPD) -> Result<(), Box<dyn Error>> {
+        let period = match mpd.periods.first() {
             Some(success) => success,
             None => {
                 eprintln!("Failed to parse Period");
                 return Err("Failed to parse Period".into());
             }
         };
+
+        let adaptation_sets = &period.adaptation_sets;
+        for adaptation in adaptation_sets {
+            let content_type = adaptation.content_type.as_str();
+            match content_type {
+                "video" => {
+                    println!("It is video")
+                }
+                "audio" => {
+                    println!("It is audio")
+                }
+                "text" => {
+                    println!("It is text")
+                }
+                _ => println!("Not supported"),
+            }
+        }
 
         Ok(())
     }

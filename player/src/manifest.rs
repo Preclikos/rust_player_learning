@@ -62,7 +62,7 @@ pub struct Period {
 }
 
 #[derive(Deserialize, Clone)]
-struct AdaptationSet {
+pub struct AdaptationSet {
     #[serde(rename = "@contentType")]
     pub content_type: String,
 

@@ -1,20 +1,11 @@
 mod manifest;
 mod track_manager;
+mod tracks;
 use std::error::Error;
 use url::Url;
 
 use crate::manifest::Manifest;
 use crate::track_manager::TrackManager;
-
-fn parse_base_url(full_url: &str) -> String {
-    let mut url = Url::parse(full_url).expect("Invalid URL");
-
-    url.path_segments_mut()
-        .expect("Cannot modify path segments")
-        .pop();
-
-    return url.to_string() + "/";
-}
 
 pub struct Player<'a> {
     base_url: Option<String>,
@@ -32,8 +23,18 @@ impl<'a> Player<'a> {
         }
     }
 
+    fn parse_base_url(full_url: &str) -> String {
+        let mut url = Url::parse(full_url).expect("Invalid URL");
+
+        url.path_segments_mut()
+            .expect("Cannot modify path segments")
+            .pop();
+
+        return url.to_string() + "/";
+    }
+
     pub fn open_url(&mut self, url: &str) -> Result<(), Box<dyn Error>> {
-        let base_url = parse_base_url(url);
+        let base_url = Self::parse_base_url(url);
         self.base_url = Some(base_url);
 
         let url = url.to_string();
@@ -52,7 +53,7 @@ impl<'a> Player<'a> {
             }
         };
 
-        let track_manager = TrackManager::new(&manifest.manifest)?;
+        let track_manager = TrackManager::new(&manifest.mpd)?;
         self.track_manager = Some(track_manager);
 
         Ok(())

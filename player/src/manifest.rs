@@ -5,7 +5,7 @@ use serde::Deserialize;
 pub struct Manifest {
     url: String,
     content: String,
-    pub manifest: MPD,
+    pub mpd: MPD,
 }
 
 impl Manifest {
@@ -16,7 +16,7 @@ impl Manifest {
         Ok(Manifest {
             url: url,
             content: content,
-            manifest: mpd,
+            mpd: mpd,
         })
     }
 

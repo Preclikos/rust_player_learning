@@ -1,4 +1,7 @@
-use crate::manifest::MPD;
+use crate::manifest::{AdaptationSet, MPD};
+use crate::tracks::audio::AudioAdaptation;
+use crate::tracks::text::TextAdaptation;
+use crate::tracks::video::VideoAdaptation;
 use iso8601_duration::Duration as IsoDuration;
 use std::error::Error;
 use std::time::Duration;
@@ -35,6 +38,22 @@ impl<'a> TrackManager<'a> {
         }
     }
 
+    fn parse_video_adaptation(
+        adaptation: &AdaptationSet,
+    ) -> Result<VideoAdaptation, Box<dyn Error>> {
+        Ok(VideoAdaptation {})
+    }
+
+    fn parse_audio_adaptation(
+        adaptation: &AdaptationSet,
+    ) -> Result<AudioAdaptation, Box<dyn Error>> {
+        Ok(AudioAdaptation {})
+    }
+
+    fn parse_text_adaptation(adaptation: &AdaptationSet) -> Result<TextAdaptation, Box<dyn Error>> {
+        Ok(TextAdaptation {})
+    }
+
     fn parse_tracks(mpd: &MPD) -> Result<(), Box<dyn Error>> {
         let period = match mpd.periods.first() {
             Some(success) => success,
@@ -44,18 +63,25 @@ impl<'a> TrackManager<'a> {
             }
         };
 
+        let mut video_adaptations: Vec<VideoAdaptation> = vec![];
+        let mut audio_adaptations: Vec<AudioAdaptation> = vec![];
+        let mut text_adaptations: Vec<TextAdaptation> = vec![];
+
         let adaptation_sets = &period.adaptation_sets;
         for adaptation in adaptation_sets {
             let content_type = adaptation.content_type.as_str();
             match content_type {
                 "video" => {
-                    println!("It is video")
+                    let value = Self::parse_video_adaptation(adaptation)?;
+                    video_adaptations.push(value);
                 }
                 "audio" => {
-                    println!("It is audio")
+                    let value = Self::parse_audio_adaptation(adaptation)?;
+                    audio_adaptations.push(value);
                 }
                 "text" => {
-                    println!("It is text")
+                    let value = Self::parse_text_adaptation(adaptation)?;
+                    text_adaptations.push(value);
                 }
                 _ => println!("Not supported"),
             }

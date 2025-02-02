@@ -61,14 +61,29 @@ impl Tracks {
     ) -> Result<VideoAdaptation, Box<dyn Error>> {
         let mut video_representations: Vec<VideoRepresenation> = vec![];
 
+        let frame_rate = match &adaptation.frame_rate {
+            Some(value) => value,
+            None => {
+                return Err(format!(
+                    "Cannot get frameRate from AdaptationSet Id: {}",
+                    adaptation.id
+                )
+                .into())
+            }
+        };
+
         let representations = &adaptation.representations;
         for representation in representations {
-            video_representations.push(VideoRepresenation {});
+            let video_representation = VideoRepresenation {};
+            video_representations.push(video_representation);
         }
 
-        Ok(VideoAdaptation {
+        let video_adaptation = VideoAdaptation {
+            frame_rate: frame_rate.to_string(),
             representations: video_representations,
-        })
+        };
+
+        Ok(video_adaptation)
     }
 
     fn parse_audio_adaptation(

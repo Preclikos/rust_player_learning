@@ -63,13 +63,17 @@ pub struct Period {
 
 #[derive(Deserialize, Clone)]
 pub struct AdaptationSet {
+    #[serde(rename = "@id")]
+    pub id: u32,
     #[serde(rename = "@contentType")]
     pub content_type: String,
 
     #[serde(rename = "@maxWidth")]
-    pub max_width: Option<i32>,
+    pub max_width: Option<u32>,
     #[serde(rename = "@maxHeight")]
-    pub max_height: Option<i32>,
+    pub max_height: Option<u32>,
+    #[serde(rename = "@frameRate")]
+    pub frame_rate: Option<String>,
 
     #[serde(rename = "@lang")]
     pub lang: Option<String>,
@@ -91,11 +95,11 @@ pub struct Representation {
     pub codecs: Option<String>,
 
     #[serde(rename = "@width")]
-    pub width: Option<i32>,
+    pub width: Option<u32>,
     #[serde(rename = "@height")]
-    pub height: Option<i32>,
+    pub height: Option<u32>,
     #[serde(rename = "@frameRate")]
-    pub frame_rate: Option<i32>,
+    pub frame_rate: Option<u32>,
 
     #[serde(rename = "BaseURL")]
     pub base_url: BaseURL,

@@ -22,18 +22,18 @@ impl Player {
         }
     }
 
-    fn parse_base_url(full_url: &str) -> String {
-        let mut url = Url::parse(full_url).expect("Invalid URL");
+    fn parse_base_url(full_url: &str) -> Result<String, Box<dyn Error>> {
+        let mut url = Url::parse(full_url)?;
 
         url.path_segments_mut()
             .expect("Cannot modify path segments")
             .pop();
 
-        return url.to_string() + "/";
+        return Ok(url.to_string() + "/");
     }
 
     pub fn open_url(&mut self, url: &str) -> Result<(), Box<dyn Error>> {
-        let base_url = Self::parse_base_url(url);
+        let base_url = Self::parse_base_url(url)?;
         self.base_url = Some(base_url);
 
         let url = url.to_string();

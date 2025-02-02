@@ -1,3 +1,4 @@
-pub struct TextAdaptation {}
-
-impl TextAdaptation {}
+pub struct TextAdaptation {
+    pub representations: Vec<TextRepresenation>,
+}
+pub struct TextRepresenation {}

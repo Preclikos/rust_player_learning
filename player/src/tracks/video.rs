@@ -1,3 +1,5 @@
-pub struct VideoAdaptation {}
+pub struct VideoAdaptation {
+    pub representations: Vec<VideoRepresenation>,
+}
 
-impl VideoAdaptation {}
+pub struct VideoRepresenation {}

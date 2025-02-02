@@ -79,7 +79,7 @@ pub struct AdaptationSet {
 }
 
 #[derive(Deserialize, Clone)]
-struct Representation {
+pub struct Representation {
     #[serde(rename = "@id")]
     pub id: String,
     #[serde(rename = "@bandwidth")]
@@ -104,13 +104,13 @@ struct Representation {
 }
 
 #[derive(Deserialize, Clone)]
-struct BaseURL {
+pub struct BaseURL {
     #[serde(rename = "$text")]
     pub value: String,
 }
 
 #[derive(Deserialize, Clone)]
-struct SegmentBase {
+pub struct SegmentBase {
     #[serde(rename = "@indexRange")]
     pub index_range: String,
 
@@ -119,7 +119,7 @@ struct SegmentBase {
 }
 
 #[derive(Deserialize, Clone)]
-struct Initialization {
+pub struct Initialization {
     #[serde(rename = "@range")]
     pub range: String,
 }

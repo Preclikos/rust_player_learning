@@ -1,25 +1,24 @@
 mod manifest;
-mod track_manager;
 mod tracks;
 use std::error::Error;
+use tracks::Tracks;
 use url::Url;
 
-use crate::manifest::Manifest;
-use crate::track_manager::TrackManager;
+use manifest::Manifest;
 
-pub struct Player<'a> {
+pub struct Player {
     base_url: Option<String>,
     manifest: Option<Manifest>,
-    track_manager: Option<TrackManager<'a>>,
+    tracks: Option<Tracks>,
 }
 
-impl<'a> Player<'a> {
+impl Player {
     pub fn new() -> Self {
         //Here i want pass texture and other device -> wgpu and cpal
         Player {
             base_url: None,
             manifest: None,
-            track_manager: None,
+            tracks: None,
         }
     }
 
@@ -44,7 +43,7 @@ impl<'a> Player<'a> {
         Ok(())
     }
 
-    pub fn prepare(&'a mut self) -> Result<(), Box<dyn Error>> {
+    pub fn prepare(mut self) -> Result<(), Box<dyn Error>> {
         let manifest = match &self.manifest {
             Some(success) => success,
             None => {
@@ -53,8 +52,8 @@ impl<'a> Player<'a> {
             }
         };
 
-        let track_manager = TrackManager::new(&manifest.mpd)?;
-        self.track_manager = Some(track_manager);
+        let track_manager = Tracks::new(&manifest.mpd)?;
+        self.tracks = Some(track_manager);
 
         Ok(())
     }

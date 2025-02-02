@@ -1,3 +1,5 @@
-pub struct AudioAdaptation {}
+pub struct AudioAdaptation {
+    pub representations: Vec<AudioRepresentation>,
+}
 
-impl AudioAdaptation {}
+pub struct AudioRepresentation {}

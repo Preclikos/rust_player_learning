@@ -12,36 +12,35 @@ fn iso_to_std_duration(iso_duration: &IsoDuration) -> Duration {
 
 pub struct TrackManager<'a> {
     mpd: &'a MPD,
-    duration: Option<Duration>,
+    duration: Duration,
 }
 
 impl<'a> TrackManager<'a> {
-    pub fn new(mpd: &'a MPD) -> Self {
-        TrackManager {
-            mpd: &mpd,
-            duration: None,
+    pub fn new(mpd: &'a MPD) -> Result<Self, Box<dyn Error>> {
+        let duration = Self::parse_duration(mpd)?;
+        Ok(TrackManager { mpd, duration })
+    }
+
+    fn parse_duration(mpd: &MPD) -> Result<Duration, Box<dyn Error>> {
+        match mpd.media_presentation_duration.parse::<IsoDuration>() {
+            Ok(iso_duration) => Ok(iso_to_std_duration(&iso_duration)),
+            Err(e) => {
+                eprintln!(
+                    "Failed to parse media presentation duration: {}",
+                    e.position
+                );
+                Err("Failed to parse media presentation duration".into())
+            }
         }
     }
 
-    pub fn parse_tracks(&mut self) -> Result<(), Box<dyn Error>> {
+    fn parse_tracks(&mut self) -> Result<(), Box<dyn Error>> {
         let period_first = self.mpd.periods.first();
 
         let period = match period_first {
             Some(success) => success,
             None => {
                 eprintln!("Failed to parse Period");
-                return Err("Failed to parse Period".into());
-            }
-        };
-
-        let parsed_duration = &self.mpd.media_presentation_duration.parse::<IsoDuration>();
-        match parsed_duration {
-            Ok(success) => {
-                let duration = iso_to_std_duration(&success);
-                self.duration = Some(duration)
-            }
-            Err(e) => {
-                eprintln!("Failed to parse Priod - duration: {}", e.position);
                 return Err("Failed to parse Period".into());
             }
         };

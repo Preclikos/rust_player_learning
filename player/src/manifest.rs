@@ -4,21 +4,24 @@ use serde::Deserialize;
 
 pub struct Manifest {
     url: String,
-    body: Option<String>,
-    pub manifest: Option<MPD>,
+    content: String,
+    pub manifest: MPD,
 }
 
 impl Manifest {
-    pub fn new(url: String) -> Self {
-        Manifest {
+    pub fn new(url: String) -> Result<Self, Box<dyn std::error::Error>> {
+        let content = Self::download(&url)?;
+        let mpd = Self::parse(&content)?;
+
+        Ok(Manifest {
             url: url,
-            body: None,
-            manifest: None,
-        }
+            content: content,
+            manifest: mpd,
+        })
     }
 
-    pub fn download(&mut self) -> Result<(), Error> {
-        let response = get(&self.url);
+    fn download(url: &str) -> Result<String, Error> {
+        let response = get(url);
 
         let manifest_content = match response {
             Ok(success) => success.text()?,
@@ -28,31 +31,18 @@ impl Manifest {
             }
         };
 
-        self.body = Some(manifest_content);
-        Ok(())
+        Ok(manifest_content)
     }
 
-    pub fn parse(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let manifest = match &self.body {
-            Some(body) => body.as_str(),
-            None => {
-                eprintln!("Failed to parse empty Manifest");
-                return Err("Failed to parse empty Manifest".into());
-            }
-        };
-
-        let mpd = match from_str::<MPD>(manifest) {
+    fn parse(content: &str) -> Result<MPD, Box<dyn std::error::Error>> {
+        let mpd = match from_str::<MPD>(content) {
             Ok(mpd) => mpd,
             Err(e) => {
                 eprintln!("Failed to parse MPD: {}", e);
                 return Err("Failed to parse MPD:".into());
             }
         };
-
-        //println!("Parsed MPD: {:#?}", mpd);
-        self.manifest = Some(mpd);
-
-        Ok(())
+        Ok(mpd)
     }
 }
 

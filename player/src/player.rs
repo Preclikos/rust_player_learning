@@ -1,11 +1,23 @@
 mod manifest;
 mod track_manager;
 use std::error::Error;
+use url::Url;
 
 use crate::manifest::Manifest;
 use crate::track_manager::TrackManager;
 
+fn parse_base_url(full_url: &str) -> String {
+    let mut url = Url::parse(full_url).expect("Invalid URL");
+
+    url.path_segments_mut()
+        .expect("Cannot modify path segments")
+        .pop();
+
+    return url.to_string() + "/";
+}
+
 pub struct Player<'a> {
+    base_url: Option<String>,
     manifest: Option<Manifest>,
     track_manager: Option<TrackManager<'a>>,
 }
@@ -14,33 +26,19 @@ impl<'a> Player<'a> {
     pub fn new() -> Self {
         //Here i want pass texture and other device -> wgpu and cpal
         Player {
+            base_url: None,
             manifest: None,
             track_manager: None,
         }
     }
 
     pub fn open_url(&mut self, url: &str) -> Result<(), Box<dyn Error>> {
+        let base_url = parse_base_url(url);
+        self.base_url = Some(base_url);
+
         let url = url.to_string();
-        let mut manifest = Manifest::new(url);
-
-        let download = manifest.download();
-        let parse = match download {
-            Ok(_) => manifest.parse(),
-            Err(e) => {
-                eprintln!("Manifest download failed: {}", e);
-                return Err("Manifest download failed".into());
-            }
-        };
-
-        match parse {
-            Ok(_) => {
-                self.manifest = Some(manifest);
-            }
-            Err(e) => {
-                eprintln!("Manifest parsing failed");
-                return Err(e);
-            }
-        };
+        let manifest = Manifest::new(url)?;
+        self.manifest = Some(manifest);
 
         Ok(())
     }
@@ -54,23 +52,8 @@ impl<'a> Player<'a> {
             }
         };
 
-        let mpd = match &manifest.manifest {
-            Some(success) => success,
-            None => {
-                eprintln!("MPD not prepared!");
-                return Err("MPD not loaded!".into());
-            }
-        };
-
-        let mut track_manager = TrackManager::new(&mpd);
-
-        match track_manager.parse_tracks() {
-            Ok(_) => self.track_manager = Some(track_manager),
-            Err(e) => {
-                eprintln!("TrackManager cannot parse tracks: {}", e);
-                return Err("TrackManager cannot parse tracks".into());
-            }
-        }
+        let track_manager = TrackManager::new(&manifest.manifest)?;
+        self.track_manager = Some(track_manager);
 
         Ok(())
     }

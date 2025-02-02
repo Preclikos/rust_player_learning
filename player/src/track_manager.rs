@@ -34,7 +34,7 @@ impl<'a> TrackManager<'a> {
             }
         };
 
-        let parsed_duration = period.duration.parse::<IsoDuration>();
+        let parsed_duration = &self.mpd.media_presentation_duration.parse::<IsoDuration>();
         match parsed_duration {
             Ok(success) => {
                 let duration = iso_to_std_duration(&success);

@@ -58,25 +58,31 @@ impl Manifest {
 
 #[derive(Deserialize, Clone)]
 pub struct MPD {
+    #[serde(rename = "@mediaPresentationDuration")]
+    pub media_presentation_duration: String,
+
     #[serde(rename = "Period")]
     pub periods: Vec<Period>,
 }
 
 #[derive(Deserialize, Clone)]
 pub struct Period {
-    #[serde(rename = "@duration")]
-    pub duration: String,
-
     #[serde(rename = "AdaptationSet")]
     pub adaptation_sets: Vec<AdaptationSet>,
 }
 
 #[derive(Deserialize, Clone)]
 struct AdaptationSet {
+    #[serde(rename = "@contentType")]
+    pub content_type: String,
+
     #[serde(rename = "@maxWidth")]
     pub max_width: Option<i32>,
     #[serde(rename = "@maxHeight")]
     pub max_height: Option<i32>,
+
+    #[serde(rename = "@lang")]
+    pub lang: Option<String>,
 
     #[serde(rename = "Representation")]
     pub representations: Vec<Representation>,
@@ -104,7 +110,7 @@ struct Representation {
     #[serde(rename = "BaseURL")]
     pub base_url: BaseURL,
     #[serde(rename = "SegmentBase")]
-    pub segment_base: SegmentBase,
+    pub segment_base: Option<SegmentBase>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -115,8 +121,6 @@ struct BaseURL {
 
 #[derive(Deserialize, Clone)]
 struct SegmentBase {
-    #[serde(rename = "@indexRangeExact")]
-    pub index_range_exact: bool,
     #[serde(rename = "@indexRange")]
     pub index_range: String,
 

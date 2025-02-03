@@ -1,12 +1,15 @@
 mod manifest;
+mod networking;
 mod tracks;
 use std::error::Error;
 use tracks::Tracks;
 use url::Url;
 
 use manifest::Manifest;
+use networking::HttpClient;
 
 pub struct Player {
+    http_client: HttpClient,
     base_url: Option<String>,
     manifest: Option<Manifest>,
     tracks: Option<Tracks>,
@@ -15,7 +18,9 @@ pub struct Player {
 impl Player {
     pub fn new() -> Self {
         //Here i want pass texture and other device -> wgpu and cpal
+        let client = HttpClient::new();
         Player {
+            http_client: client,
             base_url: None,
             manifest: None,
             tracks: None,

@@ -1,5 +1,10 @@
 use std::error::Error;
 
+use reqwest::{
+    blocking::{get, Client},
+    header::{HeaderValue, RANGE},
+};
+
 pub struct Segment {
     base_url: String,
     file_url: String,
@@ -25,5 +30,15 @@ impl Segment {
             start,
             end,
         })
+    }
+
+    pub fn download(&mut self) {
+        let client = Client::new();
+
+        let range_value = format!("bytes={}-{}", self.start, self.end);
+        let range_header = HeaderValue::from_str(&range_value).unwrap();
+
+        let url = format!("{}{}", &self.base_url, &self.file_url);
+        let response = client.get(url).header(RANGE, range_header).send();
     }
 }

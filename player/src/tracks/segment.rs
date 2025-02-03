@@ -1,9 +1,8 @@
-use std::error::Error;
-
 use reqwest::{
     blocking::{get, Client},
     header::{HeaderValue, RANGE},
 };
+use std::{error::Error, str::Bytes};
 
 pub struct Segment {
     base_url: String,
@@ -32,7 +31,7 @@ impl Segment {
         })
     }
 
-    pub fn download(&mut self) {
+    pub fn download(&mut self) -> Result<Vec<u8>, Box<dyn Error>> {
         let client = Client::new();
 
         let range_value = format!("bytes={}-{}", self.start, self.end);
@@ -40,5 +39,17 @@ impl Segment {
 
         let url = format!("{}{}", &self.base_url, &self.file_url);
         let response = client.get(url).header(RANGE, range_header).send();
+
+        let response_bytes = match response {
+            Ok(success) => success.bytes(),
+            Err(e) => return Err(format!("Segment response error: {}", e).into()),
+        };
+
+        let bytes = match response_bytes {
+            Ok(success) => success,
+            Err(e) => return Err(format!("Cannot read segment bytes: {}", e).into()),
+        };
+
+        Ok(bytes.to_vec())
     }
 }

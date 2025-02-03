@@ -52,7 +52,15 @@ impl Player {
             }
         };
 
-        let tracks = Tracks::new(&manifest.mpd)?;
+        let base_url = match &self.base_url {
+            Some(success) => success.to_string(),
+            None => {
+                eprintln!("BaseUrl not loaded!");
+                return Err("BaseUrl not loaded!".into());
+            }
+        };
+
+        let tracks = Tracks::new(base_url, &manifest.mpd)?;
         self.tracks = Some(tracks);
 
         Ok(())

@@ -1,3 +1,5 @@
+use super::segment::Segment;
+
 pub struct VideoAdaptation {
     pub id: u32,
 
@@ -13,6 +15,13 @@ pub struct VideoAdaptation {
 
 pub struct VideoRepresenation {
     pub id: u32,
+
+    pub base_url: String,
+    pub file_url: String,
+
+    pub segment_init: Segment,
+    pub segment_range: Segment,
+    pub segments: Vec<Segment>,
 
     pub bandwidth: u64,
 

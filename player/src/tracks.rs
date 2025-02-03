@@ -1,4 +1,5 @@
 pub mod audio;
+pub mod segment;
 pub mod text;
 pub mod video;
 
@@ -7,6 +8,7 @@ use crate::tracks::audio::{AudioAdaptation, AudioRepresentation};
 use crate::tracks::text::{TextAdaptation, TextRepresenation};
 use crate::tracks::video::{VideoAdaptation, VideoRepresenation};
 use iso8601_duration::Duration as IsoDuration;
+use segment::Segment;
 use std::error::Error;
 use std::time::Duration;
 
@@ -31,9 +33,9 @@ pub struct Tracks {
 }
 
 impl Tracks {
-    pub fn new(mpd: &MPD) -> Result<Self, Box<dyn Error>> {
+    pub fn new(base_url: String, mpd: &MPD) -> Result<Self, Box<dyn Error>> {
         let duration = Self::parse_duration(mpd)?;
-        let tracks = Self::parse_tracks(mpd)?;
+        let tracks = Self::parse_tracks(base_url, mpd)?;
 
         Ok(Tracks {
             duration,
@@ -57,6 +59,7 @@ impl Tracks {
     }
 
     fn parse_video_representation(
+        base_url: &String,
         representation: &Representation,
     ) -> Result<VideoRepresenation, Box<dyn Error>> {
         let codecs = match &representation.codecs {
@@ -103,20 +106,43 @@ impl Tracks {
             }
         };
 
+        let url_base = base_url.to_string();
+        let file_url = representation.base_url.value.to_string();
+
+        let base_segment = match &representation.segment_base {
+            Some(segment) => segment,
+            None => {
+                return Err(format!(
+                    "Cannot get segmentBase from Representation Id: {}",
+                    representation.id
+                )
+                .into())
+            }
+        };
+
+        let init_segment = Segment::new(&url_base, &file_url, &base_segment.initialization.range)?;
+        let index_segment = Segment::new(&url_base, &file_url, &base_segment.index_range)?;
+
         let video_representation = VideoRepresenation {
             id: representation.id,
+            base_url: url_base,
+            file_url: file_url,
             bandwidth: representation.bandwidth,
             codecs: codecs,
             mime_type: representation.mime_type.to_string(),
             width: *width,
             height: *height,
             sar: sar,
+            segment_init: init_segment,
+            segment_range: index_segment,
+            segments: vec![],
         };
 
         Ok(video_representation)
     }
 
     fn parse_video_adaptation(
+        base_url: &String,
         adaptation: &AdaptationSet,
     ) -> Result<VideoAdaptation, Box<dyn Error>> {
         let mut video_representations: Vec<VideoRepresenation> = vec![];
@@ -170,7 +196,7 @@ impl Tracks {
 
         let representations = &adaptation.representations;
         for representation in representations {
-            let video_representation = Self::parse_video_representation(representation)?;
+            let video_representation = Self::parse_video_representation(base_url, representation)?;
             video_representations.push(video_representation);
         }
 
@@ -188,6 +214,7 @@ impl Tracks {
     }
 
     fn parse_audio_adaptation(
+        base_url: &String,
         adaptation: &AdaptationSet,
     ) -> Result<AudioAdaptation, Box<dyn Error>> {
         let mut audio_representations: Vec<AudioRepresentation> = vec![];
@@ -202,7 +229,10 @@ impl Tracks {
         })
     }
 
-    fn parse_text_adaptation(adaptation: &AdaptationSet) -> Result<TextAdaptation, Box<dyn Error>> {
+    fn parse_text_adaptation(
+        base_url: &String,
+        adaptation: &AdaptationSet,
+    ) -> Result<TextAdaptation, Box<dyn Error>> {
         let mut text_representations: Vec<TextRepresenation> = vec![];
 
         let representations = &adaptation.representations;
@@ -215,7 +245,7 @@ impl Tracks {
         })
     }
 
-    fn parse_tracks(mpd: &MPD) -> Result<TracksResult, Box<dyn Error>> {
+    fn parse_tracks(base_url: String, mpd: &MPD) -> Result<TracksResult, Box<dyn Error>> {
         let period = match mpd.periods.first() {
             Some(success) => success,
             None => {
@@ -233,15 +263,15 @@ impl Tracks {
             let content_type = adaptation.content_type.as_str();
             match content_type {
                 "video" => {
-                    let value = Self::parse_video_adaptation(adaptation)?;
+                    let value = Self::parse_video_adaptation(&base_url, adaptation)?;
                     video_adaptations.push(value);
                 }
                 "audio" => {
-                    let value = Self::parse_audio_adaptation(adaptation)?;
+                    let value = Self::parse_audio_adaptation(&base_url, adaptation)?;
                     audio_adaptations.push(value);
                 }
                 "text" => {
-                    let value = Self::parse_text_adaptation(adaptation)?;
+                    let value = Self::parse_text_adaptation(&base_url, adaptation)?;
                     text_adaptations.push(value);
                 }
                 _ => println!("Not supported"),

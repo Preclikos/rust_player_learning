@@ -4,7 +4,7 @@ pub mod text;
 pub mod video;
 
 use crate::manifest::{AdaptationSet, Representation, MPD};
-use crate::parsers::mp4::parse_sidx;
+use crate::parsers::mp4::{parse_sidx, SidxBox};
 use crate::tracks::audio::{AudioAdaptation, AudioRepresentation};
 use crate::tracks::text::{TextAdaptation, TextRepresenation};
 use crate::tracks::video::{VideoAdaptation, VideoRepresenation};
@@ -22,10 +22,10 @@ struct TracksResult {
 }
 
 pub struct Tracks {
-    duration: Duration,
-    video: Vec<VideoAdaptation>,
-    audio: Vec<AudioAdaptation>,
-    text: Vec<TextAdaptation>,
+    pub duration: Duration,
+    pub video: Vec<VideoAdaptation>,
+    pub audio: Vec<AudioAdaptation>,
+    pub text: Vec<TextAdaptation>,
 }
 
 impl Tracks {
@@ -60,6 +60,27 @@ impl Tracks {
                 Err("Failed to parse media presentation duration".into())
             }
         }
+    }
+
+    fn generate_segments_from_sidx(
+        base_url: &String,
+        file_url: &String,
+        sidx: SidxBox,
+        offset: u64,
+    ) -> Result<Vec<Segment>, Box<dyn Error>> {
+        let entires = sidx.entries;
+        let mut segments: Vec<Segment> = vec![];
+
+        let mut start_byte = offset + u64::from(sidx.size) + u64::from(sidx.first_offset);
+        for entry in entires.iter() {
+            let end = start_byte + entry.reference_size - 1;
+            let segment = Segment::new(base_url, file_url, start_byte, end)?;
+            segments.push(segment);
+
+            start_byte += entry.reference_size
+        }
+
+        Ok(segments)
     }
 
     fn parse_video_representation(
@@ -129,13 +150,15 @@ impl Tracks {
         let index_range = Self::parse_range(&base_segment.index_range)?;
         let index_segment = Segment::new(&url_base, &file_url, index_range.0, index_range.1)?;
 
-        let segments: Vec<Segment> = vec![];
+        let segments: Vec<Segment>;
 
         match representation.mime_type.as_str() {
             "video/mp4" => {
                 let index_vec = index_segment.download()?;
                 let mut index_slice = &index_vec[..];
-                let sidx = parse_sidx(index_range.1, &mut index_slice);
+                let sidx = parse_sidx(index_range.1, &mut index_slice)?;
+                segments =
+                    Self::generate_segments_from_sidx(&url_base, &file_url, sidx, index_range.1)?;
             }
             _ => {
                 return Err(format!(

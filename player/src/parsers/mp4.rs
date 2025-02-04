@@ -1,4 +1,4 @@
-use crate::tracks::segment::Segment;
+use std::error::Error;
 
 fn read_u32(data: &mut &[u8]) -> u32 {
     let result = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
@@ -12,7 +12,30 @@ fn read_u16(data: &mut &[u8]) -> u16 {
     result
 }
 
-pub fn parse_sidx(segment_offset: u64, data: &mut &[u8]) {
+#[derive(Debug)]
+pub struct SidxEntry {
+    pub reference_type: u8,
+    pub reference_size: u64,
+    pub subsegment_duration: u32,
+    pub starts_with_sap: u8,
+    pub sap_type: u8,
+    pub sap_delta: u32,
+}
+
+#[derive(Debug)]
+pub struct SidxBox {
+    pub size: u32,
+    pub version: u8,
+    pub flags: u32,
+    pub reference_id: u32,
+    pub timescale: u32,
+    pub earliest_presentation_time: u32,
+    pub first_offset: u32,
+    pub entry_count: u16,
+    pub entries: Vec<SidxEntry>,
+}
+
+pub fn parse_sidx(segment_offset: u64, data: &mut &[u8]) -> Result<SidxBox, Box<dyn Error>> {
     // Read the size of the box (we ignore the size field here)
     let size = read_u32(data);
 
@@ -22,8 +45,7 @@ pub fn parse_sidx(segment_offset: u64, data: &mut &[u8]) {
     *data = &data[4..]; // Move the slice forward
 
     if type_str != "sidx" {
-        println!("Not a valid sidx box!");
-        return;
+        return Err("Not a valid sidx box!".into());
     }
 
     // Read version and flags
@@ -39,55 +61,38 @@ pub fn parse_sidx(segment_offset: u64, data: &mut &[u8]) {
     *data = &data[2..]; // Move the slice forward reserved 16bits
 
     let entry_count = read_u16(data); // Number of entries in the sidx
+    let mut entries = Vec::new();
 
-    // Print basic sidx box info
-    println!("sidx box information:");
-    println!("  size: {}", size);
-    println!("  version: {}", version);
-    println!("  flags: {:#X}", flags);
-    println!("  reference_id: {}", reference_id);
-    println!("  timescale: {}", timescale);
-    println!(
-        "  earliest_presentation_time: {}",
-        earliest_presentation_time
-    );
-    println!("  first_offset: {}", first_offset);
-    println!("  entry_count: {}", entry_count);
-
-    let mut startByte = segment_offset + u64::from(size) + u64::from(first_offset);
     // Parse the entries and generate segments
-    for i in 0..entry_count {
-        // Read chunk (4 bytes)
-        let mut chunk = read_u32(data);
-        // Extract referenceType (1 bit) and referenceSize (31 bits)
-        let reference_type = (chunk >> 31) & 0x1;
-        let reference_size = chunk & 0x7FFFFFFF;
-
-        // Read the subsegment duration (4 bytes)
+    for _ in 0..entry_count {
+        let chunk = read_u32(data);
+        let reference_type = (chunk >> 31) as u8;
+        let reference_size = u64::from(chunk & 0x7FFFFFFF);
         let subsegment_duration = read_u32(data);
-
-        // Read chunk for SAP-related information (4 bytes)
-        chunk = read_u32(data);
-
-        // Extract startsWithSap, sapType, sapDelta
-        let starts_with_sap = (chunk >> 31) & 0x1;
-        let sap_type = (chunk >> 28) & 0x7;
+        let chunk = read_u32(data);
+        let starts_with_sap = (chunk >> 31) as u8;
+        let sap_type = ((chunk >> 28) & 0x7) as u8;
         let sap_delta = chunk & 0x0FFFFFFF;
 
-        // Debug output (optional)
-        println!("Processing segment {}", i + 1);
-        println!("  Segment Start Size: {}", startByte);
-        println!(
-            "  Segment End Size: {}",
-            startByte + u64::from(reference_size) - 1
-        );
-        println!("  Reference Type: {}", reference_type);
-        println!("  Reference Size: {}", reference_size);
-        println!("  Subsegment Duration: {}", subsegment_duration);
-        println!("  Starts with SAP: {}", starts_with_sap);
-        println!("  SAP Type: {}", sap_type);
-        println!("  SAP Delta: {}", sap_delta);
-
-        startByte += u64::from(reference_size);
+        entries.push(SidxEntry {
+            reference_type,
+            reference_size,
+            subsegment_duration,
+            starts_with_sap,
+            sap_type,
+            sap_delta,
+        });
     }
+
+    Ok(SidxBox {
+        size,
+        version,
+        flags,
+        reference_id,
+        timescale,
+        earliest_presentation_time,
+        first_offset,
+        entry_count,
+        entries,
+    })
 }

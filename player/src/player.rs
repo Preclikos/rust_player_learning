@@ -71,6 +71,10 @@ impl Player {
         let tracks = Tracks::new(base_url, &manifest.mpd)?;
         self.tracks = Some(tracks);
 
+        let tracks = self.tracks.unwrap();
+        let selectedVideo = tracks.video.first().unwrap();
+        let selectedRepresentation = selectedVideo.representations.first().unwrap();
+
         Ok(())
     }
 }

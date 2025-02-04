@@ -1,5 +1,6 @@
 use super::segment::Segment;
 
+#[derive(Clone)]
 pub struct VideoAdaptation {
     pub id: u32,
 
@@ -13,6 +14,7 @@ pub struct VideoAdaptation {
     pub representations: Vec<VideoRepresenation>,
 }
 
+#[derive(Clone)]
 pub struct VideoRepresenation {
     pub id: u32,
 

@@ -5,7 +5,11 @@ mod tracks;
 mod utils;
 
 use std::error::Error;
-use tracks::Tracks;
+use tracks::{
+    audio::AudioAdaptation,
+    video::{VideoAdaptation, VideoRepresenation},
+    Tracks,
+};
 use url::Url;
 
 use manifest::Manifest;
@@ -16,6 +20,9 @@ pub struct Player {
     base_url: Option<String>,
     manifest: Option<Manifest>,
     tracks: Option<Tracks>,
+
+    video_adaptation: Option<VideoAdaptation>,
+    video_representation: Option<VideoRepresenation>,
 }
 
 impl Player {
@@ -27,6 +34,8 @@ impl Player {
             base_url: None,
             manifest: None,
             tracks: None,
+            video_adaptation: None,
+            video_representation: None,
         }
     }
 
@@ -51,7 +60,7 @@ impl Player {
         Ok(())
     }
 
-    pub fn prepare(mut self) -> Result<(), Box<dyn Error>> {
+    pub fn prepare(&mut self) -> Result<(), Box<dyn Error>> {
         let manifest = match &self.manifest {
             Some(success) => success,
             None => {
@@ -71,10 +80,22 @@ impl Player {
         let tracks = Tracks::new(base_url, &manifest.mpd)?;
         self.tracks = Some(tracks);
 
-        let tracks = self.tracks.unwrap();
-        let selectedVideo = tracks.video.first().unwrap();
-        let selectedRepresentation = selectedVideo.representations.first().unwrap();
-
         Ok(())
+    }
+
+    pub fn get_tracks(&self) -> Result<&Tracks, Box<dyn Error>> {
+        match &self.tracks {
+            Some(success) => Ok(success),
+            None => Err("No parsed tracks - player not prepared".into()),
+        }
+    }
+
+    pub fn set_video_track(
+        &mut self,
+        adaptation: &VideoAdaptation,
+        representation: &VideoRepresenation,
+    ) {
+        self.video_adaptation = Some(adaptation.clone());
+        self.video_representation = Some(representation.clone());
     }
 }

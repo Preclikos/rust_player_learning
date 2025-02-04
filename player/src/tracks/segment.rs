@@ -1,9 +1,10 @@
 use reqwest::{
-    blocking::{get, Client},
+    blocking::Client,
     header::{HeaderValue, RANGE},
 };
-use std::{error::Error, str::Bytes};
+use std::error::Error;
 
+#[derive(Clone)]
 pub struct Segment {
     base_url: String,
     file_url: String,

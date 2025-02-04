@@ -4,20 +4,16 @@ pub mod text;
 pub mod video;
 
 use crate::manifest::{AdaptationSet, Representation, MPD};
+use crate::parsers::mp4::parse_sidx;
 use crate::tracks::audio::{AudioAdaptation, AudioRepresentation};
 use crate::tracks::text::{TextAdaptation, TextRepresenation};
 use crate::tracks::video::{VideoAdaptation, VideoRepresenation};
+use crate::utils::time::iso_to_std_duration;
+
 use iso8601_duration::Duration as IsoDuration;
 use segment::Segment;
 use std::error::Error;
 use std::time::Duration;
-
-fn iso_to_std_duration(iso_duration: &IsoDuration) -> Duration {
-    let total_seconds =
-        iso_duration.hour * 3600.0 + iso_duration.minute * 60.0 + iso_duration.second;
-
-    Duration::from_secs_f32(total_seconds)
-}
 
 struct TracksResult {
     video: Vec<VideoAdaptation>,
@@ -43,6 +39,14 @@ impl Tracks {
             audio: tracks.audio,
             text: tracks.text,
         })
+    }
+
+    fn parse_range(range: &String) -> Result<(u64, u64), Box<dyn Error>> {
+        let mut parts = range.split('-');
+
+        let start = parts.next().ok_or("Missing start number")?.parse::<u64>()?;
+        let end = parts.next().ok_or("Missing end number")?.parse::<u64>()?;
+        Ok((start, end))
     }
 
     fn parse_duration(mpd: &MPD) -> Result<Duration, Box<dyn Error>> {
@@ -120,8 +124,27 @@ impl Tracks {
             }
         };
 
-        let init_segment = Segment::new(&url_base, &file_url, &base_segment.initialization.range)?;
-        let index_segment = Segment::new(&url_base, &file_url, &base_segment.index_range)?;
+        let init_range = Self::parse_range(&base_segment.initialization.range)?;
+        let init_segment = Segment::new(&url_base, &file_url, init_range.0, init_range.1)?;
+        let index_range = Self::parse_range(&base_segment.index_range)?;
+        let index_segment = Segment::new(&url_base, &file_url, index_range.0, index_range.1)?;
+
+        let segments: Vec<Segment> = vec![];
+
+        match representation.mime_type.as_str() {
+            "video/mp4" => {
+                let index_vec = index_segment.download()?;
+                let mut index_slice = &index_vec[..];
+                let sidx = parse_sidx(index_range.1, &mut index_slice);
+            }
+            _ => {
+                return Err(format!(
+                    "Representation with type {} not supported",
+                    representation.mime_type
+                )
+                .into())
+            }
+        }
 
         let video_representation = VideoRepresenation {
             id: representation.id,
@@ -135,7 +158,7 @@ impl Tracks {
             sar: sar,
             segment_init: init_segment,
             segment_range: index_segment,
-            segments: vec![],
+            segments: segments,
         };
 
         Ok(video_representation)

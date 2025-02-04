@@ -1,6 +1,9 @@
 mod manifest;
 mod networking;
+mod parsers;
 mod tracks;
+mod utils;
+
 use std::error::Error;
 use tracks::Tracks;
 use url::Url;

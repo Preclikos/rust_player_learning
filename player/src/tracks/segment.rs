@@ -16,13 +16,9 @@ impl Segment {
     pub fn new(
         base_url: &String,
         file_url: &String,
-        range: &String,
+        start: u64,
+        end: u64,
     ) -> Result<Self, Box<dyn Error>> {
-        let mut parts = range.split('-');
-
-        let start = parts.next().ok_or("Missing start number")?.parse::<u64>()?;
-        let end = parts.next().ok_or("Missing end number")?.parse::<u64>()?;
-
         Ok(Segment {
             base_url: base_url.to_string(),
             file_url: file_url.to_string(),
@@ -31,7 +27,7 @@ impl Segment {
         })
     }
 
-    pub fn download(&mut self) -> Result<Vec<u8>, Box<dyn Error>> {
+    pub fn download(&self) -> Result<Vec<u8>, Box<dyn Error>> {
         let client = Client::new();
 
         let range_value = format!("bytes={}-{}", self.start, self.end);

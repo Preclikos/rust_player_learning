@@ -1,5 +1,5 @@
 use quick_xml::de::from_str;
-use reqwest::{blocking::get, Error};
+use reqwest::{blocking::get, Client, Error};
 use serde::Deserialize;
 
 pub struct Manifest {
@@ -9,8 +9,8 @@ pub struct Manifest {
 }
 
 impl Manifest {
-    pub fn new(url: String) -> Result<Self, Box<dyn std::error::Error>> {
-        let content = Self::download(&url)?;
+    pub async fn new(url: String) -> Result<Self, Box<dyn std::error::Error>> {
+        let content = Self::download(&url).await?;
         let mpd = Self::parse(&content)?;
 
         Ok(Manifest {
@@ -20,11 +20,13 @@ impl Manifest {
         })
     }
 
-    fn download(url: &str) -> Result<String, Error> {
-        let response = get(url);
+    async fn download(url: &str) -> Result<String, Error> {
+        let client = Client::new();
+
+        let response = client.get(url).send().await;
 
         let manifest_content = match response {
-            Ok(success) => success.text()?,
+            Ok(success) => success.text().await?,
             Err(e) => {
                 println!("Manifest download failed: {}", e);
                 return Err(e);

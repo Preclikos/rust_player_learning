@@ -5,3 +5,4 @@ edition = "2021"
 
 [dependencies]
 player = { path = "../player" }
+tokio = { version = "1.43.0", features = ["full"] }

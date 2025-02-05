@@ -1,6 +1,6 @@
 use reqwest::{
-    blocking::Client,
     header::{HeaderValue, RANGE},
+    Client,
 };
 use std::error::Error;
 
@@ -28,17 +28,17 @@ impl Segment {
         })
     }
 
-    pub fn download(&self) -> Result<Vec<u8>, Box<dyn Error>> {
+    pub async fn download(&self) -> Result<Vec<u8>, Box<dyn Error>> {
         let client = Client::new();
 
         let range_value = format!("bytes={}-{}", self.start, self.end);
         let range_header = HeaderValue::from_str(&range_value).unwrap();
 
         let url = format!("{}{}", &self.base_url, &self.file_url);
-        let response = client.get(url).header(RANGE, range_header).send();
+        let response = client.get(url).header(RANGE, range_header).send().await;
 
         let response_bytes = match response {
-            Ok(success) => success.bytes(),
+            Ok(success) => success.bytes().await,
             Err(e) => return Err(format!("Segment response error: {}", e).into()),
         };
 

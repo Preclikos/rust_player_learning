@@ -21,6 +21,7 @@ struct TracksResult {
     text: Vec<TextAdaptation>,
 }
 
+#[derive(Clone)]
 pub struct Tracks {
     pub duration: Duration,
     pub video: Vec<VideoAdaptation>,
@@ -29,9 +30,9 @@ pub struct Tracks {
 }
 
 impl Tracks {
-    pub fn new(base_url: String, mpd: &MPD) -> Result<Self, Box<dyn Error>> {
+    pub async fn new(base_url: String, mpd: &MPD) -> Result<Self, Box<dyn Error>> {
         let duration = Self::parse_duration(mpd)?;
-        let tracks = Self::parse_tracks(base_url, mpd)?;
+        let tracks = Self::parse_tracks(base_url, mpd).await?;
 
         Ok(Tracks {
             duration,
@@ -83,7 +84,7 @@ impl Tracks {
         Ok(segments)
     }
 
-    fn parse_video_representation(
+    async fn parse_video_representation(
         base_url: &String,
         representation: &Representation,
     ) -> Result<VideoRepresenation, Box<dyn Error>> {
@@ -154,7 +155,7 @@ impl Tracks {
 
         match representation.mime_type.as_str() {
             "video/mp4" => {
-                let index_vec = index_segment.download()?;
+                let index_vec = index_segment.download().await?;
                 let mut index_slice = &index_vec[..];
                 let sidx = parse_sidx(index_range.1, &mut index_slice)?;
                 segments =
@@ -187,7 +188,7 @@ impl Tracks {
         Ok(video_representation)
     }
 
-    fn parse_video_adaptation(
+    async fn parse_video_adaptation(
         base_url: &String,
         adaptation: &AdaptationSet,
     ) -> Result<VideoAdaptation, Box<dyn Error>> {
@@ -242,7 +243,8 @@ impl Tracks {
 
         let representations = &adaptation.representations;
         for representation in representations {
-            let video_representation = Self::parse_video_representation(base_url, representation)?;
+            let video_representation =
+                Self::parse_video_representation(base_url, representation).await?;
             video_representations.push(video_representation);
         }
 
@@ -291,7 +293,7 @@ impl Tracks {
         })
     }
 
-    fn parse_tracks(base_url: String, mpd: &MPD) -> Result<TracksResult, Box<dyn Error>> {
+    async fn parse_tracks(base_url: String, mpd: &MPD) -> Result<TracksResult, Box<dyn Error>> {
         let period = match mpd.periods.first() {
             Some(success) => success,
             None => {
@@ -309,7 +311,7 @@ impl Tracks {
             let content_type = adaptation.content_type.as_str();
             match content_type {
                 "video" => {
-                    let value = Self::parse_video_adaptation(&base_url, adaptation)?;
+                    let value = Self::parse_video_adaptation(&base_url, adaptation).await?;
                     video_adaptations.push(value);
                 }
                 "audio" => {

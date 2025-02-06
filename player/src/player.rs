@@ -5,7 +5,10 @@ mod tracks;
 mod utils;
 
 use quick_xml::se;
-use std::error::Error;
+use std::{
+    error::Error,
+    sync::atomic::{AtomicBool, Ordering},
+};
 use tracks::{
     audio::AudioAdaptation,
     video::{VideoAdaptation, VideoRepresenation},
@@ -107,7 +110,10 @@ impl Player {
     }
 
     pub async fn play(&mut self) -> Result<(), Box<dyn Error>> {
-        let (tx, mut rx) = mpsc::channel::<DataSegment>(2);
+        let stoping = Arc::new(AtomicBool::new(false));
+
+        let (download_tx, mut download_rx) = mpsc::channel::<DataSegment>(2);
+        let (frame_tx, mut frame_rx) = mpsc::channel::<DataSegment>(2);
 
         let video_representation = match &self.video_representation {
             Some(success) => success,
@@ -118,33 +124,56 @@ impl Player {
 
         let video = video_representation;
         let segments = video.segments.clone();
-        //let segments = segments_clone[..];
 
-        task::spawn(async move {
+        let stopp = stoping.clone();
+        let download_task = task::spawn(async move {
             let segment_slice = &segments[..];
             for i in 0..segment_slice.len() {
+                if stopp.load(Ordering::Relaxed) {
+                    print!("Stopping producer");
+                    break;
+                }
+
                 let seg = &segment_slice[i];
 
                 let data = seg.download().await.unwrap();
 
                 let data_segment = DataSegment {
                     id: i,
-                    size: 0,
+                    size: data.len(),
                     data,
                 };
 
-                tx.send(data_segment).await.unwrap();
+                download_tx.send(data_segment).await.unwrap();
                 println!("Produced segment {}", i);
+            }
+            drop(download_tx);
+        });
+
+        let decoder_task = task::spawn(async move {
+            while let Some(segment) = download_rx.recv().await {
+                println!("Consuming segment and push it frame");
+                frame_tx.send(segment).await.unwrap();
+                // Simulate processing
             }
         });
 
-        while let Some(segment) = rx.recv().await {
-            println!(
-                "Consuming segment {} (size: {} bytes)",
-                segment.id, segment.size
-            );
-            sleep(Duration::from_millis(500)).await; // Simulate processing
-        }
+        let read_frame_task = task::spawn(async move {
+            while let Some(segment) = frame_rx.recv().await {
+                println!(
+                    "Consuming frame {} (size: {} bytes)",
+                    segment.id, segment.size
+                );
+                // Simulate processing
+            }
+        });
+        sleep(Duration::from_millis(2000)).await;
+
+        //stoping.clone().store(true, Ordering::Relaxed);
+
+        download_task.await?;
+        decoder_task.await?;
+        read_frame_task.await?;
 
         Ok(())
     }

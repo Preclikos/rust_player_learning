@@ -8,15 +8,15 @@ use std::error::Error;
 pub struct Segment {
     base_url: String,
     file_url: String,
-
     start: u64,
-    end: u64,
+    pub end: u64,
 }
 
 impl Segment {
     pub fn new(
         base_url: &String,
         file_url: &String,
+
         start: u64,
         end: u64,
     ) -> Result<Self, Box<dyn Error>> {

@@ -14,7 +14,7 @@ async fn main() {
 
     let tracks = tracks.unwrap();
     let selected_video = tracks.video.first().unwrap();
-    let selected_representation = selected_video.representations.first().unwrap();
+    let selected_representation = selected_video.representations.last().unwrap();
 
     player.set_video_track(selected_video, selected_representation);
 

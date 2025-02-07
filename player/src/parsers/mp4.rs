@@ -35,7 +35,7 @@ pub struct SidxBox {
     pub entries: Vec<SidxEntry>,
 }
 
-pub fn parse_sidx(segment_offset: u64, data: &mut &[u8]) -> Result<SidxBox, Box<dyn Error>> {
+pub fn parse_sidx(data: &mut &[u8]) -> Result<SidxBox, Box<dyn Error>> {
     // Read the size of the box (we ignore the size field here)
     let size = read_u32(data);
 

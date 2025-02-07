@@ -4,22 +4,20 @@ mod parsers;
 mod tracks;
 mod utils;
 
-use quick_xml::se;
-use std::{
-    error::Error,
-    sync::atomic::{AtomicBool, Ordering},
-};
+use re_mp4::Mp4;
+use std::error::Error;
+use std::io::{Cursor, Read, Seek, SeekFrom};
+use tokio::join;
+use tokio::sync::Notify;
 use tracks::{
-    audio::AudioAdaptation,
     video::{VideoAdaptation, VideoRepresenation},
     Tracks,
 };
 use url::Url;
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task;
-use tokio::time::{sleep, Duration};
 
 use manifest::Manifest;
 use networking::HttpClient;
@@ -110,51 +108,104 @@ impl Player {
     }
 
     pub async fn play(&mut self) -> Result<(), Box<dyn Error>> {
-        let stoping = Arc::new(AtomicBool::new(false));
-
-        let (download_tx, mut download_rx) = mpsc::channel::<DataSegment>(2);
-        let (frame_tx, mut frame_rx) = mpsc::channel::<DataSegment>(2);
+        let (download_tx, mut download_rx) = mpsc::channel::<DataSegment>(MAX_SEGMENTS);
+        let (frame_tx, mut frame_rx) = mpsc::channel::<DataSegment>(MAX_SEGMENTS);
+        let stop = Arc::new(Notify::new());
 
         let video_representation = match &self.video_representation {
-            Some(success) => success,
+            Some(success) => success.clone(),
             None => return Err("Video Track not set".into()),
         };
 
         let init_data = video_representation.segment_init.download().await?;
+        /*
+                let init_bytes = &init_data[..];
+                let mp4 = Mp4::read_bytes(init_bytes)?;
 
+                let tracks = mp4.tracks().len();
+                println!("Current tracks in MP4 {}", tracks);
+        */
         let video = video_representation;
         let segments = video.segments.clone();
 
-        let stopp = stoping.clone();
         let download_task = task::spawn(async move {
             let segment_slice = &segments[..];
             for i in 0..segment_slice.len() {
-                if stopp.load(Ordering::Relaxed) {
-                    print!("Stopping producer");
-                    break;
-                }
-
                 let seg = &segment_slice[i];
+                tokio::select! { data = seg.download() => {
+                       let downloaded_data = data.unwrap();
 
-                let data = seg.download().await.unwrap();
+                        let data_segment = DataSegment {
+                            id: i,
+                            size: downloaded_data.len(),
+                            data: downloaded_data,
+                        };
 
-                let data_segment = DataSegment {
-                    id: i,
-                    size: data.len(),
-                    data,
-                };
+                        match download_tx.try_send(data_segment) {
+                            Ok(()) => println!("Produced segment {}", i),
+                            Err(e) => {
+                                eprintln!("Failed to send segment {}: {}", i, e);
+                                break;
+                            },
+                        }
+                    }
 
-                download_tx.send(data_segment).await.unwrap();
-                println!("Produced segment {}", i);
+                    _ = stop.notified() => {
+                        break;
+                    }
+                }
             }
-            drop(download_tx);
         });
 
         let decoder_task = task::spawn(async move {
             while let Some(segment) = download_rx.recv().await {
                 println!("Consuming segment and push it frame");
-                frame_tx.send(segment).await.unwrap();
-                // Simulate processing
+
+                let mut data_vec = init_data.clone();
+                data_vec.extend_from_slice(&segment.data);
+
+                let data = &data_vec[..];
+                let mp4 = match Mp4::read_bytes(data) {
+                    Ok(success) => success,
+                    Err(e) => {
+                        println!("Parsing error {}", e);
+                        break;
+                    }
+                };
+
+                for track in mp4.tracks() {
+                    println!("--- Track id: {} ---", track.0);
+                    // For each sample in the track, print its offset and size.
+                    // (The sample data is stored in the mdat box.)
+                    let samples = &track.1.samples;
+
+                    for sample in samples {
+                        let mut cursor = Cursor::new(&data_vec);
+
+                        println!("Sample: offset {} size {}", sample.offset, sample.size);
+
+                        // Read the sample's raw data from our in-memory vector.
+                        let mut sample_data = vec![0u8; sample.size as usize];
+                        // Seek to the beginning of the sample in the vector.
+                        _ = cursor.seek(SeekFrom::Start(sample.offset));
+                        // Read the sample data.
+                        _ = cursor.read_exact(&mut sample_data);
+
+                        let hex_string: String = sample_data[1..8]
+                            .iter()
+                            .map(|b| format!("{:02X}", b))
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        println!("{}", hex_string);
+
+                        // Now `sample_data` holds the raw bytes from the sample (typically stored in the mdat box).
+                        // You can now pass these bytes to your decoder or reassembly logic.
+                        println!("Read {} bytes of sample data.", sample_data.len());
+                    }
+                }
+
+                //frame_tx.send(segment).await.unwrap();
+                // Simulate processing*/
             }
         });
 
@@ -167,13 +218,11 @@ impl Player {
                 // Simulate processing
             }
         });
-        sleep(Duration::from_millis(2000)).await;
 
         //stoping.clone().store(true, Ordering::Relaxed);
-
-        download_task.await?;
-        decoder_task.await?;
-        read_frame_task.await?;
+        _ = join!(download_task);
+        _ = join!(decoder_task);
+        //read_frame_task.await?;
 
         Ok(())
     }

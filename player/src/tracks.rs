@@ -72,9 +72,9 @@ impl Tracks {
         let entires = sidx.entries;
         let mut segments: Vec<Segment> = vec![];
 
-        let mut start_byte = offset + u64::from(sidx.size) + u64::from(sidx.first_offset);
+        let mut start_byte = offset + u64::from(sidx.first_offset);
         for entry in entires.iter() {
-            let end = start_byte + entry.reference_size - 1;
+            let end = start_byte + (entry.reference_size - 1);
             let segment = Segment::new(base_url, file_url, start_byte, end)?;
             segments.push(segment);
 
@@ -157,9 +157,13 @@ impl Tracks {
             "video/mp4" => {
                 let index_vec = index_segment.download().await?;
                 let mut index_slice = &index_vec[..];
-                let sidx = parse_sidx(index_range.1, &mut index_slice)?;
-                segments =
-                    Self::generate_segments_from_sidx(&url_base, &file_url, sidx, index_range.1)?;
+                let sidx = parse_sidx(&mut index_slice)?;
+                segments = Self::generate_segments_from_sidx(
+                    &url_base,
+                    &file_url,
+                    sidx,
+                    index_range.1 + 1,
+                )?;
             }
             _ => {
                 return Err(format!(

@@ -146,10 +146,10 @@ impl Tracks {
             }
         };
 
-        let init_range = Self::parse_range(&base_segment.initialization.range)?;
-        let init_segment = Segment::new(&url_base, &file_url, init_range.0, init_range.1)?;
-        let index_range = Self::parse_range(&base_segment.index_range)?;
-        let index_segment = Segment::new(&url_base, &file_url, index_range.0, index_range.1)?;
+        let (init_start, init_end) = Self::parse_range(&base_segment.initialization.range)?;
+        let init_segment = Segment::new(&url_base, &file_url, init_start, init_end)?;
+        let (index_start, index_end) = Self::parse_range(&base_segment.index_range)?;
+        let index_segment = Segment::new(&url_base, &file_url, index_start, index_end)?;
 
         let segments: Vec<Segment>;
 
@@ -158,12 +158,8 @@ impl Tracks {
                 let index_vec = index_segment.download().await?;
                 let mut index_slice = &index_vec[..];
                 let sidx = parse_sidx(&mut index_slice)?;
-                segments = Self::generate_segments_from_sidx(
-                    &url_base,
-                    &file_url,
-                    sidx,
-                    index_range.1 + 1,
-                )?;
+                segments =
+                    Self::generate_segments_from_sidx(&url_base, &file_url, sidx, index_end + 1)?;
             }
             _ => {
                 return Err(format!(

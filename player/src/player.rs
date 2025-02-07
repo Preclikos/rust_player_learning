@@ -4,7 +4,7 @@ mod parsers;
 mod tracks;
 mod utils;
 
-use re_mp4::Mp4;
+use re_mp4::{Mp4, Mp4Box, Mp4Sample};
 use std::error::Error;
 use std::io::{Cursor, Read, Seek, SeekFrom};
 use tokio::join;
@@ -107,6 +107,42 @@ impl Player {
         self.video_representation = Some(representation.clone());
     }
 
+    fn parse_h265_nals(sample_data: &[u8]) {
+        let mut pos = 0;
+        while pos + 4 <= sample_data.len() {
+            // Read 4 bytes for the NAL unit length.
+            let nal_length = u32::from_be_bytes([
+                sample_data[pos],
+                sample_data[pos + 1],
+                sample_data[pos + 2],
+                sample_data[pos + 3],
+            ]) as usize;
+            pos += 4;
+
+            if pos + nal_length > sample_data.len() {
+                eprintln!(
+                    "Incomplete NAL unit: expected {} bytes, but only {} available.",
+                    nal_length,
+                    sample_data.len() - pos
+                );
+                break;
+            }
+
+            let nal_unit = &sample_data[pos..pos + nal_length];
+            println!("Found H.265 NAL unit (size: {} bytes)", nal_unit.len());
+
+            // (Optional) Parse the NAL header.
+            if nal_unit.len() >= 2 {
+                // For H.265, the NAL header is typically 2 bytes; bits 9..14 (from a big-endian 16-bit value)
+                let nal_header = u16::from_be_bytes([nal_unit[0], nal_unit[1]]);
+                let nal_type = (nal_header >> 9) & 0x3F;
+                println!("  NAL type: {}", nal_type);
+            }
+
+            pos += nal_length;
+        }
+    }
+
     pub async fn play(&mut self) -> Result<(), Box<dyn Error>> {
         let (download_tx, mut download_rx) = mpsc::channel::<DataSegment>(MAX_SEGMENTS);
         let (frame_tx, mut frame_rx) = mpsc::channel::<DataSegment>(MAX_SEGMENTS);
@@ -125,6 +161,7 @@ impl Player {
                 let tracks = mp4.tracks().len();
                 println!("Current tracks in MP4 {}", tracks);
         */
+
         let video = video_representation;
         let segments = video.segments.clone();
 
@@ -159,12 +196,11 @@ impl Player {
 
         let decoder_task = task::spawn(async move {
             while let Some(segment) = download_rx.recv().await {
-                println!("Consuming segment and push it frame");
-
                 let mut data_vec = init_data.clone();
                 data_vec.extend_from_slice(&segment.data);
 
                 let data = &data_vec[..];
+
                 let mp4 = match Mp4::read_bytes(data) {
                     Ok(success) => success,
                     Err(e) => {
@@ -173,34 +209,30 @@ impl Player {
                     }
                 };
 
-                for track in mp4.tracks() {
-                    println!("--- Track id: {} ---", track.0);
-                    // For each sample in the track, print its offset and size.
-                    // (The sample data is stored in the mdat box.)
-                    let samples = &track.1.samples;
+                let segment_data = &segment.data[..];
+
+                for (track_id, track) in mp4.tracks() {
+                    let samples = &track.samples;
 
                     for sample in samples {
-                        let mut cursor = Cursor::new(&data_vec);
+                        let sample_offset = sample.offset as usize;
+                        let sample_size = sample.size as usize;
 
-                        println!("Sample: offset {} size {}", sample.offset, sample.size);
+                        if sample_offset + sample_size > data.len() {
+                            eprintln!(
+                                "Sample at offset {} (size {}) exceeds mdat bounds (size {})",
+                                sample_offset,
+                                sample_size,
+                                data.len()
+                            );
+                            continue;
+                        }
 
-                        // Read the sample's raw data from our in-memory vector.
-                        let mut sample_data = vec![0u8; sample.size as usize];
-                        // Seek to the beginning of the sample in the vector.
-                        _ = cursor.seek(SeekFrom::Start(sample.offset));
-                        // Read the sample data.
-                        _ = cursor.read_exact(&mut sample_data);
-
-                        let hex_string: String = sample_data[1..8]
-                            .iter()
-                            .map(|b| format!("{:02X}", b))
-                            .collect::<Vec<_>>()
-                            .join(" ");
-                        println!("{}", hex_string);
-
-                        // Now `sample_data` holds the raw bytes from the sample (typically stored in the mdat box).
-                        // You can now pass these bytes to your decoder or reassembly logic.
-                        println!("Read {} bytes of sample data.", sample_data.len());
+                        let sample_data = &data[sample_offset..sample_offset + sample_size];
+                        println!(
+                            "Processing sample: offset {} size {} bytes",
+                            sample_offset, sample_size
+                        );
                     }
                 }
 

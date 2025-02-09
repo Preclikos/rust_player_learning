@@ -4,12 +4,14 @@ mod parsers;
 mod tracks;
 mod utils;
 
-use re_mp4::{Mp4, Mp4Box, Mp4Sample};
+use ffmpeg_next::Rational;
+use ffmpeg_next::{codec::Context, Frame, Packet};
+use re_mp4::{Mp4, StsdBoxContent};
 use std::error::Error;
-use std::io::{Cursor, Read, Seek, SeekFrom};
-use tokio::join;
 use tokio::sync::Notify;
+use tokio::{join, sync::mpsc::Sender};
 use tracks::{
+    segment::Segment,
     video::{VideoAdaptation, VideoRepresenation},
     Tracks,
 };
@@ -36,6 +38,7 @@ pub struct Player {
 impl Player {
     pub fn new() -> Self {
         //Here i want pass texture and other device -> wgpu and cpal
+
         let client = HttpClient::new();
         Player {
             http_client: client,
@@ -69,6 +72,7 @@ impl Player {
     }
 
     pub async fn prepare(&mut self) -> Result<(), Box<dyn Error>> {
+        ffmpeg_next::init()?;
         let manifest = match &self.manifest {
             Some(success) => success,
             None => {
@@ -145,7 +149,6 @@ impl Player {
 
     pub async fn play(&mut self) -> Result<(), Box<dyn Error>> {
         let (download_tx, mut download_rx) = mpsc::channel::<DataSegment>(MAX_SEGMENTS);
-        let (frame_tx, mut frame_rx) = mpsc::channel::<DataSegment>(MAX_SEGMENTS);
         let stop = Arc::new(Notify::new());
 
         let video_representation = match &self.video_representation {
@@ -154,13 +157,62 @@ impl Player {
         };
 
         let init_data = video_representation.segment_init.download().await?;
-        /*
-                let init_bytes = &init_data[..];
-                let mp4 = Mp4::read_bytes(init_bytes)?;
 
-                let tracks = mp4.tracks().len();
-                println!("Current tracks in MP4 {}", tracks);
-        */
+        let mp4_init = Mp4::read_bytes(&init_data[..]);
+        let unwrap = mp4_init.unwrap();
+
+        let codec_id = ffmpeg_next::codec::Id::HEVC;
+        let codec = ffmpeg_next::decoder::find(codec_id).unwrap();
+        let mut decoder = Context::new_with_codec(codec).decoder().video().unwrap();
+        let nalu_header: Vec<u8> = vec![0x00, 0x00, 0x00, 0x01];
+
+        match unwrap
+            .moov
+            .traks
+            .first()
+            .unwrap()
+            .mdia
+            .minf
+            .stbl
+            .stsd
+            .contents
+            .clone()
+        {
+            StsdBoxContent::Hvc1(hvc) => {
+                println!("Hvc1");
+                for nalus_unit in hvc.hvcc.arrays.clone() {
+                    for nalu in nalus_unit.nalus {
+                        let mut full_nalu = nalu_header.clone();
+                        let mut data = nalu.data.clone();
+                        full_nalu.append(&mut data);
+
+                        let mut packet = Packet::new(full_nalu.len());
+                        packet.data_mut().unwrap().clone_from_slice(&full_nalu[..]);
+
+                        decoder.send_packet(&packet).unwrap();
+                    }
+                }
+            }
+            StsdBoxContent::Hev1(hev) => {
+                println!("Hev1");
+                for nalus_unit in hev.hvcc.arrays.clone() {
+                    for nalu in nalus_unit.nalus {
+                        let mut full_nalu = nalu_header.clone();
+                        let mut data = nalu.data.clone();
+                        full_nalu.append(&mut data);
+
+                        let mut packet = Packet::new(full_nalu.len());
+                        packet.data_mut().unwrap().clone_from_slice(&full_nalu[..]);
+
+                        decoder.send_packet(&packet).unwrap();
+                    }
+                }
+            }
+            _ => {
+                println!("WTF");
+                return Err("Codec not supported!".into());
+            }
+        };
 
         let video = video_representation;
         let segments = video.segments.clone();
@@ -169,24 +221,11 @@ impl Player {
             let segment_slice = &segments[..];
             for i in 0..segment_slice.len() {
                 let seg = &segment_slice[i];
-                tokio::select! { data = seg.download() => {
-                       let downloaded_data = data.unwrap();
-
-                        let data_segment = DataSegment {
-                            id: i,
-                            size: downloaded_data.len(),
-                            data: downloaded_data,
-                        };
-
-                        match download_tx.try_send(data_segment) {
-                            Ok(()) => println!("Produced segment {}", i),
-                            Err(e) => {
-                                eprintln!("Failed to send segment {}: {}", i, e);
-                                break;
-                            },
+                let sender = download_tx.clone();
+                tokio::select! {
+                        _ = download_and_queue(i, seg, sender) => {
+                            println!("Producing segment {}", i);
                         }
-                    }
-
                     _ = stop.notified() => {
                         break;
                     }
@@ -194,10 +233,13 @@ impl Player {
             }
         });
 
+        let mut conter = 0;
+
         let decoder_task = task::spawn(async move {
             while let Some(segment) = download_rx.recv().await {
+                println!("Consuming segment: {}", segment.id);
                 let mut data_vec = init_data.clone();
-                data_vec.extend_from_slice(&segment.data);
+                data_vec.extend_from_slice(&segment.data.clone());
 
                 let data = &data_vec[..];
 
@@ -209,9 +251,7 @@ impl Player {
                     }
                 };
 
-                let segment_data = &segment.data[..];
-
-                for (track_id, track) in mp4.tracks() {
+                for (_track_id, track) in mp4.tracks() {
                     let samples = &track.samples;
 
                     for sample in samples {
@@ -229,40 +269,88 @@ impl Player {
                         }
 
                         let sample_data = &data[sample_offset..sample_offset + sample_size];
-                        println!(
-                            "Processing sample: offset {} size {} bytes",
-                            sample_offset, sample_size
-                        );
+
+                        let mut index = 0;
+
+                        while index < sample_data.len() {
+                            let byte_array: [u8; 4] = sample_data[index..index + 4]
+                                .try_into()
+                                .expect("Failed to convert");
+                            let length_u32 = u32::from_be_bytes(byte_array);
+                            let length = usize::try_from(length_u32).unwrap();
+
+                            index += 4;
+
+                            if index + length > sample_data.len() {
+                                panic!("Invalid length: Not enough bytes in the vector");
+                            }
+
+                            // Read the next `length` bytes into a separate vector
+                            let chunk: Vec<u8> = sample_data[index..index + length].to_vec();
+                            let mut chunk_mut = chunk.clone();
+                            index += length;
+
+                            let mut full_nalu = nalu_header.clone();
+                            full_nalu.append(&mut chunk_mut);
+
+                            let mut packet = Packet::new(full_nalu.len());
+
+                            packet.set_pts(Some(sample.composition_timestamp));
+                            packet.set_time_base(Rational(1, sample.timescale as i32));
+
+                            packet.data_mut().unwrap().clone_from_slice(&full_nalu[..]);
+
+                            if let Err(e) = decoder.send_packet(&packet) {
+                                println!("Error sending packet: {:?}", e);
+                            }
+                        }
+
+                        let mut frame = unsafe { Frame::empty() };
+                        while let Ok(()) = decoder.receive_frame(&mut frame) {
+                            conter += 1;
+                            let frame_pts = frame.pts().unwrap();
+                            println!(
+                                "Decoded frame: {:?} key: {} pts: {}",
+                                conter,
+                                frame.is_key(),
+                                frame_pts
+                            );
+                        }
                     }
                 }
-
-                //frame_tx.send(segment).await.unwrap();
-                // Simulate processing*/
             }
         });
 
-        let read_frame_task = task::spawn(async move {
-            while let Some(segment) = frame_rx.recv().await {
-                println!(
-                    "Consuming frame {} (size: {} bytes)",
-                    segment.id, segment.size
-                );
-                // Simulate processing
-            }
-        });
-
-        //stoping.clone().store(true, Ordering::Relaxed);
         _ = join!(download_task);
         _ = join!(decoder_task);
-        //read_frame_task.await?;
 
         Ok(())
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct DataSegment {
     id: usize,
     size: usize,   // Size in bytes
     data: Vec<u8>, // Simulated data
+}
+
+async fn download_and_queue(
+    index: usize,
+    segment: &Segment,
+    sender: Sender<DataSegment>,
+) -> Result<(), Box<dyn Error>> {
+    let downloaded_data = segment.download().await.unwrap();
+
+    let data_segment = DataSegment {
+        id: index,
+        size: downloaded_data.len(),
+        data: downloaded_data,
+    };
+
+    if let Err(e) = sender.send(data_segment).await {
+        eprintln!("Error: {:?}", e);
+    }
+
+    Ok(())
 }

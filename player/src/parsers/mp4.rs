@@ -120,3 +120,27 @@ pub fn find_mdat_box(file_data: &[u8]) -> Option<(usize, usize)> {
     }
     None
 }
+
+pub fn find_hvcC_box(file_data: &[u8]) -> Option<(usize, usize)> {
+    let mut offset = 0;
+    while offset + 8 <= file_data.len() {
+        // Read the box size (4 bytes, big-endian).
+        let size = u32::from_be_bytes([
+            file_data[offset],
+            file_data[offset + 1],
+            file_data[offset + 2],
+            file_data[offset + 3],
+        ]) as usize;
+        // Read the box type (4 bytes).
+        let typ = &file_data[offset + 4..offset + 8];
+        if typ == b"mdat" {
+            return Some((offset, size));
+        }
+        // Prevent an infinite loop on invalid box size.
+        if size < 8 {
+            break;
+        }
+        offset += size;
+    }
+    None
+}

@@ -6,3 +6,7 @@ edition = "2021"
 [dependencies]
 player = { path = "../player" }
 tokio = { version = "1.43.0", features = ["full"] }
+winit = "0.30.9"
+wgpu = "24.0.1"
+pollster = "0.4.0"
+ffmpeg-next = {version = "7.1.0"}

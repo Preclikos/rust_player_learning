@@ -111,42 +111,6 @@ impl Player {
         self.video_representation = Some(representation.clone());
     }
 
-    fn parse_h265_nals(sample_data: &[u8]) {
-        let mut pos = 0;
-        while pos + 4 <= sample_data.len() {
-            // Read 4 bytes for the NAL unit length.
-            let nal_length = u32::from_be_bytes([
-                sample_data[pos],
-                sample_data[pos + 1],
-                sample_data[pos + 2],
-                sample_data[pos + 3],
-            ]) as usize;
-            pos += 4;
-
-            if pos + nal_length > sample_data.len() {
-                eprintln!(
-                    "Incomplete NAL unit: expected {} bytes, but only {} available.",
-                    nal_length,
-                    sample_data.len() - pos
-                );
-                break;
-            }
-
-            let nal_unit = &sample_data[pos..pos + nal_length];
-            println!("Found H.265 NAL unit (size: {} bytes)", nal_unit.len());
-
-            // (Optional) Parse the NAL header.
-            if nal_unit.len() >= 2 {
-                // For H.265, the NAL header is typically 2 bytes; bits 9..14 (from a big-endian 16-bit value)
-                let nal_header = u16::from_be_bytes([nal_unit[0], nal_unit[1]]);
-                let nal_type = (nal_header >> 9) & 0x3F;
-                println!("  NAL type: {}", nal_type);
-            }
-
-            pos += nal_length;
-        }
-    }
-
     pub async fn play(&mut self) -> Result<(), Box<dyn Error>> {
         let (download_tx, mut download_rx) = mpsc::channel::<DataSegment>(MAX_SEGMENTS);
         let stop = Arc::new(Notify::new());

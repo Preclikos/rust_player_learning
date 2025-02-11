@@ -3,11 +3,15 @@ mod networking;
 mod parsers;
 mod tracks;
 mod utils;
+use image::{ImageBuffer, Rgb};
 
+use ffmpeg_next::frame::Video;
 use ffmpeg_next::Rational;
-use ffmpeg_next::{codec::Context, Frame, Packet};
+use ffmpeg_next::{codec::Context, Packet};
 use re_mp4::{Mp4, StsdBoxContent};
 use std::error::Error;
+use std::fs::File;
+use std::io::Write;
 use tokio::sync::Notify;
 use tokio::{join, sync::mpsc::Sender};
 use tracks::{
@@ -22,31 +26,30 @@ use tokio::sync::mpsc;
 use tokio::task;
 
 use manifest::Manifest;
-use networking::HttpClient;
 
 const MAX_SEGMENTS: usize = 2;
+
 pub struct Player {
-    http_client: HttpClient,
     base_url: Option<String>,
     manifest: Option<Manifest>,
     tracks: Option<Tracks>,
 
     video_adaptation: Option<VideoAdaptation>,
     video_representation: Option<VideoRepresenation>,
+
+    frame_sender: Option<Sender<Video>>,
 }
 
 impl Player {
-    pub fn new() -> Self {
+    pub fn new(sender: Sender<Video>) -> Self {
         //Here i want pass texture and other device -> wgpu and cpal
-
-        let client = HttpClient::new();
         Player {
-            http_client: client,
             base_url: None,
             manifest: None,
             tracks: None,
             video_adaptation: None,
             video_representation: None,
+            frame_sender: Some(sender),
         }
     }
 
@@ -57,7 +60,7 @@ impl Player {
             .expect("Cannot modify path segments")
             .pop();
 
-        return Ok(url.to_string() + "/");
+        Ok(url.to_string() + "/")
     }
 
     pub async fn open_url(&mut self, url: &str) -> Result<(), Box<dyn Error>> {
@@ -199,6 +202,8 @@ impl Player {
 
         let mut conter = 0;
 
+        let sender = self.frame_sender.clone().unwrap();
+
         let decoder_task = task::spawn(async move {
             while let Some(segment) = download_rx.recv().await {
                 println!("Consuming segment: {}", segment.id);
@@ -269,16 +274,42 @@ impl Player {
                             }
                         }
 
-                        let mut frame = unsafe { Frame::empty() };
+                        let mut frame = ffmpeg_next::util::frame::Video::empty();
                         while let Ok(()) = decoder.receive_frame(&mut frame) {
                             conter += 1;
                             let frame_pts = frame.pts().unwrap();
-                            println!(
-                                "Decoded frame: {:?} key: {} pts: {}",
+                            /*println!(
+                                "Decoded frame: {:?} key: {} pts: {} width: {} height: {}: pix fmt: {:?}",
                                 conter,
                                 frame.is_key(),
-                                frame_pts
-                            );
+                                frame_pts,
+                                frame.width(),
+                                frame.height(),
+                                frame.format()
+                            );*/
+
+                            let width = frame.width();
+                            let height = frame.height();
+
+                            let src_format = ffmpeg_next::format::Pixel::YUV420P;
+                            let dst_format = ffmpeg_next::format::Pixel::RGBA; // MJPEG accepts RGB24
+
+                            let mut dst_frame =
+                                ffmpeg_next::util::frame::Video::new(dst_format, width, height);
+
+                            _ = ffmpeg_next::software::scaling::Context::get(
+                                src_format,
+                                width,
+                                height,
+                                dst_format,
+                                width,
+                                height,
+                                ffmpeg_next::software::scaling::Flags::BILINEAR,
+                            )
+                            .unwrap()
+                            .run(&frame, &mut dst_frame);
+
+                            _ = sender.send(dst_frame.clone()).await;
                         }
                     }
                 }
@@ -304,7 +335,7 @@ async fn download_and_queue(
     segment: &Segment,
     sender: Sender<DataSegment>,
 ) -> Result<(), Box<dyn Error>> {
-    let downloaded_data = segment.download().await.unwrap();
+    let downloaded_data = segment.download().await?;
 
     let data_segment = DataSegment {
         id: index,
@@ -314,6 +345,7 @@ async fn download_and_queue(
 
     if let Err(e) = sender.send(data_segment).await {
         eprintln!("Error: {:?}", e);
+        return Err(format!("Error: {:?}", e).into());
     }
 
     Ok(())

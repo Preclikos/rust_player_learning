@@ -3,15 +3,12 @@ mod networking;
 mod parsers;
 mod tracks;
 mod utils;
-use image::{ImageBuffer, Rgb};
 
 use ffmpeg_next::frame::Video;
 use ffmpeg_next::Rational;
 use ffmpeg_next::{codec::Context, Packet};
 use re_mp4::{Mp4, StsdBoxContent};
 use std::error::Error;
-use std::fs::File;
-use std::io::Write;
 use tokio::sync::Notify;
 use tokio::{join, sync::mpsc::Sender};
 use tracks::{

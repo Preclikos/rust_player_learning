@@ -1,5 +1,5 @@
 use quick_xml::de::from_str;
-use reqwest::{blocking::get, Client, Error};
+use reqwest::{Client, Error};
 use serde::Deserialize;
 
 pub struct Manifest {

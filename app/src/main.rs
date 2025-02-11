@@ -4,7 +4,7 @@ use ffmpeg_next::util::frame::Video as Frame;
 use player::Player;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::Receiver;
-use wgpu::{BindGroup, RenderPipeline};
+use wgpu::{BindGroup, RenderPipeline, TextureFormat};
 use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalSize, Size};
 use winit::event::WindowEvent;
@@ -16,6 +16,7 @@ struct State {
     queue: wgpu::Queue,
     size: winit::dpi::PhysicalSize<u32>,
     surface: wgpu::Surface<'static>,
+    surface_format: TextureFormat,
     render_texture: wgpu::Texture,
     texture_bind_group: BindGroup,
     render_pipeline: RenderPipeline,
@@ -36,8 +37,8 @@ impl State {
         let size = window.inner_size();
 
         let surface = instance.create_surface(window.clone()).unwrap();
-        /*let cap = surface.get_capabilities(&adapter);
-        let surface_format = cap.formats[0];*/
+        let cap = surface.get_capabilities(&adapter);
+        let surface_format = cap.formats[0];
 
         let render_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Render Texture"),
@@ -49,11 +50,11 @@ impl State {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
+            format: surface_format,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                 | wgpu::TextureUsages::TEXTURE_BINDING
                 | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[wgpu::TextureFormat::Rgba8Unorm],
+            view_formats: &[surface_format],
         });
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -90,7 +91,7 @@ impl State {
             });
 
         let view = render_texture.create_view(&wgpu::TextureViewDescriptor {
-            format: Some(wgpu::TextureFormat::Rgba8Unorm),
+            format: Some(surface_format),
             ..Default::default()
         });
 
@@ -184,7 +185,7 @@ impl State {
                 targets: &[Some(wgpu::ColorTargetState {
                     blend: Some(wgpu::BlendState::REPLACE),
                     write_mask: wgpu::ColorWrites::ALL,
-                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    format: surface_format,
                 })],
             }),
             primitive: wgpu::PrimitiveState::default(),
@@ -200,6 +201,7 @@ impl State {
             queue,
             size,
             surface,
+            surface_format,
             render_texture,
             texture_bind_group,
             render_pipeline,
@@ -218,8 +220,8 @@ impl State {
     fn configure_surface(&self) {
         let surface_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            view_formats: vec![wgpu::TextureFormat::Rgba8Unorm],
+            format: self.surface_format,
+            view_formats: vec![self.surface_format],
             alpha_mode: wgpu::CompositeAlphaMode::Auto,
             width: self.size.width,
             height: self.size.height,
@@ -262,7 +264,7 @@ impl State {
         let texture_view = surface_texture
             .texture
             .create_view(&wgpu::TextureViewDescriptor {
-                format: Some(wgpu::TextureFormat::Rgba8Unorm),
+                format: Some(self.surface_format),
                 ..Default::default()
             });
 
@@ -334,21 +336,23 @@ impl ApplicationHandler for App {
         default_attrs.inner_size = Some(Size::Physical(PhysicalSize::new(900, 800)));
         let window = Arc::new(event_loop.create_window(default_attrs).unwrap());
 
-        let mut player = Player::new(frame_tx);
-
-        let _ =
-            pollster::block_on(player.open_url("https://preclikos.cz/examples/raw/manifest.mpd"));
-
-        let _ = pollster::block_on(player.prepare());
-
-        let tracks = player.get_tracks();
-
-        let tracks = tracks.unwrap();
-        let selected_video = tracks.video.first().unwrap();
-        let selected_representation = &selected_video.representations[4];
-
-        player.set_video_track(selected_video, selected_representation);
         tokio::spawn(async move {
+            let mut player = Player::new(frame_tx);
+
+            let _ = player
+                .open_url("https://preclikos.cz/examples/raw/manifest.mpd")
+                .await;
+
+            let _ = player.prepare().await;
+
+            let tracks = player.get_tracks();
+
+            let tracks = tracks.unwrap();
+            let selected_video = tracks.video.first().unwrap();
+            let selected_representation = &selected_video.representations[4];
+
+            player.set_video_track(selected_video, selected_representation);
+
             let a = player.play().await;
         });
 

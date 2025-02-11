@@ -289,7 +289,7 @@ impl Player {
                             let height = frame.height();
 
                             let src_format = ffmpeg_next::format::Pixel::YUV420P;
-                            let dst_format = ffmpeg_next::format::Pixel::RGBA; // MJPEG accepts RGB24
+                            let dst_format = ffmpeg_next::format::Pixel::BGRA;
 
                             let mut dst_frame =
                                 ffmpeg_next::util::frame::Video::new(dst_format, width, height);

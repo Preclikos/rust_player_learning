@@ -1,4 +1,6 @@
 use std::sync::Arc;
+use std::thread::sleep;
+use std::time::Duration;
 
 use ffmpeg_next::util::frame::Video as Frame;
 use player::Player;
@@ -392,7 +394,7 @@ impl ApplicationHandler for App {
 
             let tracks = tracks.unwrap();
             let selected_video = tracks.video.first().unwrap();
-            let selected_representation = &selected_video.representations[4];
+            let selected_representation = &selected_video.representations.last().unwrap();
 
             player.set_video_track(selected_video, selected_representation);
 
@@ -417,6 +419,8 @@ impl ApplicationHandler for App {
             }
             WindowEvent::RedrawRequested => {
                 if let Ok(frame) = receiver.try_recv() {
+                    let frame_duration = Duration::from_millis(24000 / 1001);
+                    sleep(frame_duration);
                     state.render(frame);
                 }
 

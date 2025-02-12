@@ -240,11 +240,14 @@ impl State {
     fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
         self.size = new_size;
 
+        let width = self.size.width;
+        let height = self.size.height;
+
         self.render_texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Render Texture"),
             size: wgpu::Extent3d {
-                width: new_size.width & !1,
-                height: new_size.height & !1,
+                width,
+                height,
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
@@ -296,8 +299,8 @@ impl State {
                 ..Default::default()
             });
 
-        let width = self.size.width & !1;
-        let height = self.size.height & !1;
+        let width = self.size.width;
+        let height = self.size.height;
 
         let dst_format = ffmpeg_next::format::Pixel::BGRA;
 
@@ -315,7 +318,6 @@ impl State {
         .unwrap()
         .run(&frame, &mut dst_frame);
 
-        // Upload the RGBA data to the copy texture
         self.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &self.render_texture,
@@ -398,7 +400,9 @@ impl ApplicationHandler for App {
 
             player.set_video_track(selected_video, selected_representation);
 
-            let a = player.play().await;
+            loop {
+                let a = player.play().await;
+            }
         });
 
         let state = pollster::block_on(State::new(window.clone()));

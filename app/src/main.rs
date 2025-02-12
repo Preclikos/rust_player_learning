@@ -428,13 +428,9 @@ impl ApplicationHandler for App {
                     state.render(frame);
                 }
 
-                //state.render();
-                // Emits a new redraw requested event.
                 state.get_window().request_redraw();
             }
             WindowEvent::Resized(size) => {
-                // Reconfigures the size of the surface. We do not re-render
-                // here as this event is always followed up by redraw request.
                 state.resize(size);
             }
             _ => (),

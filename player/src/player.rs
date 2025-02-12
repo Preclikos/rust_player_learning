@@ -10,9 +10,7 @@ use ffmpeg_next::{codec::Context, Packet};
 use parsers::mp4::{apped_hevc_header, parse_hevc_nalu};
 use re_mp4::{Mp4, StsdBoxContent};
 use std::error::Error;
-use std::time::Duration;
 use tokio::sync::Notify;
-use tokio::time::sleep;
 use tokio::{join, sync::mpsc::Sender};
 use tracks::{
     segment::Segment,
@@ -130,15 +128,23 @@ impl Player {
             Err(e) => return Err(format!("Error parsing mp4 Init {}", e).into()),
         };
 
-        let (_track_id, track) = mp4_info.tracks().first_key_value().unwrap();
+        let (_track_id, track) = match mp4_info.tracks().first_key_value() {
+            Some(track_info) => track_info,
+            None => return Err("Cannot find any track".into()),
+        };
 
         let codec_id = ffmpeg_next::codec::Id::HEVC;
-        let codec = ffmpeg_next::decoder::find(codec_id).unwrap();
-        let mut decoder = Context::new_with_codec(codec).decoder().video().unwrap();
+        let codec = match ffmpeg_next::decoder::find(codec_id) {
+            Some(codec) => codec,
+            None => return Err("Cannot find codec for track".into()),
+        };
+        let mut decoder = match Context::new_with_codec(codec).decoder().video() {
+            Ok(context) => context,
+            Err(e) => return Err(format!("Cannot find decoder for codec {}", e).into()),
+        };
 
         match track.trak(&mp4_info).mdia.minf.stbl.stsd.contents.clone() {
             StsdBoxContent::Hvc1(hvc) => {
-                println!("Hvc1");
                 for nalus_unit in hvc.hvcc.arrays.clone() {
                     for nalu in nalus_unit.nalus {
                         let nalu_data = nalu.data;
@@ -152,7 +158,6 @@ impl Player {
                 }
             }
             StsdBoxContent::Hev1(hev) => {
-                println!("Hev1");
                 for nalus_unit in hev.hvcc.arrays.clone() {
                     for nalu in nalus_unit.nalus {
                         let nalu_data = nalu.data;
@@ -242,7 +247,10 @@ impl Player {
 
                     let mut frame = ffmpeg_next::util::frame::Video::empty();
                     while let Ok(()) = decoder.receive_frame(&mut frame) {
-                        _ = sender.send(frame.clone()).await;
+                        match sender.send(frame.clone()).await {
+                            Ok(_success) => {}
+                            Err(e) => println!("Cannot send frame to channel"),
+                        };
                     }
                 }
             }

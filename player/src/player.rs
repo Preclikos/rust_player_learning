@@ -7,6 +7,7 @@ mod utils;
 use ffmpeg_next::frame::Video;
 use ffmpeg_next::Rational;
 use ffmpeg_next::{codec::Context, Packet};
+use parsers::mp4::{apped_hevc_header, parse_hevc_nalu};
 use re_mp4::{Mp4, StsdBoxContent};
 use std::error::Error;
 use std::time::Duration;
@@ -124,36 +125,27 @@ impl Player {
 
         let init_data = video_representation.segment_init.download().await?;
 
-        let mp4_init = Mp4::read_bytes(&init_data[..]);
-        let unwrap = mp4_init.unwrap();
+        let mp4_info = match Mp4::read_bytes(&init_data[..]) {
+            Ok(success) => success,
+            Err(e) => return Err(format!("Error parsing mp4 Init {}", e).into()),
+        };
+
+        let (_track_id, track) = mp4_info.tracks().first_key_value().unwrap();
 
         let codec_id = ffmpeg_next::codec::Id::HEVC;
         let codec = ffmpeg_next::decoder::find(codec_id).unwrap();
         let mut decoder = Context::new_with_codec(codec).decoder().video().unwrap();
-        let nalu_header: Vec<u8> = vec![0x00, 0x00, 0x00, 0x01];
 
-        match unwrap
-            .moov
-            .traks
-            .first()
-            .unwrap()
-            .mdia
-            .minf
-            .stbl
-            .stsd
-            .contents
-            .clone()
-        {
+        match track.trak(&mp4_info).mdia.minf.stbl.stsd.contents.clone() {
             StsdBoxContent::Hvc1(hvc) => {
                 println!("Hvc1");
                 for nalus_unit in hvc.hvcc.arrays.clone() {
                     for nalu in nalus_unit.nalus {
-                        let mut full_nalu = nalu_header.clone();
-                        let mut data = nalu.data.clone();
-                        full_nalu.append(&mut data);
+                        let nalu_data = nalu.data;
+                        let nalu = apped_hevc_header(nalu_data);
 
-                        let mut packet = Packet::new(full_nalu.len());
-                        packet.data_mut().unwrap().clone_from_slice(&full_nalu[..]);
+                        let mut packet = Packet::new(nalu.len());
+                        packet.data_mut().unwrap().clone_from_slice(&nalu[..]);
 
                         decoder.send_packet(&packet).unwrap();
                     }
@@ -163,13 +155,11 @@ impl Player {
                 println!("Hev1");
                 for nalus_unit in hev.hvcc.arrays.clone() {
                     for nalu in nalus_unit.nalus {
-                        let mut full_nalu = nalu_header.clone();
-                        let mut data = nalu.data.clone();
-                        full_nalu.append(&mut data);
+                        let nalu_data = nalu.data;
+                        let nalu = apped_hevc_header(nalu_data);
 
-                        let mut packet = Packet::new(full_nalu.len());
-                        packet.data_mut().unwrap().clone_from_slice(&full_nalu[..]);
-
+                        let mut packet = Packet::new(nalu.len());
+                        packet.data_mut().unwrap().clone_from_slice(&nalu[..]);
                         decoder.send_packet(&packet).unwrap();
                     }
                 }
@@ -199,8 +189,6 @@ impl Player {
             }
         });
 
-        let mut conter = 0;
-
         let sender = self.frame_sender.clone().unwrap();
 
         let decoder_task = task::spawn(async move {
@@ -219,75 +207,42 @@ impl Player {
                     }
                 };
 
-                for (_track_id, track) in mp4.tracks() {
-                    let samples = &track.samples;
+                let (_track_id, track) = mp4.tracks().first_key_value().unwrap();
+                let samples = &track.samples;
 
-                    for sample in samples {
-                        let sample_offset = sample.offset as usize;
-                        let sample_size = sample.size as usize;
+                for sample in samples {
+                    let sample_offset = sample.offset as usize;
+                    let sample_size = sample.size as usize;
 
-                        if sample_offset + sample_size > data.len() {
-                            eprintln!(
-                                "Sample at offset {} (size {}) exceeds mdat bounds (size {})",
-                                sample_offset,
-                                sample_size,
-                                data.len()
-                            );
-                            continue;
+                    if sample_offset + sample_size > data.len() {
+                        eprintln!(
+                            "Sample at offset {} (size {}) exceeds mdat bounds (size {})",
+                            sample_offset,
+                            sample_size,
+                            data.len()
+                        );
+                        continue;
+                    }
+
+                    let sample_data = &data[sample_offset..sample_offset + sample_size];
+                    let nalus = parse_hevc_nalu(sample_data).unwrap();
+
+                    for nalu in nalus {
+                        let mut packet = Packet::new(nalu.len());
+
+                        packet.set_pts(Some(sample.composition_timestamp));
+                        packet.set_time_base(Rational(1, sample.timescale as i32));
+
+                        packet.data_mut().unwrap().clone_from_slice(&nalu[..]);
+
+                        if let Err(e) = decoder.send_packet(&packet) {
+                            println!("Error sending packet: {:?}", e);
                         }
+                    }
 
-                        let sample_data = &data[sample_offset..sample_offset + sample_size];
-
-                        let mut index = 0;
-
-                        while index < sample_data.len() {
-                            let byte_array: [u8; 4] = sample_data[index..index + 4]
-                                .try_into()
-                                .expect("Failed to convert");
-                            let length_u32 = u32::from_be_bytes(byte_array);
-                            let length = usize::try_from(length_u32).unwrap();
-
-                            index += 4;
-
-                            if index + length > sample_data.len() {
-                                panic!("Invalid length: Not enough bytes in the vector");
-                            }
-
-                            // Read the next `length` bytes into a separate vector
-                            let chunk: Vec<u8> = sample_data[index..index + length].to_vec();
-                            let mut chunk_mut = chunk.clone();
-                            index += length;
-
-                            let mut full_nalu = nalu_header.clone();
-                            full_nalu.append(&mut chunk_mut);
-
-                            let mut packet = Packet::new(full_nalu.len());
-
-                            packet.set_pts(Some(sample.composition_timestamp));
-                            packet.set_time_base(Rational(1, sample.timescale as i32));
-
-                            packet.data_mut().unwrap().clone_from_slice(&full_nalu[..]);
-
-                            if let Err(e) = decoder.send_packet(&packet) {
-                                println!("Error sending packet: {:?}", e);
-                            }
-                        }
-
-                        let mut frame = ffmpeg_next::util::frame::Video::empty();
-                        while let Ok(()) = decoder.receive_frame(&mut frame) {
-                            conter += 1;
-                            let frame_pts = frame.pts().unwrap();
-                            /*println!(
-                                "Decoded frame: {:?} key: {} pts: {} width: {} height: {}: pix fmt: {:?}",
-                                conter,
-                                frame.is_key(),
-                                frame_pts,
-                                frame.width(),
-                                frame.height(),
-                                frame.format()
-                            );*/
-                            _ = sender.send(frame.clone()).await;
-                        }
+                    let mut frame = ffmpeg_next::util::frame::Video::empty();
+                    while let Ok(()) = decoder.receive_frame(&mut frame) {
+                        _ = sender.send(frame.clone()).await;
                     }
                 }
             }

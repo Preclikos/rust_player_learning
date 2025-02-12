@@ -97,26 +97,44 @@ pub fn parse_sidx(data: &mut &[u8]) -> Result<SidxBox, Box<dyn Error>> {
     })
 }
 
-pub fn find_mdat_box(file_data: &[u8]) -> Option<(usize, usize)> {
-    let mut offset = 0;
-    while offset + 8 <= file_data.len() {
-        // Read the box size (4 bytes, big-endian).
-        let size = u32::from_be_bytes([
-            file_data[offset],
-            file_data[offset + 1],
-            file_data[offset + 2],
-            file_data[offset + 3],
-        ]) as usize;
-        // Read the box type (4 bytes).
-        let typ = &file_data[offset + 4..offset + 8];
-        if typ == b"mdat" {
-            return Some((offset, size));
+pub fn apped_hevc_header(mut nalu_data: Vec<u8>) -> Vec<u8> {
+    let nalu_header: Vec<u8> = vec![0x00, 0x00, 0x00, 0x01];
+    let mut nalu = nalu_header.clone();
+    nalu.append(nalu_data.as_mut());
+
+    nalu
+}
+
+pub fn parse_hevc_nalu(data: &[u8]) -> Result<Vec<Vec<u8>>, Box<dyn Error>> {
+    let mut nalus: Vec<Vec<u8>> = vec![];
+
+    let nalu_header: Vec<u8> = vec![0x00, 0x00, 0x00, 0x01];
+
+    let mut index = 0;
+    while index < data.len() {
+        let byte_array: [u8; 4] = match data[index..index + 4].try_into() {
+            Ok(success) => success,
+            Err(e) => return Err(format!("Failed to convert {}", e).into()),
+        };
+
+        let length_u32 = u32::from_be_bytes(byte_array);
+        let length = usize::try_from(length_u32).unwrap();
+
+        index += 4;
+
+        if index + length > data.len() {
+            return Err("Invalid length: Not enough bytes in the vector".into());
         }
-        // Prevent an infinite loop on invalid box size.
-        if size < 8 {
-            break;
-        }
-        offset += size;
+
+        let chunk: Vec<u8> = data[index..index + length].to_vec();
+        let mut chunk_mut = chunk.clone();
+        index += length;
+
+        let mut nalu = nalu_header.clone();
+        nalu.append(&mut chunk_mut);
+
+        nalus.push(nalu);
     }
-    None
+
+    Ok(nalus)
 }

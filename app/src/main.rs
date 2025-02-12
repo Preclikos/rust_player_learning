@@ -4,7 +4,7 @@ use ffmpeg_next::util::frame::Video as Frame;
 use player::Player;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::Receiver;
-use wgpu::{BindGroup, RenderPipeline, TextureFormat};
+use wgpu::{BindGroup, BindGroupLayout, RenderPipeline, Sampler, TextureFormat};
 use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalSize, Size};
 use winit::event::WindowEvent;
@@ -17,8 +17,10 @@ struct State {
     size: winit::dpi::PhysicalSize<u32>,
     surface: wgpu::Surface<'static>,
     surface_format: TextureFormat,
+    sampler: Sampler,
     render_texture: wgpu::Texture,
     texture_bind_group: BindGroup,
+    texture_bind_group_layout: BindGroupLayout,
     render_pipeline: RenderPipeline,
 }
 
@@ -202,8 +204,10 @@ impl State {
             size,
             surface,
             surface_format,
+            sampler,
             render_texture,
             texture_bind_group,
+            texture_bind_group_layout,
             render_pipeline,
         };
 
@@ -233,24 +237,46 @@ impl State {
 
     fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
         self.size = new_size;
-        /*
-                self.render_texture = self.device.create_texture(&wgpu::TextureDescriptor {
-                    label: Some("Render Texture"),
-                    size: wgpu::Extent3d {
-                        width: new_size.width,
-                        height: new_size.height,
-                        depth_or_array_layers: 1,
-                    },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: wgpu::TextureFormat::Rgba8Unorm,
-                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                        | wgpu::TextureUsages::TEXTURE_BINDING
-                        | wgpu::TextureUsages::COPY_DST,
-                    view_formats: &[wgpu::TextureFormat::Rgba8Unorm],
-                });
-        */
+
+        self.render_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Render Texture"),
+            size: wgpu::Extent3d {
+                width: new_size.width & !1,
+                height: new_size.height & !1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.surface_format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[self.surface_format],
+        });
+
+        let view = self
+            .render_texture
+            .create_view(&wgpu::TextureViewDescriptor {
+                format: Some(self.surface_format),
+                ..Default::default()
+            });
+
+        self.texture_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &self.texture_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+            ],
+            label: Some("texture_bind_group"),
+        });
+
         // Reconfigure the surface
         self.configure_surface();
     }
@@ -268,7 +294,24 @@ impl State {
                 ..Default::default()
             });
 
-        let (width, height) = (frame.width(), frame.height());
+        let width = self.size.width & !1;
+        let height = self.size.height & !1;
+
+        let dst_format = ffmpeg_next::format::Pixel::BGRA;
+
+        let mut dst_frame = ffmpeg_next::util::frame::Video::new(dst_format, width, height);
+
+        _ = ffmpeg_next::software::scaling::Context::get(
+            frame.format(),
+            frame.width(),
+            frame.height(),
+            dst_format,
+            width,
+            height,
+            ffmpeg_next::software::scaling::Flags::BILINEAR,
+        )
+        .unwrap()
+        .run(&frame, &mut dst_frame);
 
         // Upload the RGBA data to the copy texture
         self.queue.write_texture(
@@ -278,7 +321,7 @@ impl State {
                 origin: wgpu::Origin3d { x: 0, y: 0, z: 0 },
                 aspect: wgpu::TextureAspect::All,
             },
-            frame.data(0),
+            dst_frame.data(0),
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(4 * width),
@@ -330,10 +373,10 @@ struct App {
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        let (frame_tx, mut frame_rx) = mpsc::channel::<Frame>(3);
+        let (frame_tx, frame_rx) = mpsc::channel::<Frame>(3);
         // Create window object
         let mut default_attrs = Window::default_attributes();
-        default_attrs.inner_size = Some(Size::Physical(PhysicalSize::new(900, 800)));
+        default_attrs.inner_size = Some(Size::Physical(PhysicalSize::new(1280, 800)));
         let window = Arc::new(event_loop.create_window(default_attrs).unwrap());
 
         tokio::spawn(async move {
@@ -393,24 +436,6 @@ impl ApplicationHandler for App {
 
 #[tokio::main]
 async fn main() {
-    /*let mut player = Player::new();
-
-    let _ = player
-        .open_url("https://preclikos.cz/examples/raw/manifest.mpd")
-        .await;
-
-    let _ = player.prepare().await;
-
-    let tracks = player.get_tracks();
-
-    let tracks = tracks.unwrap();
-    let selected_video = tracks.video.first().unwrap();
-    let selected_representation = selected_video.representations.last().unwrap();
-
-    player.set_video_track(selected_video, selected_representation);
-
-    //player.play().await;*/
-
     let event_loop = EventLoop::new().unwrap();
 
     // ControlFlow::Poll continuously runs the event loop, even if the OS hasn't

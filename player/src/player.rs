@@ -9,7 +9,9 @@ use ffmpeg_next::Rational;
 use ffmpeg_next::{codec::Context, Packet};
 use re_mp4::{Mp4, StsdBoxContent};
 use std::error::Error;
+use std::time::Duration;
 use tokio::sync::Notify;
+use tokio::time::sleep;
 use tokio::{join, sync::mpsc::Sender};
 use tracks::{
     segment::Segment,
@@ -284,29 +286,7 @@ impl Player {
                                 frame.height(),
                                 frame.format()
                             );*/
-
-                            let width = frame.width();
-                            let height = frame.height();
-
-                            let src_format = ffmpeg_next::format::Pixel::YUV420P;
-                            let dst_format = ffmpeg_next::format::Pixel::BGRA;
-
-                            let mut dst_frame =
-                                ffmpeg_next::util::frame::Video::new(dst_format, width, height);
-
-                            _ = ffmpeg_next::software::scaling::Context::get(
-                                src_format,
-                                width,
-                                height,
-                                dst_format,
-                                width,
-                                height,
-                                ffmpeg_next::software::scaling::Flags::BILINEAR,
-                            )
-                            .unwrap()
-                            .run(&frame, &mut dst_frame);
-
-                            _ = sender.send(dst_frame.clone()).await;
+                            _ = sender.send(frame.clone()).await;
                         }
                     }
                 }

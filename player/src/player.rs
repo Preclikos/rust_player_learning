@@ -21,7 +21,7 @@ use url::Url;
 
 use std::sync::Arc;
 use tokio::sync::mpsc::{self, Receiver};
-use tokio::task;
+use tokio::task::{self, JoinHandle};
 
 use manifest::Manifest;
 
@@ -199,15 +199,12 @@ impl Player {
         Ok(())
     }
 
-    pub async fn play(&mut self) -> Result<(), Box<dyn Error + Send + Sync>> {
-        let (download_tx, mut download_rx) = mpsc::channel::<DataSegment>(MAX_SEGMENTS);
-        let stop = Arc::new(Notify::new());
-
-        let video_representation = match &self.video_representation {
-            Some(success) => success.clone(),
-            None => return Err("Video Track not set".into()),
-        };
-
+    async fn video_play(
+        video_representation: VideoRepresenation,
+        sender: Sender<Video>,
+        stop: Arc<Notify>,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let (download_tx, download_rx) = mpsc::channel::<DataSegment>(MAX_SEGMENTS);
         let init_data = match video_representation.segment_init.download().await {
             Ok(data) => data,
             Err(e) => return Err(format!("Error download init segment: {}", e).into()),
@@ -269,12 +266,27 @@ impl Player {
 
         let download_task = task::spawn(Self::download_task(segments, download_tx, stop));
 
-        let sender = self.frame_sender.clone();
         let decoder_task = task::spawn(Self::decoder_task(download_rx, sender, decoder, init_data));
 
         _ = join!(download_task, decoder_task);
 
         Ok(())
+    }
+
+    pub fn play(
+        &mut self,
+    ) -> Result<JoinHandle<Result<(), Box<dyn Error + Send + Sync>>>, Box<dyn Error + Send + Sync>>
+    {
+        let stop = Arc::new(Notify::new());
+        let sender = self.frame_sender.clone();
+        let video_representation = match &self.video_representation {
+            Some(success) => success.clone(),
+            None => return Err("Video Track not set".into()),
+        };
+
+        let play = task::spawn(Self::video_play(video_representation, sender, stop));
+
+        Ok(play)
     }
 }
 

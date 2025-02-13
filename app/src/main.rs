@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use ffmpeg_next::util::frame::Video as Frame;
 use player::Player;
+use tokio::join;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::Receiver;
 use wgpu::{BindGroup, BindGroupLayout, RenderPipeline, Sampler, TextureFormat};
@@ -401,7 +402,8 @@ impl ApplicationHandler for App {
             player.set_video_track(selected_video, selected_representation);
 
             loop {
-                let a = player.play().await;
+                let play = player.play().unwrap();
+                _ = join!(play);
             }
         });
 
@@ -422,7 +424,7 @@ impl ApplicationHandler for App {
                 event_loop.exit();
             }
             WindowEvent::RedrawRequested => {
-                let frame_duration = Duration::from_millis(24000 / 1001);
+                let frame_duration = Duration::from_nanos(24000000 / 1001000);
                 sleep(frame_duration);
                 if let Ok(frame) = receiver.try_recv() {
                     state.render(frame);

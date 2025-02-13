@@ -20,7 +20,7 @@ use tracks::{
 use url::Url;
 
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::mpsc::{self, Receiver};
 use tokio::task;
 
 use manifest::Manifest;
@@ -35,7 +35,7 @@ pub struct Player {
     video_adaptation: Option<VideoAdaptation>,
     video_representation: Option<VideoRepresenation>,
 
-    frame_sender: Option<Sender<Video>>,
+    frame_sender: Sender<Video>,
 }
 
 impl Player {
@@ -47,7 +47,7 @@ impl Player {
             tracks: None,
             video_adaptation: None,
             video_representation: None,
-            frame_sender: Some(sender),
+            frame_sender: sender,
         }
     }
 
@@ -112,7 +112,94 @@ impl Player {
         self.video_representation = Some(representation.clone());
     }
 
-    pub async fn play(&mut self) -> Result<(), Box<dyn Error>> {
+    async fn download_task(
+        segments: Vec<Segment>,
+        segment_sender: Sender<DataSegment>,
+        stop: Arc<Notify>,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let segment_slice = &segments[..];
+        for i in 0..segment_slice.len() {
+            let sender = segment_sender.clone();
+            let seg = &segment_slice[i];
+            tokio::select! {
+                    _ = download_and_queue(i, seg, sender) => {
+                        println!("Producing segment {}", i);
+                    }
+                _ = stop.notified() => {
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn decoder_task(
+        mut receiver: Receiver<DataSegment>,
+        sender: Sender<ffmpeg_next::util::frame::Video>,
+        mut decoder: ffmpeg_next::decoder::Video,
+        init_data: Vec<u8>,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        while let Some(segment) = receiver.recv().await {
+            println!("Consuming segment: {}", segment.id);
+
+            let mut data_vec = init_data.clone();
+            data_vec.extend_from_slice(&segment.data[..]);
+
+            let data = &data_vec[..];
+
+            let mp4 = match Mp4::read_bytes(data) {
+                Ok(success) => success,
+                Err(e) => {
+                    return Err(format!("Parsing error {}", e).into());
+                }
+            };
+
+            let (_track_id, track) = mp4.tracks().first_key_value().unwrap();
+            let samples = &track.samples;
+
+            for sample in samples {
+                let sample_offset = sample.offset as usize;
+                let sample_size = sample.size as usize;
+
+                if sample_offset + sample_size > data.len() {
+                    eprintln!(
+                        "Sample at offset {} (size {}) exceeds mdat bounds (size {})",
+                        sample_offset,
+                        sample_size,
+                        data.len()
+                    );
+                    continue;
+                }
+
+                let sample_data = &data[sample_offset..sample_offset + sample_size];
+                let nalus = parse_hevc_nalu(sample_data).unwrap();
+
+                for nalu in nalus {
+                    let mut packet = Packet::new(nalu.len());
+
+                    packet.set_pts(Some(sample.composition_timestamp));
+                    packet.set_time_base(Rational(1, sample.timescale as i32));
+
+                    packet.data_mut().unwrap().clone_from_slice(&nalu[..]);
+
+                    if let Err(e) = decoder.send_packet(&packet) {
+                        return Err(format!("Error sending packet to decoder: {:?}", e).into());
+                    }
+                }
+
+                let mut frame = ffmpeg_next::util::frame::Video::empty();
+                while let Ok(()) = decoder.receive_frame(&mut frame) {
+                    match sender.send(frame.clone()).await {
+                        Ok(_success) => {}
+                        Err(e) => return Err(format!("Cannot send frame to channel {}", e).into()),
+                    };
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn play(&mut self) -> Result<(), Box<dyn Error + Send + Sync>> {
         let (download_tx, mut download_rx) = mpsc::channel::<DataSegment>(MAX_SEGMENTS);
         let stop = Arc::new(Notify::new());
 
@@ -121,7 +208,10 @@ impl Player {
             None => return Err("Video Track not set".into()),
         };
 
-        let init_data = video_representation.segment_init.download().await?;
+        let init_data = match video_representation.segment_init.download().await {
+            Ok(data) => data,
+            Err(e) => return Err(format!("Error download init segment: {}", e).into()),
+        };
 
         let mp4_info = match Mp4::read_bytes(&init_data[..]) {
             Ok(success) => success,
@@ -170,7 +260,6 @@ impl Player {
                 }
             }
             _ => {
-                println!("WTF");
                 return Err("Codec not supported!".into());
             }
         };
@@ -178,86 +267,12 @@ impl Player {
         let video = video_representation;
         let segments = video.segments.clone();
 
-        let download_task = task::spawn(async move {
-            let segment_slice = &segments[..];
-            for i in 0..segment_slice.len() {
-                let seg = &segment_slice[i];
-                let sender = download_tx.clone();
-                tokio::select! {
-                        _ = download_and_queue(i, seg, sender) => {
-                            println!("Producing segment {}", i);
-                        }
-                    _ = stop.notified() => {
-                        break;
-                    }
-                }
-            }
-        });
+        let download_task = task::spawn(Self::download_task(segments, download_tx, stop));
 
-        let sender = self.frame_sender.clone().unwrap();
+        let sender = self.frame_sender.clone();
+        let decoder_task = task::spawn(Self::decoder_task(download_rx, sender, decoder, init_data));
 
-        let decoder_task = task::spawn(async move {
-            while let Some(segment) = download_rx.recv().await {
-                println!("Consuming segment: {}", segment.id);
-                let mut data_vec = init_data.clone();
-                data_vec.extend_from_slice(&segment.data.clone());
-
-                let data = &data_vec[..];
-
-                let mp4 = match Mp4::read_bytes(data) {
-                    Ok(success) => success,
-                    Err(e) => {
-                        println!("Parsing error {}", e);
-                        break;
-                    }
-                };
-
-                let (_track_id, track) = mp4.tracks().first_key_value().unwrap();
-                let samples = &track.samples;
-
-                for sample in samples {
-                    let sample_offset = sample.offset as usize;
-                    let sample_size = sample.size as usize;
-
-                    if sample_offset + sample_size > data.len() {
-                        eprintln!(
-                            "Sample at offset {} (size {}) exceeds mdat bounds (size {})",
-                            sample_offset,
-                            sample_size,
-                            data.len()
-                        );
-                        continue;
-                    }
-
-                    let sample_data = &data[sample_offset..sample_offset + sample_size];
-                    let nalus = parse_hevc_nalu(sample_data).unwrap();
-
-                    for nalu in nalus {
-                        let mut packet = Packet::new(nalu.len());
-
-                        packet.set_pts(Some(sample.composition_timestamp));
-                        packet.set_time_base(Rational(1, sample.timescale as i32));
-
-                        packet.data_mut().unwrap().clone_from_slice(&nalu[..]);
-
-                        if let Err(e) = decoder.send_packet(&packet) {
-                            println!("Error sending packet: {:?}", e);
-                        }
-                    }
-
-                    let mut frame = ffmpeg_next::util::frame::Video::empty();
-                    while let Ok(()) = decoder.receive_frame(&mut frame) {
-                        match sender.send(frame.clone()).await {
-                            Ok(_success) => {}
-                            Err(e) => println!("Cannot send frame to channel"),
-                        };
-                    }
-                }
-            }
-        });
-
-        _ = join!(download_task);
-        _ = join!(decoder_task);
+        _ = join!(download_task, decoder_task);
 
         Ok(())
     }

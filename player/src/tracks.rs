@@ -173,19 +173,99 @@ impl Tracks {
         let video_representation = VideoRepresenation {
             id: representation.id,
             base_url: url_base,
-            file_url: file_url,
+            file_url,
             bandwidth: representation.bandwidth,
-            codecs: codecs,
+            codecs,
             mime_type: representation.mime_type.to_string(),
             width: *width,
             height: *height,
-            sar: sar,
+            sar,
             segment_init: init_segment,
             segment_range: index_segment,
-            segments: segments,
+            segments,
         };
 
         Ok(video_representation)
+    }
+
+    async fn parse_audio_representation(
+        base_url: &String,
+        representation: &Representation,
+    ) -> Result<AudioRepresentation, Box<dyn Error>> {
+        let codecs = match &representation.codecs {
+            Some(value) => value.to_string(),
+            None => {
+                return Err(format!(
+                    "Cannot get codecs from Representation Id: {}",
+                    representation.id
+                )
+                .into())
+            }
+        };
+
+        let audio_sampling_rate = match &representation.audio_sampling_rate {
+            Some(value) => value,
+            None => {
+                return Err(format!(
+                    "Cannot get audioSamplingRate from Representation Id: {}",
+                    representation.id
+                )
+                .into())
+            }
+        };
+
+        let url_base = base_url.to_string();
+        let file_url = representation.base_url.value.to_string();
+
+        let base_segment = match &representation.segment_base {
+            Some(segment) => segment,
+            None => {
+                return Err(format!(
+                    "Cannot get segmentBase from Representation Id: {}",
+                    representation.id
+                )
+                .into())
+            }
+        };
+
+        let (init_start, init_end) = Self::parse_range(&base_segment.initialization.range)?;
+        let init_segment = Segment::new(&url_base, &file_url, init_start, init_end)?;
+        let (index_start, index_end) = Self::parse_range(&base_segment.index_range)?;
+        let index_segment = Segment::new(&url_base, &file_url, index_start, index_end)?;
+
+        let segments: Vec<Segment>;
+
+        match representation.mime_type.as_str() {
+            "audio/mp4" => {
+                let index_vec = index_segment.download().await?;
+                let mut index_slice = &index_vec[..];
+                let sidx = parse_sidx(&mut index_slice)?;
+                segments =
+                    Self::generate_segments_from_sidx(&url_base, &file_url, sidx, index_end + 1)?;
+            }
+            _ => {
+                return Err(format!(
+                    "Representation with type {} not supported",
+                    representation.mime_type
+                )
+                .into())
+            }
+        }
+
+        let audio_representation = AudioRepresentation {
+            id: representation.id,
+            base_url: url_base,
+            file_url,
+            bandwidth: representation.bandwidth,
+            codecs,
+            mime_type: representation.mime_type.to_string(),
+            audio_sampling_rate: *audio_sampling_rate,
+            segment_init: init_segment,
+            segment_range: index_segment,
+            segments,
+        };
+
+        Ok(audio_representation)
     }
 
     async fn parse_video_adaptation(
@@ -250,29 +330,48 @@ impl Tracks {
 
         let video_adaptation = VideoAdaptation {
             id: adaptation.id,
-            subsegment_alignment: subsegment_alignment,
-            frame_rate: frame_rate,
+            subsegment_alignment,
+            frame_rate,
             max_width: *max_width,
             max_height: *max_height,
-            par: par,
+            par,
             representations: video_representations,
         };
 
         Ok(video_adaptation)
     }
 
-    fn parse_audio_adaptation(
+    async fn parse_audio_adaptation(
         base_url: &String,
         adaptation: &AdaptationSet,
     ) -> Result<AudioAdaptation, Box<dyn Error>> {
         let mut audio_representations: Vec<AudioRepresentation> = vec![];
 
+        let lang = match &adaptation.lang {
+            Some(value) => value.to_string(),
+            None => {
+                return Err(
+                    format!("Cannot get lang from AdaptationSet Id: {}", adaptation.id).into(),
+                )
+            }
+        };
+
+        let subsegment_alignment = match &adaptation.subsegment_alignment {
+            Some(value) => value.clone(),
+            None => false,
+        };
+
         let representations = &adaptation.representations;
         for representation in representations {
-            audio_representations.push(AudioRepresentation {});
+            let audio_representation =
+                Self::parse_audio_representation(base_url, representation).await?;
+            audio_representations.push(audio_representation);
         }
 
         Ok(AudioAdaptation {
+            id: adaptation.id,
+            lang,
+            subsegment_alignment,
             representations: audio_representations,
         })
     }
@@ -315,7 +414,7 @@ impl Tracks {
                     video_adaptations.push(value);
                 }
                 "audio" => {
-                    let value = Self::parse_audio_adaptation(&base_url, adaptation)?;
+                    let value = Self::parse_audio_adaptation(&base_url, adaptation).await?;
                     audio_adaptations.push(value);
                 }
                 "text" => {

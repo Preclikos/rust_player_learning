@@ -16,3 +16,8 @@ url = "2.5.4"
 tokio = { version = "1.43.0", features = ["full"] }
 re_mp4 = { version = "0.3.0"}
 ffmpeg-next = {version = "7.1.0"}
+ffmpeg-sys-next = {version = "7.1.0"}
+hex = "0.4"
+cpal = "0.15.3"
+ringbuf = "0.4.7"
+bytemuck = "1.13.1"

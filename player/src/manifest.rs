@@ -109,6 +109,9 @@ pub struct Representation {
     #[serde(rename = "@sar")]
     pub sar: Option<String>,
 
+    #[serde(rename = "@audioSamplingRate")]
+    pub audio_sampling_rate: Option<u32>,
+
     #[serde(rename = "BaseURL")]
     pub base_url: BaseURL,
     #[serde(rename = "SegmentBase")]

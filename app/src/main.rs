@@ -355,9 +355,14 @@ impl ApplicationHandler for App {
 
             let tracks = tracks.unwrap();
             let selected_video = tracks.video.first().unwrap();
-            let selected_representation = &selected_video.representations.last().unwrap();
+            let selected_video_representation = &selected_video.representations.last().unwrap();
 
-            player.set_video_track(selected_video, selected_representation);
+            player.set_video_track(selected_video, selected_video_representation);
+
+            let selected_audio = tracks.audio.last().unwrap();
+            let selected_audio_representation = &selected_audio.representations.last().unwrap();
+
+            player.set_audio_track(selected_audio, selected_audio_representation);
 
             loop {
                 let play = player.play().unwrap();

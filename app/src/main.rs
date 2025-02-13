@@ -424,7 +424,7 @@ impl ApplicationHandler for App {
                 event_loop.exit();
             }
             WindowEvent::RedrawRequested => {
-                let frame_duration = Duration::from_nanos(24000000 / 1001000);
+                let frame_duration = Duration::from_millis(1000 / (24000000 / 1001000));
                 sleep(frame_duration);
                 if let Ok(frame) = receiver.try_recv() {
                     state.render(frame);

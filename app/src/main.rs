@@ -30,10 +30,18 @@ struct State {
 impl State {
     async fn new(window: Arc<Window>) -> State {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+
+        let surface = instance.create_surface(window.clone()).unwrap();
+
         let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions::default())
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::default(),
+                compatible_surface: Some(&surface),
+                force_fallback_adapter: false,
+            })
             .await
             .unwrap();
+
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor::default(), None)
             .await
@@ -41,7 +49,6 @@ impl State {
 
         let size = window.inner_size();
 
-        let surface = instance.create_surface(window.clone()).unwrap();
         let cap = surface.get_capabilities(&adapter);
         let surface_format = cap.formats[0];
 
@@ -115,51 +122,7 @@ impl State {
             label: Some("texture_bind_group"),
         });
 
-        // Create shader module
-        let shader_source = r#"
-        @group(0) @binding(0) var my_texture: texture_2d<f32>;
-        @group(0) @binding(1) var my_sampler: sampler;
-
-        struct VertexOutput {
-            @builtin(position) position: vec4<f32>,
-            @location(0) tex_coords: vec2<f32>,
-        };
-
-        @vertex
-        fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
-            var positions = array<vec2<f32>, 6>(
-                vec2<f32>(-1.0, -1.0),
-                vec2<f32>(1.0, -1.0),
-                vec2<f32>(-1.0, 1.0),
-                vec2<f32>(-1.0, 1.0),
-                vec2<f32>(1.0, -1.0),
-                vec2<f32>(1.0, 1.0)
-            );
-            var tex_coords = array<vec2<f32>, 6>(
-        vec2<f32>(0.0, 1.0), // Invert Y coordinate
-        vec2<f32>(1.0, 1.0), // Invert Y coordinate
-        vec2<f32>(0.0, 0.0), // Invert Y coordinate
-        vec2<f32>(0.0, 0.0), // Invert Y coordinate
-        vec2<f32>(1.0, 1.0), // Invert Y coordinate
-        vec2<f32>(1.0, 0.0)  // Invert Y coordinate
-            );
-
-            var output: VertexOutput;
-            output.position = vec4<f32>(positions[vertex_index], 0.0, 1.0);
-            output.tex_coords = tex_coords[vertex_index];
-            return output;
-        }
-
-        @fragment
-        fn fs_main(@location(0) in_tex_coords: vec2<f32>) -> @location(0) vec4<f32> {
-            return textureSample(my_texture, my_sampler, in_tex_coords);
-        }
-    "#;
-
-        let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Shader"),
-            source: wgpu::ShaderSource::Wgsl(shader_source.into()),
-        });
+        let shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
 
         // Create pipeline layout
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -168,29 +131,24 @@ impl State {
             push_constant_ranges: &[],
         });
 
-        let pipeline_compilation_options = wgpu::PipelineCompilationOptions {
-            constants: &std::collections::HashMap::new(), // Use this to specify pipeline-overridable constants
-            zero_initialize_workgroup_memory: true, // Set to true if you want to zero-initialize workgroup memory
-        };
-
         // Create render pipeline
         let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Render Pipeline"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
-                module: &shader_module,
+                module: &shader,
                 entry_point: Some("vs_main"),
                 buffers: &[],
-                compilation_options: pipeline_compilation_options.clone(),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
             fragment: Some(wgpu::FragmentState {
-                module: &shader_module,
+                module: &shader,
                 entry_point: Some("fs_main"),
-                compilation_options: pipeline_compilation_options.clone(),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
                 targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_format,
                     blend: Some(wgpu::BlendState::REPLACE),
                     write_mask: wgpu::ColorWrites::ALL,
-                    format: surface_format,
                 })],
             }),
             primitive: wgpu::PrimitiveState::default(),

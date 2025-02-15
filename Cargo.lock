@@ -1965,6 +1965,7 @@ dependencies = [
  "bytemuck",
  "cpal",
  "ffmpeg-next",
+ "ffmpeg-sys-next",
  "hex",
  "iso8601-duration",
  "quick-xml",

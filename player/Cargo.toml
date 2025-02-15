@@ -16,6 +16,7 @@ url = { version = "2.5.4" }
 tokio = { version = "1.43.0", features = ["full"] }
 re_mp4 = { version = "0.3.0" }
 ffmpeg-next = { version = "7.1.0"}
+ffmpeg-sys-next = { version = "7.1.0"}
 hex = { version = "0.4" }
 cpal ={ version =  "0.15.3" }
 ringbuf = { version = "0.4.7" }

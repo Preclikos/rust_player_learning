@@ -5,12 +5,11 @@ mod tracks;
 mod utils;
 mod video;
 
-use cpal::SampleRate;
 use ffmpeg_next::format::sample::Type;
 use ffmpeg_next::frame::{Audio, Video};
 use ffmpeg_next::software::resampling::Context;
-use ffmpeg_next::Packet;
-use parsers::mp4::{apped_hevc_header, parse_hevc_nalu};
+use ffmpeg_next::{Packet, Rational};
+use parsers::mp4::{aac_sampling_frequency_index_to_u32, apped_hevc_header, parse_hevc_nalu};
 use re_mp4::{Mp4, StsdBoxContent};
 
 use std::error::Error;
@@ -73,6 +72,10 @@ async fn video_sync_producer(
         if pts > elapsed {
             tokio::time::sleep(Duration::from_millis(pts - elapsed)).await;
         }
+        if pts + 20 < elapsed {
+            println!("Video drift more then 20ms dropping frame");
+            continue;
+        }
         _ = output_tx.send(frame).await;
     }
 }
@@ -88,6 +91,10 @@ async fn audio_sync_producer(
         if pts > elapsed {
             tokio::time::sleep(Duration::from_millis(pts - elapsed)).await;
         }
+        if pts + 20 < elapsed {
+            println!("Audio drift more then 20ms dropping frame");
+            continue;
+        }
         _ = output_tx.send(frame).await;
     }
 }
@@ -100,7 +107,6 @@ async fn lifetime_handler(
     audio_ready: Arc<Notify>,
     audio_rx: mpsc::Receiver<Audio>,
     audio_tx: mpsc::Sender<Audio>,
-    //text_ready: Arc<Notify>,
     stop: Arc<Notify>,
 ) {
     //loop {
@@ -141,13 +147,11 @@ impl Player {
             audio_representation: None,
 
             frame_consumer,
-            //frame_producer,
             sample_consumer,
-            //sample_producer,
-            //play_handle,
+
             video_ready,
             audio_ready,
-            //text_ready,
+
             stop,
 
             start_time,
@@ -255,7 +259,7 @@ impl Player {
         video_ready: Arc<Notify>,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         while let Some(segment) = receiver.recv().await {
-            println!("Consuming segment: {}", segment.id);
+            println!("Consuming video segment: {}", segment.id);
 
             let mut data_vec = init_data.clone();
             data_vec.extend_from_slice(&segment.data[..]);
@@ -317,14 +321,13 @@ impl Player {
     async fn audio_decoder_task(
         mut receiver: Receiver<DataSegment>,
         sender: Sender<Audio>,
-        //mut sender: Caching<Arc<SharedRb<Heap<f32>>>, true, false>,
         mut decoder: ffmpeg_next::decoder::Audio,
         init_data: Vec<u8>,
         audio_ready: Arc<Notify>,
         mut resampler: Context,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         while let Some(segment) = receiver.recv().await {
-            println!("Consuming segment: {}", segment.id);
+            println!("Consuming audio segment: {}", segment.id);
 
             let mut data_vec = init_data.clone();
             data_vec.extend_from_slice(&segment.data[..]);
@@ -359,9 +362,9 @@ impl Player {
 
                 let mut packet = Packet::new(sample_data.len());
 
-                let pts = sample.composition_timestamp * 1000 / (sample.timescale as i64);
+                let pts = sample.composition_timestamp * 1000 / (resampler.output().rate as i64);
                 packet.set_pts(Some(pts));
-
+                packet.set_time_base(Rational(1, sample.timescale as i32));
                 packet.data_mut().unwrap().clone_from_slice(sample_data);
 
                 if let Err(e) = decoder.send_packet(&packet) {
@@ -372,10 +375,11 @@ impl Player {
                 let mut frame = ffmpeg_next::util::frame::Audio::empty();
                 let mut dst_frame = ffmpeg_next::util::frame::Audio::empty();
 
+                audio_ready.notify_waiters();
                 while let Ok(()) = decoder.receive_frame(&mut frame) {
                     _ = resampler.run(&frame, &mut dst_frame)?;
                     dst_frame.set_pts(frame.pts());
-                    audio_ready.notify_waiters();
+
                     match sender.send(dst_frame.clone()).await {
                         Ok(_success) => {}
                         Err(e) => return Err(format!("Cannot send frame to channel {}", e).into()),
@@ -514,7 +518,7 @@ impl Player {
 
                 let frame_length = 1024;
 
-                let channel_config = esds.es_desc.dec_config.buffer_size_db;
+                //let channel_config = esds.es_desc.dec_config.buffer_size_db;
 
                 let profile = esds.es_desc.dec_config.dec_specific.profile;
                 let sampling_frequency_index = esds.es_desc.dec_config.dec_specific.freq_index;
@@ -522,39 +526,27 @@ impl Player {
 
                 let mut header = [0u8; 8];
 
+                //
                 // Start constructing the ADTS header
                 header[0] = 0xFF; // Fixed first byte
                 header[1] = 0xF1; // MPEG-4 AAC, Layer 0
-
-                // Byte 2: profile, sampling frequency index, and part of channel config
-                // Adjust to ensure the result is 0x50
+                                  // Byte 2: profile, sampling frequency index, and part of channel config
+                                  // Adjust to ensure the result is 0x50
                 header[2] = ((profile - 1) << 6) // Profile value (adjusted for correct byte)
                     | (sampling_frequency_index << 2) // Sampling frequency index
                     | ((channel_config & 0x4) >> 2); // Part of the channel config
-
-                // Byte 3: the remaining channel config and frame length (upper bits)
-                // Adjusted to match 0x80 in byte 3
+                                                     // Byte 3: the remaining channel config and frame length (upper bits)
+                                                     // Adjusted to match 0x80 in byte 3
                 header[3] = ((channel_config & 0x3) << 6) | ((frame_length >> 11) as u8 & 0x03);
-
                 // Byte 4: frame length (next 8 bits)
                 header[4] = ((frame_length >> 3) & 0xFF) as u8;
-
                 // Byte 5: frame length (remaining bits)
                 header[5] = (((frame_length & 0x07) as u8) << 5) | 0x1F;
-
                 // Byte 6: Buffer fullness (set to 0xFF for variable bitrate)
                 header[6] = 0xFC; // Adjusted for the required value
-
-                // Byte 8: Explicit END marker (distinct terminator)
+                                  // Byte 8: Explicit END marker (distinct terminator)
                 header[7] = 0xFF; // Explicit END marker
 
-                let hex_string = "FFF150802F5FFCFF";
-
-                let hex_string_test = slice_to_hex_string(&header);
-
-                println!("Hex String: {}", hex_string_test);
-
-                let bytes = hex::decode(hex_string).expect("Invalid hex string");
                 let mut packet = Packet::new(header.len());
                 packet.data_mut().unwrap().clone_from_slice(&header[..]);
 
@@ -565,7 +557,7 @@ impl Player {
                     }
                 };
 
-                sampling_frequency_index_to_u32(esds.es_desc.dec_config.dec_specific.freq_index)
+                aac_sampling_frequency_index_to_u32(esds.es_desc.dec_config.dec_specific.freq_index)
             }
             _ => {
                 return Err("Codec not supported!".into());
@@ -680,27 +672,4 @@ async fn download_and_queue(
     }
 
     Ok(())
-}
-
-fn slice_to_hex_string(slice: &[u8]) -> String {
-    slice.iter().map(|b| format!("{:02X}", b)).collect()
-}
-
-fn sampling_frequency_index_to_u32(index: u8) -> u32 {
-    match index {
-        0 => 96000,
-        1 => 88200,
-        2 => 64000,
-        3 => 48000,
-        4 => 44100,
-        5 => 32000,
-        6 => 24000,
-        7 => 22050,
-        8 => 16000,
-        9 => 12000,
-        10 => 11025,
-        11 => 8000,
-        12 => 7350,
-        _ => 44100,
-    }
 }

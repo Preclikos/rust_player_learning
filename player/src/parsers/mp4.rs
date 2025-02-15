@@ -138,3 +138,22 @@ pub fn parse_hevc_nalu(data: &[u8]) -> Result<Vec<Vec<u8>>, Box<dyn Error>> {
 
     Ok(nalus)
 }
+
+pub fn aac_sampling_frequency_index_to_u32(index: u8) -> u32 {
+    match index {
+        0 => 96000,
+        1 => 88200,
+        2 => 64000,
+        3 => 48000,
+        4 => 44100,
+        5 => 32000,
+        6 => 24000,
+        7 => 22050,
+        8 => 16000,
+        9 => 12000,
+        10 => 11025,
+        11 => 8000,
+        12 => 7350,
+        _ => 44100,
+    }
+}

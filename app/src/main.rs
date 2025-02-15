@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::thread::{self, sleep};
+use std::thread::sleep;
 use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -8,9 +8,7 @@ use ffmpeg_next::frame::Audio;
 use ffmpeg_next::util::frame::Video;
 use player::Player;
 use pollster::FutureExt;
-use ringbuf::storage::Heap;
-use ringbuf::wrap::caching::Caching;
-use ringbuf::{traits::*, HeapRb, SharedRb};
+use ringbuf::{traits::*, HeapRb};
 use tokio::join;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::{mpsc, Notify};
@@ -345,8 +343,8 @@ struct App {
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        let (frame_tx, frame_rx) = mpsc::channel::<Video>(6);
-        let (sample_tx, mut sample_rx) = mpsc::channel::<Audio>(20);
+        let (frame_tx, frame_rx) = mpsc::channel::<Video>(4);
+        let (sample_tx, mut sample_rx) = mpsc::channel::<Audio>(8);
         // Create window object
         let mut default_attrs = Window::default_attributes();
         default_attrs.inner_size = Some(Size::Physical(PhysicalSize::new(1280, 800)));
@@ -360,7 +358,7 @@ impl ApplicationHandler for App {
         let end_producer = eof.clone();
         tokio::spawn(async move {
             while let Some(dst_frame) = sample_rx.recv().await {
-                let expected_bytes = dst_frame.samples()
+                let expected_bytes: usize = dst_frame.samples()
                     * dst_frame.channels() as usize
                     * core::mem::size_of::<f32>();
 
@@ -414,13 +412,14 @@ impl ApplicationHandler for App {
 
             end.notified().block_on();
         });
+
         let sample_rate = config.clone().sample_rate();
         let channels = config.channels();
         tokio::spawn(async move {
             let mut player = Player::new(frame_tx, sample_tx, sample_rate.0, channels);
             //tearsofsteel_
             let _ = player
-                .open_url("https://preclikos.cz/examples/raw/manifest.mpd")
+                .open_url("https://preclikos.cz/examples/tearsofsteel_raw/manifest.mpd")
                 .await;
 
             let _ = player.prepare().await;
@@ -429,7 +428,7 @@ impl ApplicationHandler for App {
 
             let tracks = tracks.unwrap();
             let selected_video = tracks.video.first().unwrap();
-            let selected_video_representation = &selected_video.representations.last().unwrap();
+            let selected_video_representation = &selected_video.representations[3]; //.first().unwrap();
 
             player.set_video_track(selected_video, selected_video_representation);
 

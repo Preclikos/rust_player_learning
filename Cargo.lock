@@ -117,9 +117,12 @@ dependencies = [
 name = "app"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
+ "cpal",
  "ffmpeg-next",
  "player",
  "pollster",
+ "ringbuf",
  "tokio",
  "wgpu",
  "winit",
@@ -1962,7 +1965,6 @@ dependencies = [
  "bytemuck",
  "cpal",
  "ffmpeg-next",
- "ffmpeg-sys-next",
  "hex",
  "iso8601-duration",
  "quick-xml",

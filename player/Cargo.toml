@@ -9,15 +9,14 @@ path = "src/player.rs"
 
 [dependencies]
 reqwest = { version = "0.12.12", features = ["blocking"] }
-quick-xml = {version ="0.37.2", features = [ "serialize" ]}
+quick-xml = {version ="0.37.2", features = [ "serialize" ] }
 serde = { version = "1.0", features = ["derive"] }
-iso8601-duration = "0.2"
-url = "2.5.4"
+iso8601-duration = { version = "0.2" }
+url = { version = "2.5.4" }
 tokio = { version = "1.43.0", features = ["full"] }
-re_mp4 = { version = "0.3.0"}
-ffmpeg-next = {version = "7.1.0"}
-ffmpeg-sys-next = {version = "7.1.0"}
-hex = "0.4"
-cpal = "0.15.3"
-ringbuf = "0.4.7"
-bytemuck = "1.13.1"
+re_mp4 = { version = "0.3.0" }
+ffmpeg-next = { version = "7.1.0"}
+hex = { version = "0.4" }
+cpal ={ version =  "0.15.3" }
+ringbuf = { version = "0.4.7" }
+bytemuck ={ version =  "1.13.1" }

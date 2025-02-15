@@ -2,8 +2,14 @@ use std::sync::Arc;
 use std::thread::sleep;
 use std::time::Duration;
 
-use ffmpeg_next::util::frame::Video as Frame;
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::{Sample, StreamConfig};
+use ffmpeg_next::frame::Audio;
+use ffmpeg_next::util::frame::Video;
 use player::Player;
+use ringbuf::storage::Heap;
+use ringbuf::wrap::caching::Caching;
+use ringbuf::{traits::*, HeapRb, SharedRb};
 use tokio::join;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::Receiver;
@@ -13,6 +19,7 @@ use winit::dpi::{PhysicalSize, Size};
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId};
+
 struct State {
     window: Arc<Window>,
     device: wgpu::Device,
@@ -245,7 +252,7 @@ impl State {
         self.configure_surface();
     }
 
-    fn render(&mut self, frame: Frame) {
+    fn render(&mut self, frame: Video) {
         // Create texture view for rendering
         let surface_texture = self
             .surface
@@ -331,19 +338,76 @@ impl State {
 #[derive(Default)]
 struct App {
     state: Option<State>,
-    receiver: Option<Receiver<Frame>>,
+    receiver: Option<Receiver<Video>>,
 }
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        let (frame_tx, frame_rx) = mpsc::channel::<Frame>(3);
+        let (frame_tx, frame_rx) = mpsc::channel::<Video>(3);
+        let (sample_tx, mut sample_rx) = mpsc::channel::<Audio>(3);
         // Create window object
         let mut default_attrs = Window::default_attributes();
         default_attrs.inner_size = Some(Size::Physical(PhysicalSize::new(1280, 800)));
         let window = Arc::new(event_loop.create_window(default_attrs).unwrap());
 
+        let buffer = HeapRb::<f32>::new(8192);
+        let (mut sample_producer, mut sample_consumer) = buffer.split();
+
         tokio::spawn(async move {
-            let mut player = Player::new(frame_tx);
+            while let Some(dst_frame) = sample_rx.recv().await {
+                let expected_bytes = (dst_frame.samples()
+                    * dst_frame.channels() as usize
+                    * core::mem::size_of::<f32>());
+
+                let cpal_sample_data: &[f32] =
+                    bytemuck::cast_slice(&dst_frame.data(0)[..expected_bytes]);
+
+                let mut remaining = cpal_sample_data;
+                while !remaining.is_empty() {
+                    let written = sample_producer.push_slice(remaining);
+                    remaining = &remaining[written..];
+                    std::thread::yield_now(); // Yield to let other threads run
+                }
+            }
+        });
+
+        tokio::spawn(async {
+            let device = cpal::default_host()
+                .default_output_device()
+                .ok_or("No output device")
+                .unwrap();
+
+            let configs = device.default_output_config().unwrap();
+
+            let stream_config = StreamConfig {
+                channels: configs.channels(),
+                sample_rate: configs.sample_rate(),
+                buffer_size: cpal::BufferSize::Default,
+            };
+
+            let err_fn = |err| eprintln!("an error occurred on stream: {}", err);
+
+            let callback = move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                let filled = sample_consumer.pop_slice(data);
+                data[filled..].fill(Sample::EQUILIBRIUM);
+            };
+
+            let stream = device
+                .build_output_stream(
+                    &stream_config,
+                    callback,
+                    err_fn,
+                    Some(Duration::from_secs(20)),
+                )
+                .unwrap();
+
+            stream.play().unwrap();
+
+            sleep(Duration::from_secs(200));
+        });
+
+        tokio::spawn(async move {
+            let mut player = Player::new(frame_tx, sample_tx);
 
             let _ = player
                 .open_url("https://preclikos.cz/examples/raw/manifest.mpd")
@@ -365,8 +429,8 @@ impl ApplicationHandler for App {
             player.set_audio_track(selected_audio, selected_audio_representation);
 
             loop {
-                let play = player.play().unwrap();
-                _ = join!(play);
+                let play = player.play();
+                _ = join!(play.unwrap());
             }
         });
 
@@ -387,11 +451,10 @@ impl ApplicationHandler for App {
                 event_loop.exit();
             }
             WindowEvent::RedrawRequested => {
-                let frame_duration = Duration::from_millis(1000 / (24000000 / 1001000));
-                sleep(frame_duration);
                 if let Ok(frame) = receiver.try_recv() {
                     state.render(frame);
                 }
+                sleep(Duration::from_millis(6));
 
                 state.get_window().request_redraw();
             }

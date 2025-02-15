@@ -3,22 +3,19 @@ mod networking;
 mod parsers;
 mod tracks;
 mod utils;
+mod video;
 
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{Sample, StreamConfig};
 use ffmpeg_next::format::sample::Type;
-use ffmpeg_next::frame::Video;
+use ffmpeg_next::frame::{Audio, Video};
 use ffmpeg_next::Rational;
 use ffmpeg_next::{codec::Context, Packet};
 use parsers::mp4::{apped_hevc_header, parse_hevc_nalu};
 use re_mp4::{Mp4, StsdBoxContent};
-use ringbuf::storage::Heap;
-use ringbuf::wrap::caching::Caching;
-use ringbuf::{traits::*, HeapRb, SharedRb};
+
 use std::error::Error;
-use std::thread::sleep;
 use std::time::Duration;
 use tokio::sync::Notify;
+use tokio::time::Instant;
 use tokio::{join, sync::mpsc::Sender};
 use tracks::audio::{AudioAdaptation, AudioRepresentation};
 use tracks::{
@@ -35,7 +32,6 @@ use tokio::task::{self, JoinHandle};
 use manifest::Manifest;
 
 const MAX_SEGMENTS: usize = 2;
-type PlayerJoinHandle = JoinHandle<Result<(), Box<dyn Error + Send + Sync>>>;
 
 pub struct Player {
     base_url: Option<String>,
@@ -48,12 +44,84 @@ pub struct Player {
     audio_adaptation: Option<AudioAdaptation>,
     audio_representation: Option<AudioRepresentation>,
 
-    frame_sender: Sender<Video>,
+    //frame_producer: Receiver<Video>,
+    frame_consumer: Sender<Video>,
+
+    //sample_producer: Receiver<Audio>,
+    sample_consumer: Sender<Audio>,
+
+    //play_handle: JoinHandle<()>,
+    start_time: Arc<Instant>,
+    video_ready: Arc<Notify>,
+    audio_ready: Arc<Notify>,
+    //text_ready: Arc<Notify>,
+    stop: Arc<Notify>,
+}
+
+async fn video_sync_producer(
+    start_time: Arc<Instant>,
+    mut input_rx: mpsc::Receiver<Video>,
+    output_tx: mpsc::Sender<Video>,
+) {
+    while let Some(frame) = input_rx.recv().await {
+        let elapsed = start_time.elapsed().as_millis() as u64;
+        let pts = frame.pts().unwrap() as u64;
+        if pts > elapsed {
+            tokio::time::sleep(Duration::from_millis(pts - elapsed)).await;
+        }
+        _ = output_tx.send(frame).await;
+    }
+}
+
+async fn audio_sync_producer(
+    start_time: Arc<Instant>,
+    mut input_rx: mpsc::Receiver<Audio>,
+    output_tx: mpsc::Sender<Audio>,
+) {
+    while let Some(frame) = input_rx.recv().await {
+        let elapsed = start_time.elapsed().as_millis() as u64;
+        let pts = frame.pts().unwrap() as u64;
+        if pts > elapsed {
+            tokio::time::sleep(Duration::from_millis(pts - elapsed)).await;
+        }
+        _ = output_tx.send(frame).await;
+    }
+}
+
+async fn lifetime_handler(
+    mut start_time: Arc<Instant>,
+    video_ready: Arc<Notify>,
+    video_rx: mpsc::Receiver<Video>,
+    video_tx: mpsc::Sender<Video>,
+    audio_ready: Arc<Notify>,
+    audio_rx: mpsc::Receiver<Audio>,
+    audio_tx: mpsc::Sender<Audio>,
+    //text_ready: Arc<Notify>,
+    stop: Arc<Notify>,
+) {
+    //loop {
+    tokio::join!(video_ready.notified(), audio_ready.notified());
+    start_time = Arc::new(Instant::now());
+    tokio::select! {
+        _ = tokio::spawn(video_sync_producer(start_time.clone(), video_rx, video_tx)) => {
+
+        }
+        _ = tokio::spawn(audio_sync_producer(start_time.clone(), audio_rx, audio_tx)) => { }
+        /*_ = text_play => {
+        }*/
+    }
+    stop.notify_waiters();
+    //}
 }
 
 impl Player {
-    pub fn new(sender: Sender<Video>) -> Self {
-        //Here i want pass texture and other device -> wgpu and cpal
+    pub fn new(frame_consumer: Sender<Video>, sample_consumer: Sender<Audio>) -> Self {
+        let start_time = Arc::new(Instant::now());
+
+        let video_ready = Arc::new(Notify::new());
+        let audio_ready = Arc::new(Notify::new());
+        let stop = Arc::new(Notify::new());
+
         Player {
             base_url: None,
             manifest: None,
@@ -62,7 +130,18 @@ impl Player {
             video_representation: None,
             audio_adaptation: None,
             audio_representation: None,
-            frame_sender: sender,
+
+            frame_consumer,
+            //frame_producer,
+            sample_consumer,
+            //sample_producer,
+            //play_handle,
+            video_ready,
+            audio_ready,
+            //text_ready,
+            stop,
+
+            start_time,
         }
     }
 
@@ -162,6 +241,7 @@ impl Player {
         sender: Sender<ffmpeg_next::util::frame::Video>,
         mut decoder: ffmpeg_next::decoder::Video,
         init_data: Vec<u8>,
+        video_ready: Arc<Notify>,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         while let Some(segment) = receiver.recv().await {
             println!("Consuming segment: {}", segment.id);
@@ -200,9 +280,8 @@ impl Player {
 
                 for nalu in nalus {
                     let mut packet = Packet::new(nalu.len());
-
-                    packet.set_pts(Some(sample.composition_timestamp));
-                    packet.set_time_base(Rational(1, sample.timescale as i32));
+                    let pts = sample.composition_timestamp * 1000 / (sample.timescale as i64);
+                    packet.set_pts(Some(pts));
 
                     packet.data_mut().unwrap().clone_from_slice(&nalu[..]);
 
@@ -213,6 +292,7 @@ impl Player {
 
                 let mut frame = ffmpeg_next::util::frame::Video::empty();
                 while let Ok(()) = decoder.receive_frame(&mut frame) {
+                    video_ready.notify_waiters();
                     match sender.send(frame.clone()).await {
                         Ok(_success) => {}
                         Err(e) => return Err(format!("Cannot send frame to channel {}", e).into()),
@@ -225,9 +305,11 @@ impl Player {
 
     async fn audio_decoder_task(
         mut receiver: Receiver<DataSegment>,
-        mut sender: Caching<Arc<SharedRb<Heap<f32>>>, true, false>,
+        sender: Sender<Audio>,
+        //mut sender: Caching<Arc<SharedRb<Heap<f32>>>, true, false>,
         mut decoder: ffmpeg_next::decoder::Audio,
         init_data: Vec<u8>,
+        audio_ready: Arc<Notify>,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         //let mut audio_data: Vec<Audio> = vec![];
         let mut resampler = ffmpeg_next::software::resampling::Context::get(
@@ -274,8 +356,8 @@ impl Player {
 
                 let mut packet = Packet::new(sample_data.len());
 
-                packet.set_pts(Some(sample.composition_timestamp));
-                packet.set_time_base(Rational(1, sample.timescale as i32));
+                let pts = sample.composition_timestamp * 1000 / (sample.timescale as i64);
+                packet.set_pts(Some(pts));
 
                 packet.data_mut().unwrap().clone_from_slice(sample_data);
 
@@ -286,21 +368,15 @@ impl Player {
 
                 let mut frame = ffmpeg_next::util::frame::Audio::empty();
                 let mut dst_frame = ffmpeg_next::util::frame::Audio::empty();
+
                 while let Ok(()) = decoder.receive_frame(&mut frame) {
                     _ = resampler.run(&frame, &mut dst_frame)?;
-
-                    let expected_bytes = dst_frame.samples()
-                        * dst_frame.channels() as usize
-                        * core::mem::size_of::<f32>();
-                    let cpal_sample_data: &[f32] =
-                        bytemuck::cast_slice(&dst_frame.data(0)[..expected_bytes]);
-
-                    let mut remaining = &cpal_sample_data[..];
-                    while !remaining.is_empty() {
-                        let written = sender.push_slice(remaining);
-                        remaining = &remaining[written..];
-                        std::thread::yield_now(); // Yield to let other threads run
-                    }
+                    dst_frame.set_pts(frame.pts());
+                    audio_ready.notify_waiters();
+                    match sender.send(dst_frame.clone()).await {
+                        Ok(_success) => {}
+                        Err(e) => return Err(format!("Cannot send frame to channel {}", e).into()),
+                    };
                 }
             }
         }
@@ -310,6 +386,7 @@ impl Player {
 
     async fn video_play(
         video_representation: VideoRepresenation,
+        video_ready: Arc<Notify>,
         sender: Sender<Video>,
         stop: Arc<Notify>,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -380,6 +457,7 @@ impl Player {
             sender,
             decoder,
             init_data,
+            video_ready,
         ));
 
         _ = join!(download_task, decoder_task);
@@ -389,7 +467,9 @@ impl Player {
 
     async fn audio_play(
         audio_representation: AudioRepresentation,
-        mut sender: Caching<Arc<SharedRb<Heap<f32>>>, true, false>,
+        audio_ready: Arc<Notify>,
+        sender: Sender<Audio>,
+        //sender: Caching<Arc<SharedRb<Heap<f32>>>, true, false>,
         stop: Arc<Notify>,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         let (download_tx, download_rx) = mpsc::channel::<DataSegment>(MAX_SEGMENTS);
@@ -476,12 +556,65 @@ impl Player {
             sender,
             decoder,
             init_data,
+            audio_ready,
         ));
 
         _ = join!(download_task, decoder_task);
         Ok(())
     }
 
+    pub fn play(&mut self) -> Result<JoinHandle<()>, Box<dyn Error>> {
+        let video_representation = match &self.video_representation {
+            Some(success) => success.clone(),
+            None => return Err("Video Track not set".into()),
+        };
+
+        let audio_representation = match &self.audio_representation {
+            Some(success) => success.clone(),
+            None => return Err("Audio Track not set".into()),
+        };
+
+        let start_time = self.start_time.clone();
+        let video_ready = self.video_ready.clone();
+        let audio_ready = self.audio_ready.clone();
+        let frame_consumer = self.frame_consumer.clone();
+        let sample_consumer = self.sample_consumer.clone();
+        let stop = self.stop.clone();
+
+        let play = tokio::spawn(async move {
+            let (frame_sender, frame_receiver) = mpsc::channel::<Video>(3);
+            let (sample_sender, sample_receiver) = mpsc::channel::<Audio>(3);
+            let play = tokio::spawn(Self::video_play(
+                video_representation,
+                video_ready.clone(),
+                frame_sender,
+                stop.clone(),
+            ));
+
+            let audio = tokio::spawn(Self::audio_play(
+                audio_representation,
+                audio_ready.clone(),
+                sample_sender,
+                stop.clone(),
+            ));
+
+            lifetime_handler(
+                start_time.clone(),
+                video_ready.clone(),
+                frame_receiver,
+                frame_consumer,
+                audio_ready.clone(),
+                sample_receiver,
+                sample_consumer,
+                stop.clone(),
+            )
+            .await;
+
+            _ = join!(play, audio);
+        });
+        Ok(play)
+    }
+    /*
     pub fn play(&mut self) -> Result<JoinHandle<()>, Box<dyn Error>> {
         //let (sample_sender, sample_receiver) = mpsc::channel::<Audio>(12);
         let buffer = HeapRb::<f32>::new(8192);
@@ -505,6 +638,7 @@ impl Player {
             frame_sender,
             stop.clone(),
         ));
+
         let audio_play = task::spawn(Self::audio_play(
             audio_representation,
             sample_producer,
@@ -541,10 +675,10 @@ impl Player {
 
         let play = task::spawn(async { _ = join!(video_play, audio_play) });
 
-        sleep(Duration::from_secs(60));
+        //sleep(Duration::from_secs(60));
 
         Ok(play)
-    }
+    }*/
 }
 
 #[derive(Debug, Clone)]
@@ -573,11 +707,4 @@ async fn download_and_queue(
     }
 
     Ok(())
-}
-
-#[derive(Clone, Copy, Debug)]
-enum State {
-    Idle,
-    Active,
-    Equilibrium,
 }

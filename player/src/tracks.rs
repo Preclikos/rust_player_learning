@@ -317,7 +317,7 @@ impl Tracks {
         };
 
         let subsegment_alignment = match &adaptation.subsegment_alignment {
-            Some(value) => value.clone(),
+            Some(value) => *value,
             None => false,
         };
 
@@ -357,7 +357,7 @@ impl Tracks {
         };
 
         let subsegment_alignment = match &adaptation.subsegment_alignment {
-            Some(value) => value.clone(),
+            Some(value) => *value,
             None => false,
         };
 

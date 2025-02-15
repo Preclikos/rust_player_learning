@@ -8,7 +8,7 @@ pub struct VideoAdaptation {
     pub max_width: u32,
     pub max_height: u32,
 
-    pub par: String,
+    //pub par: String,
     pub subsegment_alignment: bool,
 
     pub representations: Vec<VideoRepresenation>,

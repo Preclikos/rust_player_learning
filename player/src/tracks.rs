@@ -306,16 +306,16 @@ impl Tracks {
                 .into())
             }
         };
-
-        let par = match &adaptation.par {
-            Some(value) => value.to_string(),
-            None => {
-                return Err(
-                    format!("Cannot get PAR from AdaptationSet Id: {}", adaptation.id).into(),
-                )
-            }
-        };
-
+        /*
+                let par = match &adaptation.par {
+                    Some(value) => value.to_string(),
+                    None => {
+                        return Err(
+                            format!("Cannot get PAR from AdaptationSet Id: {}", adaptation.id).into(),
+                        )
+                    }
+                };
+        */
         let subsegment_alignment = match &adaptation.subsegment_alignment {
             Some(value) => *value,
             None => false,
@@ -334,7 +334,7 @@ impl Tracks {
             frame_rate,
             max_width: *max_width,
             max_height: *max_height,
-            par,
+            //par,
             representations: video_representations,
         };
 

@@ -5,10 +5,11 @@ mod tracks;
 mod utils;
 mod video;
 
+use cpal::SampleRate;
 use ffmpeg_next::format::sample::Type;
 use ffmpeg_next::frame::{Audio, Video};
-use ffmpeg_next::Rational;
-use ffmpeg_next::{codec::Context, Packet};
+use ffmpeg_next::software::resampling::Context;
+use ffmpeg_next::Packet;
 use parsers::mp4::{apped_hevc_header, parse_hevc_nalu};
 use re_mp4::{Mp4, StsdBoxContent};
 
@@ -56,6 +57,9 @@ pub struct Player {
     audio_ready: Arc<Notify>,
     //text_ready: Arc<Notify>,
     stop: Arc<Notify>,
+
+    sample_rate: u32,
+    channels: u16,
 }
 
 async fn video_sync_producer(
@@ -115,7 +119,12 @@ async fn lifetime_handler(
 }
 
 impl Player {
-    pub fn new(frame_consumer: Sender<Video>, sample_consumer: Sender<Audio>) -> Self {
+    pub fn new(
+        frame_consumer: Sender<Video>,
+        sample_consumer: Sender<Audio>,
+        sample_rate: u32,
+        channels: u16,
+    ) -> Self {
         let start_time = Arc::new(Instant::now());
 
         let video_ready = Arc::new(Notify::new());
@@ -142,6 +151,8 @@ impl Player {
             stop,
 
             start_time,
+            sample_rate,
+            channels,
         }
     }
 
@@ -310,16 +321,8 @@ impl Player {
         mut decoder: ffmpeg_next::decoder::Audio,
         init_data: Vec<u8>,
         audio_ready: Arc<Notify>,
+        mut resampler: Context,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        //let mut audio_data: Vec<Audio> = vec![];
-        let mut resampler = ffmpeg_next::software::resampling::Context::get(
-            decoder.format(),
-            decoder.channel_layout(),
-            96000,
-            ffmpeg_next::util::format::sample::Sample::F32(Type::Packed),
-            ffmpeg_next::util::channel_layout::ChannelLayout::STEREO,
-            48000,
-        )?;
         while let Some(segment) = receiver.recv().await {
             println!("Consuming segment: {}", segment.id);
 
@@ -411,7 +414,10 @@ impl Player {
             Some(codec) => codec,
             None => return Err("Cannot find codec for track".into()),
         };
-        let mut decoder = match Context::new_with_codec(codec).decoder().video() {
+        let mut decoder = match ffmpeg_next::codec::Context::new_with_codec(codec)
+            .decoder()
+            .video()
+        {
             Ok(context) => context,
             Err(e) => return Err(format!("Cannot find decoder for codec {}", e).into()),
         };
@@ -469,6 +475,7 @@ impl Player {
         audio_representation: AudioRepresentation,
         audio_ready: Arc<Notify>,
         sender: Sender<Audio>,
+        sample_rate: u32,
         //sender: Caching<Arc<SharedRb<Heap<f32>>>, true, false>,
         stop: Arc<Notify>,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -493,16 +500,19 @@ impl Player {
             Some(codec) => codec,
             None => return Err("Cannot find codec for track".into()),
         };
-        let mut decoder = match Context::new_with_codec(codec).decoder().audio() {
+        let mut decoder = match ffmpeg_next::codec::Context::new_with_codec(codec)
+            .decoder()
+            .audio()
+        {
             Ok(context) => context,
             Err(e) => return Err(format!("Cannot find decoder for codec {}", e).into()),
         };
 
-        match track.trak(&mp4_info).mdia.minf.stbl.stsd.contents.clone() {
+        let sample_rate_src = match track.trak(&mp4_info).mdia.minf.stbl.stsd.contents.clone() {
             StsdBoxContent::Mp4a(mp4a) => {
                 let esds = mp4a.esds.unwrap();
 
-                let frame_length = 0;
+                let frame_length = 1024;
 
                 let channel_config = esds.es_desc.dec_config.buffer_size_db;
 
@@ -510,29 +520,43 @@ impl Player {
                 let sampling_frequency_index = esds.es_desc.dec_config.dec_specific.freq_index;
                 let channel_config = esds.es_desc.dec_config.dec_specific.chan_conf;
 
-                let mut header = [0u8; 9];
+                let mut header = [0u8; 8];
 
-                header[0] = 0xFF;
+                // Start constructing the ADTS header
+                header[0] = 0xFF; // Fixed first byte
                 header[1] = 0xF1; // MPEG-4 AAC, Layer 0
-                header[2] = ((profile - 1) << 6)
-                    | (sampling_frequency_index << 2)
-                    | ((channel_config & 0x4) >> 2);
+
+                // Byte 2: profile, sampling frequency index, and part of channel config
+                // Adjust to ensure the result is 0x50
+                header[2] = ((profile - 1) << 6) // Profile value (adjusted for correct byte)
+                    | (sampling_frequency_index << 2) // Sampling frequency index
+                    | ((channel_config & 0x4) >> 2); // Part of the channel config
+
+                // Byte 3: the remaining channel config and frame length (upper bits)
+                // Adjusted to match 0x80 in byte 3
                 header[3] = ((channel_config & 0x3) << 6) | ((frame_length >> 11) as u8 & 0x03);
-                header[4] = ((frame_length >> 3) as u8) & 0xFF;
-                header[5] = ((frame_length << 5) as u8) | 0x1F;
 
-                // Buffer fullness (set to 0x7FF for variable bitrate) and frame count
-                header[6] = 0xFF; // Adjusted to match typical ADTS endings like FFC0
-                header[7] = 0xC0; // Matching user's header style
+                // Byte 4: frame length (next 8 bits)
+                header[4] = ((frame_length >> 3) & 0xFF) as u8;
 
-                // Explicit END marker to signal completion
-                header[8] = 0xFF; // Distinct terminator to avoid buffer exhaustion issues
+                // Byte 5: frame length (remaining bits)
+                header[5] = (((frame_length & 0x07) as u8) << 5) | 0x1F;
 
-                let hex_string = "FFF140801CDFFCFF";
+                // Byte 6: Buffer fullness (set to 0xFF for variable bitrate)
+                header[6] = 0xFC; // Adjusted for the required value
+
+                // Byte 8: Explicit END marker (distinct terminator)
+                header[7] = 0xFF; // Explicit END marker
+
+                let hex_string = "FFF150802F5FFCFF";
+
+                let hex_string_test = slice_to_hex_string(&header);
+
+                println!("Hex String: {}", hex_string_test);
 
                 let bytes = hex::decode(hex_string).expect("Invalid hex string");
-                let mut packet = Packet::new(bytes.len());
-                packet.data_mut().unwrap().clone_from_slice(&bytes[..]);
+                let mut packet = Packet::new(header.len());
+                packet.data_mut().unwrap().clone_from_slice(&header[..]);
 
                 match decoder.send_packet(&packet) {
                     Ok(()) => {}
@@ -540,6 +564,8 @@ impl Player {
                         println!("Acc header error {}", e);
                     }
                 };
+
+                sampling_frequency_index_to_u32(esds.es_desc.dec_config.dec_specific.freq_index)
             }
             _ => {
                 return Err("Codec not supported!".into());
@@ -551,12 +577,22 @@ impl Player {
 
         let download_task = task::spawn(Self::download_task(segments, download_tx, stop));
 
+        let resampler = ffmpeg_next::software::resampling::Context::get(
+            decoder.format(),
+            decoder.channel_layout(),
+            sample_rate_src,
+            ffmpeg_next::util::format::sample::Sample::F32(Type::Packed),
+            ffmpeg_next::util::channel_layout::ChannelLayout::STEREO,
+            sample_rate,
+        )?;
+
         let decoder_task = task::spawn(Self::audio_decoder_task(
             download_rx,
             sender,
             decoder,
             init_data,
             audio_ready,
+            resampler,
         ));
 
         _ = join!(download_task, decoder_task);
@@ -581,9 +617,10 @@ impl Player {
         let sample_consumer = self.sample_consumer.clone();
         let stop = self.stop.clone();
 
+        let sample_rate = self.sample_rate;
         let play = tokio::spawn(async move {
-            let (frame_sender, frame_receiver) = mpsc::channel::<Video>(3);
-            let (sample_sender, sample_receiver) = mpsc::channel::<Audio>(3);
+            let (frame_sender, frame_receiver) = mpsc::channel::<Video>(10);
+            let (sample_sender, sample_receiver) = mpsc::channel::<Audio>(64);
             let play = tokio::spawn(Self::video_play(
                 video_representation,
                 video_ready.clone(),
@@ -595,6 +632,7 @@ impl Player {
                 audio_representation,
                 audio_ready.clone(),
                 sample_sender,
+                sample_rate,
                 stop.clone(),
             ));
 
@@ -614,71 +652,6 @@ impl Player {
         });
         Ok(play)
     }
-    /*
-    pub fn play(&mut self) -> Result<JoinHandle<()>, Box<dyn Error>> {
-        //let (sample_sender, sample_receiver) = mpsc::channel::<Audio>(12);
-        let buffer = HeapRb::<f32>::new(8192);
-        let (sample_producer, mut sample_consumer) = buffer.split();
-
-        let stop = Arc::new(Notify::new());
-        let frame_sender = self.frame_sender.clone();
-        //let sample_sender = sample_sender.clone();
-        let video_representation = match &self.video_representation {
-            Some(success) => success.clone(),
-            None => return Err("Video Track not set".into()),
-        };
-
-        let audio_representation = match &self.audio_representation {
-            Some(success) => success.clone(),
-            None => return Err("Audio Track not set".into()),
-        };
-
-        let video_play = task::spawn(Self::video_play(
-            video_representation,
-            frame_sender,
-            stop.clone(),
-        ));
-
-        let audio_play = task::spawn(Self::audio_play(
-            audio_representation,
-            sample_producer,
-            stop.clone(),
-        ));
-
-        let device = cpal::default_host()
-            .default_output_device()
-            .ok_or("No output device")?;
-
-        let configs = device.default_output_config().unwrap();
-
-        let stream_config = StreamConfig {
-            channels: configs.channels(),
-            sample_rate: configs.sample_rate(),
-            buffer_size: cpal::BufferSize::Default,
-        };
-
-        let err_fn = |err| eprintln!("an error occurred on stream: {}", err);
-
-        let callback = move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-            let filled = sample_consumer.pop_slice(data);
-            data[filled..].fill(Sample::EQUILIBRIUM);
-        };
-
-        let stream = device.build_output_stream(
-            &stream_config,
-            callback,
-            err_fn,
-            Some(Duration::from_secs(1)),
-        )?;
-
-        stream.play().unwrap();
-
-        let play = task::spawn(async { _ = join!(video_play, audio_play) });
-
-        //sleep(Duration::from_secs(60));
-
-        Ok(play)
-    }*/
 }
 
 #[derive(Debug, Clone)]
@@ -707,4 +680,27 @@ async fn download_and_queue(
     }
 
     Ok(())
+}
+
+fn slice_to_hex_string(slice: &[u8]) -> String {
+    slice.iter().map(|b| format!("{:02X}", b)).collect()
+}
+
+fn sampling_frequency_index_to_u32(index: u8) -> u32 {
+    match index {
+        0 => 96000,
+        1 => 88200,
+        2 => 64000,
+        3 => 48000,
+        4 => 44100,
+        5 => 32000,
+        6 => 24000,
+        7 => 22050,
+        8 => 16000,
+        9 => 12000,
+        10 => 11025,
+        11 => 8000,
+        12 => 7350,
+        _ => 44100,
+    }
 }

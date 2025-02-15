@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::thread::sleep;
+use std::thread::{self, sleep};
 use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -7,12 +7,13 @@ use cpal::{Sample, StreamConfig};
 use ffmpeg_next::frame::Audio;
 use ffmpeg_next::util::frame::Video;
 use player::Player;
+use pollster::FutureExt;
 use ringbuf::storage::Heap;
 use ringbuf::wrap::caching::Caching;
 use ringbuf::{traits::*, HeapRb, SharedRb};
 use tokio::join;
-use tokio::sync::mpsc;
 use tokio::sync::mpsc::Receiver;
+use tokio::sync::{mpsc, Notify};
 use wgpu::{BindGroup, BindGroupLayout, RenderPipeline, Sampler, TextureFormat};
 use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalSize, Size};
@@ -339,25 +340,29 @@ impl State {
 struct App {
     state: Option<State>,
     receiver: Option<Receiver<Video>>,
+    eof: Option<Arc<Notify>>,
 }
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        let (frame_tx, frame_rx) = mpsc::channel::<Video>(3);
-        let (sample_tx, mut sample_rx) = mpsc::channel::<Audio>(3);
+        let (frame_tx, frame_rx) = mpsc::channel::<Video>(6);
+        let (sample_tx, mut sample_rx) = mpsc::channel::<Audio>(20);
         // Create window object
         let mut default_attrs = Window::default_attributes();
         default_attrs.inner_size = Some(Size::Physical(PhysicalSize::new(1280, 800)));
         let window = Arc::new(event_loop.create_window(default_attrs).unwrap());
 
+        let eof = Arc::new(Notify::new());
+
         let buffer = HeapRb::<f32>::new(8192);
         let (mut sample_producer, mut sample_consumer) = buffer.split();
 
+        let end_producer = eof.clone();
         tokio::spawn(async move {
             while let Some(dst_frame) = sample_rx.recv().await {
-                let expected_bytes = (dst_frame.samples()
+                let expected_bytes = dst_frame.samples()
                     * dst_frame.channels() as usize
-                    * core::mem::size_of::<f32>());
+                    * core::mem::size_of::<f32>();
 
                 let cpal_sample_data: &[f32] =
                     bytemuck::cast_slice(&dst_frame.data(0)[..expected_bytes]);
@@ -366,22 +371,26 @@ impl ApplicationHandler for App {
                 while !remaining.is_empty() {
                     let written = sample_producer.push_slice(remaining);
                     remaining = &remaining[written..];
-                    std::thread::yield_now(); // Yield to let other threads run
+                    tokio::task::yield_now().await; // thread::yield_now();
                 }
             }
+            end_producer.notify_waiters();
         });
 
-        tokio::spawn(async {
-            let device = cpal::default_host()
-                .default_output_device()
-                .ok_or("No output device")
-                .unwrap();
+        let end = eof.clone();
+        let device = cpal::default_host()
+            .default_output_device()
+            .ok_or("No output device")
+            .unwrap();
+        let config = device
+            .default_output_config()
+            .expect("Failed to get default config");
 
-            let configs = device.default_output_config().unwrap();
-
+        let audio_config = config.clone();
+        tokio::spawn(async move {
             let stream_config = StreamConfig {
-                channels: configs.channels(),
-                sample_rate: configs.sample_rate(),
+                channels: audio_config.channels(),
+                sample_rate: audio_config.sample_rate(),
                 buffer_size: cpal::BufferSize::Default,
             };
 
@@ -399,16 +408,17 @@ impl ApplicationHandler for App {
                     err_fn,
                     Some(Duration::from_secs(20)),
                 )
-                .unwrap();
+                .expect("Failed to build audio stream");
 
-            stream.play().unwrap();
+            stream.play().expect("Failed to start audio stream");
 
-            sleep(Duration::from_secs(200));
+            end.notified().block_on();
         });
-
+        let sample_rate = config.clone().sample_rate();
+        let channels = config.channels();
         tokio::spawn(async move {
-            let mut player = Player::new(frame_tx, sample_tx);
-
+            let mut player = Player::new(frame_tx, sample_tx, sample_rate.0, channels);
+            //tearsofsteel_
             let _ = player
                 .open_url("https://preclikos.cz/examples/raw/manifest.mpd")
                 .await;
@@ -439,6 +449,8 @@ impl ApplicationHandler for App {
 
         self.receiver = Some(frame_rx);
 
+        self.eof = Some(eof);
+
         window.request_redraw();
     }
 
@@ -447,6 +459,9 @@ impl ApplicationHandler for App {
         let receiver = self.receiver.as_mut().unwrap();
         match event {
             WindowEvent::CloseRequested => {
+                if let Some(eof) = &self.eof {
+                    eof.notify_waiters();
+                }
                 println!("The close button was pressed; stopping");
                 event_loop.exit();
             }

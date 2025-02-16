@@ -290,7 +290,16 @@ impl State {
         self.surface.configure(&self.device, &surface_config);
     }
 
-    fn configure_vertext_buffer(&mut self, scale_x: f32, scale_y: f32) {
+    fn configure_vertext_buffer(&mut self, width: u32, height: u32) {
+        let texture_aspect = self.frame_size.width as f32 / self.frame_size.height as f32;
+        let window_aspect = width as f32 / height as f32;
+
+        let (scale_x, scale_y) = if texture_aspect > window_aspect {
+            (1.0, window_aspect / texture_aspect)
+        } else {
+            (texture_aspect / window_aspect, 1.0)
+        };
+
         let vertices = generate_verticles(scale_x, scale_y);
         self.vertex_buffer.destroy();
         let vertex_buffer = self
@@ -310,16 +319,7 @@ impl State {
             let width = self.size.width;
             let height = self.size.height;
 
-            let texture_aspect = self.frame_size.width as f32 / self.frame_size.height as f32;
-            let window_aspect = width as f32 / height as f32;
-
-            let (scale_x, scale_y) = if texture_aspect > window_aspect {
-                (1.0, window_aspect / texture_aspect)
-            } else {
-                (texture_aspect / window_aspect, 1.0)
-            };
-
-            self.configure_vertext_buffer(scale_x, scale_y);
+            self.configure_vertext_buffer(width, height);
             self.configure_surface();
         }
     }
@@ -329,6 +329,9 @@ impl State {
         let height = frame.height();
 
         self.frame_size = winit::dpi::PhysicalSize::new(width, height);
+
+        let windows_size = self.get_window().inner_size();
+        self.configure_vertext_buffer(windows_size.width, windows_size.height);
 
         let dst_format = ffmpeg_next::format::Pixel::BGRA;
         self.frame_scaler = ffmpeg_next::software::scaling::Context::get(

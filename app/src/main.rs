@@ -13,6 +13,7 @@ use ringbuf::{traits::*, HeapRb};
 use tokio::join;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::{mpsc, Notify};
+use wgpu::util::DeviceExt;
 use wgpu::{BindGroup, BindGroupLayout, RenderPipeline, Sampler, TextureFormat};
 use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalSize, Size};
@@ -20,18 +21,79 @@ use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId};
 
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct Vertex {
+    position: [f32; 3],
+    tex_coords: [f32; 2],
+}
+
+impl Vertex {
+    fn desc() -> wgpu::VertexBufferLayout<'static> {
+        use std::mem;
+        wgpu::VertexBufferLayout {
+            array_stride: mem::size_of::<Vertex>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &[
+                wgpu::VertexAttribute {
+                    offset: 0,
+                    shader_location: 0,
+                    format: wgpu::VertexFormat::Float32x3,
+                },
+                wgpu::VertexAttribute {
+                    offset: mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
+                    shader_location: 1,
+                    format: wgpu::VertexFormat::Float32x2,
+                },
+            ],
+        }
+    }
+}
+
+fn generate_verticles(scale_x: f32, scale_y: f32) -> [Vertex; 6] {
+    [
+        Vertex {
+            position: [-1. * scale_x, -1. * scale_y, 0.0],
+            tex_coords: [0., 1.],
+        }, // A
+        Vertex {
+            position: [1. * scale_x, -1. * scale_y, 0.0],
+            tex_coords: [1., 1.],
+        }, // B
+        Vertex {
+            position: [-1. * scale_x, 1. * scale_y, 0.0],
+            tex_coords: [0., 0.],
+        }, // C
+        Vertex {
+            position: [-1. * scale_x, 1. * scale_y, 0.0],
+            tex_coords: [0., 0.],
+        }, // D
+        Vertex {
+            position: [1. * scale_x, -1. * scale_y, 0.0],
+            tex_coords: [1., 1.],
+        }, // E
+        Vertex {
+            position: [1. * scale_x, 1. * scale_y, 0.0],
+            tex_coords: [1., 0.],
+        }, // E
+    ]
+}
+
 struct State {
     window: Arc<Window>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     size: winit::dpi::PhysicalSize<u32>,
+    frame_size: winit::dpi::PhysicalSize<u32>,
     surface: wgpu::Surface<'static>,
     surface_format: TextureFormat,
     sampler: Sampler,
     render_texture: wgpu::Texture,
+    vertex_buffer: wgpu::Buffer,
     texture_bind_group: BindGroup,
     texture_bind_group_layout: BindGroupLayout,
     render_pipeline: RenderPipeline,
+    frame_scaler: Context,
 }
 
 impl State {
@@ -62,8 +124,8 @@ impl State {
         let render_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Render Texture"),
             size: wgpu::Extent3d {
-                width: 1920,
-                height: 1080,
+                width: 1280,
+                height: 720,
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
@@ -75,6 +137,21 @@ impl State {
                 | wgpu::TextureUsages::COPY_DST,
             view_formats: &[surface_format],
         });
+
+        let frame_size = winit::dpi::PhysicalSize::new(1, 1);
+
+        //Need some dynamic
+        let dst_format = ffmpeg_next::format::Pixel::BGRA;
+        let frame_scaler = ffmpeg_next::software::scaling::Context::get(
+            ffmpeg_next::format::Pixel::BGRA,
+            frame_size.width,
+            frame_size.height,
+            dst_format,
+            frame_size.width,
+            frame_size.height,
+            ffmpeg_next::software::scaling::Flags::BILINEAR,
+        )
+        .unwrap();
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -145,7 +222,7 @@ impl State {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_main"),
-                buffers: &[],
+                buffers: &[Vertex::desc()],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -165,18 +242,28 @@ impl State {
             cache: None,
         });
 
+        let vertices = generate_verticles(1., 1.);
+        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Vertex Buffer"),
+            contents: bytemuck::cast_slice(&vertices),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
         let state = State {
             window,
             device,
             queue,
             size,
+            frame_size,
             surface,
             surface_format,
             sampler,
             render_texture,
+            vertex_buffer,
             texture_bind_group,
             texture_bind_group_layout,
             render_pipeline,
+            frame_scaler,
         };
 
         // Configure surface for the first time
@@ -203,76 +290,96 @@ impl State {
         self.surface.configure(&self.device, &surface_config);
     }
 
+    fn configure_vertext_buffer(&mut self, scale_x: f32, scale_y: f32) {
+        let vertices = generate_verticles(scale_x, scale_y);
+        self.vertex_buffer.destroy();
+        let vertex_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Vertex Buffer"),
+                contents: bytemuck::cast_slice(&vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+
+        self.vertex_buffer = vertex_buffer;
+    }
+
     fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
         self.size = new_size;
         if self.size.width > 0 && self.size.height > 0 {
             let width = self.size.width;
             let height = self.size.height;
 
-            self.render_texture = self.device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("Render Texture"),
-                size: wgpu::Extent3d {
-                    width,
-                    height,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: self.surface_format,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                    | wgpu::TextureUsages::TEXTURE_BINDING
-                    | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[self.surface_format],
-            });
+            let texture_aspect = self.frame_size.width as f32 / self.frame_size.height as f32;
+            let window_aspect = width as f32 / height as f32;
 
-            let view = self
-                .render_texture
-                .create_view(&wgpu::TextureViewDescriptor {
-                    format: Some(self.surface_format),
-                    ..Default::default()
-                });
+            let (scale_x, scale_y) = if texture_aspect > window_aspect {
+                (1.0, window_aspect / texture_aspect)
+            } else {
+                (texture_aspect / window_aspect, 1.0)
+            };
 
-            self.texture_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                layout: &self.texture_bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&self.sampler),
-                    },
-                ],
-                label: Some("texture_bind_group"),
-            });
-
-            // Reconfigure the surface
+            self.configure_vertext_buffer(scale_x, scale_y);
             self.configure_surface();
         }
     }
 
-    fn resize_texture(
-        frame_width: u32,
-        frame_height: u32,
-        window_width: u32,
-        window_height: u32,
-    ) -> (u32, u32, u32, u32) {
-        let frame_aspect = frame_width as f32 / frame_height as f32;
-        let window_aspect = window_width as f32 / window_height as f32;
+    fn on_resize_frame(&mut self, frame: Video) {
+        let width = frame.width();
+        let height = frame.height();
 
-        if frame_aspect > window_aspect {
-            let new_width = window_width;
-            let new_height = (window_width as f32 / frame_aspect) as u32;
-            let y_offset = (window_height - new_height) / 2;
-            (new_width, new_height, 0, y_offset)
-        } else {
-            let new_height = window_height;
-            let new_width = (window_height as f32 * frame_aspect) as u32;
-            let x_offset = (window_width - new_width) / 2;
-            (new_width, new_height, x_offset, 0)
-        }
+        self.frame_size = winit::dpi::PhysicalSize::new(width, height);
+
+        let dst_format = ffmpeg_next::format::Pixel::BGRA;
+        self.frame_scaler = ffmpeg_next::software::scaling::Context::get(
+            frame.format(),
+            width,
+            height,
+            dst_format,
+            width,
+            height,
+            ffmpeg_next::software::scaling::Flags::BILINEAR,
+        )
+        .unwrap();
+
+        self.render_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Render Texture"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.surface_format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[self.surface_format],
+        });
+
+        let view = self
+            .render_texture
+            .create_view(&wgpu::TextureViewDescriptor {
+                format: Some(self.surface_format),
+                ..Default::default()
+            });
+
+        self.texture_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &self.texture_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+            ],
+            label: Some("texture_bind_group"),
+        });
     }
 
     fn render(&mut self, frame: Video) {
@@ -281,6 +388,7 @@ impl State {
             .surface
             .get_current_texture()
             .expect("failed to acquire next swapchain texture");
+
         let texture_view = surface_texture
             .texture
             .create_view(&wgpu::TextureViewDescriptor {
@@ -288,54 +396,39 @@ impl State {
                 ..Default::default()
             });
 
-        let width = self.size.width;
-        let height = self.size.height;
+        if frame.width() != self.frame_size.width || frame.height() != self.frame_size.height {
+            self.on_resize_frame(frame.clone());
+        }
 
-        let dst_format = ffmpeg_next::format::Pixel::BGRA;
-
-        let (new_width, new_height, x_offset, y_offset) =
-            Self::resize_texture(frame.width(), frame.height(), width, height);
-
-        let mut dst_frame = ffmpeg_next::util::frame::Video::new(dst_format, new_width, new_height);
-
-        _ = ffmpeg_next::software::scaling::Context::get(
-            frame.format(),
+        let mut dst_frame = ffmpeg_next::util::frame::Video::new(
+            self.frame_scaler.output().format,
             frame.width(),
             frame.height(),
-            dst_format,
-            new_width,
-            new_height,
-            ffmpeg_next::software::scaling::Flags::BILINEAR,
-        )
-        .unwrap()
-        .run(&frame, &mut dst_frame);
+        );
+
+        _ = self.frame_scaler.run(&frame, &mut dst_frame);
 
         let width_bytes = dst_frame.stride(0);
         self.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &self.render_texture,
                 mip_level: 0,
-                origin: wgpu::Origin3d {
-                    x: x_offset,
-                    y: y_offset,
-                    z: 0,
-                },
+                origin: wgpu::Origin3d { x: 0, y: 0, z: 0 },
                 aspect: wgpu::TextureAspect::All,
             },
             dst_frame.data(0),
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(width_bytes as u32),
-                rows_per_image: Some(new_height),
+                rows_per_image: Some(frame.height()),
             },
             wgpu::Extent3d {
-                width: new_width,
-                height: new_height,
+                width: frame.width(),
+                height: frame.height(),
                 depth_or_array_layers: 1,
             },
         );
 
-        // Render the frame
         let mut encoder = self.device.create_command_encoder(&Default::default());
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -344,7 +437,7 @@ impl State {
                     view: &texture_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), // Clear with black
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -353,9 +446,11 @@ impl State {
                 occlusion_query_set: None,
             });
 
-            // Bind the texture and render pipeline
             render_pass.set_pipeline(&self.render_pipeline);
             render_pass.set_bind_group(0, &self.texture_bind_group, &[]);
+
+            render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+
             render_pass.draw(0..6, 0..1);
         }
 

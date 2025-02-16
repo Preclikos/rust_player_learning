@@ -311,9 +311,8 @@ impl Player {
 
                 let mut frame = ffmpeg_next::util::frame::Video::empty();
                 let mut cpu_frame = ffmpeg_next::util::frame::Video::empty();
+                video_ready.notify_waiters();
                 while let Ok(()) = decoder.receive_frame(&mut frame) {
-                    video_ready.notify_waiters();
-
                     unsafe {
                         // Transfer the GPU frame to system memory
                         let ret =

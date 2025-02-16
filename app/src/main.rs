@@ -5,6 +5,7 @@ use std::time::Duration;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Sample, StreamConfig};
 use ffmpeg_next::frame::Audio;
+use ffmpeg_next::software::scaling::Context;
 use ffmpeg_next::util::frame::Video;
 use player::Player;
 use pollster::FutureExt;
@@ -204,51 +205,74 @@ impl State {
 
     fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
         self.size = new_size;
+        if self.size.width > 0 && self.size.height > 0 {
+            let width = self.size.width;
+            let height = self.size.height;
 
-        let width = self.size.width;
-        let height = self.size.height;
-
-        self.render_texture = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("Render Texture"),
-            size: wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: self.surface_format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                | wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[self.surface_format],
-        });
-
-        let view = self
-            .render_texture
-            .create_view(&wgpu::TextureViewDescriptor {
-                format: Some(self.surface_format),
-                ..Default::default()
+            self.render_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("Render Texture"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: self.surface_format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[self.surface_format],
             });
 
-        self.texture_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: &self.texture_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
-            ],
-            label: Some("texture_bind_group"),
-        });
+            let view = self
+                .render_texture
+                .create_view(&wgpu::TextureViewDescriptor {
+                    format: Some(self.surface_format),
+                    ..Default::default()
+                });
 
-        // Reconfigure the surface
-        self.configure_surface();
+            self.texture_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                layout: &self.texture_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                ],
+                label: Some("texture_bind_group"),
+            });
+
+            // Reconfigure the surface
+            self.configure_surface();
+        }
+    }
+
+    fn resize_texture(
+        frame_width: u32,
+        frame_height: u32,
+        window_width: u32,
+        window_height: u32,
+    ) -> (u32, u32, u32, u32) {
+        let frame_aspect = frame_width as f32 / frame_height as f32;
+        let window_aspect = window_width as f32 / window_height as f32;
+
+        if frame_aspect > window_aspect {
+            let new_width = window_width;
+            let new_height = (window_width as f32 / frame_aspect) as u32;
+            let y_offset = (window_height - new_height) / 2;
+            (new_width, new_height, 0, y_offset)
+        } else {
+            let new_height = window_height;
+            let new_width = (window_height as f32 * frame_aspect) as u32;
+            let x_offset = (window_width - new_width) / 2;
+            (new_width, new_height, x_offset, 0)
+        }
     }
 
     fn render(&mut self, frame: Video) {
@@ -269,36 +293,44 @@ impl State {
 
         let dst_format = ffmpeg_next::format::Pixel::BGRA;
 
-        let mut dst_frame = ffmpeg_next::util::frame::Video::new(dst_format, width, height);
+        let (new_width, new_height, x_offset, y_offset) =
+            Self::resize_texture(frame.width(), frame.height(), width, height);
+
+        let mut dst_frame = ffmpeg_next::util::frame::Video::new(dst_format, new_width, new_height);
 
         _ = ffmpeg_next::software::scaling::Context::get(
             frame.format(),
             frame.width(),
             frame.height(),
             dst_format,
-            width,
-            height,
+            new_width,
+            new_height,
             ffmpeg_next::software::scaling::Flags::BILINEAR,
         )
         .unwrap()
         .run(&frame, &mut dst_frame);
 
+        let width_bytes = dst_frame.stride(0);
         self.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &self.render_texture,
                 mip_level: 0,
-                origin: wgpu::Origin3d { x: 0, y: 0, z: 0 },
+                origin: wgpu::Origin3d {
+                    x: x_offset,
+                    y: y_offset,
+                    z: 0,
+                },
                 aspect: wgpu::TextureAspect::All,
             },
             dst_frame.data(0),
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(4 * width),
-                rows_per_image: Some(height),
+                bytes_per_row: Some(width_bytes as u32),
+                rows_per_image: Some(new_height),
             },
             wgpu::Extent3d {
-                width,
-                height,
+                width: new_width,
+                height: new_height,
                 depth_or_array_layers: 1,
             },
         );

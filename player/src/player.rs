@@ -9,7 +9,11 @@ use ffmpeg_next::format::sample::Type;
 use ffmpeg_next::frame::{Audio, Video};
 use ffmpeg_next::software::resampling::Context;
 use ffmpeg_next::{Packet, Rational};
+use ffmpeg_sys_next::{
+    av_hwdevice_ctx_create, av_hwframe_transfer_data, AVBufferRef, AVCodecContext, AVHWDeviceType,
+};
 use parsers::mp4::{aac_sampling_frequency_index_to_u32, apped_hevc_header, parse_hevc_nalu};
+use quick_xml::de;
 use re_mp4::{Mp4, StsdBoxContent};
 
 use std::error::Error;
@@ -306,9 +310,22 @@ impl Player {
                 }
 
                 let mut frame = ffmpeg_next::util::frame::Video::empty();
+                let mut cpu_frame = ffmpeg_next::util::frame::Video::empty();
                 while let Ok(()) = decoder.receive_frame(&mut frame) {
                     video_ready.notify_waiters();
-                    match sender.send(frame.clone()).await {
+
+                    unsafe {
+                        // Transfer the GPU frame to system memory
+                        let ret =
+                            av_hwframe_transfer_data(cpu_frame.as_mut_ptr(), frame.as_mut_ptr(), 0);
+                        if ret < 0 {
+                            panic!("Failed to transfer data from GPU to CPU: {}", ret);
+                        }
+                    }
+
+                    cpu_frame.set_pts(frame.pts());
+
+                    match sender.send(cpu_frame.clone()).await {
                         Ok(_success) => {}
                         Err(e) => return Err(format!("Cannot send frame to channel {}", e).into()),
                     };
@@ -425,6 +442,29 @@ impl Player {
             Ok(context) => context,
             Err(e) => return Err(format!("Cannot find decoder for codec {}", e).into()),
         };
+
+        unsafe {
+            let mut hw_device_ctx: *mut AVBufferRef = std::ptr::null_mut();
+            let device_type = AVHWDeviceType::AV_HWDEVICE_TYPE_DXVA2;
+
+            // Create the DXVA2 hardware device
+            let ret = av_hwdevice_ctx_create(
+                &mut hw_device_ctx,
+                device_type,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                0,
+            );
+            if ret < 0 {
+                panic!("Failed to create DXVA2 hardware device: {}", ret);
+            }
+
+            // Assign the device context to the codec context
+            let codec_ctx_ptr = decoder.as_mut_ptr();
+            (*codec_ctx_ptr).hw_device_ctx = hw_device_ctx;
+
+            println!("DXVA2 hardware device context created successfully.");
+        }
 
         match track.trak(&mp4_info).mdia.minf.stbl.stsd.contents.clone() {
             StsdBoxContent::Hvc1(hvc) => {

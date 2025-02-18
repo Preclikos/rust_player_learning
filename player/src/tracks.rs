@@ -42,7 +42,7 @@ impl Tracks {
         })
     }
 
-    fn parse_range(range: &String) -> Result<(u64, u64), Box<dyn Error>> {
+    fn parse_range(range: &str) -> Result<(u64, u64), Box<dyn Error>> {
         let mut parts = range.split('-');
 
         let start = parts.next().ok_or("Missing start number")?.parse::<u64>()?;
@@ -377,7 +377,7 @@ impl Tracks {
     }
 
     fn parse_text_adaptation(
-        base_url: &String,
+        base_url: &str,
         adaptation: &AdaptationSet,
     ) -> Result<TextAdaptation, Box<dyn Error>> {
         let mut text_representations: Vec<TextRepresenation> = vec![];

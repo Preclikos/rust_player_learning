@@ -9,7 +9,6 @@ use ffmpeg_next::util::frame::Video;
 use player::Player;
 use pollster::FutureExt;
 use ringbuf::{traits::*, HeapRb};
-use tokio::join;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::{mpsc, Notify};
 use tokio::time::Instant;
@@ -80,13 +79,13 @@ fn generate_verticles(scale_x: f32, scale_y: f32) -> [Vertex; 6] {
     ]
 }
 
-struct State {
+struct State<'a> {
     window: Arc<Window>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     size: winit::dpi::PhysicalSize<u32>,
     frame_size: winit::dpi::PhysicalSize<u32>,
-    surface: wgpu::Surface<'static>,
+    surface: wgpu::Surface<'a>,
     surface_format: TextureFormat,
     sampler: Sampler,
     render_texture: wgpu::Texture,
@@ -97,8 +96,8 @@ struct State {
     frame_scaler: Context,
 }
 
-impl State {
-    async fn new(window: Arc<Window>) -> State {
+impl<'a> State<'a> {
+    async fn new(window: Arc<Window>) -> Self {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
 
         let surface = instance.create_surface(window.clone()).unwrap();
@@ -387,7 +386,6 @@ impl State {
     }
 
     fn render(&mut self, frame: Video) {
-        // Create texture view for rendering
         let surface_texture = self
             .surface
             .get_current_texture()
@@ -466,8 +464,8 @@ impl State {
 }
 
 //#[derive(Default)]
-struct App {
-    state: Option<State>,
+struct App<'a> {
+    state: Option<State<'a>>,
     receiver: Option<Receiver<Video>>,
     eof: Option<Arc<Notify>>,
     start_time: Instant,
@@ -476,7 +474,7 @@ struct App {
     frame_count: u32,
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler for App<'_> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let (frame_tx, frame_rx) = mpsc::channel::<Video>(4);
         let (sample_tx, mut sample_rx) = mpsc::channel::<Audio>(16);
@@ -551,9 +549,13 @@ impl ApplicationHandler for App {
         let sample_rate = config.clone().sample_rate();
         let channels = config.channels();
         let mut player = Player::new(frame_tx, sample_tx, sample_rate.0, channels);
+
         tokio::spawn(async move {
-            //tearsofsteel_
             let _ = player
+                .open_url("https://preclikos.cz/examples/tearsofsteel_raw/manifest.mpd")
+                .await;
+            //tearsofsteel_
+            /*let _ = player
                 .open_url("https://preclikos.cz/examples/tearsofsteel_raw/manifest.mpd")
                 .await;
 
@@ -575,7 +577,7 @@ impl ApplicationHandler for App {
             loop {
                 let play = player.play();
                 _ = join!(play.unwrap());
-            }
+            }*/
         });
 
         let state = pollster::block_on(State::new(window.clone()));

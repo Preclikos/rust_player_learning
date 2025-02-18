@@ -13,7 +13,6 @@ use ffmpeg_sys_next::{
     av_hwdevice_ctx_create, av_hwframe_transfer_data, AVBufferRef, AVCodecContext, AVHWDeviceType,
 };
 use parsers::mp4::{aac_sampling_frequency_index_to_u32, apped_hevc_header, parse_hevc_nalu};
-use quick_xml::de;
 use re_mp4::{Mp4, StsdBoxContent};
 
 use std::error::Error;
@@ -519,7 +518,6 @@ impl Player {
         audio_ready: Arc<Notify>,
         sender: Sender<Audio>,
         sample_rate: u32,
-        //sender: Caching<Arc<SharedRb<Heap<f32>>>, true, false>,
         stop: Arc<Notify>,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         let (download_tx, download_rx) = mpsc::channel::<DataSegment>(MAX_SEGMENTS);

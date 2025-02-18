@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::thread::sleep;
 use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -13,12 +12,14 @@ use ringbuf::{traits::*, HeapRb};
 use tokio::join;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::{mpsc, Notify};
+use tokio::time::Instant;
 use wgpu::util::DeviceExt;
 use wgpu::{BindGroup, BindGroupLayout, RenderPipeline, Sampler, TextureFormat};
 use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalSize, Size};
-use winit::event::WindowEvent;
+use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 #[repr(C)]
@@ -464,17 +465,21 @@ impl State {
     }
 }
 
-#[derive(Default)]
+//#[derive(Default)]
 struct App {
     state: Option<State>,
     receiver: Option<Receiver<Video>>,
     eof: Option<Arc<Notify>>,
+    start_time: Instant,
+    last_second: Instant,
+    last_frame_time: Instant,
+    frame_count: u32,
 }
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let (frame_tx, frame_rx) = mpsc::channel::<Video>(4);
-        let (sample_tx, mut sample_rx) = mpsc::channel::<Audio>(8);
+        let (sample_tx, mut sample_rx) = mpsc::channel::<Audio>(16);
         // Create window object
         let mut default_attrs = Window::default_attributes();
         default_attrs.inner_size = Some(Size::Physical(PhysicalSize::new(1280, 800)));
@@ -482,7 +487,7 @@ impl ApplicationHandler for App {
 
         let eof = Arc::new(Notify::new());
 
-        let buffer = HeapRb::<f32>::new(8192);
+        let buffer = HeapRb::<f32>::new(4096);
         let (mut sample_producer, mut sample_consumer) = buffer.split();
 
         let end_producer = eof.clone();
@@ -545,8 +550,8 @@ impl ApplicationHandler for App {
 
         let sample_rate = config.clone().sample_rate();
         let channels = config.channels();
+        let mut player = Player::new(frame_tx, sample_tx, sample_rate.0, channels);
         tokio::spawn(async move {
-            let mut player = Player::new(frame_tx, sample_tx, sample_rate.0, channels);
             //tearsofsteel_
             let _ = player
                 .open_url("https://preclikos.cz/examples/tearsofsteel_raw/manifest.mpd")
@@ -558,7 +563,7 @@ impl ApplicationHandler for App {
 
             let tracks = tracks.unwrap();
             let selected_video = tracks.video.first().unwrap();
-            let selected_video_representation = &selected_video.representations[0]; //.first().unwrap();
+            let selected_video_representation = &selected_video.representations[3]; //.first().unwrap();
 
             player.set_video_track(selected_video, selected_video_representation);
 
@@ -584,7 +589,7 @@ impl ApplicationHandler for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        let state = self.state.as_mut().unwrap();
+        let state: &mut State = self.state.as_mut().unwrap();
         let receiver = self.receiver.as_mut().unwrap();
         match event {
             WindowEvent::CloseRequested => {
@@ -595,16 +600,47 @@ impl ApplicationHandler for App {
                 event_loop.exit();
             }
             WindowEvent::RedrawRequested => {
+                let frame_duration = Duration::from_secs_f64(1.0 / 120.);
+
+                self.frame_count += 1;
+
+                let now = Instant::now();
+                if now.duration_since(self.last_second) >= Duration::from_secs(1) {
+                    let elapsed = now.duration_since(self.start_time).as_secs_f64();
+                    let fps = self.frame_count as f64 / elapsed;
+                    println!("Frames: {}, FPS: {:.2}", self.frame_count, fps);
+                    self.last_second = now;
+                }
+
                 if let Ok(frame) = receiver.try_recv() {
                     state.render(frame);
                 }
-                sleep(Duration::from_millis(6));
+
+                let elapsed = self.last_frame_time.elapsed();
+                if elapsed < frame_duration {
+                    std::thread::sleep(frame_duration - elapsed);
+                }
+                self.last_frame_time = Instant::now();
 
                 state.get_window().request_redraw();
             }
             WindowEvent::Resized(size) => {
                 state.resize(size);
             }
+            WindowEvent::KeyboardInput {
+                device_id: _,
+                event,
+                is_synthetic: _,
+            } => match (event.physical_key, event.state) {
+                (PhysicalKey::Code(KeyCode::Escape), ElementState::Pressed) => {
+                    println!("Escape key pressed; exiting");
+                    if let Some(eof) = &self.eof {
+                        eof.notify_waiters();
+                    }
+                    event_loop.exit();
+                }
+                _ => {}
+            },
             _ => (),
         }
     }
@@ -623,6 +659,14 @@ async fn main() {
     // input, and uses significantly less power/CPU time than ControlFlow::Poll.
     event_loop.set_control_flow(ControlFlow::Wait);
 
-    let mut app = App::default();
+    let mut app = App {
+        state: None,
+        receiver: None,
+        eof: None,
+        start_time: Instant::now(),
+        last_second: Instant::now(),
+        last_frame_time: Instant::now(),
+        frame_count: 0,
+    };
     _ = event_loop.run_app(&mut app);
 }

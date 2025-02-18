@@ -310,21 +310,21 @@ impl Player {
                 }
 
                 let mut frame = ffmpeg_next::util::frame::Video::empty();
-                let mut cpu_frame = ffmpeg_next::util::frame::Video::empty();
+                //let mut cpu_frame = ffmpeg_next::util::frame::Video::empty();
                 video_ready.notify_waiters();
                 while let Ok(()) = decoder.receive_frame(&mut frame) {
-                    unsafe {
-                        // Transfer the GPU frame to system memory
-                        let ret =
-                            av_hwframe_transfer_data(cpu_frame.as_mut_ptr(), frame.as_mut_ptr(), 0);
-                        if ret < 0 {
-                            panic!("Failed to transfer data from GPU to CPU: {}", ret);
-                        }
-                    }
+                    /* unsafe {
+                                            // Transfer the GPU frame to system memory
+                                            let ret =
+                                                av_hwframe_transfer_data(cpu_frame.as_mut_ptr(), frame.as_mut_ptr(), 0);
+                                            if ret < 0 {
+                                                panic!("Failed to transfer data from GPU to CPU: {}", ret);
+                                            }
+                                        }
 
-                    cpu_frame.set_pts(frame.pts());
-
-                    match sender.send(cpu_frame.clone()).await {
+                                        cpu_frame.set_pts(frame.pts());
+                    */
+                    match sender.send(frame.clone()).await {
                         Ok(_success) => {}
                         Err(e) => return Err(format!("Cannot send frame to channel {}", e).into()),
                     };
@@ -441,30 +441,30 @@ impl Player {
             Ok(context) => context,
             Err(e) => return Err(format!("Cannot find decoder for codec {}", e).into()),
         };
+        /*
+                unsafe {
+                    let mut hw_device_ctx: *mut AVBufferRef = std::ptr::null_mut();
+                    //let device_type = AVHWDeviceType::AV_HWDEVICE_TYPE_DXVA2;
+                    let device_type = AVHWDeviceType::AV_HWDEVICE_TYPE_DXVA2;
+                    // Create the DXVA2 hardware device
+                    let ret = av_hwdevice_ctx_create(
+                        &mut hw_device_ctx,
+                        device_type,
+                        std::ptr::null(),
+                        std::ptr::null_mut(),
+                        0,
+                    );
+                    if ret < 0 {
+                        panic!("Failed to create DXVA2 hardware device: {}", ret);
+                    }
 
-        unsafe {
-            let mut hw_device_ctx: *mut AVBufferRef = std::ptr::null_mut();
-            let device_type = AVHWDeviceType::AV_HWDEVICE_TYPE_DXVA2;
+                    // Assign the device context to the codec context
+                    let codec_ctx_ptr = decoder.as_mut_ptr();
+                    (*codec_ctx_ptr).hw_device_ctx = hw_device_ctx;
 
-            // Create the DXVA2 hardware device
-            let ret = av_hwdevice_ctx_create(
-                &mut hw_device_ctx,
-                device_type,
-                std::ptr::null(),
-                std::ptr::null_mut(),
-                0,
-            );
-            if ret < 0 {
-                panic!("Failed to create DXVA2 hardware device: {}", ret);
-            }
-
-            // Assign the device context to the codec context
-            let codec_ctx_ptr = decoder.as_mut_ptr();
-            (*codec_ctx_ptr).hw_device_ctx = hw_device_ctx;
-
-            println!("DXVA2 hardware device context created successfully.");
-        }
-
+                    println!("DXVA2 hardware device context created successfully.");
+                }
+        */
         match track.trak(&mp4_info).mdia.minf.stbl.stsd.contents.clone() {
             StsdBoxContent::Hvc1(hvc) => {
                 for nalus_unit in hvc.hvcc.arrays.clone() {
@@ -650,8 +650,8 @@ impl Player {
 
         let sample_rate = self.sample_rate;
         let play = tokio::spawn(async move {
-            let (frame_sender, frame_receiver) = mpsc::channel::<Video>(10);
-            let (sample_sender, sample_receiver) = mpsc::channel::<Audio>(64);
+            let (frame_sender, frame_receiver) = mpsc::channel::<Video>(4);
+            let (sample_sender, sample_receiver) = mpsc::channel::<Audio>(32);
             let play = tokio::spawn(Self::video_play(
                 video_representation,
                 video_ready.clone(),

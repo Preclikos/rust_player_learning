@@ -468,7 +468,6 @@ impl<'a> State<'a> {
 struct App<'a> {
     state: Option<State<'a>>,
     receiver: Option<Receiver<Video>>,
-    eof: Option<Arc<Notify>>,
     start_time: Instant,
     last_second: Instant,
     last_frame_time: Instant,
@@ -479,77 +478,12 @@ struct App<'a> {
 impl ApplicationHandler for App<'_> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let (frame_tx, frame_rx) = mpsc::channel::<Video>(4);
-        let (sample_tx, mut sample_rx) = mpsc::channel::<Audio>(16);
+
         // Create window object
         let mut default_attrs = Window::default_attributes();
         default_attrs.inner_size = Some(Size::Physical(PhysicalSize::new(1280, 800)));
         let window = Arc::new(event_loop.create_window(default_attrs).unwrap());
-        /*
-        let eof: Arc<Notify> = Arc::new(Notify::new());
 
-        let buffer = HeapRb::<f32>::new(4096);
-        let (mut sample_producer, mut sample_consumer) = buffer.split();
-
-        let end_producer = eof.clone();
-        tokio::spawn(async move {
-            while let Some(dst_frame) = sample_rx.recv().await {
-                let expected_bytes: usize = dst_frame.samples()
-                    * dst_frame.channels() as usize
-                    * core::mem::size_of::<f32>();
-
-                let cpal_sample_data: &[f32] =
-                    bytemuck::cast_slice(&dst_frame.data(0)[..expected_bytes]);
-
-                let mut remaining = cpal_sample_data;
-                while !remaining.is_empty() {
-                    let written = sample_producer.push_slice(remaining);
-                    remaining = &remaining[written..];
-                    tokio::task::yield_now().await; // thread::yield_now();
-                }
-            }
-            end_producer.notify_waiters();
-        });
-
-        let end = eof.clone();
-        let device = cpal::default_host()
-            .default_output_device()
-            .ok_or("No output device")
-            .unwrap();
-        let config = device
-            .default_output_config()
-            .expect("Failed to get default config");
-
-        let audio_config = config.clone();
-        tokio::spawn(async move {
-            let stream_config = StreamConfig {
-                channels: audio_config.channels(),
-                sample_rate: audio_config.sample_rate(),
-                buffer_size: cpal::BufferSize::Default,
-            };
-
-            let err_fn = |err| eprintln!("an error occurred on stream: {}", err);
-
-            let callback = move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                let filled = sample_consumer.pop_slice(data);
-                data[filled..].fill(Sample::EQUILIBRIUM);
-            };
-
-            let stream = device
-                .build_output_stream(
-                    &stream_config,
-                    callback,
-                    err_fn,
-                    Some(Duration::from_secs(20)),
-                )
-                .expect("Failed to build audio stream");
-
-            stream.play().expect("Failed to start audio stream");
-
-            end.notified().block_on();
-        });
-
-        let sample_rate = config.clone().sample_rate();
-        let channels = config.channels();*/
         let player = Player::new(frame_tx);
 
         self.player = Some(player.clone());
@@ -595,8 +529,9 @@ impl ApplicationHandler for App<'_> {
         let receiver = self.receiver.as_mut().unwrap();
         match event {
             WindowEvent::CloseRequested => {
-                if let Some(eof) = &self.eof {
-                    eof.notify_waiters();
+                if let Some(player) = &self.player {
+                    let mut player_clone = player.clone();
+                    player_clone.stop().block_on();
                 }
                 println!("The close button was pressed; stopping");
                 event_loop.exit();
@@ -663,12 +598,11 @@ async fn main() {
     // input, and uses significantly less power/CPU time than ControlFlow::Poll.
     //event_loop.set_control_flow(ControlFlow::Wait);
 
-    platform::prevent_screensaver();
+    //platform::prevent_screensaver();
 
     let mut app = App {
         state: None,
         receiver: None,
-        eof: None,
         start_time: Instant::now(),
         last_second: Instant::now(),
         last_frame_time: Instant::now(),
@@ -677,7 +611,7 @@ async fn main() {
     };
     _ = event_loop.run_app(&mut app);
 }
-
+/*
 // Windows: Prevent sleep/screensaver
 #[cfg(target_os = "windows")]
 mod platform {
@@ -705,4 +639,4 @@ mod platform {
             }
         }
     }
-}
+}*/

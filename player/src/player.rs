@@ -1,6 +1,7 @@
 mod manifest;
 mod networking;
 mod parsers;
+mod renderers;
 mod tracks;
 mod utils;
 mod video;
@@ -14,6 +15,7 @@ use ffmpeg_sys_next::{
 };
 use parsers::mp4::{aac_sampling_frequency_index_to_u32, apped_hevc_header, parse_hevc_nalu};
 use re_mp4::{Mp4, StsdBoxContent};
+use renderers::audio::AudioRenderer;
 
 use std::error::Error;
 use std::time::Duration;
@@ -61,7 +63,7 @@ pub struct Player {
     stop: Arc<Notify>,
 
     sample_rate: u32,
-    channels: u16,
+    audio_renderer: AudioRenderer,
 }
 
 async fn video_sync_producer(
@@ -140,6 +142,8 @@ impl Player {
         let audio_ready = Arc::new(Notify::new());
         let stop = Arc::new(Notify::new());
 
+        let audio_renderer = AudioRenderer::new();
+
         Player {
             base_url: None,
             manifest: None,
@@ -159,7 +163,7 @@ impl Player {
 
             start_time,
             sample_rate,
-            channels,
+            audio_renderer,
         }
     }
 
@@ -629,6 +633,7 @@ impl Player {
     }
 
     pub fn play(&mut self) -> Result<JoinHandle<()>, Box<dyn Error>> {
+        self.audio_renderer.start();
         let video_representation = match &self.video_representation {
             Some(success) => success.clone(),
             None => return Err("Video Track not set".into()),

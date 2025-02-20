@@ -9,6 +9,7 @@ use ffmpeg_next::util::frame::Video;
 use player::Player;
 use pollster::FutureExt;
 use ringbuf::{traits::*, HeapRb};
+use tokio::join;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::{mpsc, Notify};
 use tokio::time::Instant;
@@ -483,7 +484,7 @@ impl ApplicationHandler for App<'_> {
         default_attrs.inner_size = Some(Size::Physical(PhysicalSize::new(1280, 800)));
         let window = Arc::new(event_loop.create_window(default_attrs).unwrap());
 
-        let eof = Arc::new(Notify::new());
+        let eof: Arc<Notify> = Arc::new(Notify::new());
 
         let buffer = HeapRb::<f32>::new(4096);
         let (mut sample_producer, mut sample_consumer) = buffer.split();
@@ -551,11 +552,8 @@ impl ApplicationHandler for App<'_> {
         let mut player = Player::new(frame_tx, sample_tx, sample_rate.0, channels);
 
         tokio::spawn(async move {
-            let _ = player
-                .open_url("https://preclikos.cz/examples/tearsofsteel_raw/manifest.mpd")
-                .await;
             //tearsofsteel_
-            /*let _ = player
+            let _ = player
                 .open_url("https://preclikos.cz/examples/tearsofsteel_raw/manifest.mpd")
                 .await;
 
@@ -577,7 +575,7 @@ impl ApplicationHandler for App<'_> {
             loop {
                 let play = player.play();
                 _ = join!(play.unwrap());
-            }*/
+            }
         });
 
         let state = pollster::block_on(State::new(window.clone()));
@@ -659,7 +657,9 @@ async fn main() {
     // ControlFlow::Wait pauses the event loop if no events are available to process.
     // This is ideal for non-game applications that only update in response to user
     // input, and uses significantly less power/CPU time than ControlFlow::Poll.
-    event_loop.set_control_flow(ControlFlow::Wait);
+    //event_loop.set_control_flow(ControlFlow::Wait);
+
+    platform::prevent_screensaver();
 
     let mut app = App {
         state: None,
@@ -671,4 +671,33 @@ async fn main() {
         frame_count: 0,
     };
     _ = event_loop.run_app(&mut app);
+}
+
+// Windows: Prevent sleep/screensaver
+#[cfg(target_os = "windows")]
+mod platform {
+    use windows::Win32::System::Power::{
+        SetThreadExecutionState, ES_CONTINUOUS, ES_DISPLAY_REQUIRED,
+    };
+
+    pub fn prevent_screensaver() {
+        unsafe {
+            SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED);
+        }
+    }
+}
+
+// Linux (X11): Prevent screensaver
+#[cfg(target_os = "linux")]
+mod platform {
+    use x11::xlib::{XOpenDisplay, XResetScreenSaver};
+
+    pub fn prevent_screensaver() {
+        unsafe {
+            let display = XOpenDisplay(std::ptr::null());
+            if !display.is_null() {
+                XResetScreenSaver(display);
+            }
+        }
+    }
 }

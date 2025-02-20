@@ -2,6 +2,7 @@ use quick_xml::de::from_str;
 use reqwest::{Client, Error};
 use serde::Deserialize;
 
+#[derive(Clone)]
 pub struct Manifest {
     url: String,
     content: String,

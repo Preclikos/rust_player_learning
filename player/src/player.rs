@@ -19,7 +19,7 @@ use renderers::audio::AudioRenderer;
 
 use std::error::Error;
 use std::time::Duration;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, RwLock};
 use tokio::time::Instant;
 use tokio::{join, sync::mpsc::Sender};
 use tracks::audio::{AudioAdaptation, AudioRepresentation};
@@ -38,6 +38,7 @@ use manifest::Manifest;
 
 const MAX_SEGMENTS: usize = 2;
 
+#[derive(Clone)]
 pub struct Player {
     base_url: Option<String>,
     manifest: Option<Manifest>,
@@ -52,9 +53,6 @@ pub struct Player {
     //frame_producer: Receiver<Video>,
     frame_consumer: Sender<Video>,
 
-    //sample_producer: Receiver<Audio>,
-    sample_consumer: Sender<Audio>,
-
     //play_handle: JoinHandle<()>,
     start_time: Arc<Instant>,
     video_ready: Arc<Notify>,
@@ -62,8 +60,7 @@ pub struct Player {
     //text_ready: Arc<Notify>,
     stop: Arc<Notify>,
 
-    sample_rate: u32,
-    audio_renderer: AudioRenderer,
+    audio_renderer: Arc<RwLock<AudioRenderer>>,
 }
 
 async fn video_sync_producer(
@@ -88,7 +85,7 @@ async fn video_sync_producer(
 async fn audio_sync_producer(
     start_time: Arc<Instant>,
     mut input_rx: mpsc::Receiver<Audio>,
-    output_tx: mpsc::Sender<Audio>,
+    output_tx: Arc<RwLock<AudioRenderer>>,
 ) {
     while let Some(frame) = input_rx.recv().await {
         let elapsed = start_time.elapsed().as_millis() as u64;
@@ -100,7 +97,8 @@ async fn audio_sync_producer(
             println!("Audio drift more then 20ms dropping frame");
             continue;
         }
-        _ = output_tx.send(frame).await;
+        let renderer = output_tx.read().await;
+        _ = renderer.put_sample(frame).await;
     }
 }
 
@@ -111,7 +109,7 @@ async fn lifetime_handler(
     video_tx: mpsc::Sender<Video>,
     audio_ready: Arc<Notify>,
     audio_rx: mpsc::Receiver<Audio>,
-    audio_tx: mpsc::Sender<Audio>,
+    audio_tx: Arc<RwLock<AudioRenderer>>,
     stop: Arc<Notify>,
 ) {
     //loop {
@@ -130,19 +128,14 @@ async fn lifetime_handler(
 }
 
 impl Player {
-    pub fn new(
-        frame_consumer: Sender<Video>,
-        sample_consumer: Sender<Audio>,
-        sample_rate: u32,
-        channels: u16,
-    ) -> Self {
+    pub fn new(frame_consumer: Sender<Video>) -> Self {
         let start_time = Arc::new(Instant::now());
 
         let video_ready = Arc::new(Notify::new());
         let audio_ready = Arc::new(Notify::new());
         let stop = Arc::new(Notify::new());
 
-        let audio_renderer = AudioRenderer::new();
+        let audio_renderer = Arc::new(RwLock::new(AudioRenderer::new()));
 
         Player {
             base_url: None,
@@ -154,7 +147,6 @@ impl Player {
             audio_representation: None,
 
             frame_consumer,
-            sample_consumer,
 
             video_ready,
             audio_ready,
@@ -162,7 +154,6 @@ impl Player {
             stop,
 
             start_time,
-            sample_rate,
             audio_renderer,
         }
     }
@@ -633,7 +624,8 @@ impl Player {
     }
 
     pub fn play(&mut self) -> Result<JoinHandle<()>, Box<dyn Error>> {
-        self.audio_renderer.start();
+        //let mut audio_renderer = self.audio_renderer.blocking_write();
+
         let video_representation = match &self.video_representation {
             Some(success) => success.clone(),
             None => return Err("Video Track not set".into()),
@@ -648,11 +640,19 @@ impl Player {
         let video_ready = self.video_ready.clone();
         let audio_ready = self.audio_ready.clone();
         let frame_consumer = self.frame_consumer.clone();
-        let sample_consumer = self.sample_consumer.clone();
+        //let sample_consumer = self.sample_consumer.clone();
         let stop = self.stop.clone();
 
-        let sample_rate = self.sample_rate;
+        let renderer_clone = Arc::clone(&self.audio_renderer);
+        let renderer_clone_second = Arc::clone(&self.audio_renderer);
         let play = tokio::spawn(async move {
+            let sample_rate = {
+                let mut audio_renderer = renderer_clone.write().await;
+                audio_renderer.start();
+
+                audio_renderer.sample_rate()
+            };
+
             let (frame_sender, frame_receiver) = mpsc::channel::<Video>(4);
             let (sample_sender, sample_receiver) = mpsc::channel::<Audio>(32);
             let play = tokio::spawn(Self::video_play(
@@ -677,7 +677,7 @@ impl Player {
                 frame_consumer,
                 audio_ready.clone(),
                 sample_receiver,
-                sample_consumer,
+                renderer_clone_second,
                 stop.clone(),
             )
             .await;
@@ -685,6 +685,11 @@ impl Player {
             _ = join!(play, audio);
         });
         Ok(play)
+    }
+
+    pub async fn stop(&mut self) {
+        let mut audio_renderer = self.audio_renderer.write().await;
+        audio_renderer.stop().await;
     }
 }
 

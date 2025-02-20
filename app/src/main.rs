@@ -473,6 +473,7 @@ struct App<'a> {
     last_second: Instant,
     last_frame_time: Instant,
     frame_count: u32,
+    player: Option<Player>,
 }
 
 impl ApplicationHandler for App<'_> {
@@ -483,7 +484,7 @@ impl ApplicationHandler for App<'_> {
         let mut default_attrs = Window::default_attributes();
         default_attrs.inner_size = Some(Size::Physical(PhysicalSize::new(1280, 800)));
         let window = Arc::new(event_loop.create_window(default_attrs).unwrap());
-
+        /*
         let eof: Arc<Notify> = Arc::new(Notify::new());
 
         let buffer = HeapRb::<f32>::new(4096);
@@ -548,32 +549,35 @@ impl ApplicationHandler for App<'_> {
         });
 
         let sample_rate = config.clone().sample_rate();
-        let channels = config.channels();
-        let mut player = Player::new(frame_tx, sample_tx, sample_rate.0, channels);
+        let channels = config.channels();*/
+        let player = Player::new(frame_tx);
+
+        self.player = Some(player.clone());
 
         tokio::spawn(async move {
+            let mut inner_player = player.clone();
             //tearsofsteel_
-            let _ = player
+            let _ = inner_player
                 .open_url("https://preclikos.cz/examples/tearsofsteel_raw/manifest.mpd")
                 .await;
 
-            let _ = player.prepare().await;
+            let _ = inner_player.prepare().await;
 
-            let tracks = player.get_tracks();
+            let tracks = inner_player.get_tracks();
 
             let tracks = tracks.unwrap();
             let selected_video = tracks.video.first().unwrap();
             let selected_video_representation = &selected_video.representations[3]; //.first().unwrap();
 
-            player.set_video_track(selected_video, selected_video_representation);
+            inner_player.set_video_track(selected_video, selected_video_representation);
 
             let selected_audio = tracks.audio.last().unwrap();
             let selected_audio_representation = &selected_audio.representations.last().unwrap();
 
-            player.set_audio_track(selected_audio, selected_audio_representation);
+            inner_player.set_audio_track(selected_audio, selected_audio_representation);
 
             loop {
-                let play = player.play();
+                let play = inner_player.play();
                 _ = join!(play.unwrap());
             }
         });
@@ -582,8 +586,6 @@ impl ApplicationHandler for App<'_> {
         self.state = Some(state);
 
         self.receiver = Some(frame_rx);
-
-        self.eof = Some(eof);
 
         window.request_redraw();
     }
@@ -634,9 +636,11 @@ impl ApplicationHandler for App<'_> {
             } => match (event.physical_key, event.state) {
                 (PhysicalKey::Code(KeyCode::Escape), ElementState::Pressed) => {
                     println!("Escape key pressed; exiting");
-                    if let Some(eof) = &self.eof {
-                        eof.notify_waiters();
+                    if let Some(player) = &self.player {
+                        let mut asd = player.clone();
+                        asd.stop().block_on();
                     }
+
                     event_loop.exit();
                 }
                 _ => {}
@@ -669,6 +673,7 @@ async fn main() {
         last_second: Instant::now(),
         last_frame_time: Instant::now(),
         frame_count: 0,
+        player: None,
     };
     _ = event_loop.run_app(&mut app);
 }

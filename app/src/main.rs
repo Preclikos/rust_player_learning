@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::traits::{HostTrait, StreamTrait};
 use cpal::{Sample, StreamConfig};
 use ffmpeg_next::frame::Audio;
 use ffmpeg_next::software::scaling::Context;
@@ -20,7 +20,7 @@ use winit::dpi::{PhysicalSize, Size};
 use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
-use winit::window::{Window, WindowId};
+use winit::window::{Fullscreen, Window, WindowId};
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -484,39 +484,38 @@ impl ApplicationHandler for App<'_> {
         default_attrs.inner_size = Some(Size::Physical(PhysicalSize::new(1280, 800)));
         let window = Arc::new(event_loop.create_window(default_attrs).unwrap());
 
-        let player = Player::new(frame_tx);
+        let mut player = Player::new(frame_tx);
 
         self.player = Some(player.clone());
 
         tokio::spawn(async move {
-            let mut inner_player = player.clone();
             //tearsofsteel_
-            let _ = inner_player
+            let _ = player
                 .open_url("https://preclikos.cz/examples/tearsofsteel_raw/manifest.mpd")
                 .await;
 
-            let _ = inner_player.prepare().await;
+            let _ = player.prepare().await;
 
-            let tracks = inner_player.get_tracks();
+            let tracks = player.get_tracks();
 
             let tracks = tracks.unwrap();
             let selected_video = tracks.video.first().unwrap();
-            let selected_video_representation = &selected_video.representations[3]; //.first().unwrap();
+            let selected_video_representation = &selected_video.representations[2]; //.first().unwrap();
 
-            inner_player.set_video_track(selected_video, selected_video_representation);
+            player.set_video_track(selected_video, selected_video_representation);
 
             let selected_audio = tracks.audio.last().unwrap();
             let selected_audio_representation = &selected_audio.representations.last().unwrap();
 
-            inner_player.set_audio_track(selected_audio, selected_audio_representation);
+            player.set_audio_track(selected_audio, selected_audio_representation);
 
             loop {
-                let play = inner_player.play();
+                let play = player.play();
                 _ = join!(play.unwrap());
             }
         });
 
-        let state = pollster::block_on(State::new(window.clone()));
+        let state = State::new(window.clone()).block_on();
         self.state = Some(state);
 
         self.receiver = Some(frame_rx);
@@ -572,11 +571,27 @@ impl ApplicationHandler for App<'_> {
                 (PhysicalKey::Code(KeyCode::Escape), ElementState::Pressed) => {
                     println!("Escape key pressed; exiting");
                     if let Some(player) = &self.player {
-                        let mut asd = player.clone();
-                        asd.stop().block_on();
+                        let mut player = player.clone();
+                        player.stop().block_on();
                     }
 
                     event_loop.exit();
+                }
+                (PhysicalKey::Code(KeyCode::KeyF), ElementState::Pressed) => {
+                    state
+                        .get_window()
+                        .set_fullscreen(Some(Fullscreen::Borderless(None)));
+                }
+                (PhysicalKey::Code(KeyCode::KeyW), ElementState::Pressed) => {
+                    state.get_window().set_fullscreen(None);
+                }
+                (PhysicalKey::Code(KeyCode::KeyA), ElementState::Pressed) => {
+                    let player = self.player.as_ref().unwrap();
+                    player.volume(0.05);
+                }
+                (PhysicalKey::Code(KeyCode::KeyZ), ElementState::Pressed) => {
+                    let player = self.player.as_ref().unwrap();
+                    player.volume(-0.05);
                 }
                 _ => {}
             },

@@ -1,17 +1,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use cpal::traits::{HostTrait, StreamTrait};
-use cpal::{Sample, StreamConfig};
-use ffmpeg_next::frame::Audio;
 use ffmpeg_next::software::scaling::Context;
 use ffmpeg_next::util::frame::Video;
 use player::Player;
 use pollster::FutureExt;
-use ringbuf::{traits::*, HeapRb};
 use tokio::join;
+use tokio::sync::mpsc;
 use tokio::sync::mpsc::Receiver;
-use tokio::sync::{mpsc, Notify};
 use tokio::time::Instant;
 use wgpu::util::DeviceExt;
 use wgpu::{BindGroup, BindGroupLayout, RenderPipeline, Sampler, TextureFormat};
@@ -468,8 +464,6 @@ impl<'a> State<'a> {
 struct App<'a> {
     state: Option<State<'a>>,
     receiver: Option<Receiver<Video>>,
-    start_time: Instant,
-    last_second: Instant,
     last_frame_time: Instant,
     frame_count: u32,
     player: Option<Player>,
@@ -540,14 +534,6 @@ impl ApplicationHandler for App<'_> {
 
                 self.frame_count += 1;
 
-                let now = Instant::now();
-                if now.duration_since(self.last_second) >= Duration::from_secs(1) {
-                    let elapsed = now.duration_since(self.start_time).as_secs_f64();
-                    let fps = self.frame_count as f64 / elapsed;
-                    println!("Frames: {}, FPS: {:.2}", self.frame_count, fps);
-                    self.last_second = now;
-                }
-
                 if let Ok(frame) = receiver.try_recv() {
                     state.render(frame);
                 }
@@ -613,20 +599,18 @@ async fn main() {
     // input, and uses significantly less power/CPU time than ControlFlow::Poll.
     //event_loop.set_control_flow(ControlFlow::Wait);
 
-    //platform::prevent_screensaver();
+    platform::prevent_screensaver();
 
     let mut app = App {
         state: None,
         receiver: None,
-        start_time: Instant::now(),
-        last_second: Instant::now(),
         last_frame_time: Instant::now(),
         frame_count: 0,
         player: None,
     };
     _ = event_loop.run_app(&mut app);
 }
-/*
+
 // Windows: Prevent sleep/screensaver
 #[cfg(target_os = "windows")]
 mod platform {
@@ -641,17 +625,52 @@ mod platform {
     }
 }
 
-// Linux (X11): Prevent screensaver
 #[cfg(target_os = "linux")]
 mod platform {
+    use std::env;
+    use std::ptr;
+
+    extern crate x11;
     use x11::xlib::{XOpenDisplay, XResetScreenSaver};
 
+    use wayland_client::Display;
+
     pub fn prevent_screensaver() {
+        if let Ok(xdg_session_type) = env::var("XDG_SESSION_TYPE") {
+            match xdg_session_type.as_str() {
+                "x11" => prevent_screensaver_x11(),
+                "wayland" => prevent_screensaver_wayland(),
+                _ => eprintln!("Unsupported display server: {}", xdg_session_type),
+            }
+        } else {
+            eprintln!("Failed to detect XDG_SESSION_TYPE");
+        }
+    }
+
+    fn prevent_screensaver_x11() {
         unsafe {
-            let display = XOpenDisplay(std::ptr::null());
+            let display = XOpenDisplay(ptr::null());
             if !display.is_null() {
                 XResetScreenSaver(display);
+            } else {
+                eprintln!("Failed to open X display");
             }
         }
     }
-}*/
+
+    fn prevent_screensaver_wayland() {
+        if let Ok(display) = Display::connect_to_env() {
+            eprintln!("Wayland support requires compositor-specific methods.");
+        } else {
+            eprintln!("Failed to connect to Wayland display");
+        }
+    }
+}
+
+// Default implementation for other platforms
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+mod platform {
+    pub fn prevent_screensaver() {
+        eprintln!("Screensaver prevention is not supported on this platform.");
+    }
+}

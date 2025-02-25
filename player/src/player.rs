@@ -14,12 +14,15 @@ use ffmpeg_sys_next::{
     av_hwdevice_ctx_create, av_hwframe_transfer_data, AVBufferRef, AVCodecContext, AVHWDeviceType,
 };
 use parsers::mp4::{aac_sampling_frequency_index_to_u32, apped_hevc_header, parse_hevc_nalu};
+use pollster::FutureExt;
 use re_mp4::{Mp4, StsdBoxContent};
 use renderers::audio::AudioRenderer;
+use renderers::video::VideoRenderer;
+use winit::window::Window;
 
 use std::error::Error;
 use std::time::Duration;
-use tokio::sync::{Notify, RwLock};
+use tokio::sync::Notify;
 use tokio::time::Instant;
 use tokio::{join, sync::mpsc::Sender};
 use tracks::audio::{AudioAdaptation, AudioRepresentation};
@@ -51,7 +54,7 @@ pub struct Player {
     audio_representation: Option<AudioRepresentation>,
 
     //frame_producer: Receiver<Video>,
-    frame_consumer: Sender<Video>,
+    //frame_consumer: Sender<Video>,
 
     //play_handle: JoinHandle<()>,
     start_time: Arc<Instant>,
@@ -60,14 +63,14 @@ pub struct Player {
     //text_ready: Arc<Notify>,
     stop: Arc<Notify>,
 
-    //video_renderer: Arc<RwLock<AudioRenderer>>,
+    video_renderer: Arc<VideoRenderer>,
     audio_renderer: Arc<AudioRenderer>,
 }
 
 async fn video_sync_producer(
     start_time: Arc<Instant>,
     mut input_rx: mpsc::Receiver<Video>,
-    output_tx: mpsc::Sender<Video>,
+    output_tx: Arc<VideoRenderer>,
 ) {
     while let Some(frame) = input_rx.recv().await {
         let elapsed = start_time.elapsed().as_millis() as u64;
@@ -79,7 +82,7 @@ async fn video_sync_producer(
             println!("Video drift more then 20ms dropping frame");
             continue;
         }
-        _ = output_tx.send(frame).await;
+        _ = output_tx.render(frame);
     }
 }
 
@@ -103,13 +106,14 @@ async fn audio_sync_producer(
 }
 
 impl Player {
-    pub fn new(frame_consumer: Sender<Video>) -> Self {
+    pub fn new(window: Arc<Window>) -> Self {
         let start_time = Arc::new(Instant::now());
 
         let video_ready = Arc::new(Notify::new());
         let audio_ready = Arc::new(Notify::new());
         let stop = Arc::new(Notify::new());
 
+        let video_renderer = Arc::new(VideoRenderer::new(window).block_on());
         let audio_renderer = Arc::new(AudioRenderer::new());
 
         Player {
@@ -121,14 +125,14 @@ impl Player {
             audio_adaptation: None,
             audio_representation: None,
 
-            frame_consumer,
-
             video_ready,
             audio_ready,
 
             stop,
 
             start_time,
+
+            video_renderer,
             audio_renderer,
         }
     }
@@ -601,7 +605,7 @@ impl Player {
         mut start_time: Arc<Instant>,
         video_ready: Arc<Notify>,
         video_rx: mpsc::Receiver<Video>,
-        video_tx: mpsc::Sender<Video>,
+        video_tx: Arc<VideoRenderer>,
         audio_ready: Arc<Notify>,
         audio_rx: mpsc::Receiver<Audio>,
         audio_tx: Arc<AudioRenderer>,
@@ -636,10 +640,11 @@ impl Player {
         let start_time = self.start_time.clone();
         let video_ready = self.video_ready.clone();
         let audio_ready = self.audio_ready.clone();
-        let frame_consumer = self.frame_consumer.clone();
+        //let frame_consumer = self.frame_consumer.clone();
         //let sample_consumer = self.sample_consumer.clone();
         let stop = self.stop.clone();
 
+        let video_renderer = self.video_renderer.clone();
         let audio_renderer = self.audio_renderer.clone();
 
         let play = tokio::spawn(async move {
@@ -666,7 +671,7 @@ impl Player {
                 start_time.clone(),
                 video_ready.clone(),
                 frame_receiver,
-                frame_consumer,
+                video_renderer,
                 audio_ready.clone(),
                 sample_receiver,
                 audio_renderer,

@@ -1,12 +1,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use ffmpeg_next::util::frame::Video;
 use player::Player;
 use pollster::FutureExt;
 use tokio::join;
-use tokio::sync::mpsc;
-use tokio::sync::mpsc::Receiver;
 use tokio::time::Instant;
 use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalSize, Size};
@@ -17,7 +14,6 @@ use winit::window::{Fullscreen, Window, WindowId};
 
 struct App {
     window: Option<Arc<Window>>,
-    receiver: Option<Receiver<Video>>,
     last_frame_time: Instant,
     frame_count: u32,
     player: Option<Player>,
@@ -25,8 +21,6 @@ struct App {
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        let (frame_tx, frame_rx) = mpsc::channel::<Video>(4);
-
         // Create window object
         let mut default_attrs = Window::default_attributes();
         default_attrs.inner_size = Some(Size::Physical(PhysicalSize::new(1280, 800)));
@@ -64,7 +58,6 @@ impl ApplicationHandler for App {
         });
 
         self.window = Some(window.clone());
-        self.receiver = Some(frame_rx);
 
         window.request_redraw();
     }
@@ -73,7 +66,6 @@ impl ApplicationHandler for App {
         let player: &mut Player = self.player.as_mut().unwrap();
         let window = Arc::clone(self.window.as_ref().unwrap());
 
-        let receiver = self.receiver.as_mut().unwrap();
         match event {
             WindowEvent::CloseRequested => {
                 if let Some(player) = &self.player {
@@ -87,10 +79,6 @@ impl ApplicationHandler for App {
                 let frame_duration = Duration::from_secs_f64(1.0 / 120.);
 
                 self.frame_count += 1;
-
-                if let Ok(frame) = receiver.try_recv() {
-                    //player.render(frame);
-                }
 
                 let elapsed = self.last_frame_time.elapsed();
                 if elapsed < frame_duration {
@@ -153,7 +141,6 @@ async fn main() {
 
     let mut app = App {
         window: None,
-        receiver: None,
         last_frame_time: Instant::now(),
         frame_count: 0,
         player: None,

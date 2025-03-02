@@ -33,7 +33,7 @@ use tracks::{
 };
 use url::Url;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::{self, Receiver};
 use tokio::task::{self, JoinHandle};
 
@@ -69,7 +69,7 @@ pub struct Player {
 
 async fn video_sync_producer(
     start_time: Arc<Instant>,
-    mut input_rx: mpsc::Receiver<Video>,
+    mut input_rx: mpsc::Receiver<Arc<Video>>,
     output_tx: Arc<VideoRenderer>,
 ) {
     while let Some(frame) = input_rx.recv().await {
@@ -230,7 +230,7 @@ impl Player {
 
     async fn video_decoder_task(
         mut receiver: Receiver<DataSegment>,
-        sender: Sender<ffmpeg_next::util::frame::Video>,
+        sender: Sender<Arc<ffmpeg_next::util::frame::Video>>,
         mut decoder: ffmpeg_next::decoder::Video,
         init_data: Vec<u8>,
         video_ready: Arc<Notify>,
@@ -285,8 +285,10 @@ impl Player {
                 let mut frame = ffmpeg_next::util::frame::Video::empty();
                 //let mut cpu_frame = ffmpeg_next::util::frame::Video::empty();
                 video_ready.notify_waiters();
+
                 while let Ok(()) = decoder.receive_frame(&mut frame) {
-                    /* unsafe {
+                    let frame_arc = Arc::new(frame);
+                    /*
                         // Transfer the GPU frame to system memory
                         let ret =
                             av_hwframe_transfer_data(cpu_frame.as_mut_ptr(), frame.as_mut_ptr(), 0);
@@ -296,10 +298,13 @@ impl Player {
                     }
 
                     cpu_frame.set_pts(frame.pts());*/
-                    match sender.send(frame.clone()).await {
+
+                    match sender.send(frame_arc).await {
                         Ok(_success) => {}
                         Err(e) => return Err(format!("Cannot send frame to channel {}", e).into()),
                     };
+
+                    frame = ffmpeg_next::util::frame::Video::empty(); // Create a new empty frame
                 }
             }
         }
@@ -382,7 +387,7 @@ impl Player {
     async fn video_play(
         video_representation: VideoRepresenation,
         video_ready: Arc<Notify>,
-        sender: Sender<Video>,
+        sender: Sender<Arc<Video>>,
         stop: Arc<Notify>,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         let (download_tx, download_rx) = mpsc::channel::<DataSegment>(MAX_SEGMENTS);
@@ -413,30 +418,30 @@ impl Player {
             Ok(context) => context,
             Err(e) => return Err(format!("Cannot find decoder for codec {}", e).into()),
         };
-        /*
-                unsafe {
-                    let mut hw_device_ctx: *mut AVBufferRef = std::ptr::null_mut();
-                    //let device_type = AVHWDeviceType::AV_HWDEVICE_TYPE_DXVA2;
-                    let device_type = AVHWDeviceType::AV_HWDEVICE_TYPE_DXVA2;
-                    // Create the DXVA2 hardware device
-                    let ret = av_hwdevice_ctx_create(
-                        &mut hw_device_ctx,
-                        device_type,
-                        std::ptr::null(),
-                        std::ptr::null_mut(),
-                        0,
-                    );
-                    if ret < 0 {
-                        panic!("Failed to create DXVA2 hardware device: {}", ret);
-                    }
 
-                    // Assign the device context to the codec context
-                    let codec_ctx_ptr = decoder.as_mut_ptr();
-                    (*codec_ctx_ptr).hw_device_ctx = hw_device_ctx;
+        unsafe {
+            let mut hw_device_ctx: *mut AVBufferRef = std::ptr::null_mut();
+            //let device_type = AVHWDeviceType::AV_HWDEVICE_TYPE_DXVA2;
+            let device_type = AVHWDeviceType::AV_HWDEVICE_TYPE_DXVA2;
+            // Create the DXVA2 hardware device
+            let ret = av_hwdevice_ctx_create(
+                &mut hw_device_ctx,
+                device_type,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                0,
+            );
+            if ret < 0 {
+                panic!("Failed to create DXVA2 hardware device: {}", ret);
+            }
 
-                    println!("DXVA2 hardware device context created successfully.");
-                }
-        */
+            // Assign the device context to the codec context
+            let codec_ctx_ptr = decoder.as_mut_ptr();
+            (*codec_ctx_ptr).hw_device_ctx = hw_device_ctx;
+
+            println!("DXVA2 hardware device context created successfully.");
+        }
+
         match track.trak(&mp4_info).mdia.minf.stbl.stsd.contents.clone() {
             StsdBoxContent::Hvc1(hvc) => {
                 for nalus_unit in hvc.hvcc.arrays.clone() {
@@ -604,7 +609,7 @@ impl Player {
     async fn lifetime_handler(
         mut start_time: Arc<Instant>,
         video_ready: Arc<Notify>,
-        video_rx: mpsc::Receiver<Video>,
+        video_rx: mpsc::Receiver<Arc<Video>>,
         video_tx: Arc<VideoRenderer>,
         audio_ready: Arc<Notify>,
         audio_rx: mpsc::Receiver<Audio>,
@@ -648,7 +653,7 @@ impl Player {
         let audio_renderer = self.audio_renderer.clone();
 
         let play = tokio::spawn(async move {
-            let (frame_sender, frame_receiver) = mpsc::channel::<Video>(4);
+            let (frame_sender, frame_receiver) = mpsc::channel::<Arc<Video>>(4);
             let (sample_sender, sample_receiver) = mpsc::channel::<Audio>(32);
             let play = tokio::spawn(Self::video_play(
                 video_representation,

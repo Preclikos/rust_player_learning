@@ -422,7 +422,7 @@ impl Player {
         unsafe {
             let mut hw_device_ctx: *mut AVBufferRef = std::ptr::null_mut();
             //let device_type = AVHWDeviceType::AV_HWDEVICE_TYPE_DXVA2;
-            let device_type = AVHWDeviceType::AV_HWDEVICE_TYPE_DXVA2;
+            let device_type = AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA;
             // Create the DXVA2 hardware device
             let ret = av_hwdevice_ctx_create(
                 &mut hw_device_ctx,

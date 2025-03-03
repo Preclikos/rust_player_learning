@@ -1,19 +1,21 @@
-use std::sync::Arc;
-
 use ffmpeg_next::{frame::Video, software::scaling::Context};
-use wgpu::{util::DeviceExt, BindGroup, BindGroupLayout, RenderPipeline, Sampler, TextureFormat};
+use std::ptr::NonNull;
+use std::sync::Arc;
+use wgpu::hal::api::Dx12;
+use wgpu::hal::api::Vulkan;
+use wgpu::Extent3d;
+use wgpu::MemoryHints;
+use wgpu::{Backends, Instance, InstanceDescriptor};
+
+use wgpu::TextureFormat;
+use wgpu::TextureUsages;
+use wgpu::{util::DeviceExt, BindGroup, BindGroupLayout, RenderPipeline, Sampler};
 use windows::core::Interface;
-use windows::Win32::Foundation::{HANDLE, HMODULE};
-use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0};
-use windows::Win32::Graphics::Direct3D11::{
-    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
-    D3D11_CREATE_DEVICE_FLAG, D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX,
-    D3D11_RESOURCE_MISC_SHARED_NTHANDLE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
-};
-use windows::Win32::Graphics::Direct3D9::*;
-use windows::Win32::Graphics::Dxgi::{
-    IDXGIResource, IDXGIResource1, DXGI_SHARED_RESOURCE_READ, DXGI_SHARED_RESOURCE_WRITE,
-};
+use windows::Win32::Foundation::HMODULE;
+use windows::Win32::Foundation::{CloseHandle, E_FAIL, E_NOINTERFACE, GENERIC_ALL, HANDLE};
+use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
+use windows::Win32::Graphics::{Direct3D11::*, Dxgi::Common::*, Dxgi::*};
+use windows::Win32::System::Threading::{CreateEventA, WaitForSingleObject};
 use winit::window::Window;
 
 #[repr(C)]
@@ -45,14 +47,6 @@ impl Vertex {
     }
 }
 
-fn get_shared_handle(surface: &IDirect3DSurface9) -> HANDLE {
-    unsafe {
-        let dxgi_resource: IDXGIResource = surface.cast().unwrap();
-
-        dxgi_resource.GetSharedHandle().unwrap()
-    }
-}
-
 fn open_d3d11_device() -> ID3D11Device {
     unsafe {
         let mut d3d11_device: Option<ID3D11Device> = None;
@@ -76,7 +70,10 @@ fn open_d3d11_device() -> ID3D11Device {
     }
 }
 
-pub fn get_shared_texture_d3d11(device: &ID3D11Device, texture: &ID3D11Texture2D) -> HANDLE {
+pub fn get_shared_texture_d3d11(
+    device: &ID3D11Device,
+    texture: &ID3D11Texture2D,
+) -> Result<HANDLE, Box<dyn std::error::Error>> {
     unsafe {
         // Try to open or create shared handle if possible
         if let Ok(dxgi_resource) = texture.cast::<IDXGIResource1>() {
@@ -86,7 +83,7 @@ pub fn get_shared_texture_d3d11(device: &ID3D11Device, texture: &ID3D11Texture2D
                 None,
             ) {
                 if !handle.is_invalid() {
-                    return handle;
+                    return Ok(handle);
                 }
             }
         }
@@ -99,28 +96,25 @@ pub fn get_shared_texture_d3d11(device: &ID3D11Device, texture: &ID3D11Texture2D
             | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX.0 as u32;
 
         let mut new_texture = None;
-        device
-            .CreateTexture2D(&desc, None, Some(&mut new_texture))
-            .unwrap();
+        device.CreateTexture2D(&desc, None, Some(&mut new_texture))?;
         if let Some(new_texture) = new_texture {
-            let dxgi_resource: IDXGIResource1 = new_texture.cast::<IDXGIResource1>().unwrap();
-            let handle = dxgi_resource
-                .CreateSharedHandle(
-                    None,
-                    DXGI_SHARED_RESOURCE_READ.0 | DXGI_SHARED_RESOURCE_WRITE.0,
-                    None,
-                )
-                .unwrap();
-            handle
-            /*Ok((
-                handle,
-                Some(DirectX11SharedTexture {
-                    intermediate_texture: new_texture,
-                    fence: DirectX11Fence::new(device)?,
-                }),
-            ))*/
+            let dxgi_resource: IDXGIResource1 = new_texture.cast::<IDXGIResource1>()?;
+            let handle = dxgi_resource.CreateSharedHandle(
+                None,
+                DXGI_SHARED_RESOURCE_READ.0 | DXGI_SHARED_RESOURCE_WRITE.0,
+                None,
+            )?;
+
+            Ok(
+                //(
+                handle, /* ,
+                       Some(DirectX11SharedTexture {
+                           intermediate_texture: new_texture,
+                           fence: DirectX11Fence::new(device)?,
+                       })*/
+            ) //)
         } else {
-            panic!("Call to CreateTexture2D failed");
+            Err("Call to CreateTexture2D failed".into())
         }
     }
 }
@@ -193,7 +187,7 @@ fn dxgi_format_to_wgpu_format(dxgi_format: u32) -> wgpu::TextureFormat {
         _ => panic!("Format error"),
     }
 }
-
+/*
 fn create_texture_from_dxgi_desc(
     dxgi_desc: &D3DSURFACE_DESC, // Your DXGI description
     device: &wgpu::Device,
@@ -216,7 +210,7 @@ fn create_texture_from_dxgi_desc(
     };
 
     device.create_texture(&texture_desc)
-}
+}*/
 
 fn generate_verticles(scale_x: f32, scale_y: f32) -> [Vertex; 6] {
     [
@@ -261,12 +255,16 @@ pub struct VideoRenderer {
     texture_bind_group: BindGroup,
     texture_bind_group_layout: BindGroupLayout,
     render_pipeline: RenderPipeline,
-    //frame_scaler: Context,
+    dx_device: ID3D11Device, //frame_scaler: Context,
 }
 
 impl VideoRenderer {
     pub async fn new(window: Arc<Window>) -> Self {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let instance = Instance::new(&InstanceDescriptor {
+            backends: Backends::DX12,
+            flags: wgpu::InstanceFlags::DEBUG, // Force DirectX 12 backend
+            ..Default::default()
+        });
 
         let surface = instance.create_surface(window.clone()).unwrap();
 
@@ -280,7 +278,15 @@ impl VideoRenderer {
             .unwrap();
 
         let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor::default(), None)
+            .request_device(
+                &wgpu::DeviceDescriptor {
+                    required_features: wgpu::Features::TEXTURE_FORMAT_NV12, // Enable NV12
+                    required_limits: wgpu::Limits::default(),
+                    label: Some("Device with NV12 support"),
+                    memory_hints: MemoryHints::Performance,
+                },
+                None,
+            )
             .await
             .unwrap();
 
@@ -288,6 +294,8 @@ impl VideoRenderer {
 
         let cap = surface.get_capabilities(&adapter);
         let surface_format = cap.formats[0];
+
+        let dxdevice = open_d3d11_device();
 
         let render_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Render Texture"),
@@ -431,7 +439,7 @@ impl VideoRenderer {
             texture_bind_group,
             texture_bind_group_layout,
             render_pipeline,
-            //frame_scaler,
+            dx_device: dxdevice, //frame_scaler,
         };
 
         // Configure surface for the first time
@@ -453,7 +461,7 @@ impl VideoRenderer {
             width: self.size.width,
             height: self.size.height,
             present_mode: wgpu::PresentMode::AutoVsync,
-            desired_maximum_frame_latency: 20,
+            desired_maximum_frame_latency: 10,
         };
         self.surface.configure(&self.device, &surface_config);
     }
@@ -555,160 +563,183 @@ impl VideoRenderer {
 
     pub fn render(&self, frame: Arc<Video>) {
         let format = frame.format();
+        unsafe {
+            /*
+                    let mut desc = D3DSURFACE_DESC::default();
+                    unsafe {
+                        let texture = (*frame.as_ptr()).data[3] as *mut _;
 
-        let device = open_d3d11_device();
-
-        /*
-                let mut desc = D3DSURFACE_DESC::default();
-                unsafe {
-                    let texture = (*frame.as_ptr()).data[3] as *mut _;
-
-                    if let Err(e) = IDirect3DSurface9::from_raw_borrowed(&texture)
-                        .unwrap()
-                        .GetDesc(&mut desc)
-                    {
-                        //log::error!("Failed to get DXVA2 {}", e);
-                        println!("Failed to get DXVA2 {}", e);
+                        if let Err(e) = IDirect3DSurface9::from_raw_borrowed(&texture)
+                            .unwrap()
+                            .GetDesc(&mut desc)
+                        {
+                            //log::error!("Failed to get DXVA2 {}", e);
+                            println!("Failed to get DXVA2 {}", e);
+                        }
                     }
-                }
-        */
-        let texture = unsafe {
+            */
+
             let frame_ptr = frame.as_ptr();
             // println!("Frame pointer: {:?}", frame_ptr);
 
-            let texture_ptr = (*frame_ptr).data[3] as *mut std::ffi::c_void;
-            //println!("DXVA2 texture pointer: {:?}", texture_ptr);
+            //let texture_ptr = (*frame_ptr).data[3] as *mut std::ffi::c_void;
 
-            if texture_ptr.is_null() {
-                println!("Error: DXVA2 surface pointer is null");
-                return;
-            }
+            //let tex_ptr = (*frame_ptr).data[3] as *mut ID3D11Texture2D;
+            //let tex: Option<&ID3D11Texture2D> = NonNull::new(tex_ptr).map(|ptr| &*ptr.as_ptr());
 
-            let surface = IDirect3DSurface9::from_raw_borrowed(&texture_ptr).unwrap();
+            let texture = (*frame_ptr).data[0] as *mut _;
+            let texture = ID3D11Texture2D::from_raw_borrowed(&texture);
+            //let mut desc11 = D3D11_TEXTURE2D_DESC::default();
+            //tex.unwrap().GetDesc(&mut desc11);
 
-            //let dxgi_resource: IDXGIResource = surface.cast().unwrap();
+            let shared_text = get_shared_texture_d3d11(&self.dx_device, texture.unwrap()).unwrap();
 
-            let mut texture: Option<IDirect3DTexture9> = None;
-            surface
-                .GetContainer(&IDirect3DTexture9::IID, &mut texture as *mut _ as *mut _)
-                .ok();
+            let raw_image = self
+                .device
+                .as_hal::<Dx12, _, _>(|hdevice| {
+                    hdevice.map(|hdevice| {
+                        let raw_device = hdevice.raw_device();
 
-            let texture = texture.unwrap();
+                        let mut resource =
+                            None::<windows::Win32::Graphics::Direct3D12::ID3D12Resource>;
 
-            // Cast the texture to IDXGIResource
-            let dxgi_resource: IDXGIResource = texture.cast().unwrap();
-            let shared_texture = get_shared_texture_d3d11(&device, &texture);
+                        match raw_device.OpenSharedHandle(shared_text, &mut resource) {
+                            Ok(_) => Ok(resource.unwrap()),
+                            Err(e) => Err(e),
+                        }
+                    })
+                })
+                .unwrap()
+                .unwrap(); // TODO: unwrap
 
-            //            let shared = get_shared_handle(surface);
-            //let texture = open_d3d11_texture(shared);
-            // Dump information about the IDirect3DSurface9 object
-            /*println!("IDirect3DSurface9 Information:");
-                        println!("  Surface Address: {:?}", surface);
-            */
-            // Retrieve the surface description (D3DSURFACE_DESC)
-            let mut desc = D3DSURFACE_DESC::default();
-            if let Err(e) = surface.GetDesc(&mut desc) {
-                println!("Failed to get surface description: {}", e);
-            } else {
-                // Dump information about the D3DSURFACE_DESC
-                /*  println!("D3DSURFACE_DESC Information:");
-                println!("  Format: {:?}", desc.Format);
-                println!("  Width: {}", desc.Width);
-                println!("  Height: {}", desc.Height);
-                //println!("  Pitch: {}", desc.Pitch);
-                println!("  Usage: {:?}", desc.Usage);
-                println!("  Pool: {:?}", desc.Pool);
-                println!("  MultiSampleType: {:?}", desc.MultiSampleType);
-                println!("  MultiSampleQuality: {}", desc.MultiSampleQuality);
-                //println!("  Stereo: {}", desc.Stereo);*/
-            }
+            let usage = wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC;
 
-            create_texture_from_dxgi_desc(&desc, &self.device)
-        };
+            let desc = wgpu::TextureDescriptor {
+                label: None,
+                size: Extent3d {
+                    width: 1920,
+                    height: 896,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: TextureFormat::NV12,
+                usage,
+                view_formats: &[],
+            };
 
-        let view = self
+            let texture = <Dx12 as wgpu::hal::Api>::Device::texture_from_raw(
+                raw_image,
+                desc.format,
+                desc.dimension,
+                desc.size,
+                1,
+                1,
+            );
+
+            let texture = self.device.create_texture_from_hal::<Dx12>(texture, &desc);
+
+            /* let view = self
             .render_texture
             .create_view(&wgpu::TextureViewDescriptor {
                 format: Some(self.surface_format),
                 ..Default::default()
-            });
+            });*/
 
-        let src_view: wgpu::TextureView =
-            texture.create_view(&wgpu::TextureViewDescriptor::default());
-
-        let texture_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: &self.texture_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&src_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
-            ],
-            label: Some("texture_bind_group"),
-        });
-
-        let surface_texture = self
-            .surface
-            .get_current_texture()
-            .expect("failed to acquire next swapchain texture");
-
-        let texture_view = surface_texture
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor {
-                format: Some(self.surface_format),
+            let y_plane_view = texture.create_view(&wgpu::TextureViewDescriptor {
+                format: Some(wgpu::TextureFormat::R8Unorm), // Y plane
+                aspect: wgpu::TextureAspect::Plane0,        // First plane (Y)
                 ..Default::default()
             });
-        /*
-        if frame.width() != self.frame_size.width || frame.height() != self.frame_size.height {
-            //self.on_resize_frame(frame.clone());
-        }
 
-        let dst_format = ffmpeg_next::format::Pixel::BGRA;
-        let mut frame_scaler = ffmpeg_next::software::scaling::Context::get(
-            frame.format(),
-            frame.width(),
-            frame.height(),
-            dst_format,
-            frame.width(),
-            frame.height(),
-            ffmpeg_next::software::scaling::Flags::BILINEAR,
-        )
-        .unwrap();
+            let uv_plane_view = texture.create_view(&wgpu::TextureViewDescriptor {
+                format: Some(wgpu::TextureFormat::Rg8Unorm), // UV plane
+                aspect: wgpu::TextureAspect::Plane1,         // Second plane (UV)
+                ..Default::default()
+            });
 
-        let mut dst_frame = ffmpeg_next::util::frame::Video::new(
-            frame_scaler.output().format,
-            frame.width(),
-            frame.height(),
-        );
+            /*let view_heh = texture.create_view(&wgpu::TextureViewDescriptor {
+                format: Some(self.surface_format),
+                ..Default::default()
+            });*/
 
-        _ = frame_scaler.run(&frame, &mut dst_frame);
+            //let src_view: wgpu::TextureView =
+            //    texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        let width_bytes = dst_frame.stride(0);
-        self.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &self.render_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d { x: 0, y: 0, z: 0 },
-                aspect: wgpu::TextureAspect::All,
-            },
-            dst_frame.data(0),
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(width_bytes as u32),
-                rows_per_image: Some(frame.height()),
-            },
-            wgpu::Extent3d {
-                width: frame.width(),
-                height: frame.height(),
-                depth_or_array_layers: 1,
-            },
-        );*/
+            let texture_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                layout: &self.texture_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&uv_plane_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                ],
+                label: Some("texture_bind_group"),
+            });
 
-        let texture_bind_group_layout =
+            let surface_texture = self
+                .surface
+                .get_current_texture()
+                .expect("failed to acquire next swapchain texture");
+
+            let texture_view = surface_texture
+                .texture
+                .create_view(&wgpu::TextureViewDescriptor {
+                    format: Some(self.surface_format),
+                    ..Default::default()
+                });
+            /*
+            if frame.width() != self.frame_size.width || frame.height() != self.frame_size.height {
+                //self.on_resize_frame(frame.clone());
+            }
+
+            let dst_format = ffmpeg_next::format::Pixel::BGRA;
+            let mut frame_scaler = ffmpeg_next::software::scaling::Context::get(
+                frame.format(),
+                frame.width(),
+                frame.height(),
+                dst_format,
+                frame.width(),
+                frame.height(),
+                ffmpeg_next::software::scaling::Flags::BILINEAR,
+            )
+            .unwrap();
+
+            let mut dst_frame = ffmpeg_next::util::frame::Video::new(
+                frame_scaler.output().format,
+                frame.width(),
+                frame.height(),
+            );
+
+            _ = frame_scaler.run(&frame, &mut dst_frame);
+
+            let width_bytes = dst_frame.stride(0);
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.render_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x: 0, y: 0, z: 0 },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                dst_frame.data(0),
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(width_bytes as u32),
+                    rows_per_image: Some(frame.height()),
+                },
+                wgpu::Extent3d {
+                    width: frame.width(),
+                    height: frame.height(),
+                    depth_or_array_layers: 1,
+                },
+            );*/
+
+            /*let texture_bind_group_layout =
             self.device
                 .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                     entries: &[
@@ -716,7 +747,9 @@ impl VideoRenderer {
                             binding: 0,
                             visibility: wgpu::ShaderStages::FRAGMENT,
                             ty: wgpu::BindingType::Texture {
-                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                                sample_type: wgpu::TextureSampleType::Float {
+                                    filterable: true,
+                                },
                                 view_dimension: wgpu::TextureViewDimension::D2,
                                 multisampled: false,
                             },
@@ -730,78 +763,79 @@ impl VideoRenderer {
                         },
                     ],
                     label: Some("texture_bind_group_layout"),
+                });*/
+
+            let shader = self
+                .device
+                .create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
+
+            // Create pipeline layout
+            let pipeline_layout =
+                self.device
+                    .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                        label: Some("Pipeline Layout"),
+                        bind_group_layouts: &[&self.texture_bind_group_layout],
+                        push_constant_ranges: &[],
+                    });
+
+            // Create render pipeline
+            let render_pipeline =
+                self.device
+                    .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                        label: Some("Render Pipeline"),
+                        layout: Some(&pipeline_layout),
+                        vertex: wgpu::VertexState {
+                            module: &shader,
+                            entry_point: Some("vs_main"),
+                            buffers: &[Vertex::desc()],
+                            compilation_options: wgpu::PipelineCompilationOptions::default(),
+                        },
+                        fragment: Some(wgpu::FragmentState {
+                            module: &shader,
+                            entry_point: Some("fs_main"),
+                            compilation_options: wgpu::PipelineCompilationOptions::default(),
+                            targets: &[Some(wgpu::ColorTargetState {
+                                format: self.surface_format,
+                                blend: Some(wgpu::BlendState::REPLACE),
+                                write_mask: wgpu::ColorWrites::ALL,
+                            })],
+                        }),
+                        primitive: wgpu::PrimitiveState::default(),
+                        depth_stencil: None,
+                        multisample: wgpu::MultisampleState::default(),
+                        multiview: None,
+                        cache: None,
+                    });
+
+            let mut encoder = self.device.create_command_encoder(&Default::default());
+            {
+                let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: None,
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &texture_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
                 });
 
-        let shader = self
-            .device
-            .create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
+                render_pass.set_pipeline(&render_pipeline);
+                render_pass.set_bind_group(0, &texture_bind_group, &[]);
 
-        // Create pipeline layout
-        let pipeline_layout = self
-            .device
-            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("Pipeline Layout"),
-                bind_group_layouts: &[&texture_bind_group_layout],
-                push_constant_ranges: &[],
-            });
+                render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
 
-        // Create render pipeline
-        let render_pipeline = self
-            .device
-            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("Render Pipeline"),
-                layout: Some(&pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some("vs_main"),
-                    buffers: &[Vertex::desc()],
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some("fs_main"),
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: self.surface_format,
-                        blend: Some(wgpu::BlendState::REPLACE),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                primitive: wgpu::PrimitiveState::default(),
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState::default(),
-                multiview: None,
-                cache: None,
-            });
+                render_pass.draw(0..6, 0..1);
+            }
 
-        let mut encoder = self.device.create_command_encoder(&Default::default());
-        {
-            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: None,
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &texture_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-
-            render_pass.set_pipeline(&render_pipeline);
-            render_pass.set_bind_group(0, &texture_bind_group, &[]);
-
-            render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-
-            render_pass.draw(0..6, 0..1);
+            // Submit the command in the queue to execute
+            self.queue.submit([encoder.finish()]);
+            self.window.pre_present_notify();
+            surface_texture.present();
         }
-
-        // Submit the command in the queue to execute
-        self.queue.submit([encoder.finish()]);
-        self.window.pre_present_notify();
-        surface_texture.present();
     }
 }

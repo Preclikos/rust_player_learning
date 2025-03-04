@@ -11,16 +11,21 @@ use ffmpeg_next::frame::{Audio, Video};
 use ffmpeg_next::software::resampling::Context;
 use ffmpeg_next::{Packet, Rational};
 use ffmpeg_sys_next::{
-    av_hwdevice_ctx_create, av_hwframe_transfer_data, AVBufferRef, AVCodecContext, AVHWDeviceType,
+    av_hwdevice_ctx_create, av_hwframe_transfer_data, AVBufferRef, AVCodecContext,
+    AVHWDeviceContext, AVHWDeviceType,
 };
 use parsers::mp4::{aac_sampling_frequency_index_to_u32, apped_hevc_header, parse_hevc_nalu};
 use pollster::FutureExt;
 use re_mp4::{Mp4, StsdBoxContent};
 use renderers::audio::AudioRenderer;
 use renderers::video::VideoRenderer;
+use windows::Win32::Graphics::Direct3D11::{
+    ID3D11Device, ID3D11DeviceContext, ID3D11VideoContext, ID3D11VideoDevice,
+};
 use winit::window::Window;
 
 use std::error::Error;
+use std::ptr::null_mut;
 use std::time::Duration;
 use tokio::sync::Notify;
 use tokio::time::Instant;
@@ -40,6 +45,17 @@ use tokio::task::{self, JoinHandle};
 use manifest::Manifest;
 
 const MAX_SEGMENTS: usize = 2;
+
+#[repr(C)]
+struct AVD3D11VADeviceContext {
+    device: *mut ID3D11Device,
+    device_context: *mut ID3D11DeviceContext,
+    video_device: *mut ID3D11VideoDevice,
+    video_context: *mut ID3D11VideoContext,
+    lock: Option<unsafe extern "C" fn(*mut std::ffi::c_void)>,
+    unlock: Option<unsafe extern "C" fn(*mut std::ffi::c_void)>,
+    lock_ctx: *mut std::ffi::c_void,
+}
 
 #[derive(Clone)]
 pub struct Player {
@@ -432,14 +448,25 @@ impl Player {
                 0,
             );
             if ret < 0 {
-                panic!("Failed to create DXVA2 hardware device: {}", ret);
+                panic!("Failed to create D3D11VA hardware device: {}", ret);
             }
 
             // Assign the device context to the codec context
             let codec_ctx_ptr = decoder.as_mut_ptr();
             (*codec_ctx_ptr).hw_device_ctx = hw_device_ctx;
 
-            println!("DXVA2 hardware device context created successfully.");
+            println!("D3D11VA hardware device context created successfully.");
+
+            // Get the AVHWDeviceContext from the AVBufferRef
+            let hw_device_ctx_ref = (*hw_device_ctx).data as *mut AVHWDeviceContext;
+            let hwctx = (*hw_device_ctx_ref).hwctx as *mut AVD3D11VADeviceContext;
+
+            // Get the ID3D11Device and ID3D11DeviceContext
+            let d3d11_device = (*hwctx).device as *mut ID3D11Device;
+            let d3d11_device_context = (*hwctx).device_context as *mut ID3D11DeviceContext;
+            println!("D3D11VA hardware device context created successfully.");
+            println!("ID3D11Device: {:?}", d3d11_device);
+            println!("ID3D11DeviceContext: {:?}", d3d11_device_context);
         }
 
         match track.trak(&mp4_info).mdia.minf.stbl.stsd.contents.clone() {

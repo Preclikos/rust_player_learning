@@ -1,22 +1,40 @@
-use ffmpeg_next::{frame::Video, software::scaling::Context};
-use std::ptr::NonNull;
+use ffmpeg_next::frame::Video;
+use ffmpeg_sys_next::AVFrame;
+use ffmpeg_sys_next::AVHWDeviceContext;
+use ffmpeg_sys_next::AVHWDeviceType;
+use ffmpeg_sys_next::AVHWFramesContext;
 use std::sync::Arc;
 use wgpu::hal::api::Dx12;
-use wgpu::hal::api::Vulkan;
 use wgpu::Extent3d;
 use wgpu::MemoryHints;
 use wgpu::{Backends, Instance, InstanceDescriptor};
 
+extern crate ffmpeg_sys_next;
+
 use wgpu::TextureFormat;
-use wgpu::TextureUsages;
 use wgpu::{util::DeviceExt, BindGroup, BindGroupLayout, RenderPipeline, Sampler};
 use windows::core::Interface;
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Foundation::{CloseHandle, E_FAIL, E_NOINTERFACE, GENERIC_ALL, HANDLE};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
+
+use windows::Win32::Graphics::Direct3D12::*;
+use windows::Win32::Graphics::{Direct3D11::*, Direct3D12, Dxgi::Common::*, Dxgi::*};
 use windows::Win32::Graphics::{Direct3D11::*, Dxgi::Common::*, Dxgi::*};
 use windows::Win32::System::Threading::{CreateEventA, WaitForSingleObject};
 use winit::window::Window;
+
+// Define a raw struct for AVD3D11VAContext if it's not exposed in the bindings
+#[repr(C)]
+struct AVD3D11VADeviceContext {
+    device: *mut ID3D11Device,
+    device_context: *mut ID3D11DeviceContext,
+    video_device: *mut ID3D11VideoDevice,
+    video_context: *mut ID3D11VideoContext,
+    lock: Option<unsafe extern "C" fn(*mut std::ffi::c_void)>,
+    unlock: Option<unsafe extern "C" fn(*mut std::ffi::c_void)>,
+    lock_ctx: *mut std::ffi::c_void,
+}
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -47,7 +65,7 @@ impl Vertex {
     }
 }
 
-fn open_d3d11_device() -> ID3D11Device {
+fn open_d3d11_device() -> (ID3D11Device, ID3D11DeviceContext) {
     unsafe {
         let mut d3d11_device: Option<ID3D11Device> = None;
         let mut d3d11_context: Option<ID3D11DeviceContext> = None;
@@ -66,14 +84,15 @@ fn open_d3d11_device() -> ID3D11Device {
         .unwrap();
 
         let d3d11_device = d3d11_device.unwrap();
-        d3d11_device
+        let d3d11_context = d3d11_context.unwrap();
+        (d3d11_device, d3d11_context)
     }
 }
 
 pub fn get_shared_texture_d3d11(
     device: &ID3D11Device,
     texture: &ID3D11Texture2D,
-) -> Result<HANDLE, Box<dyn std::error::Error>> {
+) -> Result<(HANDLE, Option<ID3D11Texture2D>), Box<dyn std::error::Error>> {
     unsafe {
         // Try to open or create shared handle if possible
         if let Ok(dxgi_resource) = texture.cast::<IDXGIResource1>() {
@@ -83,7 +102,7 @@ pub fn get_shared_texture_d3d11(
                 None,
             ) {
                 if !handle.is_invalid() {
-                    return Ok(handle);
+                    return Ok((handle, None));
                 }
             }
         }
@@ -105,112 +124,12 @@ pub fn get_shared_texture_d3d11(
                 None,
             )?;
 
-            Ok(
-                //(
-                handle, /* ,
-                       Some(DirectX11SharedTexture {
-                           intermediate_texture: new_texture,
-                           fence: DirectX11Fence::new(device)?,
-                       })*/
-            ) //)
+            Ok((handle, Some(new_texture)))
         } else {
             Err("Call to CreateTexture2D failed".into())
         }
     }
 }
-
-fn dxgi_format_to_wgpu_format(dxgi_format: u32) -> wgpu::TextureFormat {
-    match dxgi_format {
-        // Common Formats
-        28 => wgpu::TextureFormat::Rgba8Unorm, // DXGI_FORMAT_R8G8B8A8_UNORM
-        87 => wgpu::TextureFormat::Bgra8Unorm, // DXGI_FORMAT_B8G8R8A8_UNORM
-        22 => wgpu::TextureFormat::Rgba8Snorm, // DXGI_FORMAT_R8G8B8A8_SNORM
-        23 => wgpu::TextureFormat::Rgba8Uint,  // DXGI_FORMAT_R8G8B8A8_UINT
-        24 => wgpu::TextureFormat::Rgba8Sint,  // DXGI_FORMAT_R8G8B8A8_SINT
-        25 => wgpu::TextureFormat::Rgba16Unorm, // DXGI_FORMAT_R16G16B16A16_UNORM
-        26 => wgpu::TextureFormat::Rgba16Snorm, // DXGI_FORMAT_R16G16B16A16_SNORM
-        27 => wgpu::TextureFormat::Rgba16Uint, // DXGI_FORMAT_R16G16B16A16_UINT
-        30 => wgpu::TextureFormat::Rgba16Sint, // DXGI_FORMAT_R16G16B16A16_SINT
-        32 => wgpu::TextureFormat::Rgba32Float, // DXGI_FORMAT_R32G32B32A32_FLOAT
-        33 => wgpu::TextureFormat::Rgba32Uint, // DXGI_FORMAT_R32G32B32A32_UINT
-        34 => wgpu::TextureFormat::Rgba32Sint, // DXGI_FORMAT_R32G32B32A32_SINT
-        35 => wgpu::TextureFormat::R32Float,   // DXGI_FORMAT_R32G32B32_FLOAT
-        36 => wgpu::TextureFormat::R32Uint,    // DXGI_FORMAT_R32G32B32_UINT
-        37 => wgpu::TextureFormat::R32Sint,    // DXGI_FORMAT_R32G32B32_SINT
-        38 => wgpu::TextureFormat::R16Float,   // DXGI_FORMAT_R16G16B16A16_FLOAT
-        39 => wgpu::TextureFormat::R16Unorm,   // DXGI_FORMAT_R16G16B16A16_UNORM
-        40 => wgpu::TextureFormat::R16Snorm,   // DXGI_FORMAT_R16G16B16A16_SNORM
-        41 => wgpu::TextureFormat::R16Uint,    // DXGI_FORMAT_R16G16B16A16_UINT
-        42 => wgpu::TextureFormat::R16Sint,    // DXGI_FORMAT_R16G16B16A16_SINT
-        43 => wgpu::TextureFormat::R8Unorm,    // DXGI_FORMAT_R8G8B8A8_UNORM
-        44 => wgpu::TextureFormat::R8Snorm,    // DXGI_FORMAT_R8G8B8A8_SNORM
-        45 => wgpu::TextureFormat::R8Uint,     // DXGI_FORMAT_R8G8B8A8_UINT
-        46 => wgpu::TextureFormat::R8Sint,     // DXGI_FORMAT_R8G8B8A8_SINT
-
-        // Floating-point and compressed formats
-        41 => wgpu::TextureFormat::Rg32Float, // DXGI_FORMAT_R32G32_FLOAT
-        42 => wgpu::TextureFormat::Rg32Sint,  // DXGI_FORMAT_R32G32_SINT
-        43 => wgpu::TextureFormat::Rg32Uint,  // DXGI_FORMAT_R32G32_UINT
-
-        // Uncommon Formats
-        100 => wgpu::TextureFormat::R32Float, // DXGI_FORMAT_R32_FLOAT
-        101 => wgpu::TextureFormat::R32Uint,  // DXGI_FORMAT_R32_UINT
-        102 => wgpu::TextureFormat::R32Sint,  // DXGI_FORMAT_R32_SINT
-        //103 => wgpu::TextureFormat::R64Float, // DXGI_FORMAT_R64_FLOAT
-        104 => wgpu::TextureFormat::R64Uint, // DXGI_FORMAT_R64_UINT
-        //105 => wgpu::TextureFormat::R64Sint,  // DXGI_FORMAT_R64_SINT
-
-        // Compressed formats
-        113 => wgpu::TextureFormat::Bc1RgbaUnorm, // DXGI_FORMAT_BC1_UNORM
-        114 => wgpu::TextureFormat::Bc1RgbaUnormSrgb, // DXGI_FORMAT_BC1_UNORM_SRGB
-        115 => wgpu::TextureFormat::Bc2RgbaUnorm, // DXGI_FORMAT_BC2_UNORM
-        116 => wgpu::TextureFormat::Bc2RgbaUnormSrgb, // DXGI_FORMAT_BC2_UNORM_SRGB
-        117 => wgpu::TextureFormat::Bc3RgbaUnorm, // DXGI_FORMAT_BC3_UNORM
-        118 => wgpu::TextureFormat::Bc3RgbaUnormSrgb, // DXGI_FORMAT_BC3_UNORM_SRGB
-        119 => wgpu::TextureFormat::Bc4RUnorm,    // DXGI_FORMAT_BC4_UNORM
-        120 => wgpu::TextureFormat::Bc4RSnorm,    // DXGI_FORMAT_BC4_SNORM
-        121 => wgpu::TextureFormat::Bc5RgUnorm,   // DXGI_FORMAT_BC5_UNORM
-        122 => wgpu::TextureFormat::Bc5RgSnorm,   // DXGI_FORMAT_BC5_SNORM
-        123 => wgpu::TextureFormat::Bc6hRgbFloat, // DXGI_FORMAT_BC6H_UF16
-        //124 => wgpu::TextureFormat::Bc6hRgbSfloat, // DXGI_FORMAT_BC6H_SF16
-        125 => wgpu::TextureFormat::Bc7RgbaUnorm, // DXGI_FORMAT_BC7_UNORM
-        126 => wgpu::TextureFormat::Bc7RgbaUnormSrgb, // DXGI_FORMAT_BC7_UNORM_SRGB
-
-        // Depth-stencil formats
-        45 => wgpu::TextureFormat::Depth24PlusStencil8, // DXGI_FORMAT_D24_UNORM_S8_UINT
-        46 => wgpu::TextureFormat::Depth32Float,        // DXGI_FORMAT_D32_FLOAT
-        47 => wgpu::TextureFormat::Depth32FloatStencil8, // DXGI_FORMAT_D32_FLOAT_S8X24_UINT
-        48 => wgpu::TextureFormat::Depth16Unorm,        // DXGI_FORMAT_D16_UNORM
-
-        842094158 => wgpu::TextureFormat::Rgb10a2Unorm,
-        // Special case format: Unknown
-        _ => panic!("Format error"),
-    }
-}
-/*
-fn create_texture_from_dxgi_desc(
-    dxgi_desc: &D3DSURFACE_DESC, // Your DXGI description
-    device: &wgpu::Device,
-) -> wgpu::Texture {
-    let format = dxgi_format_to_wgpu_format(dxgi_desc.Format.0);
-
-    let texture_desc = wgpu::TextureDescriptor {
-        label: None,
-        size: wgpu::Extent3d {
-            width: dxgi_desc.Width,
-            height: dxgi_desc.Height,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-        view_formats: &[],
-    };
-
-    device.create_texture(&texture_desc)
-}*/
 
 fn generate_verticles(scale_x: f32, scale_y: f32) -> [Vertex; 6] {
     [
@@ -241,6 +160,52 @@ fn generate_verticles(scale_x: f32, scale_y: f32) -> [Vertex; 6] {
     ]
 }
 
+pub struct DirectX11Fence {
+    fence: ID3D11Fence,
+    event: HANDLE,
+    fence_value: std::sync::atomic::AtomicU64,
+}
+unsafe impl Send for DirectX11Fence {}
+impl DirectX11Fence {
+    pub fn new(device: &ID3D11Device) -> windows::core::Result<Self> {
+        unsafe {
+            let device = device.cast::<ID3D11Device5>()?;
+            let mut fence: Option<ID3D11Fence> = None;
+
+            device.CreateFence(0, D3D11_FENCE_FLAG_NONE, &mut fence)?;
+            let fence = fence.ok_or(windows::core::Error::new(E_FAIL, "Failed to create fence"))?;
+
+            let event = CreateEventA(None, false, false, windows::core::PCSTR::null())?;
+
+            Ok(Self {
+                fence,
+                event,
+                fence_value: Default::default(),
+            })
+        }
+    }
+    pub fn synchronize(&self, context: &ID3D11DeviceContext) -> windows::core::Result<()> {
+        let context = context.cast::<ID3D11DeviceContext4>()?;
+        let v = self
+            .fence_value
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        unsafe {
+            context.Signal(&self.fence, v)?;
+            self.fence.SetEventOnCompletion(v, self.event)?;
+            WaitForSingleObject(self.event, 5000);
+        }
+        Ok(())
+    }
+}
+impl Drop for DirectX11Fence {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.event);
+        }
+    }
+}
+
 pub struct VideoRenderer {
     window: Arc<Window>,
     device: wgpu::Device,
@@ -255,7 +220,8 @@ pub struct VideoRenderer {
     texture_bind_group: BindGroup,
     texture_bind_group_layout: BindGroupLayout,
     render_pipeline: RenderPipeline,
-    dx_device: ID3D11Device, //frame_scaler: Context,
+    dx_device: ID3D11Device,
+    dx_context: ID3D11DeviceContext, //frame_scaler: Context,
 }
 
 impl VideoRenderer {
@@ -277,6 +243,14 @@ impl VideoRenderer {
             .await
             .unwrap();
 
+        let features = adapter.features();
+
+        if features.contains(wgpu::Features::TEXTURE_FORMAT_NV12) {
+            println!("✅ NV12 supported!");
+        } else {
+            println!("❌ NV12 not supported! Falling back to manual YUV conversion.");
+        }
+
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
@@ -295,7 +269,7 @@ impl VideoRenderer {
         let cap = surface.get_capabilities(&adapter);
         let surface_format = cap.formats[0];
 
-        let dxdevice = open_d3d11_device();
+        let (dxdevice, dxcontext) = open_d3d11_device();
 
         let render_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Render Texture"),
@@ -308,34 +282,17 @@ impl VideoRenderer {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: surface_format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                | wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::COPY_DST,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[surface_format],
         });
 
-        let frame_size = winit::dpi::PhysicalSize::new(1, 1);
-
-        //Need some dynamic
-        let dst_format = ffmpeg_next::format::Pixel::BGRA;
-        let frame_scaler = ffmpeg_next::software::scaling::Context::get(
-            ffmpeg_next::format::Pixel::BGRA,
-            frame_size.width,
-            frame_size.height,
-            dst_format,
-            frame_size.width,
-            frame_size.height,
-            ffmpeg_next::software::scaling::Flags::BILINEAR,
-        )
-        .unwrap();
+        let frame_size = winit::dpi::PhysicalSize::new(1920, 1080);
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Nearest,
             ..Default::default()
         });
 
@@ -366,6 +323,18 @@ impl VideoRenderer {
             format: Some(surface_format),
             ..Default::default()
         });
+
+        let surface_config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format: surface_format,
+            view_formats: vec![surface_format],
+            alpha_mode: wgpu::CompositeAlphaMode::Auto,
+            width: 1920,
+            height: 1080,
+            present_mode: wgpu::PresentMode::AutoVsync,
+            desired_maximum_frame_latency: 10,
+        };
+        surface.configure(&device, &surface_config);
 
         let texture_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             layout: &texture_bind_group_layout,
@@ -439,11 +408,9 @@ impl VideoRenderer {
             texture_bind_group,
             texture_bind_group_layout,
             render_pipeline,
-            dx_device: dxdevice, //frame_scaler,
+            dx_device: dxdevice,
+            dx_context: dxcontext, //frame_scaler,
         };
-
-        // Configure surface for the first time
-        state.configure_surface();
 
         state
     }
@@ -452,147 +419,69 @@ impl VideoRenderer {
         &self.window
     }
 
-    fn configure_surface(&self) {
-        let surface_config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format: self.surface_format,
-            view_formats: vec![self.surface_format],
-            alpha_mode: wgpu::CompositeAlphaMode::Auto,
-            width: self.size.width,
-            height: self.size.height,
-            present_mode: wgpu::PresentMode::AutoVsync,
-            desired_maximum_frame_latency: 10,
-        };
-        self.surface.configure(&self.device, &surface_config);
-    }
-
-    fn configure_vertext_buffer(&mut self, width: u32, height: u32) {
-        let texture_aspect = self.frame_size.width as f32 / self.frame_size.height as f32;
-        let window_aspect = width as f32 / height as f32;
-
-        let (scale_x, scale_y) = if texture_aspect > window_aspect {
-            (1.0, window_aspect / texture_aspect)
-        } else {
-            (texture_aspect / window_aspect, 1.0)
-        };
-
-        let vertices = generate_verticles(scale_x, scale_y);
-        self.vertex_buffer.destroy();
-        let vertex_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Vertex Buffer"),
-                contents: bytemuck::cast_slice(&vertices),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
-
-        self.vertex_buffer = vertex_buffer;
-    }
-
-    fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
-        self.size = new_size;
-        if self.size.width > 0 && self.size.height > 0 {
-            let width = self.size.width;
-            let height = self.size.height;
-
-            self.configure_vertext_buffer(width, height);
-            self.configure_surface();
-        }
-    }
-
-    fn on_resize_frame(&mut self, frame: Video) {
-        let width = frame.width();
-        let height = frame.height();
-
-        self.frame_size = winit::dpi::PhysicalSize::new(width, height);
-
-        let windows_size = self.get_window().inner_size();
-        self.configure_vertext_buffer(windows_size.width, windows_size.height);
-
-        let dst_format = ffmpeg_next::format::Pixel::BGRA;
-        let frame_scaler = ffmpeg_next::software::scaling::Context::get(
-            frame.format(),
-            width,
-            height,
-            dst_format,
-            width,
-            height,
-            ffmpeg_next::software::scaling::Flags::BILINEAR,
-        )
-        .unwrap();
-
-        self.render_texture = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("Render Texture"),
-            size: wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: self.surface_format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                | wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[self.surface_format],
-        });
-
-        let view = self
-            .render_texture
-            .create_view(&wgpu::TextureViewDescriptor {
-                format: Some(self.surface_format),
-                ..Default::default()
-            });
-
-        self.texture_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: &self.texture_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
-            ],
-            label: Some("texture_bind_group"),
-        });
-    }
-
     pub fn render(&self, frame: Arc<Video>) {
-        let format = frame.format();
+        //let format = frame.format();
         unsafe {
-            /*
-                    let mut desc = D3DSURFACE_DESC::default();
-                    unsafe {
-                        let texture = (*frame.as_ptr()).data[3] as *mut _;
-
-                        if let Err(e) = IDirect3DSurface9::from_raw_borrowed(&texture)
-                            .unwrap()
-                            .GetDesc(&mut desc)
-                        {
-                            //log::error!("Failed to get DXVA2 {}", e);
-                            println!("Failed to get DXVA2 {}", e);
-                        }
-                    }
-            */
-
             let frame_ptr = frame.as_ptr();
-            // println!("Frame pointer: {:?}", frame_ptr);
+            /*
+            // Assume `frame` is your AVFrame
+            let hw_frames_ctx = (*frame_ptr).hw_frames_ctx;
+            if hw_frames_ctx.is_null() {
+                panic!("No hardware frames context associated with the frame.");
+            }
 
-            //let texture_ptr = (*frame_ptr).data[3] as *mut std::ffi::c_void;
+            // Get the AVHWFramesContext from the AVBufferRef
+            let hw_frames_ctx_ref = (*hw_frames_ctx).data as *mut AVHWFramesContext;
+            let hw_device_ctx = (*hw_frames_ctx_ref).device_ctx;
+            if hw_device_ctx.is_null() {
+                panic!("No hardware device context associated with the frames context.");
+            }
 
-            //let tex_ptr = (*frame_ptr).data[3] as *mut ID3D11Texture2D;
-            //let tex: Option<&ID3D11Texture2D> = NonNull::new(tex_ptr).map(|ptr| &*ptr.as_ptr());
+            // Get the AVHWDeviceContext from the AVBufferRef
+            let hwctx = (*hw_device_ctx).hwctx as *mut AVD3D11VADeviceContext;
+            let hwctx = (*hw_device_ctx_ref).hwctx as *mut AVD3D11VADeviceContext;
+
+            // Get the ID3D11Device and ID3D11DeviceContext
+            let d3d11_device = (*hwctx).device;
+            let d3d11_device_context = (*hwctx).device_context;
+
+            println!("ID3D11Device: {:?}", d3d11_device);
+            println!("ID3D11DeviceContext: {:?}", d3d11_device_context);*/
 
             let texture = (*frame_ptr).data[0] as *mut _;
-            let texture = ID3D11Texture2D::from_raw_borrowed(&texture);
-            //let mut desc11 = D3D11_TEXTURE2D_DESC::default();
-            //tex.unwrap().GetDesc(&mut desc11);
+            let texture_opt = ID3D11Texture2D::from_raw_borrowed(&texture);
 
-            let shared_text = get_shared_texture_d3d11(&self.dx_device, texture.unwrap()).unwrap();
+            let (shared_handle, shared_text) =
+                get_shared_texture_d3d11(&self.dx_device, texture_opt.unwrap()).unwrap();
+            //let fence = DirectX11Fence::new(&self.dx_device).unwrap();
+
+            let shared_tex = shared_text.unwrap();
+
+            let mut desc = D3D11_TEXTURE2D_DESC::default();
+            texture_opt.unwrap().GetDesc(&mut desc);
+
+            if let Ok(mutex) = shared_tex.cast::<IDXGIKeyedMutex>() {
+                let acquire_result = mutex.AcquireSync(0, 500);
+
+                if let Err(e) = acquire_result {
+                    println!("❌ AcquireSync failed! Error: {:?}", e);
+                }
+
+                self.dx_context
+                    .CopyResource(texture_opt.unwrap(), &shared_tex);
+
+                //self.fence.synchronize(context)?;
+                //fence.synchronize(&self.dx_context).unwrap();
+
+                self.dx_context.Flush();
+
+                let release_result = mutex.ReleaseSync(0);
+                if let Err(e) = release_result {
+                    println!("❌ ReleaseSync failed! Error: {:?}", e);
+                    //return Err(e);
+                }
+                //Ok(())
+            }
 
             let raw_image = self
                 .device
@@ -603,7 +492,7 @@ impl VideoRenderer {
                         let mut resource =
                             None::<windows::Win32::Graphics::Direct3D12::ID3D12Resource>;
 
-                        match raw_device.OpenSharedHandle(shared_text, &mut resource) {
+                        match raw_device.OpenSharedHandle(shared_handle, &mut resource) {
                             Ok(_) => Ok(resource.unwrap()),
                             Err(e) => Err(e),
                         }
@@ -640,13 +529,6 @@ impl VideoRenderer {
 
             let texture = self.device.create_texture_from_hal::<Dx12>(texture, &desc);
 
-            /* let view = self
-            .render_texture
-            .create_view(&wgpu::TextureViewDescriptor {
-                format: Some(self.surface_format),
-                ..Default::default()
-            });*/
-
             let y_plane_view = texture.create_view(&wgpu::TextureViewDescriptor {
                 format: Some(wgpu::TextureFormat::R8Unorm), // Y plane
                 aspect: wgpu::TextureAspect::Plane0,        // First plane (Y)
@@ -659,20 +541,12 @@ impl VideoRenderer {
                 ..Default::default()
             });
 
-            /*let view_heh = texture.create_view(&wgpu::TextureViewDescriptor {
-                format: Some(self.surface_format),
-                ..Default::default()
-            });*/
-
-            //let src_view: wgpu::TextureView =
-            //    texture.create_view(&wgpu::TextureViewDescriptor::default());
-
             let texture_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 layout: &self.texture_bind_group_layout,
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&uv_plane_view),
+                        resource: wgpu::BindingResource::TextureView(&y_plane_view),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
@@ -693,83 +567,11 @@ impl VideoRenderer {
                     format: Some(self.surface_format),
                     ..Default::default()
                 });
-            /*
-            if frame.width() != self.frame_size.width || frame.height() != self.frame_size.height {
-                //self.on_resize_frame(frame.clone());
-            }
-
-            let dst_format = ffmpeg_next::format::Pixel::BGRA;
-            let mut frame_scaler = ffmpeg_next::software::scaling::Context::get(
-                frame.format(),
-                frame.width(),
-                frame.height(),
-                dst_format,
-                frame.width(),
-                frame.height(),
-                ffmpeg_next::software::scaling::Flags::BILINEAR,
-            )
-            .unwrap();
-
-            let mut dst_frame = ffmpeg_next::util::frame::Video::new(
-                frame_scaler.output().format,
-                frame.width(),
-                frame.height(),
-            );
-
-            _ = frame_scaler.run(&frame, &mut dst_frame);
-
-            let width_bytes = dst_frame.stride(0);
-            self.queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &self.render_texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d { x: 0, y: 0, z: 0 },
-                    aspect: wgpu::TextureAspect::All,
-                },
-                dst_frame.data(0),
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(width_bytes as u32),
-                    rows_per_image: Some(frame.height()),
-                },
-                wgpu::Extent3d {
-                    width: frame.width(),
-                    height: frame.height(),
-                    depth_or_array_layers: 1,
-                },
-            );*/
-
-            /*let texture_bind_group_layout =
-            self.device
-                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    entries: &[
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 0,
-                            visibility: wgpu::ShaderStages::FRAGMENT,
-                            ty: wgpu::BindingType::Texture {
-                                sample_type: wgpu::TextureSampleType::Float {
-                                    filterable: true,
-                                },
-                                view_dimension: wgpu::TextureViewDimension::D2,
-                                multisampled: false,
-                            },
-                            count: None,
-                        },
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 1,
-                            visibility: wgpu::ShaderStages::FRAGMENT,
-                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                            count: None,
-                        },
-                    ],
-                    label: Some("texture_bind_group_layout"),
-                });*/
 
             let shader = self
                 .device
                 .create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
 
-            // Create pipeline layout
             let pipeline_layout =
                 self.device
                     .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -778,7 +580,6 @@ impl VideoRenderer {
                         push_constant_ranges: &[],
                     });
 
-            // Create render pipeline
             let render_pipeline =
                 self.device
                     .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -836,6 +637,9 @@ impl VideoRenderer {
             self.queue.submit([encoder.finish()]);
             self.window.pre_present_notify();
             surface_texture.present();
+
+            _ = CloseHandle(shared_handle);
+            drop(frame);
         }
     }
 }

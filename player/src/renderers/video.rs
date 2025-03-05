@@ -27,8 +27,8 @@ use winit::window::Window;
 // Define a raw struct for AVD3D11VAContext if it's not exposed in the bindings
 #[repr(C)]
 struct AVD3D11VADeviceContext {
-    device: *mut ID3D11Device,
-    device_context: *mut ID3D11DeviceContext,
+    device: *mut std::ffi::c_void,
+    device_context: *mut std::ffi::c_void,
     video_device: *mut ID3D11VideoDevice,
     video_context: *mut ID3D11VideoContext,
     lock: Option<unsafe extern "C" fn(*mut std::ffi::c_void)>,
@@ -351,7 +351,8 @@ impl VideoRenderer {
             label: Some("texture_bind_group"),
         });
 
-        let shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
+        let shader: wgpu::ShaderModule =
+            device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
 
         // Create pipeline layout
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -423,7 +424,7 @@ impl VideoRenderer {
         //let format = frame.format();
         unsafe {
             let frame_ptr = frame.as_ptr();
-            /*
+
             // Assume `frame` is your AVFrame
             let hw_frames_ctx = (*frame_ptr).hw_frames_ctx;
             if hw_frames_ctx.is_null() {
@@ -436,29 +437,32 @@ impl VideoRenderer {
             if hw_device_ctx.is_null() {
                 panic!("No hardware device context associated with the frames context.");
             }
-
             // Get the AVHWDeviceContext from the AVBufferRef
             let hwctx = (*hw_device_ctx).hwctx as *mut AVD3D11VADeviceContext;
-            let hwctx = (*hw_device_ctx_ref).hwctx as *mut AVD3D11VADeviceContext;
 
             // Get the ID3D11Device and ID3D11DeviceContext
-            let d3d11_device = (*hwctx).device;
-            let d3d11_device_context = (*hwctx).device_context;
+            //let d3d11_device: *mut ID3D11Device = (*hwctx).device;
+            //let d3d11_device_context = (*hwctx).device_context;
 
+            let d3d11_device = ID3D11Device::from_raw_borrowed(&(*hwctx).device).unwrap();
+            let d3d11_device_context =
+                ID3D11DeviceContext::from_raw_borrowed(&(*hwctx).device_context).unwrap();
+            /*
             println!("ID3D11Device: {:?}", d3d11_device);
-            println!("ID3D11DeviceContext: {:?}", d3d11_device_context);*/
-
+            println!("ID3D11DeviceContext: {:?}", d3d11_device_context);
+            */
             let texture = (*frame_ptr).data[0] as *mut _;
             let texture_opt = ID3D11Texture2D::from_raw_borrowed(&texture);
 
             let (shared_handle, shared_text) =
-                get_shared_texture_d3d11(&self.dx_device, texture_opt.unwrap()).unwrap();
-            //let fence = DirectX11Fence::new(&self.dx_device).unwrap();
+                get_shared_texture_d3d11(d3d11_device, texture_opt.unwrap()).unwrap();
+            let fence = DirectX11Fence::new(d3d11_device).unwrap();
 
             let shared_tex = shared_text.unwrap();
+            let text = texture_opt.unwrap();
 
             let mut desc = D3D11_TEXTURE2D_DESC::default();
-            texture_opt.unwrap().GetDesc(&mut desc);
+            text.GetDesc(&mut desc);
 
             if let Ok(mutex) = shared_tex.cast::<IDXGIKeyedMutex>() {
                 let acquire_result = mutex.AcquireSync(0, 500);
@@ -467,20 +471,16 @@ impl VideoRenderer {
                     println!("❌ AcquireSync failed! Error: {:?}", e);
                 }
 
-                self.dx_context
-                    .CopyResource(texture_opt.unwrap(), &shared_tex);
+                d3d11_device_context.CopyResource(text, &shared_tex);
 
-                //self.fence.synchronize(context)?;
-                //fence.synchronize(&self.dx_context).unwrap();
+                fence.synchronize(d3d11_device_context).unwrap();
 
-                self.dx_context.Flush();
+                d3d11_device_context.Flush();
 
                 let release_result = mutex.ReleaseSync(0);
                 if let Err(e) = release_result {
                     println!("❌ ReleaseSync failed! Error: {:?}", e);
-                    //return Err(e);
                 }
-                //Ok(())
             }
 
             let raw_image = self
@@ -515,7 +515,7 @@ impl VideoRenderer {
                 dimension: wgpu::TextureDimension::D2,
                 format: TextureFormat::NV12,
                 usage,
-                view_formats: &[],
+                view_formats: &[wgpu::TextureFormat::Rgba8Unorm],
             };
 
             let texture = <Dx12 as wgpu::hal::Api>::Device::texture_from_raw(
@@ -527,15 +527,15 @@ impl VideoRenderer {
                 1,
             );
 
-            let texture = self.device.create_texture_from_hal::<Dx12>(texture, &desc);
+            let texture_asd = self.device.create_texture_from_hal::<Dx12>(texture, &desc);
 
-            let y_plane_view = texture.create_view(&wgpu::TextureViewDescriptor {
+            let y_plane_view = texture_asd.create_view(&wgpu::TextureViewDescriptor {
                 format: Some(wgpu::TextureFormat::R8Unorm), // Y plane
                 aspect: wgpu::TextureAspect::Plane0,        // First plane (Y)
                 ..Default::default()
             });
 
-            let uv_plane_view = texture.create_view(&wgpu::TextureViewDescriptor {
+            let uv_plane_view = texture_asd.create_view(&wgpu::TextureViewDescriptor {
                 format: Some(wgpu::TextureFormat::Rg8Unorm), // UV plane
                 aspect: wgpu::TextureAspect::Plane1,         // Second plane (UV)
                 ..Default::default()

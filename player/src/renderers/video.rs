@@ -12,15 +12,13 @@ use wgpu::{Backends, Instance, InstanceDescriptor};
 extern crate ffmpeg_sys_next;
 
 use wgpu::TextureFormat;
-use wgpu::{util::DeviceExt, BindGroup, BindGroupLayout, RenderPipeline, Sampler};
+use wgpu::{util::DeviceExt, BindGroupLayout, Sampler};
 use windows::core::Interface;
 use windows::Win32::Foundation::HMODULE;
-use windows::Win32::Foundation::{CloseHandle, E_FAIL, E_NOINTERFACE, GENERIC_ALL, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, E_FAIL, HANDLE};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
 
-use windows::Win32::Graphics::Direct3D12::*;
-use windows::Win32::Graphics::{Direct3D11::*, Direct3D12, Dxgi::Common::*, Dxgi::*};
-use windows::Win32::Graphics::{Direct3D11::*, Dxgi::Common::*, Dxgi::*};
+use windows::Win32::Graphics::{Direct3D11::*, Dxgi::*};
 use windows::Win32::System::Threading::{CreateEventA, WaitForSingleObject};
 use winit::window::Window;
 
@@ -210,25 +208,25 @@ pub struct VideoRenderer {
     window: Arc<Window>,
     device: wgpu::Device,
     queue: wgpu::Queue,
-    size: winit::dpi::PhysicalSize<u32>,
-    frame_size: winit::dpi::PhysicalSize<u32>,
+    //size: winit::dpi::PhysicalSize<u32>,
+    //frame_size: winit::dpi::PhysicalSize<u32>,
     surface: wgpu::Surface<'static>,
     surface_format: TextureFormat,
     sampler: Sampler,
-    render_texture: wgpu::Texture,
+    //render_texture: wgpu::Texture,
     vertex_buffer: wgpu::Buffer,
-    texture_bind_group: BindGroup,
+    // texture_bind_group: BindGroup,
     texture_bind_group_layout: BindGroupLayout,
-    render_pipeline: RenderPipeline,
-    dx_device: ID3D11Device,
-    dx_context: ID3D11DeviceContext, //frame_scaler: Context,
+    //render_pipeline: RenderPipeline,
+    /*dx_device: ID3D11Device,
+    dx_context: ID3D11DeviceContext, *///frame_scaler: Context,
 }
 
 impl VideoRenderer {
     pub async fn new(window: Arc<Window>) -> Self {
         let instance = Instance::new(&InstanceDescriptor {
             backends: Backends::DX12,
-            flags: wgpu::InstanceFlags::DEBUG, // Force DirectX 12 backend
+            // flags: wgpu::InstanceFlags::DEBUG, // Force DirectX 12 backend
             ..Default::default()
         });
 
@@ -263,31 +261,31 @@ impl VideoRenderer {
             )
             .await
             .unwrap();
-
-        let size = window.inner_size();
-
+        /*
+                        let size = window.inner_size();
+        */
         let cap = surface.get_capabilities(&adapter);
         let surface_format = cap.formats[0];
 
-        let (dxdevice, dxcontext) = open_d3d11_device();
+        //let (dxdevice, dxcontext) = open_d3d11_device();
+        /*
+                                let render_texture = device.create_texture(&wgpu::TextureDescriptor {
+                                    label: Some("Render Texture"),
+                                    size: wgpu::Extent3d {
+                                        width: 1920,
+                                        height: 1080,
+                                        depth_or_array_layers: 1,
+                                    },
+                                    mip_level_count: 1,
+                                    sample_count: 1,
+                                    dimension: wgpu::TextureDimension::D2,
+                                    format: surface_format,
+                                    usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                                    view_formats: &[surface_format],
+                                });
 
-        let render_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("Render Texture"),
-            size: wgpu::Extent3d {
-                width: 1920,
-                height: 1080,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: surface_format,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[surface_format],
-        });
-
-        let frame_size = winit::dpi::PhysicalSize::new(1920, 1080);
-
+                                let frame_size = winit::dpi::PhysicalSize::new(1920, 1080);
+        */
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
@@ -318,12 +316,12 @@ impl VideoRenderer {
                 ],
                 label: Some("texture_bind_group_layout"),
             });
-
-        let view = render_texture.create_view(&wgpu::TextureViewDescriptor {
-            format: Some(surface_format),
-            ..Default::default()
-        });
-
+        /*
+                        let view = render_texture.create_view(&wgpu::TextureViewDescriptor {
+                            format: Some(surface_format),
+                            ..Default::default()
+                        });
+        */
         let surface_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
@@ -335,60 +333,60 @@ impl VideoRenderer {
             desired_maximum_frame_latency: 10,
         };
         surface.configure(&device, &surface_config);
+        /*
+                        let texture_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            layout: &texture_bind_group_layout,
+                            entries: &[
+                                wgpu::BindGroupEntry {
+                                    binding: 0,
+                                    resource: wgpu::BindingResource::TextureView(&view),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 1,
+                                    resource: wgpu::BindingResource::Sampler(&sampler),
+                                },
+                            ],
+                            label: Some("texture_bind_group"),
+                        });
 
-        let texture_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: &texture_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&sampler),
-                },
-            ],
-            label: Some("texture_bind_group"),
-        });
+                        let shader: wgpu::ShaderModule =
+                            device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
 
-        let shader: wgpu::ShaderModule =
-            device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
+                        // Create pipeline layout
+                        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                            label: Some("Pipeline Layout"),
+                            bind_group_layouts: &[&texture_bind_group_layout],
+                            push_constant_ranges: &[],
+                        });
 
-        // Create pipeline layout
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Pipeline Layout"),
-            bind_group_layouts: &[&texture_bind_group_layout],
-            push_constant_ranges: &[],
-        });
-
-        // Create render pipeline
-        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Render Pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                buffers: &[Vertex::desc()],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: surface_format,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview: None,
-            cache: None,
-        });
-
-        let vertices = generate_verticles(1., 1.);
+                        // Create render pipeline
+                        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                            label: Some("Render Pipeline"),
+                            layout: Some(&pipeline_layout),
+                            vertex: wgpu::VertexState {
+                                module: &shader,
+                                entry_point: Some("vs_main"),
+                                buffers: &[Vertex::desc()],
+                                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                            },
+                            fragment: Some(wgpu::FragmentState {
+                                module: &shader,
+                                entry_point: Some("fs_main"),
+                                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                                targets: &[Some(wgpu::ColorTargetState {
+                                    format: surface_format,
+                                    blend: Some(wgpu::BlendState::REPLACE),
+                                    write_mask: wgpu::ColorWrites::ALL,
+                                })],
+                            }),
+                            primitive: wgpu::PrimitiveState::default(),
+                            depth_stencil: None,
+                            multisample: wgpu::MultisampleState::default(),
+                            multiview: None,
+                            cache: None,
+                        });
+        */
+        let vertices = generate_verticles(1920., 1080.);
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Vertex Buffer"),
             contents: bytemuck::cast_slice(&vertices),
@@ -399,18 +397,18 @@ impl VideoRenderer {
             window,
             device,
             queue,
-            size,
-            frame_size,
+            //size,
+            //frame_size,
             surface,
             surface_format,
             sampler,
-            render_texture,
+            //render_texture,
             vertex_buffer,
-            texture_bind_group,
+            // texture_bind_group,
             texture_bind_group_layout,
-            render_pipeline,
-            dx_device: dxdevice,
-            dx_context: dxcontext, //frame_scaler,
+            //render_pipeline,
+            /* dx_device: dxdevice,
+            dx_context: dxcontext,*/ //frame_scaler,
         };
 
         state
@@ -471,7 +469,7 @@ impl VideoRenderer {
                     println!("❌ AcquireSync failed! Error: {:?}", e);
                 }
 
-                d3d11_device_context.CopyResource(text, &shared_tex);
+                d3d11_device_context.CopyResource(&shared_tex, text);
 
                 fence.synchronize(d3d11_device_context).unwrap();
 
@@ -546,7 +544,7 @@ impl VideoRenderer {
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&y_plane_view),
+                        resource: wgpu::BindingResource::TextureView(&uv_plane_view),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
@@ -616,7 +614,7 @@ impl VideoRenderer {
                         view: &texture_view,
                         resolve_target: None,
                         ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            load: wgpu::LoadOp::Clear(wgpu::Color::GREEN),
                             store: wgpu::StoreOp::Store,
                         },
                     })],

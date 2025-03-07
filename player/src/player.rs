@@ -464,7 +464,7 @@ impl Player {
             // Get the ID3D11Device and ID3D11DeviceContext
             let d3d11_device = (*hwctx).device as *mut ID3D11Device;
             let d3d11_device_context = (*hwctx).device_context as *mut ID3D11DeviceContext;
-            println!("D3D11VA hardware device context created successfully.");
+
             println!("ID3D11Device: {:?}", d3d11_device);
             println!("ID3D11DeviceContext: {:?}", d3d11_device_context);
         }

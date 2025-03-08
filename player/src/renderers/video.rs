@@ -1,11 +1,11 @@
 use ffmpeg_next::frame::Video;
 
 use ffmpeg_sys_next::AVHWFramesContext;
-use wgpu::RenderPipeline;
 use std::sync::Arc;
 use wgpu::hal::api::Dx12;
 use wgpu::Extent3d;
 use wgpu::MemoryHints;
+use wgpu::RenderPipeline;
 use wgpu::{Backends, Instance, InstanceDescriptor};
 
 extern crate ffmpeg_sys_next;
@@ -63,11 +63,11 @@ impl Vertex {
 pub fn get_shared_texture_d3d11(
     device: &ID3D11Device,
     texture: &ID3D11Texture2D,
-    height: u32
+    height: u32,
 ) -> Result<(HANDLE, Option<ID3D11Texture2D>), Box<dyn std::error::Error>> {
     unsafe {
         // Try to open or create shared handle if possible
-        if let Ok(dxgi_resource) = texture.cast::<IDXGIResource1>() {
+        /*if let Ok(dxgi_resource) = texture.cast::<IDXGIResource1>() {
             if let Ok(handle) = dxgi_resource.CreateSharedHandle(
                 None,
                 DXGI_SHARED_RESOURCE_READ.0 | DXGI_SHARED_RESOURCE_WRITE.0,
@@ -77,7 +77,7 @@ pub fn get_shared_texture_d3d11(
                     return Ok((handle, None));
                 }
             }
-        }
+        }*/
 
         // No shared handle and not possible to create one.
         // We need to create a new texture and use texture copy from our original one.
@@ -199,7 +199,6 @@ impl VideoRenderer {
     pub async fn new(window: Arc<Window>) -> Self {
         let instance = Instance::new(&InstanceDescriptor {
             backends: Backends::DX12,
-            // flags: wgpu::InstanceFlags::DEBUG, // Force DirectX 12 backend
             ..Default::default()
         });
 
@@ -234,17 +233,19 @@ impl VideoRenderer {
             )
             .await
             .unwrap();
-        
+
         let size = window.inner_size();
-        
+
         let cap = surface.get_capabilities(&adapter);
         let surface_format = cap.formats[0];
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
 
@@ -293,43 +294,43 @@ impl VideoRenderer {
         };
         surface.configure(&device, &surface_config);
 
-                        let shader: wgpu::ShaderModule =
-                            device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
+        let shader: wgpu::ShaderModule =
+            device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
 
-                        // Create pipeline layout
-                        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                            label: Some("Pipeline Layout"),
-                            bind_group_layouts: &[&texture_bind_group_layout],
-                            push_constant_ranges: &[],
-                        });
+        // Create pipeline layout
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Pipeline Layout"),
+            bind_group_layouts: &[&texture_bind_group_layout],
+            push_constant_ranges: &[],
+        });
 
-                        // Create render pipeline
-                        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                            label: Some("Render Pipeline"),
-                            layout: Some(&pipeline_layout),
-                            vertex: wgpu::VertexState {
-                                module: &shader,
-                                entry_point: Some("vs_main"),
-                                buffers: &[Vertex::desc()],
-                                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                            },
-                            fragment: Some(wgpu::FragmentState {
-                                module: &shader,
-                                entry_point: Some("fs_main"),
-                                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                                targets: &[Some(wgpu::ColorTargetState {
-                                    format: surface_format,
-                                    blend: Some(wgpu::BlendState::REPLACE),
-                                    write_mask: wgpu::ColorWrites::ALL,
-                                })],
-                            }),
-                            primitive: wgpu::PrimitiveState::default(),
-                            depth_stencil: None,
-                            multisample: wgpu::MultisampleState::default(),
-                            multiview: None,
-                            cache: None,
-                        });
-        
+        // Create render pipeline
+        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Render Pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[Vertex::desc()],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
         let vertices = generate_verticles(1., 1.);
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Vertex Buffer"),
@@ -348,7 +349,7 @@ impl VideoRenderer {
             sampler,
             vertex_buffer,
             texture_bind_group_layout,
-            render_pipeline
+            render_pipeline,
         };
 
         state
@@ -391,11 +392,7 @@ impl VideoRenderer {
             texture_ref.GetDesc(&mut desc);
 
             if let Ok(mutex) = shared_tex.cast::<IDXGIKeyedMutex>() {
-                let acquire_result = mutex.AcquireSync(0, 500);
-
-                if let Err(e) = acquire_result {
-                    println!("❌ AcquireSync failed! Error: {:?}", e);
-                }
+                mutex.AcquireSync(0, 500).unwrap();
 
                 d3d11_device_context.CopySubresourceRegion(
                     &shared_tex,
@@ -409,10 +406,7 @@ impl VideoRenderer {
                 );
                 fence.synchronize(d3d11_device_context).unwrap();
 
-                let release_result = mutex.ReleaseSync(0);
-                if let Err(e) = release_result {
-                    println!("❌ ReleaseSync failed! Error: {:?}", e);
-                }
+                mutex.ReleaseSync(0).unwrap();
             }
 
             let raw_image = self
@@ -448,7 +442,7 @@ impl VideoRenderer {
                 view_formats: &[TextureFormat::Bgra8UnormSrgb],
             };
 
-            let texture = <Dx12 as wgpu::hal::Api>::Device::texture_from_raw(
+            let dx_texture = <Dx12 as wgpu::hal::Api>::Device::texture_from_raw(
                 raw_image,
                 desc.format,
                 desc.dimension,
@@ -457,15 +451,17 @@ impl VideoRenderer {
                 1,
             );
 
-            let texture_asd = self.device.create_texture_from_hal::<Dx12>(texture, &desc);
+            let texture = self
+                .device
+                .create_texture_from_hal::<Dx12>(dx_texture, &desc);
 
-            let y_plane_view = texture_asd.create_view(&wgpu::TextureViewDescriptor {
+            let y_plane_view = texture.create_view(&wgpu::TextureViewDescriptor {
                 format: Some(wgpu::TextureFormat::R8Unorm), // Y plane
                 aspect: wgpu::TextureAspect::Plane0,        // First plane (Y)
                 ..Default::default()
             });
 
-            let uv_plane_view = texture_asd.create_view(&wgpu::TextureViewDescriptor {
+            let uv_plane_view = texture.create_view(&wgpu::TextureViewDescriptor {
                 format: Some(wgpu::TextureFormat::Rg8Unorm), // UV plane
                 aspect: wgpu::TextureAspect::Plane1,         // Second plane (UV)
                 ..Default::default()
@@ -534,7 +530,7 @@ impl VideoRenderer {
 
             _ = CloseHandle(shared_handle);
 
-            drop(texture_asd);
+            drop(texture);
             drop(frame);
         }
     }

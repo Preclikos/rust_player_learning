@@ -3,3 +3,4 @@ members = [
     "app",
     "player"
 ]
+resolver = "2"

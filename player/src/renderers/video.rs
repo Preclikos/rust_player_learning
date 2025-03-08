@@ -1,6 +1,7 @@
 use ffmpeg_next::frame::Video;
 
 use ffmpeg_sys_next::AVHWFramesContext;
+use wgpu::RenderPipeline;
 use std::sync::Arc;
 use wgpu::hal::api::Dx12;
 use wgpu::Extent3d;
@@ -62,6 +63,7 @@ impl Vertex {
 pub fn get_shared_texture_d3d11(
     device: &ID3D11Device,
     texture: &ID3D11Texture2D,
+    height: u32
 ) -> Result<(HANDLE, Option<ID3D11Texture2D>), Box<dyn std::error::Error>> {
     unsafe {
         // Try to open or create shared handle if possible
@@ -84,6 +86,7 @@ pub fn get_shared_texture_d3d11(
         desc.MiscFlags |= D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0 as u32
             | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX.0 as u32;
 
+        desc.Height = height;
         desc.ArraySize = 1;
 
         let mut new_texture = None;
@@ -182,16 +185,14 @@ pub struct VideoRenderer {
     window: Arc<Window>,
     device: wgpu::Device,
     queue: wgpu::Queue,
-    //size: winit::dpi::PhysicalSize<u32>,
+    size: winit::dpi::PhysicalSize<u32>,
     //frame_size: winit::dpi::PhysicalSize<u32>,
     surface: wgpu::Surface<'static>,
     surface_format: TextureFormat,
     sampler: Sampler,
-    //render_texture: wgpu::Texture,
     vertex_buffer: wgpu::Buffer,
-    // texture_bind_group: BindGroup,
     texture_bind_group_layout: BindGroupLayout,
-    //render_pipeline: RenderPipeline,
+    render_pipeline: RenderPipeline,
 }
 
 impl VideoRenderer {
@@ -233,19 +234,17 @@ impl VideoRenderer {
             )
             .await
             .unwrap();
-        /*
-                        let size = window.inner_size();
-        */
+        
+        let size = window.inner_size();
+        
         let cap = surface.get_capabilities(&adapter);
         let surface_format = cap.formats[0];
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Nearest,
             ..Default::default()
         });
 
@@ -281,38 +280,18 @@ impl VideoRenderer {
                 ],
                 label: Some("texture_bind_group_layout"),
             });
-        /*
-                        let view = render_texture.create_view(&wgpu::TextureViewDescriptor {
-                            format: Some(surface_format),
-                            ..Default::default()
-                        });
-        */
+
         let surface_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
             view_formats: vec![surface_format],
             alpha_mode: wgpu::CompositeAlphaMode::Auto,
-            width: 1920,
-            height: 1080,
+            width: 3840,
+            height: 1728,
             present_mode: wgpu::PresentMode::AutoVsync,
             desired_maximum_frame_latency: 10,
         };
         surface.configure(&device, &surface_config);
-        /*
-                        let texture_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                            layout: &texture_bind_group_layout,
-                            entries: &[
-                                wgpu::BindGroupEntry {
-                                    binding: 0,
-                                    resource: wgpu::BindingResource::TextureView(&view),
-                                },
-                                wgpu::BindGroupEntry {
-                                    binding: 1,
-                                    resource: wgpu::BindingResource::Sampler(&sampler),
-                                },
-                            ],
-                            label: Some("texture_bind_group"),
-                        });
 
                         let shader: wgpu::ShaderModule =
                             device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
@@ -350,7 +329,7 @@ impl VideoRenderer {
                             multiview: None,
                             cache: None,
                         });
-        */
+        
         let vertices = generate_verticles(1., 1.);
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Vertex Buffer"),
@@ -362,16 +341,14 @@ impl VideoRenderer {
             window,
             device,
             queue,
-            //size,
+            size,
             //frame_size,
             surface,
             surface_format,
             sampler,
-            //render_texture,
             vertex_buffer,
-            // texture_bind_group,
             texture_bind_group_layout,
-            //render_pipeline
+            render_pipeline
         };
 
         state
@@ -405,7 +382,7 @@ impl VideoRenderer {
             let texture_ref = ID3D11Texture2D::from_raw_borrowed(&texture).unwrap();
 
             let (shared_handle, shared_text) =
-                get_shared_texture_d3d11(d3d11_device, texture_ref).unwrap();
+                get_shared_texture_d3d11(d3d11_device, texture_ref, frame.height()).unwrap();
             let fence = DirectX11Fence::new(d3d11_device).unwrap();
 
             let shared_tex = shared_text.unwrap();
@@ -468,7 +445,7 @@ impl VideoRenderer {
                 dimension: wgpu::TextureDimension::D2,
                 format: TextureFormat::NV12,
                 usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC,
-                view_formats: &[self.surface_format],
+                view_formats: &[TextureFormat::Bgra8UnormSrgb],
             };
 
             let texture = <Dx12 as wgpu::hal::Api>::Device::texture_from_raw(
@@ -525,46 +502,6 @@ impl VideoRenderer {
                     ..Default::default()
                 });
 
-            let shader = self
-                .device
-                .create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
-
-            let pipeline_layout =
-                self.device
-                    .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                        label: Some("Pipeline Layout"),
-                        bind_group_layouts: &[&self.texture_bind_group_layout],
-                        push_constant_ranges: &[],
-                    });
-
-            let render_pipeline =
-                self.device
-                    .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                        label: Some("Render Pipeline"),
-                        layout: Some(&pipeline_layout),
-                        vertex: wgpu::VertexState {
-                            module: &shader,
-                            entry_point: Some("vs_main"),
-                            buffers: &[Vertex::desc()],
-                            compilation_options: wgpu::PipelineCompilationOptions::default(),
-                        },
-                        fragment: Some(wgpu::FragmentState {
-                            module: &shader,
-                            entry_point: Some("fs_main"),
-                            compilation_options: wgpu::PipelineCompilationOptions::default(),
-                            targets: &[Some(wgpu::ColorTargetState {
-                                format: self.surface_format,
-                                blend: Some(wgpu::BlendState::REPLACE),
-                                write_mask: wgpu::ColorWrites::ALL,
-                            })],
-                        }),
-                        primitive: wgpu::PrimitiveState::default(),
-                        depth_stencil: None,
-                        multisample: wgpu::MultisampleState::default(),
-                        multiview: None,
-                        cache: None,
-                    });
-
             let mut encoder = self.device.create_command_encoder(&Default::default());
             {
                 let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -582,7 +519,7 @@ impl VideoRenderer {
                     occlusion_query_set: None,
                 });
 
-                render_pass.set_pipeline(&render_pipeline);
+                render_pass.set_pipeline(&self.render_pipeline);
                 render_pass.set_bind_group(0, &texture_bind_group, &[]);
 
                 render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
@@ -596,6 +533,8 @@ impl VideoRenderer {
             surface_texture.present();
 
             _ = CloseHandle(shared_handle);
+
+            drop(texture_asd);
             drop(frame);
         }
     }

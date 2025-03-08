@@ -88,7 +88,7 @@ impl AudioRenderer {
             .default_output_config()
             .expect("Failed to get default config");
 
-        let volume = Arc::new(RwLock::new(1.0_f32));
+        let volume = Arc::new(RwLock::new(0.3_f32));
 
         let stop_cpal = stop.clone();
         let config_cpal = config.clone();

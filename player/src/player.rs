@@ -11,7 +11,7 @@ use ffmpeg_next::frame::{Audio, Video};
 use ffmpeg_next::software::resampling::Context;
 use ffmpeg_next::{Packet, Rational};
 use ffmpeg_sys_next::{
-    av_hwdevice_ctx_create, av_hwframe_transfer_data, AVBufferRef, AVCodecContext,
+    av_hwdevice_ctx_create, AVBufferRef,
     AVHWDeviceContext, AVHWDeviceType,
 };
 use parsers::mp4::{aac_sampling_frequency_index_to_u32, apped_hevc_header, parse_hevc_nalu};
@@ -25,7 +25,6 @@ use windows::Win32::Graphics::Direct3D11::{
 use winit::window::Window;
 
 use std::error::Error;
-use std::ptr::null_mut;
 use std::time::Duration;
 use tokio::sync::Notify;
 use tokio::time::Instant;
@@ -38,7 +37,7 @@ use tracks::{
 };
 use url::Url;
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::sync::mpsc::{self, Receiver};
 use tokio::task::{self, JoinHandle};
 
@@ -98,6 +97,7 @@ async fn video_sync_producer(
             println!("Video drift more then 20ms dropping frame");
             continue;
         }
+
         _ = output_tx.render(frame);
     }
 }

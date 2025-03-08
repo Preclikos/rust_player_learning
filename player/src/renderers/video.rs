@@ -1,7 +1,5 @@
 use ffmpeg_next::frame::Video;
-use ffmpeg_sys_next::AVFrame;
-use ffmpeg_sys_next::AVHWDeviceContext;
-use ffmpeg_sys_next::AVHWDeviceType;
+
 use ffmpeg_sys_next::AVHWFramesContext;
 use std::sync::Arc;
 use wgpu::hal::api::Dx12;
@@ -14,9 +12,7 @@ extern crate ffmpeg_sys_next;
 use wgpu::TextureFormat;
 use wgpu::{util::DeviceExt, BindGroupLayout, Sampler};
 use windows::core::Interface;
-use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Foundation::{CloseHandle, E_FAIL, HANDLE};
-use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
 
 use windows::Win32::Graphics::{Direct3D11::*, Dxgi::*};
 use windows::Win32::System::Threading::{CreateEventA, WaitForSingleObject};
@@ -63,30 +59,6 @@ impl Vertex {
     }
 }
 
-fn open_d3d11_device() -> (ID3D11Device, ID3D11DeviceContext) {
-    unsafe {
-        let mut d3d11_device: Option<ID3D11Device> = None;
-        let mut d3d11_context: Option<ID3D11DeviceContext> = None;
-
-        D3D11CreateDevice(
-            None,
-            D3D_DRIVER_TYPE_HARDWARE,
-            HMODULE(std::ptr::null_mut()),
-            D3D11_CREATE_DEVICE_FLAG(0),
-            None,
-            D3D11_SDK_VERSION,
-            Some(&mut d3d11_device),
-            None,
-            Some(&mut d3d11_context),
-        )
-        .unwrap();
-
-        let d3d11_device = d3d11_device.unwrap();
-        let d3d11_context = d3d11_context.unwrap();
-        (d3d11_device, d3d11_context)
-    }
-}
-
 pub fn get_shared_texture_d3d11(
     device: &ID3D11Device,
     texture: &ID3D11Texture2D,
@@ -111,6 +83,8 @@ pub fn get_shared_texture_d3d11(
         texture.GetDesc(&mut desc);
         desc.MiscFlags |= D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0 as u32
             | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX.0 as u32;
+
+        desc.ArraySize = 1;
 
         let mut new_texture = None;
         device.CreateTexture2D(&desc, None, Some(&mut new_texture))?;
@@ -218,8 +192,6 @@ pub struct VideoRenderer {
     // texture_bind_group: BindGroup,
     texture_bind_group_layout: BindGroupLayout,
     //render_pipeline: RenderPipeline,
-    /*dx_device: ID3D11Device,
-    dx_context: ID3D11DeviceContext, *///frame_scaler: Context,
 }
 
 impl VideoRenderer {
@@ -267,30 +239,13 @@ impl VideoRenderer {
         let cap = surface.get_capabilities(&adapter);
         let surface_format = cap.formats[0];
 
-        //let (dxdevice, dxcontext) = open_d3d11_device();
-        /*
-                                let render_texture = device.create_texture(&wgpu::TextureDescriptor {
-                                    label: Some("Render Texture"),
-                                    size: wgpu::Extent3d {
-                                        width: 1920,
-                                        height: 1080,
-                                        depth_or_array_layers: 1,
-                                    },
-                                    mip_level_count: 1,
-                                    sample_count: 1,
-                                    dimension: wgpu::TextureDimension::D2,
-                                    format: surface_format,
-                                    usage: wgpu::TextureUsages::TEXTURE_BINDING,
-                                    view_formats: &[surface_format],
-                                });
-
-                                let frame_size = winit::dpi::PhysicalSize::new(1920, 1080);
-        */
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Nearest,
             ..Default::default()
         });
 
@@ -309,6 +264,16 @@ impl VideoRenderer {
                     },
                     wgpu::BindGroupLayoutEntry {
                         binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                         count: None,
@@ -386,7 +351,7 @@ impl VideoRenderer {
                             cache: None,
                         });
         */
-        let vertices = generate_verticles(1920., 1080.);
+        let vertices = generate_verticles(1., 1.);
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Vertex Buffer"),
             contents: bytemuck::cast_slice(&vertices),
@@ -406,9 +371,7 @@ impl VideoRenderer {
             vertex_buffer,
             // texture_bind_group,
             texture_bind_group_layout,
-            //render_pipeline,
-            /* dx_device: dxdevice,
-            dx_context: dxcontext,*/ //frame_scaler,
+            //render_pipeline
         };
 
         state
@@ -419,48 +382,36 @@ impl VideoRenderer {
     }
 
     pub fn render(&self, frame: Arc<Video>) {
-        //let format = frame.format();
         unsafe {
             let frame_ptr = frame.as_ptr();
 
-            // Assume `frame` is your AVFrame
             let hw_frames_ctx = (*frame_ptr).hw_frames_ctx;
             if hw_frames_ctx.is_null() {
                 panic!("No hardware frames context associated with the frame.");
             }
 
-            // Get the AVHWFramesContext from the AVBufferRef
             let hw_frames_ctx_ref = (*hw_frames_ctx).data as *mut AVHWFramesContext;
             let hw_device_ctx = (*hw_frames_ctx_ref).device_ctx;
             if hw_device_ctx.is_null() {
                 panic!("No hardware device context associated with the frames context.");
             }
-            // Get the AVHWDeviceContext from the AVBufferRef
             let hwctx = (*hw_device_ctx).hwctx as *mut AVD3D11VADeviceContext;
-
-            // Get the ID3D11Device and ID3D11DeviceContext
-            //let d3d11_device: *mut ID3D11Device = (*hwctx).device;
-            //let d3d11_device_context = (*hwctx).device_context;
 
             let d3d11_device = ID3D11Device::from_raw_borrowed(&(*hwctx).device).unwrap();
             let d3d11_device_context =
                 ID3D11DeviceContext::from_raw_borrowed(&(*hwctx).device_context).unwrap();
-            /*
-            println!("ID3D11Device: {:?}", d3d11_device);
-            println!("ID3D11DeviceContext: {:?}", d3d11_device_context);
-            */
-            let texture = (*frame_ptr).data[0] as *mut _;
-            let texture_opt = ID3D11Texture2D::from_raw_borrowed(&texture);
+            let texture = (*frame.as_ptr()).data[0] as *mut _;
+            let index = (*frame.as_ptr()).data[1] as i32;
+            let texture_ref = ID3D11Texture2D::from_raw_borrowed(&texture).unwrap();
 
             let (shared_handle, shared_text) =
-                get_shared_texture_d3d11(d3d11_device, texture_opt.unwrap()).unwrap();
+                get_shared_texture_d3d11(d3d11_device, texture_ref).unwrap();
             let fence = DirectX11Fence::new(d3d11_device).unwrap();
 
             let shared_tex = shared_text.unwrap();
-            let text = texture_opt.unwrap();
 
             let mut desc = D3D11_TEXTURE2D_DESC::default();
-            text.GetDesc(&mut desc);
+            texture_ref.GetDesc(&mut desc);
 
             if let Ok(mutex) = shared_tex.cast::<IDXGIKeyedMutex>() {
                 let acquire_result = mutex.AcquireSync(0, 500);
@@ -469,11 +420,17 @@ impl VideoRenderer {
                     println!("❌ AcquireSync failed! Error: {:?}", e);
                 }
 
-                d3d11_device_context.CopyResource(&shared_tex, text);
-
+                d3d11_device_context.CopySubresourceRegion(
+                    &shared_tex,
+                    0,
+                    0,
+                    0,
+                    0,
+                    texture_ref,
+                    index as u32, // Copy from specific array slice
+                    None,
+                );
                 fence.synchronize(d3d11_device_context).unwrap();
-
-                d3d11_device_context.Flush();
 
                 let release_result = mutex.ReleaseSync(0);
                 if let Err(e) = release_result {
@@ -497,23 +454,21 @@ impl VideoRenderer {
                     })
                 })
                 .unwrap()
-                .unwrap(); // TODO: unwrap
-
-            let usage = wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC;
+                .unwrap();
 
             let desc = wgpu::TextureDescriptor {
                 label: None,
                 size: Extent3d {
-                    width: 1920,
-                    height: 896,
+                    width: desc.Width,
+                    height: desc.Height,
                     depth_or_array_layers: 1,
                 },
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: TextureFormat::NV12,
-                usage,
-                view_formats: &[wgpu::TextureFormat::Rgba8Unorm],
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[self.surface_format],
             };
 
             let texture = <Dx12 as wgpu::hal::Api>::Device::texture_from_raw(
@@ -544,10 +499,14 @@ impl VideoRenderer {
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&uv_plane_view),
+                        resource: wgpu::BindingResource::TextureView(&y_plane_view),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&uv_plane_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
                         resource: wgpu::BindingResource::Sampler(&self.sampler),
                     },
                 ],
@@ -614,7 +573,7 @@ impl VideoRenderer {
                         view: &texture_view,
                         resolve_target: None,
                         ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::GREEN),
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                             store: wgpu::StoreOp::Store,
                         },
                     })],

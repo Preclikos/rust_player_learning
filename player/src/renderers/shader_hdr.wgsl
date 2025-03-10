@@ -36,9 +36,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let v_10bit = floor(uv.g * 65535.0) / 64.0;
 
     // Adjust Y, U, V to their video-range scales
-    let yyy = (y_10bit - 64.0) * (255.0 / (940.0 - 64.0)); // Scale Y from [64,940] to [0,255]
-    let u = (u_10bit - 512.0) * (224.0 / (960.0 - 64.0));  // Scale U from [64,960] to [-112,112]
-    let v = (v_10bit - 512.0) * (224.0 / (960.0 - 64.0));  // Scale V from [64,960] to [-112,112]
+    let yyy = (y - 64.0); // Scale Y from [64,940] to [0,255]
+    let u = (uv.r - 512.0);
+    let v = (uv.g - 512.0);
+
     // YUV to RGB conversion (standard coefficients for video YUV to RGB)
     let rr = yyy + 1.402 * v;
     let gg = yyy - 0.344136 * u - 0.714136 * v;

@@ -292,8 +292,8 @@ impl VideoRenderer {
             device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
 
         /*let shader: wgpu::ShaderModule =
-        device.create_shader_module(wgpu::include_wgsl!("shader_hdr.wgsl"));*/
-
+                    device.create_shader_module(wgpu::include_wgsl!("shader_hdr.wgsl"));
+        */
         // Create pipeline layout
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Pipeline Layout"),

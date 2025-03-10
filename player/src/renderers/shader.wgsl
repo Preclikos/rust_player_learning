@@ -30,15 +30,19 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let y = textureSample(t_texture_y, s_sampler, in.tex_coords).r;
     let uv = textureSample(t_texture_uv, s_sampler, in.tex_coords);
     
-    // Adjust Y, U, V ranges
-    let yyy = y * 255.0 - 16.0; // Y is from 16 to 235 (scaled to 0 to 219)
-    let u = uv.r * 255.0 - 128.0; // U is from 16 to 240 (scaled to -112 to 112)
-    let v = uv.g * 255.0 - 128.0; // V is from 16 to 240 (scaled to -112 to 112)
+    let y_full = (y * 255.0 - 54.0);// * (219.0 / 219.0); // Scale Y from [16, 235] -> [0, 219] (not fully 0-255!)
+    let u_full = (uv.r * 255.0 - 128.0); // Center U around 0 (was [-112,112])
+    let v_full = (uv.g * 255.0 - 128.0); // Center V around 0
+    
+    // Increase saturation by scaling U and V components
+    let saturation_factor = 1.05; // Adjust this to control saturation strength
+    let u_sat = u_full * saturation_factor;
+    let v_sat = v_full * saturation_factor;
 
-    // YUV to RGB conversion (standard coefficients for video YUV to RGB)
-    let rr = yyy + 1.402 * v;
-    let gg = yyy - 0.344136 * u - 0.714136 * v;
-    let bb = yyy + 1.772 * u;
+    // YUV to RGB conversion using BT.709 coefficients (standard for video)
+    var rr = y_full + 1.403 * v_sat;
+    var gg = y_full - 0.344 * u_sat - 0.7169 * v_sat;
+    var bb = y_full + 1.779 * u_sat;
 
     // Return the final color with alpha = 1 for full opacity
     return vec4<f32>(rr / 255.0, gg / 255.0, bb / 255.0, 1.0); // BGRA format

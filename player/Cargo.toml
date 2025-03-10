@@ -21,7 +21,7 @@ hex = { version = "0.4" }
 cpal ={ version =  "0.15.3" }
 bytemuck ={ version =  "1.13.1" }
 pollster = "0.4.0"
-wgpu = "24.0.1"
+wgpu = { git = "https://github.com/Preclikos/wgpu.git" }
 winit = "0.30.9"
 
 [target.'cfg(windows)'.dependencies]

@@ -127,7 +127,7 @@ impl ApplicationHandler for App {
 #[tokio::main]
 async fn main() {
     let event_loop = EventLoop::new().unwrap();
-
+    env_logger::init();
     // ControlFlow::Poll continuously runs the event loop, even if the OS hasn't
     // dispatched any events. This is ideal for games and similar applications.
     event_loop.set_control_flow(ControlFlow::Poll);

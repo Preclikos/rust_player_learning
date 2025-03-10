@@ -7,15 +7,15 @@ use wgpu::Extent3d;
 use wgpu::MemoryHints;
 use wgpu::RenderPipeline;
 use wgpu::{Backends, Instance, InstanceDescriptor};
+use windows::Win32::Graphics::{Direct3D11::*, Dxgi::Common::*, Dxgi::*};
 
-extern crate ffmpeg_sys_next;
+//extern crate ffmpeg_sys_next;
 
 use wgpu::TextureFormat;
 use wgpu::{util::DeviceExt, BindGroupLayout, Sampler};
 use windows::core::Interface;
 use windows::Win32::Foundation::{CloseHandle, E_FAIL, HANDLE};
 
-use windows::Win32::Graphics::{Direct3D11::*, Dxgi::*};
 use windows::Win32::System::Threading::{CreateEventA, WaitForSingleObject};
 use winit::window::Window;
 
@@ -213,18 +213,12 @@ impl VideoRenderer {
             .await
             .unwrap();
 
-        let features = adapter.features();
-
-        if features.contains(wgpu::Features::TEXTURE_FORMAT_NV12) {
-            println!("✅ NV12 supported!");
-        } else {
-            println!("❌ NV12 not supported! Falling back to manual YUV conversion.");
-        }
-
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
-                    required_features: wgpu::Features::TEXTURE_FORMAT_NV12, // Enable NV12
+                    required_features: wgpu::Features::TEXTURE_FORMAT_P010 // Enable P010
+                        | wgpu::Features::TEXTURE_FORMAT_NV12
+                        | wgpu::Features::TEXTURE_FORMAT_16BIT_NORM, // Enable NV12
                     required_limits: wgpu::Limits::default(),
                     label: Some("Device with NV12 support"),
                     memory_hints: MemoryHints::Performance,
@@ -288,7 +282,7 @@ impl VideoRenderer {
             view_formats: vec![surface_format],
             alpha_mode: wgpu::CompositeAlphaMode::Auto,
             width: 3840,
-            height: 1728,
+            height: 2160,
             present_mode: wgpu::PresentMode::AutoVsync,
             desired_maximum_frame_latency: 10,
         };
@@ -296,6 +290,9 @@ impl VideoRenderer {
 
         let shader: wgpu::ShaderModule =
             device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
+
+        /*let shader: wgpu::ShaderModule =
+        device.create_shader_module(wgpu::include_wgsl!("shader_hdr.wgsl"));*/
 
         // Create pipeline layout
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -437,9 +434,9 @@ impl VideoRenderer {
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: TextureFormat::NV12,
+                format: format_dxgi_to_wgpu(desc.Format),
                 usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC,
-                view_formats: &[TextureFormat::Bgra8UnormSrgb],
+                view_formats: &[],
             };
 
             let dx_texture = <Dx12 as wgpu::hal::Api>::Device::texture_from_raw(
@@ -455,17 +452,41 @@ impl VideoRenderer {
                 .device
                 .create_texture_from_hal::<Dx12>(dx_texture, &desc);
 
-            let y_plane_view = texture.create_view(&wgpu::TextureViewDescriptor {
-                format: Some(wgpu::TextureFormat::R8Unorm), // Y plane
-                aspect: wgpu::TextureAspect::Plane0,        // First plane (Y)
-                ..Default::default()
-            });
+            let y_plane_view = match desc.format {
+                TextureFormat::P010 => {
+                    texture.create_view(&wgpu::TextureViewDescriptor {
+                        format: Some(wgpu::TextureFormat::R16Unorm), // Y plane (16-bit to match 10-bit data)
+                        aspect: wgpu::TextureAspect::Plane0,
+                        ..Default::default()
+                    })
+                }
+                TextureFormat::NV12 => {
+                    texture.create_view(&wgpu::TextureViewDescriptor {
+                        format: Some(wgpu::TextureFormat::R8Unorm), // Y plane (16-bit to match 10-bit data)
+                        aspect: wgpu::TextureAspect::Plane0,
+                        ..Default::default()
+                    })
+                }
+                _ => panic!("Not supported"),
+            };
 
-            let uv_plane_view = texture.create_view(&wgpu::TextureViewDescriptor {
-                format: Some(wgpu::TextureFormat::Rg8Unorm), // UV plane
-                aspect: wgpu::TextureAspect::Plane1,         // Second plane (UV)
-                ..Default::default()
-            });
+            let uv_plane_view = match desc.format {
+                TextureFormat::P010 => {
+                    texture.create_view(&wgpu::TextureViewDescriptor {
+                        format: Some(wgpu::TextureFormat::Rg16Unorm), // Y plane (16-bit to match 10-bit data)
+                        aspect: wgpu::TextureAspect::Plane1,
+                        ..Default::default()
+                    })
+                }
+                TextureFormat::NV12 => {
+                    texture.create_view(&wgpu::TextureViewDescriptor {
+                        format: Some(wgpu::TextureFormat::Rg8Unorm), // Y plane (16-bit to match 10-bit data)
+                        aspect: wgpu::TextureAspect::Plane1,
+                        ..Default::default()
+                    })
+                }
+                _ => panic!("Not supported"),
+            };
 
             let texture_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 layout: &self.texture_bind_group_layout,
@@ -486,6 +507,22 @@ impl VideoRenderer {
                 label: Some("texture_bind_group"),
             });
 
+            /*
+                        let texture_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            layout: &self.texture_bind_group_layout,
+                            entries: &[
+                                wgpu::BindGroupEntry {
+                                    binding: 0,
+                                    resource: wgpu::BindingResource::TextureView(&y_plane_view),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 1,
+                                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                                },
+                            ],
+                            label: Some("texture_bind_group"),
+                        });
+            */
             let surface_texture = self
                 .surface
                 .get_current_texture()
@@ -533,5 +570,73 @@ impl VideoRenderer {
             drop(texture);
             drop(frame);
         }
+    }
+}
+
+pub fn format_dxgi_to_wgpu(format: DXGI_FORMAT) -> TextureFormat {
+    match format {
+        DXGI_FORMAT_NV12 => TextureFormat::NV12,
+        DXGI_FORMAT_P010 => TextureFormat::P010,
+        DXGI_FORMAT_R8_UNORM => TextureFormat::R8Unorm,
+        DXGI_FORMAT_R8_SNORM => TextureFormat::R8Snorm,
+        DXGI_FORMAT_R8_UINT => TextureFormat::R8Uint,
+        DXGI_FORMAT_R8_SINT => TextureFormat::R8Sint,
+        DXGI_FORMAT_R16_UINT => TextureFormat::R16Uint,
+        DXGI_FORMAT_R16_SINT => TextureFormat::R16Sint,
+        DXGI_FORMAT_R16_UNORM => TextureFormat::R16Unorm,
+        DXGI_FORMAT_R16_SNORM => TextureFormat::R16Snorm,
+        DXGI_FORMAT_R16_FLOAT => TextureFormat::R16Float,
+        DXGI_FORMAT_R8G8_UNORM => TextureFormat::Rg8Unorm,
+        DXGI_FORMAT_R8G8_SNORM => TextureFormat::Rg8Snorm,
+        DXGI_FORMAT_R8G8_UINT => TextureFormat::Rg8Uint,
+        DXGI_FORMAT_R8G8_SINT => TextureFormat::Rg8Sint,
+        DXGI_FORMAT_R16G16_UNORM => TextureFormat::Rg16Unorm,
+        DXGI_FORMAT_R16G16_SNORM => TextureFormat::Rg16Snorm,
+        DXGI_FORMAT_R32_UINT => TextureFormat::R32Uint,
+        DXGI_FORMAT_R32_SINT => TextureFormat::R32Sint,
+        DXGI_FORMAT_R32_FLOAT => TextureFormat::R32Float,
+        DXGI_FORMAT_R16G16_UINT => TextureFormat::Rg16Uint,
+        DXGI_FORMAT_R16G16_SINT => TextureFormat::Rg16Sint,
+        DXGI_FORMAT_R16G16_FLOAT => TextureFormat::Rg16Float,
+        DXGI_FORMAT_R8G8B8A8_TYPELESS => TextureFormat::Rgba8Unorm,
+        DXGI_FORMAT_R8G8B8A8_UNORM => TextureFormat::Rgba8Unorm,
+        DXGI_FORMAT_R8G8B8A8_UNORM_SRGB => TextureFormat::Rgba8UnormSrgb,
+        DXGI_FORMAT_B8G8R8A8_UNORM_SRGB => TextureFormat::Bgra8UnormSrgb,
+        DXGI_FORMAT_R8G8B8A8_SNORM => TextureFormat::Rgba8Snorm,
+        DXGI_FORMAT_B8G8R8A8_UNORM => TextureFormat::Bgra8Unorm,
+        DXGI_FORMAT_R8G8B8A8_UINT => TextureFormat::Rgba8Uint,
+        DXGI_FORMAT_R8G8B8A8_SINT => TextureFormat::Rgba8Sint,
+        DXGI_FORMAT_R10G10B10A2_UNORM => TextureFormat::Rgb10a2Unorm,
+        DXGI_FORMAT_R10G10B10A2_UINT => TextureFormat::Rgb10a2Uint,
+        DXGI_FORMAT_R11G11B10_FLOAT => TextureFormat::Rg11b10Ufloat,
+        DXGI_FORMAT_R32G32_UINT => TextureFormat::Rg32Uint,
+        DXGI_FORMAT_R32G32_SINT => TextureFormat::Rg32Sint,
+        DXGI_FORMAT_R32G32_FLOAT => TextureFormat::Rg32Float,
+        DXGI_FORMAT_R16G16B16A16_UINT => TextureFormat::Rgba16Uint,
+        DXGI_FORMAT_R16G16B16A16_SINT => TextureFormat::Rgba16Sint,
+        DXGI_FORMAT_R16G16B16A16_UNORM => TextureFormat::Rgba16Unorm,
+        DXGI_FORMAT_R16G16B16A16_SNORM => TextureFormat::Rgba16Snorm,
+        DXGI_FORMAT_R16G16B16A16_FLOAT => TextureFormat::Rgba16Float,
+        DXGI_FORMAT_R32G32B32A32_UINT => TextureFormat::Rgba32Uint,
+        DXGI_FORMAT_R32G32B32A32_SINT => TextureFormat::Rgba32Sint,
+        DXGI_FORMAT_R32G32B32A32_FLOAT => TextureFormat::Rgba32Float,
+        DXGI_FORMAT_D32_FLOAT => TextureFormat::Depth32Float,
+        DXGI_FORMAT_D32_FLOAT_S8X24_UINT => TextureFormat::Depth32FloatStencil8,
+        DXGI_FORMAT_R9G9B9E5_SHAREDEXP => TextureFormat::Rgb9e5Ufloat,
+        DXGI_FORMAT_BC1_UNORM => TextureFormat::Bc1RgbaUnorm,
+        DXGI_FORMAT_BC1_UNORM_SRGB => TextureFormat::Bc1RgbaUnormSrgb,
+        DXGI_FORMAT_BC2_UNORM => TextureFormat::Bc2RgbaUnorm,
+        DXGI_FORMAT_BC2_UNORM_SRGB => TextureFormat::Bc2RgbaUnormSrgb,
+        DXGI_FORMAT_BC3_UNORM => TextureFormat::Bc3RgbaUnorm,
+        DXGI_FORMAT_BC3_UNORM_SRGB => TextureFormat::Bc3RgbaUnormSrgb,
+        DXGI_FORMAT_BC4_UNORM => TextureFormat::Bc4RUnorm,
+        DXGI_FORMAT_BC4_SNORM => TextureFormat::Bc4RSnorm,
+        DXGI_FORMAT_BC5_UNORM => TextureFormat::Bc5RgUnorm,
+        DXGI_FORMAT_BC5_SNORM => TextureFormat::Bc5RgSnorm,
+        DXGI_FORMAT_BC6H_UF16 => TextureFormat::Bc6hRgbUfloat,
+        DXGI_FORMAT_BC6H_SF16 => TextureFormat::Bc6hRgbFloat,
+        DXGI_FORMAT_BC7_UNORM => TextureFormat::Bc7RgbaUnorm,
+        DXGI_FORMAT_BC7_UNORM_SRGB => TextureFormat::Bc7RgbaUnormSrgb,
+        _ => panic!("Unsupported texture format: {:?}", format),
     }
 }

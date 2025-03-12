@@ -88,7 +88,7 @@ impl AudioRenderer {
             .default_output_config()
             .expect("Failed to get default config");
 
-        let volume = Arc::new(RwLock::new(0.3_f32));
+        let volume = Arc::new(RwLock::new(0.05_f32));
 
         let stop_cpal = stop.clone();
         let config_cpal = config.clone();
@@ -111,8 +111,20 @@ impl AudioRenderer {
                     }
                     AudioRendererCommand::Volume(new_volume) => {
                         let mut vol = volume_handle.write().await;
-                        *vol += new_volume;
+                        let  new_volume =  *vol + new_volume;
+                        if new_volume > 1.0
+                        {
+                            *vol = 1.0;
+                            
+                        } else if new_volume < 0.0
+                        {
+                            *vol = 0.0;
+                        }
+                        else {
+                            *vol = new_volume;
+                        }
                         println!("Volume changed to: {}", *vol);
+                        
                     }
                 }
             }

@@ -213,6 +213,8 @@ impl VideoRenderer {
             .await
             .unwrap();
 
+        let selected_backend =  adapter.get_info().backend;  
+
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {

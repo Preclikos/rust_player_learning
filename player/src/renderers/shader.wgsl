@@ -30,12 +30,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let y = textureSample(t_texture_y, s_sampler, in.tex_coords).r;
     let uv = textureSample(t_texture_uv, s_sampler, in.tex_coords);
     
-    let y_full = (y * 255.0 - 54.0);// * (219.0 / 219.0); // Scale Y from [16, 235] -> [0, 219] (not fully 0-255!)
+    let y_full = (y * 255.0 - 16.0);// * (219.0 / 219.0); // Scale Y from [16, 235] -> [0, 219] (not fully 0-255!)
     let u_full = (uv.r * 255.0 - 128.0); // Center U around 0 (was [-112,112])
     let v_full = (uv.g * 255.0 - 128.0); // Center V around 0
     
     // Increase saturation by scaling U and V components
-    let saturation_factor = 1.05; // Adjust this to control saturation strength
+    let saturation_factor = 1.00; // Adjust this to control saturation strength
     let u_sat = u_full * saturation_factor;
     let v_sat = v_full * saturation_factor;
 

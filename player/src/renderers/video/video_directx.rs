@@ -163,7 +163,7 @@ pub fn get_shared_texture_d3d11(
         // We need to create a new texture and use texture copy from our original one.
         let mut desc = D3D11_TEXTURE2D_DESC::default();
         texture.GetDesc(&mut desc);
-        desc.Height = 1714;
+        //desc.Height = 1714;
         desc.MiscFlags |= D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0 as u32
             | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX.0 as u32;
         desc.ArraySize = 1;

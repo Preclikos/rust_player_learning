@@ -92,7 +92,7 @@ pub struct VideoRenderer {
 impl VideoRenderer {
     pub async fn new(window: Arc<Window>) -> Self {
         let instance = Instance::new(&InstanceDescriptor {
-            //backends: Backends::DX12,
+            backends: Backends::DX12,
             ..Default::default()
         });
 

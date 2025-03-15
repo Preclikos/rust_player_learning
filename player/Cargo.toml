@@ -23,6 +23,7 @@ bytemuck ={ version =  "1.13.1" }
 pollster = "0.4.0"
 wgpu = { git = "https://github.com/Preclikos/wgpu.git" }
 winit = "0.30.9"
+ash = "0.38.0"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58.0", features = [ "Win32_System_Com", "Win32_System_Console", "Win32_System_SystemServices", "Win32_UI_Shell", "Win32_Foundation", "Wdk_Foundation", "Win32_System_LibraryLoader",

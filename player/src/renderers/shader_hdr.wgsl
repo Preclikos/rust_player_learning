@@ -30,21 +30,26 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let y = textureSample(t_texture_y, s_sampler, in.tex_coords).r;
     let uv = textureSample(t_texture_uv, s_sampler, in.tex_coords);
 
-    // Convert sampled values to 10-bit integer range (assuming stored in MSBs of 16-bit values)
-    let y_10bit = floor(y * 65535.0) / 64.0; // Extract upper 10 bits
-    let u_10bit = floor(uv.r * 65535.0) / 64.0;
-    let v_10bit = floor(uv.g * 65535.0) / 64.0;
+    // Convert from 10-bit range [0, 1023] to [0, 255]
+    let y_10bit = y * 1023.0;
+    let u_10bit = uv.r * 1023.0;
+    let v_10bit = uv.g * 1023.0;
+    
+    // Convert YUV values to full-range floating-point format
+    let y_full = (y_10bit - 64.0) * (255.0 / 876.0); // Scale Y from [64, 940] -> [0, 255]
+    let u_full = (u_10bit - 512.0) * (255.0 / 448.0); // Center U around 0 (was [-448,448])
+    let v_full = (v_10bit - 512.0) * (255.0 / 448.0); // Center V around 0
+    
+    // Increase saturation by scaling U and V components (adjust the factor if needed)
+    let saturation_factor = 1.05; // Try adjusting this if needed
+    let u_sat = u_full * saturation_factor;
+    let v_sat = v_full * saturation_factor;
 
-    // Adjust Y, U, V to their video-range scales
-    let yyy = (y - 64.0); // Scale Y from [64,940] to [0,255]
-    let u = (uv.r - 512.0);
-    let v = (uv.g - 512.0);
-
-    // YUV to RGB conversion (standard coefficients for video YUV to RGB)
-    let rr = yyy + 1.402 * v;
-    let gg = yyy - 0.344136 * u - 0.714136 * v;
-    let bb = yyy + 1.772 * u;
+    // YUV to RGB conversion using BT.709 coefficients (standard for HD video)
+    var rr = y_full + 1.5748 * v_sat;
+    var gg = y_full - 0.1873 * u_sat - 0.4681 * v_sat;
+    var bb = y_full + 1.8556 * u_sat;
 
     // Return the final color with alpha = 1 for full opacity
-    return vec4<f32>(rr / 1023.0, gg / 1023.0, bb / 1023.0, 1.0); // BGRA format
+    return vec4<f32>(rr / 255.0, gg / 255.0, bb / 255.0, 1.0);
 }

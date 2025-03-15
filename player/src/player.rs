@@ -10,10 +10,7 @@ use ffmpeg_next::format::sample::Type;
 use ffmpeg_next::frame::{Audio, Video};
 use ffmpeg_next::software::resampling::Context;
 use ffmpeg_next::{Packet, Rational};
-use ffmpeg_sys_next::{
-    av_hwdevice_ctx_create, AVBufferRef,
-    AVHWDeviceContext, AVHWDeviceType,
-};
+use ffmpeg_sys_next::{av_hwdevice_ctx_create, AVBufferRef, AVHWDeviceContext, AVHWDeviceType};
 use parsers::mp4::{aac_sampling_frequency_index_to_u32, apped_hevc_header, parse_hevc_nalu};
 use pollster::FutureExt;
 use re_mp4::{Mp4, StsdBoxContent};
@@ -44,17 +41,6 @@ use tokio::task::{self, JoinHandle};
 use manifest::Manifest;
 
 const MAX_SEGMENTS: usize = 2;
-
-#[repr(C)]
-struct AVD3D11VADeviceContext {
-    device: *mut ID3D11Device,
-    device_context: *mut ID3D11DeviceContext,
-    video_device: *mut ID3D11VideoDevice,
-    video_context: *mut ID3D11VideoContext,
-    lock: Option<unsafe extern "C" fn(*mut std::ffi::c_void)>,
-    unlock: Option<unsafe extern "C" fn(*mut std::ffi::c_void)>,
-    lock_ctx: *mut std::ffi::c_void,
-}
 
 #[derive(Clone)]
 pub struct Player {
@@ -110,9 +96,6 @@ async fn audio_sync_producer(
     while let Some(frame) = input_rx.recv().await {
         let elapsed = start_time.elapsed().as_millis() as u64;
         let pts = frame.pts().unwrap() as u64;
-        if pts > elapsed {
-            tokio::time::sleep(Duration::from_millis(pts - elapsed)).await;
-        }
         if pts + 20 < elapsed {
             println!("Audio drift more then 20ms dropping frame");
             continue;
@@ -371,9 +354,10 @@ impl Player {
 
                 let mut packet = Packet::new(sample_data.len());
 
-                let pts = sample.composition_timestamp * 1000 / (resampler.output().rate as i64);
+                let rescaled_timebase = resampler.output().rate;
+                let pts = sample.composition_timestamp * 1000 / (rescaled_timebase as i64);
                 packet.set_pts(Some(pts));
-                packet.set_time_base(Rational(1, sample.timescale as i32));
+                packet.set_time_base(Rational(1, rescaled_timebase as i32));
                 packet.data_mut().unwrap().clone_from_slice(sample_data);
 
                 if let Err(e) = decoder.send_packet(&packet) {
@@ -435,11 +419,10 @@ impl Player {
             Err(e) => return Err(format!("Cannot find decoder for codec {}", e).into()),
         };
 
+        //#[cfg(target_os = "windows")]
         unsafe {
             let mut hw_device_ctx: *mut AVBufferRef = std::ptr::null_mut();
-            //let device_type = AVHWDeviceType::AV_HWDEVICE_TYPE_DXVA2;
             let device_type = AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA;
-            // Create the DXVA2 hardware device
             let ret = av_hwdevice_ctx_create(
                 &mut hw_device_ctx,
                 device_type,
@@ -456,7 +439,7 @@ impl Player {
             (*codec_ctx_ptr).hw_device_ctx = hw_device_ctx;
 
             println!("D3D11VA hardware device context created successfully.");
-
+            /*
             // Get the AVHWDeviceContext from the AVBufferRef
             let hw_device_ctx_ref = (*hw_device_ctx).data as *mut AVHWDeviceContext;
             let hwctx = (*hw_device_ctx_ref).hwctx as *mut AVD3D11VADeviceContext;
@@ -467,6 +450,7 @@ impl Player {
 
             println!("ID3D11Device: {:?}", d3d11_device);
             println!("ID3D11DeviceContext: {:?}", d3d11_device_context);
+            */
         }
 
         match track.trak(&mp4_info).mdia.minf.stbl.stsd.contents.clone() {
@@ -588,6 +572,10 @@ impl Player {
                 header[6] = 0xFC; // Adjusted for the required value
                                   // Byte 8: Explicit END marker (distinct terminator)
                 header[7] = 0xFF; // Explicit END marker
+
+                // let hex_string: String =
+                // header.iter().map(|byte| format!("{:02x}", byte)).collect();
+                // println!("{}", hex_string);
 
                 let mut packet = Packet::new(header.len());
                 packet.data_mut().unwrap().clone_from_slice(&header[..]);

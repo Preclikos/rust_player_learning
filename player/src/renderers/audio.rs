@@ -4,7 +4,6 @@ use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
     Device, Sample, StreamConfig, SupportedStreamConfig,
 };
-
 use ffmpeg_next::frame::Audio;
 use pollster::FutureExt;
 use tokio::sync::{
@@ -27,7 +26,7 @@ impl AudioRenderer {
     pub fn new() -> Self {
         let stop = Arc::new(Notify::new());
 
-        let (command_sender, command_receiver) = mpsc::channel(32);
+        let (command_sender, command_receiver) = mpsc::channel(4);
         let audio_thread = AudioRenderer::start_thread(command_receiver, stop);
 
         AudioRenderer {
@@ -88,7 +87,7 @@ impl AudioRenderer {
             .default_output_config()
             .expect("Failed to get default config");
 
-        let volume = Arc::new(RwLock::new(0.3_f32));
+        let volume = Arc::new(RwLock::new(0.15_f32));
 
         let stop_cpal = stop.clone();
         let config_cpal = config.clone();

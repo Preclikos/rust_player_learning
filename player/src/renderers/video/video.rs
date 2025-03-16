@@ -1,19 +1,16 @@
 use ffmpeg_next::frame::Video;
 use ffmpeg_sys_next::AVHWFramesContext;
 use std::sync::Arc;
-use wgpu::{wgc::api::Dx12, Backend, Extent3d, Texture};
+use wgpu::{Backend, Extent3d, Texture};
 
 #[cfg(target_os = "windows")]
 use super::video_directx::*;
 use super::video_vulkan::create_texture_from_vk_image;
 use windows::{
     core::Interface,
-    Win32::{
-        Foundation::CloseHandle,
-        Graphics::Direct3D11::{
+    Win32::Graphics::Direct3D11::{
             ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_TEXTURE2D_DESC,
         },
-    },
 };
 
 pub struct VideoFrame {
@@ -75,7 +72,7 @@ impl VideoFrame {
 
             match self.wgpu_backend {
                 Backend::Dx12 => {
-                    let (raw_image/*, shared_texture*/) = create_dx12_resource_from_d3d11_texture(
+                    let raw_image = create_dx12_resource_from_d3d11_texture(
                         &self.wgpu_device,
                         d3d11_device,
                         d3d11_device_context,
@@ -86,10 +83,9 @@ impl VideoFrame {
 
                     create_texture_from_dx12_resource(&self.wgpu_device, raw_image, &desc)
 
-                    //let _ = CloseHandle(raw_image);
                 }
                 Backend::Vulkan => {
-                    let (raw_image) = create_vk_image_from_d3d11_texture(
+                    let raw_image = create_vk_image_from_d3d11_texture(
                         &self.wgpu_device,
                         d3d11_device,
                         d3d11_device_context,
@@ -98,15 +94,7 @@ impl VideoFrame {
                     )
                     .unwrap();
 
-                    /*let copy_texture = shared_texture.unwrap();
-
-                    _ = copy_texture.synchronized_copy_from(
-                        d3d11_device_context,
-                        frame_texture,
-                        Some(index as u32),
-                    );*/
-
-                    create_texture_from_vk_image(
+                    let texture = create_texture_from_vk_image(
                         &self.wgpu_device,
                         raw_image,
                         desc.size.width,
@@ -114,7 +102,11 @@ impl VideoFrame {
                         desc.format,
                         true,
                         true,
-                    )
+                    );
+
+
+
+                    texture
                 }
                 _ => panic!("Cannot select HW texture conversion"),
             }

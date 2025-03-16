@@ -163,7 +163,7 @@ pub fn get_shared_texture_d3d11(
         // We need to create a new texture and use texture copy from our original one.
         let mut desc = D3D11_TEXTURE2D_DESC::default();
         texture.GetDesc(&mut desc);
-        desc.Height = 1714;
+        //desc.Height = 1714;
         desc.MiscFlags |= D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0 as u32
             | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX.0 as u32;
         desc.ArraySize = 1;
@@ -223,7 +223,7 @@ pub fn create_vk_image_from_d3d11_texture(
                     let image_create_info = ImageCreateInfo::default()
                         .push_next(&mut ext_create_info)
                         .image_type(vk::ImageType::TYPE_2D)
-                        .format(vk::Format::G8_B8R8_2PLANE_420_UNORM)
+                        .format(super::video_vulkan::format_wgpu_to_vulkan(format_dxgi_to_wgpu(desc.Format)))
                         .extent(vk::Extent3D {
                             width: desc.Width,
                             height: desc.Height,
@@ -256,7 +256,7 @@ pub fn create_vk_image_from_d3d11_texture(
 
         let _ = CloseHandle(handle);
 
-        Ok((raw_image/*, shared_texture*/))
+        Ok(raw_image)
     }
 }
 
@@ -289,7 +289,7 @@ pub fn create_dx12_resource_from_d3d11_texture(
             })
             .unwrap()?; // TODO: unwrap
 
-        Ok((raw_image/* , shared_texture*/))
+        Ok(raw_image)
     }
 }
 

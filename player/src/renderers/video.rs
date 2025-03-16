@@ -92,7 +92,7 @@ pub struct VideoRenderer {
 impl VideoRenderer {
     pub async fn new(window: Arc<Window>) -> Self {
         let instance = Instance::new(&InstanceDescriptor {
-            backends: Backends::DX12,
+            //backends: Backends::DX12,
             ..Default::default()
         });
 
@@ -362,7 +362,7 @@ impl VideoRenderer {
             }
             TextureFormat::NV12 => {
                 texture.create_view(&wgpu::TextureViewDescriptor {
-                    format: Some(wgpu::TextureFormat::R8Unorm), // Y plane (16-bit to match 10-bit data)
+                    format: Some(wgpu::TextureFormat::R8Unorm), // Y plane (8-bit to match 8-bit data)
                     aspect: wgpu::TextureAspect::Plane0,
                     ..Default::default()
                 })
@@ -380,7 +380,7 @@ impl VideoRenderer {
             }
             TextureFormat::NV12 => {
                 texture.create_view(&wgpu::TextureViewDescriptor {
-                    format: Some(wgpu::TextureFormat::Rg8Unorm), // Y plane (16-bit to match 10-bit data)
+                    format: Some(wgpu::TextureFormat::Rg8Unorm), // Y plane (8-bit to match 8-bit data)
                     aspect: wgpu::TextureAspect::Plane1,
                     ..Default::default()
                 })
@@ -451,7 +451,7 @@ impl VideoRenderer {
 
         //_ = CloseHandle(shared_handle);
 
-        //drop(texture);
+        drop(texture);
         //drop(frame);
         //}
     }

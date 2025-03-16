@@ -163,7 +163,7 @@ pub fn get_shared_texture_d3d11(
         // We need to create a new texture and use texture copy from our original one.
         let mut desc = D3D11_TEXTURE2D_DESC::default();
         texture.GetDesc(&mut desc);
-        //desc.Height = 1714;
+        desc.Height = 1714;
         desc.MiscFlags |= D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0 as u32
             | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX.0 as u32;
         desc.ArraySize = 1;
@@ -210,17 +210,12 @@ pub fn create_vk_image_from_d3d11_texture(
             .as_hal::<Vulkan, _, _>(|device| {
                 device.map(|device| {
                     let raw_device = device.raw_device();
+
                     let handle_type = vk::ExternalMemoryHandleTypeFlags::D3D11_TEXTURE; // D3D12_RESOURCE_KHR
 
                     let mut import_memory_info = vk::ImportMemoryWin32HandleInfoKHR::default()
                         .handle_type(handle_type)
                         .handle(handle.0 as isize);
-
-                    let allocate_info = vk::MemoryAllocateInfo::default()
-                        .push_next(&mut import_memory_info)
-                        .memory_type_index(0);
-
-                    let allocated_memory = raw_device.allocate_memory(&allocate_info, None)?;
 
                     let mut ext_create_info =
                         vk::ExternalMemoryImageCreateInfo::default().handle_types(handle_type);
@@ -228,9 +223,7 @@ pub fn create_vk_image_from_d3d11_texture(
                     let image_create_info = ImageCreateInfo::default()
                         .push_next(&mut ext_create_info)
                         .image_type(vk::ImageType::TYPE_2D)
-                        .format(super::video_vulkan::format_wgpu_to_vulkan(
-                            format_dxgi_to_wgpu(desc.Format),
-                        ))
+                        .format(vk::Format::G8_B8R8_2PLANE_420_UNORM)
                         .extent(vk::Extent3D {
                             width: desc.Width,
                             height: desc.Height,
@@ -241,19 +234,27 @@ pub fn create_vk_image_from_d3d11_texture(
                         .samples(vk::SampleCountFlags::TYPE_1)
                         .tiling(vk::ImageTiling::OPTIMAL)
                         .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
-                        .initial_layout(ImageLayout::UNDEFINED);
-                    //.sharing_mode(vk::SharingMode::EXCLUSIVE);
+                        .sharing_mode(vk::SharingMode::EXCLUSIVE);
 
                     let raw_image = raw_device.create_image(&image_create_info, None)?;
 
-                    raw_device.bind_image_memory(raw_image, allocated_memory, 0)?;
+                    let mem_requirements = raw_device.get_image_memory_requirements(raw_image);
 
-                    let _ = CloseHandle(handle);
+                    let allocate_info = vk::MemoryAllocateInfo::default()
+                        .allocation_size(mem_requirements.size)
+                        .push_next(&mut import_memory_info)
+                        .memory_type_index(0);
+
+                    let allocated_memory = raw_device.allocate_memory(&allocate_info, None)?;
+
+                    raw_device.bind_image_memory(raw_image, allocated_memory, 0)?;
 
                     Ok::<ash::vk::Image, vk::Result>(raw_image)
                 })
             })
             .unwrap()?; // TODO: unwrap
+
+        let _ = CloseHandle(handle);
 
         Ok((raw_image/*, shared_texture*/))
     }

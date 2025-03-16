@@ -113,7 +113,7 @@ impl VideoFrame {
                         desc.size.height,
                         desc.format,
                         true,
-                        false,
+                        true,
                     )
                 }
                 _ => panic!("Cannot select HW texture conversion"),

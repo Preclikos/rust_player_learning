@@ -223,13 +223,16 @@ pub fn create_vk_image_from_d3d11_texture(
                     let image_create_info = ImageCreateInfo::default()
                         .push_next(&mut ext_create_info)
                         .image_type(vk::ImageType::TYPE_2D)
-                        .format(super::video_vulkan::format_wgpu_to_vulkan(format_dxgi_to_wgpu(desc.Format)))
+                        .format(super::video_vulkan::format_wgpu_to_vulkan(
+                            format_dxgi_to_wgpu(desc.Format),
+                        ))
                         .extent(vk::Extent3D {
                             width: desc.Width,
                             height: desc.Height,
                             depth: desc.ArraySize,
                         })
                         .mip_levels(desc.MipLevels)
+                        .flags(vk::ImageCreateFlags::ALIAS)
                         .array_layers(desc.ArraySize)
                         .samples(vk::SampleCountFlags::TYPE_1)
                         .tiling(vk::ImageTiling::OPTIMAL)
@@ -243,7 +246,7 @@ pub fn create_vk_image_from_d3d11_texture(
                     let allocate_info = vk::MemoryAllocateInfo::default()
                         .allocation_size(mem_requirements.size)
                         .push_next(&mut import_memory_info)
-                        .memory_type_index(0);
+                        .memory_type_index(2);
 
                     let allocated_memory = raw_device.allocate_memory(&allocate_info, None)?;
 

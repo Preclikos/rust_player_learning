@@ -357,7 +357,6 @@ impl VideoRenderer {
                 texture.create_view(&wgpu::TextureViewDescriptor {
                     format: Some(wgpu::TextureFormat::R16Unorm), // Y plane (16-bit to match 10-bit data)
                     aspect: wgpu::TextureAspect::Plane0,
-                    dimension: Some(wgpu::TextureViewDimension::D2),
                     ..Default::default()
                 })
             }
@@ -365,7 +364,6 @@ impl VideoRenderer {
                 texture.create_view(&wgpu::TextureViewDescriptor {
                     format: Some(wgpu::TextureFormat::R8Unorm), // Y plane (8-bit to match 8-bit data)
                     aspect: wgpu::TextureAspect::Plane0,
-                    dimension: Some(wgpu::TextureViewDimension::D2),
                     ..Default::default()
                 })
             }
@@ -377,7 +375,6 @@ impl VideoRenderer {
                 texture.create_view(&wgpu::TextureViewDescriptor {
                     format: Some(wgpu::TextureFormat::Rg16Unorm), // Y plane (16-bit to match 10-bit data)
                     aspect: wgpu::TextureAspect::Plane1,
-                    dimension: Some(wgpu::TextureViewDimension::D2),
                     ..Default::default()
                 })
             }
@@ -385,7 +382,6 @@ impl VideoRenderer {
                 texture.create_view(&wgpu::TextureViewDescriptor {
                     format: Some(wgpu::TextureFormat::Rg8Unorm), // Y plane (8-bit to match 8-bit data)
                     aspect: wgpu::TextureAspect::Plane1,
-                    dimension: Some(wgpu::TextureViewDimension::D2),
                     ..Default::default()
                 })
             }

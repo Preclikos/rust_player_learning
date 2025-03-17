@@ -45,7 +45,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let v_full = (uv.g * 255.0 - 128.0) / 255.0; // V channel
 
     // Visualize UV as false-color: U in Red, V in Blue
-    return vec4<f32>(u_full + 0.5, 0.5, v_full + 0.5, 1.0);
+    return vec4<f32>(u_full + 0.5, 0.5, 0.5, 1.0);
 }
 /*
 @fragment

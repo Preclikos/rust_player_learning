@@ -163,7 +163,7 @@ pub fn get_shared_texture_d3d11(
         // We need to create a new texture and use texture copy from our original one.
         let mut desc = D3D11_TEXTURE2D_DESC::default();
         texture.GetDesc(&mut desc);
-        //desc.Height = 1714;
+        //desc.Height = 858;
         desc.MiscFlags |= D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0 as u32
             | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX.0 as u32;
         desc.ArraySize = 1;
@@ -206,6 +206,8 @@ pub fn create_vk_image_from_d3d11_texture(
 
         _ = shared_texture.synchronized_copy_from(d3d11_device_context, texture, region);
 
+        d3d11_device_context.Flush();
+
         let raw_image = device
             .as_hal::<Vulkan, _, _>(|device| {
                 device.map(|device| {
@@ -232,11 +234,11 @@ pub fn create_vk_image_from_d3d11_texture(
                             depth: desc.ArraySize,
                         })
                         .mip_levels(desc.MipLevels)
-                        .flags(vk::ImageCreateFlags::ALIAS)
+                        .flags(vk::ImageCreateFlags::ALIAS | vk::ImageCreateFlags::MUTABLE_FORMAT)
                         .array_layers(desc.ArraySize)
                         .samples(vk::SampleCountFlags::TYPE_1)
                         .tiling(vk::ImageTiling::OPTIMAL)
-                        .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
+                        .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC)
                         .sharing_mode(vk::SharingMode::EXCLUSIVE);
 
                     let raw_image = raw_device.create_image(&image_create_info, None)?;
@@ -246,7 +248,7 @@ pub fn create_vk_image_from_d3d11_texture(
                     let allocate_info = vk::MemoryAllocateInfo::default()
                         .allocation_size(mem_requirements.size)
                         .push_next(&mut import_memory_info)
-                        .memory_type_index(2);
+                        .memory_type_index(0);
 
                     let allocated_memory = raw_device.allocate_memory(&allocate_info, None)?;
 

@@ -9,8 +9,8 @@ use super::video_vulkan::create_texture_from_vk_image;
 use windows::{
     core::Interface,
     Win32::Graphics::Direct3D11::{
-            ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_TEXTURE2D_DESC,
-        },
+        ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_TEXTURE2D_DESC,
+    },
 };
 
 pub struct VideoFrame {
@@ -52,20 +52,20 @@ impl VideoFrame {
 
             let frame_texture = ID3D11Texture2D::from_raw_borrowed(&ffmpeg_texture).unwrap();
 
-            let mut desc = D3D11_TEXTURE2D_DESC::default();
-            frame_texture.GetDesc(&mut desc);
+            let mut dx_desc = D3D11_TEXTURE2D_DESC::default();
+            frame_texture.GetDesc(&mut dx_desc);
 
             let desc = wgpu::TextureDescriptor {
                 label: None,
                 size: Extent3d {
-                    width: desc.Width,
-                    height: desc.Height,
+                    width: dx_desc.Width,
+                    height: dx_desc.Height,
                     depth_or_array_layers: 1,
                 },
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: format_dxgi_to_wgpu(desc.Format),
+                format: wgpu::TextureFormat::NV12, //format_dxgi_to_wgpu(desc.Format),
                 usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC,
                 view_formats: &[],
             };
@@ -82,7 +82,6 @@ impl VideoFrame {
                     .unwrap();
 
                     create_texture_from_dx12_resource(&self.wgpu_device, raw_image, &desc)
-
                 }
                 Backend::Vulkan => {
                     let raw_image = create_vk_image_from_d3d11_texture(
@@ -94,7 +93,7 @@ impl VideoFrame {
                     )
                     .unwrap();
 
-                    let texture = create_texture_from_vk_image(
+                    create_texture_from_vk_image(
                         &self.wgpu_device,
                         raw_image,
                         desc.size.width,
@@ -102,11 +101,7 @@ impl VideoFrame {
                         desc.format,
                         true,
                         true,
-                    );
-
-
-
-                    texture
+                    )
                 }
                 _ => panic!("Cannot select HW texture conversion"),
             }

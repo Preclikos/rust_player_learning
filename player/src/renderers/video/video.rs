@@ -3,9 +3,11 @@ use ffmpeg_sys_next::AVHWFramesContext;
 use std::sync::Arc;
 use wgpu::{Backend, Extent3d, Texture};
 
+use super::video_vulkan::create_texture_from_vk_image;
+
 #[cfg(target_os = "windows")]
 use super::video_directx::*;
-use super::video_vulkan::create_texture_from_vk_image;
+#[cfg(target_os = "windows")]
 use windows::{
     core::Interface,
     Win32::Graphics::Direct3D11::{
@@ -25,7 +27,29 @@ impl VideoFrame {
             wgpu_backend,
         }
     }
+    #[cfg(target_os = "linux")]
+    pub fn get_texture(&self, frame: Arc<Video>) -> Texture {
+        let texture_size = wgpu::Extent3d {
+            width: 256,  // Change to your desired width
+            height: 256, // Change to your desired height
+            depth_or_array_layers: 1,
+        };
 
+        let texture_descriptor = wgpu::TextureDescriptor {
+            label: Some("Empty Texture"),
+            size: texture_size,
+            mip_level_count: 1, // No mipmaps
+            sample_count: 1,    // No multisampling
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::NV12, // Standard format
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        };
+
+        self.wgpu_device.create_texture(&texture_descriptor)
+    }
+
+    #[cfg(target_os = "windows")]
     pub fn get_texture(&self, frame: Arc<Video>) -> Texture {
         unsafe {
             let frame_ptr = frame.as_ptr();

@@ -16,9 +16,6 @@ use pollster::FutureExt;
 use re_mp4::{Mp4, StsdBoxContent};
 use renderers::audio::AudioRenderer;
 use renderers::video::VideoRenderer;
-use windows::Win32::Graphics::Direct3D11::{
-    ID3D11Device, ID3D11DeviceContext, ID3D11VideoContext, ID3D11VideoDevice,
-};
 use winit::window::Window;
 
 use std::error::Error;
@@ -419,7 +416,7 @@ impl Player {
             Err(e) => return Err(format!("Cannot find decoder for codec {}", e).into()),
         };
 
-        //#[cfg(target_os = "windows")]
+        #[cfg(target_os = "windows")]
         unsafe {
             let mut hw_device_ctx: *mut AVBufferRef = std::ptr::null_mut();
             let device_type = AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA;
@@ -439,18 +436,28 @@ impl Player {
             (*codec_ctx_ptr).hw_device_ctx = hw_device_ctx;
 
             println!("D3D11VA hardware device context created successfully.");
-            /*
-            // Get the AVHWDeviceContext from the AVBufferRef
-            let hw_device_ctx_ref = (*hw_device_ctx).data as *mut AVHWDeviceContext;
-            let hwctx = (*hw_device_ctx_ref).hwctx as *mut AVD3D11VADeviceContext;
+        }
 
-            // Get the ID3D11Device and ID3D11DeviceContext
-            let d3d11_device = (*hwctx).device as *mut ID3D11Device;
-            let d3d11_device_context = (*hwctx).device_context as *mut ID3D11DeviceContext;
+        #[cfg(target_os = "linux")]
+        unsafe {
+            let mut hw_device_ctx: *mut AVBufferRef = std::ptr::null_mut();
+            let device_type = AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI;
+            let ret = av_hwdevice_ctx_create(
+                &mut hw_device_ctx,
+                device_type,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                0,
+            );
+            if ret < 0 {
+                panic!("Failed to create VAAPI hardware device: {}", ret);
+            }
 
-            println!("ID3D11Device: {:?}", d3d11_device);
-            println!("ID3D11DeviceContext: {:?}", d3d11_device_context);
-            */
+            // Assign the device context to the codec context
+            let codec_ctx_ptr = decoder.as_mut_ptr();
+            (*codec_ctx_ptr).hw_device_ctx = hw_device_ctx;
+
+            println!("VAAPI hardware device context created successfully.");
         }
 
         match track.trak(&mp4_info).mdia.minf.stbl.stsd.contents.clone() {

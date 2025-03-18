@@ -167,10 +167,9 @@ mod platform {
     use std::env;
     use std::ptr;
 
-    extern crate x11;
     use x11::xlib::{XOpenDisplay, XResetScreenSaver};
 
-    use wayland_client::Display;
+    use wayland_client::Connection;
 
     pub fn prevent_screensaver() {
         if let Ok(xdg_session_type) = env::var("XDG_SESSION_TYPE") {
@@ -196,7 +195,7 @@ mod platform {
     }
 
     fn prevent_screensaver_wayland() {
-        if let Ok(display) = Display::connect_to_env() {
+        if let Ok(display) = Connection::connect_to_env() {
             eprintln!("Wayland support requires compositor-specific methods.");
         } else {
             eprintln!("Failed to connect to Wayland display");

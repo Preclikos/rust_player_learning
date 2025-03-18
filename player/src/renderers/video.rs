@@ -3,6 +3,7 @@ use video::VideoFrame;
 use wgpu::Backends;
 
 mod video;
+#[cfg(target_os = "windows")]
 mod video_directx;
 mod video_vulkan;
 

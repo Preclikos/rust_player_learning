@@ -23,8 +23,9 @@ fn vs_main(
     out.clip_position = vec4<f32>(model.position, 1.0);
     return out;
 }
-
-/*fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+/*
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Sample the Y component
     let y = textureSample(t_texture_y, s_sampler, in.tex_coords).r;
     
@@ -33,7 +34,7 @@ fn vs_main(
 
     // Display grayscale using Y channel for RGB
     return vec4<f32>(y_full, y_full, y_full, 1.0);
-}*/
+}
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
@@ -47,7 +48,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Visualize UV as false-color: U in Red, V in Blue
     return vec4<f32>(u_full + 0.5, 0.5, 0.5, 1.0);
 }
-/*
+*/
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Sample Y, U, and V components from the textures
@@ -71,4 +72,3 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Return the final color with alpha = 1 for full opacity
     return vec4<f32>(rr / 255.0, gg / 255.0, bb / 255.0, 1.0); // BGRA format
 }
-*/

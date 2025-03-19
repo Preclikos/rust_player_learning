@@ -5,6 +5,8 @@ use wgpu::Backends;
 mod video;
 #[cfg(target_os = "windows")]
 mod video_directx;
+#[cfg(target_os = "linux")]
+mod video_vaapi;
 mod video_vulkan;
 
 use std::sync::Arc;

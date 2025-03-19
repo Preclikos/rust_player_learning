@@ -73,7 +73,7 @@ fn generate_verticles(scale_x: f32, scale_y: f32) -> [Vertex; 6] {
         Vertex {
             position: [1. * scale_x, 1. * scale_y, 0.0],
             tex_coords: [1., 0.],
-        }, // E
+        }, // F
     ]
 }
 
@@ -227,7 +227,7 @@ impl VideoRenderer {
             cache: None,
         });
 
-        let vertices = generate_verticles(1., 1.);
+        let vertices = generate_verticles(0.2, 0.2);
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Vertex Buffer"),
             contents: bytemuck::cast_slice(&vertices),

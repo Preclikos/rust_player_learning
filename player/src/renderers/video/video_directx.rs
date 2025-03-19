@@ -212,6 +212,8 @@ pub fn create_vk_image_from_d3d11_texture(
             .as_hal::<Vulkan, _, _>(|device| {
                 device.map(|device| {
                     let raw_device = device.raw_device();
+                    let physical_device = device.raw_physical_device();
+                    let instance = device.shared_instance().raw_instance();
 
                     let handle_type = vk::ExternalMemoryHandleTypeFlags::D3D11_TEXTURE; // D3D12_RESOURCE_KHR
 
@@ -245,10 +247,31 @@ pub fn create_vk_image_from_d3d11_texture(
 
                     let mem_requirements = raw_device.get_image_memory_requirements(raw_image);
 
+                    let mem_properties =
+                        instance.get_physical_device_memory_properties(physical_device);
+
+                    let index =
+                        mem_properties
+                            .memory_types
+                            .iter()
+                            .enumerate()
+                            .position(|(i, t)| {
+                                ((1 << i) & memory_req.memory_type_bits) != 0
+                                    && t.property_flags
+                                        .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+                            });
+
+                    let index = match index {
+                        None => {
+                            panic!("Failed to get DEVICE_LOCAL memory index")
+                        }
+                        Some(index) => index,
+                    };
+
                     let allocate_info = vk::MemoryAllocateInfo::default()
                         .allocation_size(mem_requirements.size)
                         .push_next(&mut import_memory_info)
-                        .memory_type_index(0);
+                        .memory_type_index(index);
 
                     let allocated_memory = raw_device.allocate_memory(&allocate_info, None)?;
 

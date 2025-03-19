@@ -1397,18 +1397,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "libva-sys"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "49e4c5aa2cb99e640a357c42cf83dcb978ed08f99a3ca09eac534091aee2e9ba"
-dependencies = [
- "cc",
- "cfg-if",
- "libc",
- "pkg-config",
-]
-
-[[package]]
 name = "linux-raw-sys"
 version = "0.4.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1618,18 +1606,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ee6cda3051665f1fb8d9e08fc35c96d5a244fb1be711a03b71118828afc9a873"
 dependencies = [
  "jni-sys",
-]
-
-[[package]]
-name = "nix"
-version = "0.29.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "71e2746dc3a24dd78b3cfcb7be93368c6de9963d30f43a6a73998a9cf4b17b46"
-dependencies = [
- "bitflags 2.9.0",
- "cfg-if",
- "cfg_aliases",
- "libc",
 ]
 
 [[package]]
@@ -2130,8 +2106,6 @@ dependencies = [
  "ffmpeg-sys-next",
  "hex",
  "iso8601-duration",
- "libva-sys",
- "nix",
  "pollster",
  "quick-xml",
  "re_mp4",

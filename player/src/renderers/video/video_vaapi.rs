@@ -1,229 +1,213 @@
-use ash::vk;
-use wgpu::hal::api::Vulkan;
-use wgpu::Device;
+use std::mem::MaybeUninit;
+use std::os::fd::RawFd;
 
-use cros_libva::VADisplay;
+use ash::vk::{self, ImageCreateInfo};
+use cros_libva::{VADisplay, VASurfaceID};
+use wgpu::hal::api::Vulkan;
 
 #[repr(C)]
 pub struct AVVAAPIDeviceContext {
     pub display: *mut VADisplay, // Pointer to VAAPI display (VADisplay)
 }
 
-pub fn create_texture_from_vk_image(
-    device: &Device,
-    image: vk::Image,
-    width: u32,
-    height: u32,
-    format: wgpu::TextureFormat,
-    is_in: bool,
-    drop: bool,
-) -> wgpu::Texture {
-    let size = wgpu::Extent3d {
-        width: width,
-        height: height,
-        depth_or_array_layers: 1,
-    };
-    let drop_guard = Box::new(|| ());
+#[repr(C)]
+pub struct PrimeSurfaceDescriptor {
+    pub fourcc: PixelFormat,
+    pub width: u32,
+    pub height: u32,
+    pub num_objects: u32,
+    pub objects: [PrimeObject; 4],
+    pub num_layers: u32,
+    pub layers: [PrimeLayer; 4],
+}
 
-    let texture = unsafe {
-        <Vulkan as wgpu::hal::Api>::Device::texture_from_raw(
-            image,
-            &wgpu::hal::TextureDescriptor {
-                label: None,
-                size,
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format,
-                view_formats: vec![],
-                usage: if is_in {
-                    wgpu::TextureUses::RESOURCE | wgpu::TextureUses::COPY_SRC
-                } else {
-                    wgpu::TextureUses::COLOR_TARGET | wgpu::TextureUses::COPY_DST
-                },
-                memory_flags: wgpu::hal::MemoryFlags::empty(),
-            },
-            if drop { None } else { Some(drop_guard) },
-        )
-    };
+#[repr(C)]
+pub struct PrimeLayer {
+    drm_format: PixelFormat,
+    num_planes: u32,
+    object_index: [u32; 4],
+    offset: [u32; 4],
+    pitch: [u32; 4],
+}
 
-    unsafe {
-        device.create_texture_from_hal::<Vulkan>(
-            texture,
-            &wgpu::TextureDescriptor {
-                label: None,
-                size,
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format,
-                view_formats: &[],
-                usage: if is_in {
-                    wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC
-                } else {
-                    wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_DST
-                },
-            },
-        )
+pub struct PixelFormat(u32);
+
+/// Describes a DRM PRIME object, represented as a DMA-BUF file descriptor.
+#[derive(Debug)]
+#[repr(C)]
+pub struct PrimeObject {
+    pub fd: RawFd,
+    pub size: u32,
+    pub drm_format_modifier: u64,
+}
+
+impl PixelFormat {
+    /// Planar YUV 4:2:0 standard pixel format.
+    ///
+    /// All samples are 8 bits in size. The plane containing Y samples comes first, followed by a
+    /// plane storing packed U and V samples (with U samples in the first byte and V samples in the
+    /// second byte).
+    ///
+    /// This format is widely supported by hardware codecs (and often the *only* supported format),
+    /// so it should be supported by all software, and may be used as the default format.
+    pub const NV12: Self = f(b"NV12");
+
+    /// Planar YUV 4:2:0 pixel format, with U and V swapped compared to `NV12`.
+    pub const NV21: Self = f(b"NV21");
+
+    /// Interleaved YUV 4:2:2, stored in memory as `yyyyyyyy uuuuuuuu YYYYYYYY vvvvvvvv`.
+    ///
+    /// `uuuuuuuu` and `vvvvvvvv` are shared by 2 horizontally neighboring pixels.
+    ///
+    /// Also known as [`YUYV`](Self::YUYV).
+    pub const YUY2: Self = f(b"YUY2");
+
+    /// Identical to [`YUY2`](Self::YUY2).
+    pub const YUYV: Self = f(b"YUYV");
+
+    /// Interleaved YUV 4:2:2, stored in memory as `uuuuuuuu yyyyyyyy vvvvvvvv YYYYYYYY`.
+    ///
+    /// `uuuuuuuu` and `vvvvvvvv` are shared by 2 neighboring pixels.
+    pub const UYVY: Self = f(b"UVYV");
+
+    /// `RGBA`: Packed 8-bit RGBA, stored in memory as `aaaaaaaa bbbbbbbb gggggggg rrrrrrrr`.
+    pub const RGBA: Self = f(b"RGBA");
+
+    /// `ARGB`: Packed 8-bit RGBA, stored in memory as `bbbbbbbb gggggggg rrrrrrrr aaaaaaaa`.
+    pub const ARGB: Self = f(b"ARGB");
+
+    /// Packed 8-bit RGBX.
+    ///
+    /// The X channel has unspecified values.
+    pub const RGBX: Self = f(b"RGBX");
+
+    /// Packed 8-bit BGRA.
+    pub const BGRA: Self = f(b"BGRA");
+
+    /// Packed 8-bit BGRX.
+    ///
+    /// The X channel has unspecified values.
+    pub const BGRX: Self = f(b"BGRX");
+
+    pub const fn from_bytes(fourcc: [u8; 4]) -> Self {
+        Self(u32::from_le_bytes(fourcc))
+    }
+
+    pub const fn from_u32_le(fourcc: u32) -> Self {
+        Self(fourcc)
+    }
+
+    pub const fn to_bytes(self) -> [u8; 4] {
+        self.0.to_le_bytes()
+    }
+
+    pub const fn to_u32_le(self) -> u32 {
+        self.0
     }
 }
 
-pub fn create_buffer_from_vk_buffer(
-    device: &Device,
-    buffer: vk::Buffer,
-    size: u64,
-    is_in: bool,
-) -> wgpu::Buffer {
-    let buffer = unsafe { <Vulkan as wgpu::hal::Api>::Device::buffer_from_raw(buffer) };
-
-    unsafe {
-        device.create_buffer_from_hal::<Vulkan>(
-            buffer,
-            &wgpu::BufferDescriptor {
-                label: None,
-                size,
-                mapped_at_creation: false,
-                usage: wgpu::BufferUsages::STORAGE
-                    | (if is_in {
-                        wgpu::BufferUsages::COPY_SRC
-                    } else {
-                        wgpu::BufferUsages::COPY_DST
-                    }),
-            },
-        )
-    }
+const fn f(fourcc: &[u8; 4]) -> PixelFormat {
+    PixelFormat::from_bytes(*fourcc)
 }
 
-pub fn format_wgpu_to_vulkan(format: wgpu::TextureFormat) -> vk::Format {
-    use ash::vk::Format as F;
-    use wgpu::TextureFormat as Tf;
-    use wgpu::{AstcBlock, AstcChannel};
-    match format {
-        Tf::R8Unorm => F::R8_UNORM,
-        Tf::R8Snorm => F::R8_SNORM,
-        Tf::R8Uint => F::R8_UINT,
-        Tf::R8Sint => F::R8_SINT,
-        Tf::R16Uint => F::R16_UINT,
-        Tf::R16Sint => F::R16_SINT,
-        Tf::R16Unorm => F::R16_UNORM,
-        Tf::R16Snorm => F::R16_SNORM,
-        Tf::R16Float => F::R16_SFLOAT,
-        Tf::R64Uint => F::R64_UINT,
-        Tf::Rg8Unorm => F::R8G8_UNORM,
-        Tf::Rg8Snorm => F::R8G8_SNORM,
-        Tf::Rg8Uint => F::R8G8_UINT,
-        Tf::Rg8Sint => F::R8G8_SINT,
-        Tf::Rg16Unorm => F::R16G16_UNORM,
-        Tf::Rg16Snorm => F::R16G16_SNORM,
-        Tf::R32Uint => F::R32_UINT,
-        Tf::R32Sint => F::R32_SINT,
-        Tf::R32Float => F::R32_SFLOAT,
-        Tf::Rg16Uint => F::R16G16_UINT,
-        Tf::Rg16Sint => F::R16G16_SINT,
-        Tf::Rg16Float => F::R16G16_SFLOAT,
-        Tf::Rgba8Unorm => F::R8G8B8A8_UNORM,
-        Tf::Rgba8UnormSrgb => F::R8G8B8A8_SRGB,
-        Tf::Bgra8UnormSrgb => F::B8G8R8A8_SRGB,
-        Tf::Rgba8Snorm => F::R8G8B8A8_SNORM,
-        Tf::Bgra8Unorm => F::B8G8R8A8_UNORM,
-        Tf::Rgba8Uint => F::R8G8B8A8_UINT,
-        Tf::Rgba8Sint => F::R8G8B8A8_SINT,
-        Tf::Rgb10a2Unorm => F::A2B10G10R10_UNORM_PACK32,
-        Tf::Rgb10a2Uint => F::A2B10G10R10_UINT_PACK32,
-        Tf::Rg11b10Ufloat => F::B10G11R11_UFLOAT_PACK32,
-        Tf::Rg32Uint => F::R32G32_UINT,
-        Tf::Rg32Sint => F::R32G32_SINT,
-        Tf::Rg32Float => F::R32G32_SFLOAT,
-        Tf::Rgba16Uint => F::R16G16B16A16_UINT,
-        Tf::Rgba16Sint => F::R16G16B16A16_SINT,
-        Tf::Rgba16Unorm => F::R16G16B16A16_UNORM,
-        Tf::Rgba16Snorm => F::R16G16B16A16_SNORM,
-        Tf::Rgba16Float => F::R16G16B16A16_SFLOAT,
-        Tf::Rgba32Uint => F::R32G32B32A32_UINT,
-        Tf::Rgba32Sint => F::R32G32B32A32_SINT,
-        Tf::Rgba32Float => F::R32G32B32A32_SFLOAT,
-        Tf::Depth16Unorm => F::D16_UNORM,
-        Tf::Depth32Float => F::D32_SFLOAT,
-        Tf::Depth32FloatStencil8 => F::D32_SFLOAT_S8_UINT,
-        Tf::Depth24Plus => F::D32_SFLOAT,
-        Tf::Depth24PlusStencil8 => F::D24_UNORM_S8_UINT,
-        Tf::Rgb9e5Ufloat => F::E5B9G9R9_UFLOAT_PACK32,
-        Tf::NV12 => F::G8_B8R8_2PLANE_420_UNORM,
-        Tf::P010 => F::G16_B16R16_2PLANE_420_UNORM,
-        Tf::Stencil8 => F::S8_UINT,
-        Tf::Bc1RgbaUnorm => F::BC1_RGBA_UNORM_BLOCK,
-        Tf::Bc1RgbaUnormSrgb => F::BC1_RGBA_SRGB_BLOCK,
-        Tf::Bc2RgbaUnorm => F::BC2_UNORM_BLOCK,
-        Tf::Bc2RgbaUnormSrgb => F::BC2_SRGB_BLOCK,
-        Tf::Bc3RgbaUnorm => F::BC3_UNORM_BLOCK,
-        Tf::Bc3RgbaUnormSrgb => F::BC3_SRGB_BLOCK,
-        Tf::Bc4RUnorm => F::BC4_UNORM_BLOCK,
-        Tf::Bc4RSnorm => F::BC4_SNORM_BLOCK,
-        Tf::Bc5RgUnorm => F::BC5_UNORM_BLOCK,
-        Tf::Bc5RgSnorm => F::BC5_SNORM_BLOCK,
-        Tf::Bc6hRgbUfloat => F::BC6H_UFLOAT_BLOCK,
-        Tf::Bc6hRgbFloat => F::BC6H_SFLOAT_BLOCK,
-        Tf::Bc7RgbaUnorm => F::BC7_UNORM_BLOCK,
-        Tf::Bc7RgbaUnormSrgb => F::BC7_SRGB_BLOCK,
-        Tf::Etc2Rgb8Unorm => F::ETC2_R8G8B8_UNORM_BLOCK,
-        Tf::Etc2Rgb8UnormSrgb => F::ETC2_R8G8B8_SRGB_BLOCK,
-        Tf::Etc2Rgb8A1Unorm => F::ETC2_R8G8B8A1_UNORM_BLOCK,
-        Tf::Etc2Rgb8A1UnormSrgb => F::ETC2_R8G8B8A1_SRGB_BLOCK,
-        Tf::Etc2Rgba8Unorm => F::ETC2_R8G8B8A8_UNORM_BLOCK,
-        Tf::Etc2Rgba8UnormSrgb => F::ETC2_R8G8B8A8_SRGB_BLOCK,
-        Tf::EacR11Unorm => F::EAC_R11_UNORM_BLOCK,
-        Tf::EacR11Snorm => F::EAC_R11_SNORM_BLOCK,
-        Tf::EacRg11Unorm => F::EAC_R11G11_UNORM_BLOCK,
-        Tf::EacRg11Snorm => F::EAC_R11G11_SNORM_BLOCK,
-        Tf::Astc { block, channel } => match channel {
-            AstcChannel::Unorm => match block {
-                AstcBlock::B4x4 => F::ASTC_4X4_UNORM_BLOCK,
-                AstcBlock::B5x4 => F::ASTC_5X4_UNORM_BLOCK,
-                AstcBlock::B5x5 => F::ASTC_5X5_UNORM_BLOCK,
-                AstcBlock::B6x5 => F::ASTC_6X5_UNORM_BLOCK,
-                AstcBlock::B6x6 => F::ASTC_6X6_UNORM_BLOCK,
-                AstcBlock::B8x5 => F::ASTC_8X5_UNORM_BLOCK,
-                AstcBlock::B8x6 => F::ASTC_8X6_UNORM_BLOCK,
-                AstcBlock::B8x8 => F::ASTC_8X8_UNORM_BLOCK,
-                AstcBlock::B10x5 => F::ASTC_10X5_UNORM_BLOCK,
-                AstcBlock::B10x6 => F::ASTC_10X6_UNORM_BLOCK,
-                AstcBlock::B10x8 => F::ASTC_10X8_UNORM_BLOCK,
-                AstcBlock::B10x10 => F::ASTC_10X10_UNORM_BLOCK,
-                AstcBlock::B12x10 => F::ASTC_12X10_UNORM_BLOCK,
-                AstcBlock::B12x12 => F::ASTC_12X12_UNORM_BLOCK,
-            },
-            AstcChannel::UnormSrgb => match block {
-                AstcBlock::B4x4 => F::ASTC_4X4_SRGB_BLOCK,
-                AstcBlock::B5x4 => F::ASTC_5X4_SRGB_BLOCK,
-                AstcBlock::B5x5 => F::ASTC_5X5_SRGB_BLOCK,
-                AstcBlock::B6x5 => F::ASTC_6X5_SRGB_BLOCK,
-                AstcBlock::B6x6 => F::ASTC_6X6_SRGB_BLOCK,
-                AstcBlock::B8x5 => F::ASTC_8X5_SRGB_BLOCK,
-                AstcBlock::B8x6 => F::ASTC_8X6_SRGB_BLOCK,
-                AstcBlock::B8x8 => F::ASTC_8X8_SRGB_BLOCK,
-                AstcBlock::B10x5 => F::ASTC_10X5_SRGB_BLOCK,
-                AstcBlock::B10x6 => F::ASTC_10X6_SRGB_BLOCK,
-                AstcBlock::B10x8 => F::ASTC_10X8_SRGB_BLOCK,
-                AstcBlock::B10x10 => F::ASTC_10X10_SRGB_BLOCK,
-                AstcBlock::B12x10 => F::ASTC_12X10_SRGB_BLOCK,
-                AstcBlock::B12x12 => F::ASTC_12X12_SRGB_BLOCK,
-            },
-            AstcChannel::Hdr => match block {
-                AstcBlock::B4x4 => F::ASTC_4X4_SFLOAT_BLOCK_EXT,
-                AstcBlock::B5x4 => F::ASTC_5X4_SFLOAT_BLOCK_EXT,
-                AstcBlock::B5x5 => F::ASTC_5X5_SFLOAT_BLOCK_EXT,
-                AstcBlock::B6x5 => F::ASTC_6X5_SFLOAT_BLOCK_EXT,
-                AstcBlock::B6x6 => F::ASTC_6X6_SFLOAT_BLOCK_EXT,
-                AstcBlock::B8x5 => F::ASTC_8X5_SFLOAT_BLOCK_EXT,
-                AstcBlock::B8x6 => F::ASTC_8X6_SFLOAT_BLOCK_EXT,
-                AstcBlock::B8x8 => F::ASTC_8X8_SFLOAT_BLOCK_EXT,
-                AstcBlock::B10x5 => F::ASTC_10X5_SFLOAT_BLOCK_EXT,
-                AstcBlock::B10x6 => F::ASTC_10X6_SFLOAT_BLOCK_EXT,
-                AstcBlock::B10x8 => F::ASTC_10X8_SFLOAT_BLOCK_EXT,
-                AstcBlock::B10x10 => F::ASTC_10X10_SFLOAT_BLOCK_EXT,
-                AstcBlock::B12x10 => F::ASTC_12X10_SFLOAT_BLOCK_EXT,
-                AstcBlock::B12x12 => F::ASTC_12X12_SFLOAT_BLOCK_EXT,
-            },
-        },
+pub unsafe fn export_shared_handle(
+    va_display: VADisplay,
+    va_surface_id: VASurfaceID,
+) -> PrimeSurfaceDescriptor {
+    let mut descriptor: MaybeUninit<PrimeSurfaceDescriptor> = MaybeUninit::uninit();
+
+    let status = cros_libva::vaExportSurfaceHandle(
+        va_display,
+        va_surface_id,
+        0x40000000,      //For DMA-BUF
+        0x8000 | 0x1000, // Optional flag for read-only access
+        descriptor.as_mut_ptr().cast(),
+    );
+
+    if (status != 0) {
+        panic!("Cannot create va shared handle")
+    }
+
+    descriptor.assume_init()
+}
+
+pub fn create_vk_image_from_dma_fd(
+    device: &wgpu::Device,
+    va_shared_prime_descriptor: PrimeSurfaceDescriptor,
+) -> Result<(vk::Image), Box<dyn std::error::Error>> {
+    unsafe {
+        let raw_image = device
+            .as_hal::<Vulkan, _, _>(|device| {
+                device.map(|device| {
+                    let raw_device = device.raw_device();
+                    let physical_device = device.raw_physical_device();
+                    let instance = device.shared_instance().raw_instance();
+
+                    let handle_type = vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT; // D3D12_RESOURCE_KHR
+
+                    let mut import_memory_info = vk::ImportMemoryFdInfoKHR::default()
+                        .handle_type(handle_type)
+                        .fd(va_shared_prime_descriptor.objects[0].fd);
+
+                    let mut ext_create_info =
+                        vk::ExternalMemoryImageCreateInfo::default().handle_types(handle_type);
+
+                    let image_create_info = ImageCreateInfo::default()
+                        .push_next(&mut ext_create_info)
+                        .image_type(vk::ImageType::TYPE_2D)
+                        .format(vk::Format::G8_B8R8_2PLANE_420_UNORM)
+                        .extent(vk::Extent3D {
+                            width: va_shared_prime_descriptor.width,
+                            height: va_shared_prime_descriptor.height,
+                            depth: 1,
+                        })
+                        .mip_levels(1)
+                        .flags(vk::ImageCreateFlags::ALIAS | vk::ImageCreateFlags::MUTABLE_FORMAT)
+                        .array_layers(1)
+                        .samples(vk::SampleCountFlags::TYPE_1)
+                        .tiling(vk::ImageTiling::OPTIMAL)
+                        .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC)
+                        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+
+                    let raw_image = raw_device.create_image(&image_create_info, None)?;
+
+                    let mem_requirements = raw_device.get_image_memory_requirements(raw_image);
+
+                    let mem_properties =
+                        instance.get_physical_device_memory_properties(physical_device);
+
+                    let index =
+                        mem_properties
+                            .memory_types
+                            .iter()
+                            .enumerate()
+                            .position(|(i, t)| {
+                                ((1 << i) & mem_requirements.memory_type_bits) != 0
+                                    && t.property_flags
+                                        .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+                            });
+
+                    let index = match index {
+                        None => {
+                            panic!("Failed to get DEVICE_LOCAL memory index")
+                        }
+                        Some(index) => index,
+                    };
+
+                    let allocate_info = vk::MemoryAllocateInfo::default()
+                        .allocation_size(mem_requirements.size)
+                        .push_next(&mut import_memory_info)
+                        .memory_type_index(index as u32);
+
+                    let allocated_memory = raw_device.allocate_memory(&allocate_info, None)?;
+
+                    raw_device.bind_image_memory(raw_image, allocated_memory, 0)?;
+
+                    Ok::<ash::vk::Image, vk::Result>(raw_image)
+                })
+            })
+            .unwrap()?; // TODO: unwrap
+
+        Ok(raw_image)
     }
 }

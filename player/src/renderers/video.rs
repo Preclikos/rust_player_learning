@@ -78,6 +78,16 @@ fn generate_verticles(scale_x: f32, scale_y: f32) -> [Vertex; 6] {
     ]
 }
 
+fn select_preferred_format(
+    available_formats: &[TextureFormat],
+    preferred_formats: &[TextureFormat],
+) -> Option<TextureFormat> {
+    preferred_formats
+        .iter()
+        .find(|&&preferred| available_formats.contains(&preferred))
+        .copied()
+}
+
 pub struct VideoRenderer {
     window: Arc<Window>,
     device: wgpu::Device,
@@ -138,8 +148,22 @@ impl VideoRenderer {
 
         let size = window.inner_size();
 
+        let preferred_formats = vec![
+            TextureFormat::Rgb10a2Unorm,
+            TextureFormat::Rgba8Unorm,
+            TextureFormat::Bgra8Unorm,
+        ];
+
         let cap = surface.get_capabilities(&adapter);
-        let surface_format = *cap.formats.last().unwrap();
+        let preffered_sufrace_format = select_preferred_format(&cap.formats, &preferred_formats);
+
+        let surface_format = match preffered_sufrace_format {
+            Some(format) => format,
+            None => cap.formats[0],
+        };
+        println!("{:?}", cap.formats);
+
+        //let surface_format = cap.formats[4]; //.last().unwrap();
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             address_mode_u: wgpu::AddressMode::ClampToEdge,

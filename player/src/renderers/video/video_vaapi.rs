@@ -5,6 +5,8 @@ use ash::vk::{self, ImageCreateInfo};
 use cros_libva::{VADisplay, VASurfaceID};
 use wgpu::hal::api::Vulkan;
 
+use super::video_vulkan::VkImageMemory;
+
 #[repr(C)]
 pub struct AVVAAPIDeviceContext {
     pub display: *mut VADisplay, // Pointer to VAAPI display (VADisplay)
@@ -134,7 +136,7 @@ pub unsafe fn export_shared_handle(
 pub fn create_vk_image_from_dma_fd(
     device: &wgpu::Device,
     va_shared_prime_descriptor: PrimeSurfaceDescriptor,
-) -> Result<(vk::Image), Box<dyn std::error::Error>> {
+) -> Result<VkImageMemory, Box<dyn std::error::Error>> {
     unsafe {
         let raw_image = device
             .as_hal::<Vulkan, _, _>(|device| {
@@ -201,9 +203,15 @@ pub fn create_vk_image_from_dma_fd(
 
                     let allocated_memory = raw_device.allocate_memory(&allocate_info, None)?;
 
-                    raw_device.bind_image_memory(raw_image, allocated_memory, 0)?;
+                    raw_device
+                        .bind_image_memory(raw_image, allocated_memory, 0)
+                        .unwrap();
 
-                    Ok::<ash::vk::Image, vk::Result>(raw_image)
+                    let image = VkImageMemory {
+                        raw_image,
+                        memory: allocated_memory,
+                    };
+                    Ok::<VkImageMemory, vk::Result>(image)
                 })
             })
             .unwrap()?; // TODO: unwrap

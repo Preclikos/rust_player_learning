@@ -1,6 +1,7 @@
 use ffmpeg_next::frame::Video;
 use video::VideoFrame;
 use wgpu::Backends;
+use wgpu::SurfaceConfiguration;
 
 mod video;
 #[cfg(target_os = "windows")]
@@ -86,6 +87,7 @@ pub struct VideoRenderer {
     //frame_size: winit::dpi::PhysicalSize<u32>,
     surface: wgpu::Surface<'static>,
     surface_format: TextureFormat,
+    surface_config: SurfaceConfiguration,
     sampler: Sampler,
     vertex_buffer: wgpu::Buffer,
     texture_bind_group_layout: BindGroupLayout,
@@ -136,9 +138,6 @@ impl VideoRenderer {
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
 
@@ -180,8 +179,8 @@ impl VideoRenderer {
             format: surface_format,
             view_formats: vec![surface_format],
             alpha_mode: wgpu::CompositeAlphaMode::Auto,
-            width: 3840,
-            height: 2160,
+            width: 1280,
+            height: 720,
             present_mode: wgpu::PresentMode::AutoVsync,
             desired_maximum_frame_latency: 10,
         };
@@ -227,7 +226,7 @@ impl VideoRenderer {
             cache: None,
         });
 
-        let vertices = generate_verticles(0.2, 0.2);
+        let vertices = generate_verticles(1., 1.);
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Vertex Buffer"),
             contents: bytemuck::cast_slice(&vertices),
@@ -243,6 +242,7 @@ impl VideoRenderer {
             //frame_size,
             surface,
             surface_format,
+            surface_config,
             sampler,
             vertex_buffer,
             texture_bind_group_layout,
@@ -254,8 +254,18 @@ impl VideoRenderer {
         &self.window
     }
 
+    pub fn change_size(&self, width: u32, height: u32) {
+        /*let old_config = self.surface_config.clone();
+        let surface_config = wgpu::SurfaceConfiguration {
+            width: width,
+            height: height,
+            ..old_config
+        };
+        self.surface.configure(&self.device, &surface_config);*/
+    }
+
     pub fn render(&self, frame: Arc<Video>) {
-        let video_frame = VideoFrame::new(self.device.clone(), self.backend);
+        let video_frame = VideoFrame::new(self.device.clone(), self.backend, frame);
         // unsafe {
         /* let frame_ptr = frame.as_ptr();
 
@@ -353,7 +363,7 @@ impl VideoRenderer {
                         .device
                         .create_texture_from_hal::<Dx12>(dx_texture, &desc);
         */
-        let texture = video_frame.get_texture(frame);
+        let texture = video_frame.get_texture();
 
         let y_plane_view = match texture.format() {
             TextureFormat::P010 => {
@@ -454,7 +464,7 @@ impl VideoRenderer {
 
         //_ = CloseHandle(shared_handle);
 
-        drop(texture);
+        //drop(texture);
         //drop(frame);
         //}
     }

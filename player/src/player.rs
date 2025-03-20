@@ -653,6 +653,10 @@ impl Player {
         //}
     }
 
+    pub fn change_size(&self, width: u32, height: u32) {
+        self.video_renderer.change_size(width, height);
+    }
+
     pub fn play(&mut self) -> Result<JoinHandle<()>, Box<dyn Error>> {
         let video_representation = match &self.video_representation {
             Some(success) => success.clone(),

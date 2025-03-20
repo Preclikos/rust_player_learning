@@ -89,6 +89,7 @@ impl ApplicationHandler for App {
                 window.request_redraw();
             }
             WindowEvent::Resized(size) => {
+                player.change_size(size.width, size.height);
                 //state.resize(size);
             }
             WindowEvent::KeyboardInput {

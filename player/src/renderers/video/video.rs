@@ -1,9 +1,10 @@
+use ash::vk;
 use ffmpeg_next::frame::Video;
 use ffmpeg_sys_next::AVHWFramesContext;
 use std::sync::Arc;
-use wgpu::{Backend, Extent3d, Texture};
+use wgpu::{wgc::api::Vulkan, Extent3d, Texture};
 
-use super::video_vulkan::create_texture_from_vk_image;
+use super::video_vulkan::{create_texture_from_vk_image, dump_memory_info};
 
 #[cfg(target_os = "linux")]
 use super::video_vaapi::*;
@@ -23,18 +24,12 @@ use windows::{
 pub struct VideoFrame {
     wgpu_device: wgpu::Device,
     wgpu_backend: wgpu::Backend,
+    memory: vk::DeviceMemory,
+    texture: Texture,
 }
 
 impl VideoFrame {
-    pub fn new(wgpu_device: wgpu::Device, wgpu_backend: wgpu::Backend) -> Self {
-        VideoFrame {
-            wgpu_device,
-            wgpu_backend,
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    pub fn get_texture(&self, frame: Arc<Video>) -> Texture {
+    pub fn new(wgpu_device: wgpu::Device, wgpu_backend: wgpu::Backend, frame: Arc<Video>) -> Self {
         unsafe {
             let frame_ptr = frame.as_ptr();
 
@@ -54,11 +49,9 @@ impl VideoFrame {
             let va_display = (*hwctx).display as *mut _;
             let va_surface_id = (*frame_ptr).data[3] as VASurfaceID;
 
-            //let sync = cros_libva::vaSyncSurface(va_display_ptr, texture);
-
             let descriptor = export_shared_handle(va_display, va_surface_id);
 
-            let raw_image = create_vk_image_from_dma_fd(&self.wgpu_device, descriptor).unwrap();
+            let image_with_memory = create_vk_image_from_dma_fd(&wgpu_device, descriptor).unwrap();
 
             let desc = wgpu::TextureDescriptor {
                 label: None,
@@ -75,42 +68,28 @@ impl VideoFrame {
                 view_formats: &[],
             };
 
-            create_texture_from_vk_image(
-                &self.wgpu_device,
-                raw_image,
+            let texture = create_texture_from_vk_image(
+                &wgpu_device,
+                image_with_memory.raw_image,
                 desc.size.width,
                 desc.size.height,
                 desc.format,
                 true,
                 true,
-            )
+            );
 
-            /*
-            match self.wgpu_backend {
-                Backend::Vulkan => {
-                    let raw_image = cre(
-                        &self.wgpu_device,
-                        d3d11_device,
-                        d3d11_device_context,
-                        frame_texture,
-                        Some(index as u32),
-                    )
-                    .unwrap();
-
-                    create_texture_from_vk_image(
-                        &self.wgpu_device,
-                        raw_image,
-                        desc.size.width,
-                        desc.size.height,
-                        desc.format,
-                        true,
-                        true,
-                    )
-                }
-                _ => panic!("Cannot select HW texture conversion"),
-            }*/
-            //panic!("Cannot select HW texture conversion");
+            VideoFrame {
+                wgpu_device,
+                wgpu_backend,
+                memory: image_with_memory.memory,
+                texture,
+            }
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn get_texture(&self) -> &Texture {
+        &self.texture
     }
 
     #[cfg(target_os = "windows")]
@@ -193,6 +172,22 @@ impl VideoFrame {
                 }
                 _ => panic!("Cannot select HW texture conversion"),
             }
+        }
+    }
+}
+
+impl Drop for VideoFrame {
+    fn drop(&mut self) {
+        unsafe {
+            self.wgpu_device.as_hal::<Vulkan, _, _>(|device| {
+                device.map(|device| {
+                    let raw_device = device.raw_device();
+
+                    //raw_device.destroy_image(self.raw_image, None);
+                    raw_device.free_memory(self.memory, None);
+                })
+            });
+            dump_memory_info(&self.wgpu_device);
         }
     }
 }

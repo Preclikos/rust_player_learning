@@ -2,6 +2,11 @@ use ash::vk;
 use wgpu::hal::api::Vulkan;
 use wgpu::Device;
 
+pub struct VkImageMemory {
+    pub raw_image: vk::Image,
+    pub memory: vk::DeviceMemory,
+}
+
 pub fn create_texture_from_vk_image(
     device: &Device,
     image: vk::Image,
@@ -219,4 +224,35 @@ pub fn format_wgpu_to_vulkan(format: wgpu::TextureFormat) -> vk::Format {
             },
         },
     }
+}
+
+pub unsafe fn dump_memory_info(device: &wgpu::Device) {
+    device.as_hal::<Vulkan, _, _>(|device| {
+        device.map(|device| {
+            let physical_device = device.raw_physical_device();
+            let instance = device.shared_instance().raw_instance();
+
+            let mut memory_budget_info = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+            let mut memory_properties =
+                vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut memory_budget_info);
+
+            instance
+                .get_physical_device_memory_properties2(physical_device, &mut memory_properties);
+
+            println!("Vulkan Memory Usage:");
+            for (i, (usage, budget)) in memory_budget_info
+                .heap_usage
+                .iter()
+                .zip(memory_budget_info.heap_budget.iter())
+                .enumerate()
+            {
+                println!(
+                    "Heap {}: Used: {} MB, Budget: {} MB",
+                    i,
+                    usage / (1024 * 1024),
+                    budget / (1024 * 1024)
+                );
+            }
+        })
+    });
 }

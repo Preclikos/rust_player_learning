@@ -9,6 +9,8 @@ use windows::Win32::Foundation::{CloseHandle, E_FAIL, E_NOINTERFACE, GENERIC_ALL
 use windows::Win32::Graphics::{Direct3D11::*, Direct3D12, Dxgi::Common::*, Dxgi::*};
 use windows::Win32::System::Threading::{CreateEventA, WaitForSingleObject};
 
+use super::video_vulkan::VkImageMemory;
+
 // Define a raw struct for AVD3D11VAContext if it's not exposed in the bindings
 #[repr(C)]
 pub struct AVD3D11VADeviceContext {
@@ -197,7 +199,7 @@ pub fn create_vk_image_from_d3d11_texture(
     d3d11_device_context: &ID3D11DeviceContext,
     texture: &ID3D11Texture2D,
     region: Option<u32>,
-) -> Result<(vk::Image), Box<dyn std::error::Error>> {
+) -> Result<VkImageMemory, Box<dyn std::error::Error>> {
     unsafe {
         let (handle, shared_texture) = get_shared_texture_d3d11(d3d11_device, texture)?;
 
@@ -256,7 +258,7 @@ pub fn create_vk_image_from_d3d11_texture(
                             .iter()
                             .enumerate()
                             .position(|(i, t)| {
-                                ((1 << i) & memory_req.memory_type_bits) != 0
+                                ((1 << i) & mem_requirements.memory_type_bits) != 0
                                     && t.property_flags
                                         .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
                             });
@@ -271,13 +273,18 @@ pub fn create_vk_image_from_d3d11_texture(
                     let allocate_info = vk::MemoryAllocateInfo::default()
                         .allocation_size(mem_requirements.size)
                         .push_next(&mut import_memory_info)
-                        .memory_type_index(index);
+                        .memory_type_index(index as u32);
 
                     let allocated_memory = raw_device.allocate_memory(&allocate_info, None)?;
 
                     raw_device.bind_image_memory(raw_image, allocated_memory, 0)?;
 
-                    Ok::<ash::vk::Image, vk::Result>(raw_image)
+                    let image_with_memory = VkImageMemory {
+                        raw_image,
+                        memory: allocated_memory,
+                    };
+
+                    Ok::<VkImageMemory, vk::Result>(image_with_memory)
                 })
             })
             .unwrap()?; // TODO: unwrap

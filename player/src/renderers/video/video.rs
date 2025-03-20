@@ -2,7 +2,7 @@ use ash::vk;
 use ffmpeg_next::frame::Video;
 use ffmpeg_sys_next::AVHWFramesContext;
 use std::sync::Arc;
-use wgpu::{wgc::api::Vulkan, Extent3d, Texture};
+use wgpu::{wgc::api::Vulkan, Backend, Extent3d, Texture};
 
 use super::video_vulkan::{create_texture_from_vk_image, dump_memory_info};
 
@@ -24,11 +24,12 @@ use windows::{
 pub struct VideoFrame {
     wgpu_device: wgpu::Device,
     wgpu_backend: wgpu::Backend,
-    memory: vk::DeviceMemory,
+    memory: Option<vk::DeviceMemory>,
     texture: Texture,
 }
 
 impl VideoFrame {
+    #[cfg(target_os = "linux")]
     pub fn new(wgpu_device: wgpu::Device, wgpu_backend: wgpu::Backend, frame: Arc<Video>) -> Self {
         unsafe {
             let frame_ptr = frame.as_ptr();
@@ -81,19 +82,16 @@ impl VideoFrame {
             VideoFrame {
                 wgpu_device,
                 wgpu_backend,
-                memory: image_with_memory.memory,
+                memory: Some(image_with_memory.memory),
                 texture,
             }
         }
     }
 
-    #[cfg(target_os = "linux")]
-    pub fn get_texture(&self) -> &Texture {
-        &self.texture
-    }
-
     #[cfg(target_os = "windows")]
-    pub fn get_texture(&self, frame: Arc<Video>) -> Texture {
+    pub fn new(wgpu_device: wgpu::Device, wgpu_backend: wgpu::Backend, frame: Arc<Video>) -> Self {
+        use wgpu::Backend;
+
         unsafe {
             let frame_ptr = frame.as_ptr();
 
@@ -137,10 +135,10 @@ impl VideoFrame {
                 view_formats: &[],
             };
 
-            match self.wgpu_backend {
+            match wgpu_backend {
                 Backend::Dx12 => {
                     let raw_image = create_dx12_resource_from_d3d11_texture(
-                        &self.wgpu_device,
+                        &wgpu_device,
                         d3d11_device,
                         d3d11_device_context,
                         frame_texture,
@@ -148,11 +146,18 @@ impl VideoFrame {
                     )
                     .unwrap();
 
-                    create_texture_from_dx12_resource(&self.wgpu_device, raw_image, &desc)
+                    let texture = create_texture_from_dx12_resource(&wgpu_device, raw_image, &desc);
+
+                    VideoFrame {
+                        wgpu_device,
+                        wgpu_backend,
+                        memory: None,
+                        texture,
+                    }
                 }
                 Backend::Vulkan => {
-                    let raw_image = create_vk_image_from_d3d11_texture(
-                        &self.wgpu_device,
+                    let image_with_memory = create_vk_image_from_d3d11_texture(
+                        &wgpu_device,
                         d3d11_device,
                         d3d11_device_context,
                         frame_texture,
@@ -160,34 +165,49 @@ impl VideoFrame {
                     )
                     .unwrap();
 
-                    create_texture_from_vk_image(
-                        &self.wgpu_device,
-                        raw_image,
+                    let texture = create_texture_from_vk_image(
+                        &wgpu_device,
+                        image_with_memory.raw_image,
                         desc.size.width,
                         desc.size.height,
                         desc.format,
                         true,
                         true,
-                    )
+                    );
+
+                    VideoFrame {
+                        wgpu_device,
+                        wgpu_backend,
+                        memory: Some(image_with_memory.memory),
+                        texture,
+                    }
                 }
                 _ => panic!("Cannot select HW texture conversion"),
             }
         }
     }
+
+    pub fn get_texture(&self) -> &Texture {
+        &self.texture
+    }
 }
 
 impl Drop for VideoFrame {
     fn drop(&mut self) {
-        unsafe {
-            self.wgpu_device.as_hal::<Vulkan, _, _>(|device| {
-                device.map(|device| {
-                    let raw_device = device.raw_device();
+        if self.wgpu_backend == Backend::Vulkan {
+            if let Some(memory) = self.memory {
+                unsafe {
+                    self.wgpu_device.as_hal::<Vulkan, _, _>(|device| {
+                        device.map(|device| {
+                            let raw_device = device.raw_device();
 
-                    //raw_device.destroy_image(self.raw_image, None);
-                    raw_device.free_memory(self.memory, None);
-                })
-            });
-            dump_memory_info(&self.wgpu_device);
+                            //raw_device.destroy_image(self.raw_image, None);
+                            raw_device.free_memory(memory, None);
+                        })
+                    });
+                }
+                //dump_memory_info(&self.wgpu_device);
+            }
         }
     }
 }

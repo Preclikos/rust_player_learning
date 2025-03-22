@@ -23,7 +23,8 @@ impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         // Create window object
         let mut default_attrs = Window::default_attributes();
-        default_attrs.inner_size = Some(Size::Physical(PhysicalSize::new(1280, 800)));
+        default_attrs.title = "Video Player".to_string();
+        //default_attrs.inner_size = Some(Size::Physical(PhysicalSize::new(1280, 800)));
         let window = Arc::new(event_loop.create_window(default_attrs).unwrap());
 
         let mut player = Player::new(window.clone());

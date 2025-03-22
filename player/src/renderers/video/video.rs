@@ -212,11 +212,11 @@ impl Drop for VideoFrame {
                         let raw_device = device.raw_device();
                         /*if let Some(image) = self.image {
                             raw_device.destroy_image(image, None);
-                        }
+                        }*/
 
                         if let Some(memory) = self.memory {
                             raw_device.free_memory(memory, None);
-                        }*/
+                        }
                     })
                 });
 

@@ -1,7 +1,8 @@
 use ffmpeg_next::frame::Video;
+use quick_xml::se;
 use tokio::sync::{
     mpsc::{self, Receiver, Sender},
-    Mutex,
+    Mutex, MutexGuard, RwLock,
 };
 use video::VideoFrame;
 use wgpu::Backends;
@@ -99,7 +100,7 @@ pub struct VideoRenderer {
     backend: wgpu::Backend,
     queue: wgpu::Queue,
     size: winit::dpi::PhysicalSize<u32>,
-    //frame_size: winit::dpi::PhysicalSize<u32>,
+    frame_size: Arc<Mutex<winit::dpi::PhysicalSize<u32>>>,
     surface: Arc<Mutex<wgpu::Surface<'static>>>,
     surface_format: TextureFormat,
     surface_config: Arc<Mutex<SurfaceConfiguration>>,
@@ -282,7 +283,7 @@ impl VideoRenderer {
             backend,
             queue,
             size,
-            //frame_size,
+            frame_size: Arc::new(Mutex::new(size)),
             surface: Arc::new(Mutex::new(surface)),
             surface_format,
             surface_config: Arc::new(Mutex::new(surface_config)),
@@ -301,8 +302,10 @@ impl VideoRenderer {
     fn spawn_command_thread(&self, mut command_receiver: Receiver<VideoRendererCommand>) {
         let surface = Arc::clone(&self.surface);
         let config = Arc::clone(&self.surface_config);
+        let frame_size = Arc::clone(&self.frame_size);
+        let vertex_buffer = Arc::clone(&self.vertex_buffer);
         let device = self.device.clone();
-
+        let window = self.window.clone();
         tokio::spawn(async move {
             while let Some(command) = command_receiver.recv().await {
                 match command {
@@ -313,6 +316,33 @@ impl VideoRenderer {
                         config_guard.width = new_size.width;
                         config_guard.height = new_size.height;
                         surface_guard.configure(&device, &config_guard);
+
+                        let window_size = window.inner_size();
+                        let texture_aspect = {
+                            let frame_size_guard = frame_size.lock().await;
+                            frame_size_guard.width as f32 / frame_size_guard.height as f32
+                        };
+                        let window_aspect = window_size.width as f32 / window_size.height as f32;
+
+                        let (scale_x, scale_y) = if texture_aspect > window_aspect {
+                            (1.0, window_aspect / texture_aspect)
+                        } else {
+                            (texture_aspect / window_aspect, 1.0)
+                        };
+
+                        {
+                            let mut vertex_buffer_guard = vertex_buffer.lock().await;
+                            vertex_buffer_guard.destroy();
+
+                            let vertices = generate_verticles(scale_x, scale_y);
+
+                            *vertex_buffer_guard =
+                                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                                    label: Some("Vertex Buffer"),
+                                    contents: bytemuck::cast_slice(&vertices),
+                                    usage: wgpu::BufferUsages::VERTEX,
+                                });
+                        }
                     }
                 }
             }
@@ -331,10 +361,38 @@ impl VideoRenderer {
     }
 
     pub async fn render(&self, frame: Arc<Video>) {
-        let video_frame = VideoFrame::new(self.device.clone(), self.backend, frame);
+        let video_frame = VideoFrame::new(self.device.clone(), self.backend, frame.clone());
 
         let texture = video_frame.get_texture();
 
+        {
+            let mut frame_size = self.frame_size.lock().await;
+            if frame_size.width != frame.width() || frame_size.height != frame.height() {
+                /*let window_size = self.get_window().inner_size();
+                let texture_aspect = frame_size.width as f32 / frame_size.height as f32;
+                let window_aspect = window_size.width as f32 / window_size.height as f32;
+
+                let (scale_x, scale_y) = if texture_aspect > window_aspect {
+                    (1.0, window_aspect / texture_aspect)
+                } else {
+                    (texture_aspect / window_aspect, 1.0)
+                };
+
+                vertex_buffer.destroy();
+
+                let vertices = generate_verticles(scale_x, scale_y);
+
+                *vertex_buffer = self
+                    .device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("Vertex Buffer"),
+                        contents: bytemuck::cast_slice(&vertices),
+                        usage: wgpu::BufferUsages::VERTEX,
+                    });*/
+
+                *frame_size = PhysicalSize::new(frame.width(), frame.height())
+            }
+        }
         let y_plane_view = match texture.format() {
             TextureFormat::P010 => {
                 texture.create_view(&wgpu::TextureViewDescriptor {

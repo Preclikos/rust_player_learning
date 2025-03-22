@@ -313,35 +313,38 @@ impl VideoRenderer {
                         let surface_guard = surface.lock().await;
                         let mut config_guard = config.write().await;
 
-                        config_guard.width = new_size.width;
-                        config_guard.height = new_size.height;
-                        surface_guard.configure(&device, &config_guard);
+                        if new_size.width > 0 && new_size.height > 0 {
+                            config_guard.width = new_size.width;
+                            config_guard.height = new_size.height;
+                            surface_guard.configure(&device, &config_guard);
 
-                        let window_size = window.inner_size();
-                        let texture_aspect = {
-                            let frame_size_guard = frame_size.read().await;
-                            frame_size_guard.width as f32 / frame_size_guard.height as f32
-                        };
-                        let window_aspect = window_size.width as f32 / window_size.height as f32;
+                            let window_size = window.inner_size();
+                            let texture_aspect = {
+                                let frame_size_guard = frame_size.read().await;
+                                frame_size_guard.width as f32 / frame_size_guard.height as f32
+                            };
+                            let window_aspect =
+                                window_size.width as f32 / window_size.height as f32;
 
-                        let (scale_x, scale_y) = if texture_aspect > window_aspect {
-                            (1.0, window_aspect / texture_aspect)
-                        } else {
-                            (texture_aspect / window_aspect, 1.0)
-                        };
+                            let (scale_x, scale_y) = if texture_aspect > window_aspect {
+                                (1.0, window_aspect / texture_aspect)
+                            } else {
+                                (texture_aspect / window_aspect, 1.0)
+                            };
 
-                        {
-                            let mut vertex_buffer_guard = vertex_buffer.write().await;
-                            vertex_buffer_guard.destroy();
+                            {
+                                let mut vertex_buffer_guard = vertex_buffer.write().await;
+                                vertex_buffer_guard.destroy();
 
-                            let vertices = generate_verticles(scale_x, scale_y);
+                                let vertices = generate_verticles(scale_x, scale_y);
 
-                            *vertex_buffer_guard =
-                                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                                    label: Some("Vertex Buffer"),
-                                    contents: bytemuck::cast_slice(&vertices),
-                                    usage: wgpu::BufferUsages::VERTEX,
-                                });
+                                *vertex_buffer_guard =
+                                    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                                        label: Some("Vertex Buffer"),
+                                        contents: bytemuck::cast_slice(&vertices),
+                                        usage: wgpu::BufferUsages::VERTEX,
+                                    });
+                            }
                         }
                     }
                 }

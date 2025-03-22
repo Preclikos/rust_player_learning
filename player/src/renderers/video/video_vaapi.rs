@@ -121,8 +121,8 @@ pub unsafe fn export_shared_handle(
     let status = cros_libva::vaExportSurfaceHandle(
         va_display,
         va_surface_id,
-        0x40000000,      //For DMA-BUF
-        0x8000 | 0x1000, // Optional flag for read-only access
+        0x40000000, //For DMA-BUF
+        0x1000,     // Optional flag for read-only access
         descriptor.as_mut_ptr().cast(),
     );
 

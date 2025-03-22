@@ -25,6 +25,7 @@ pub struct VideoFrame {
     wgpu_device: wgpu::Device,
     wgpu_backend: wgpu::Backend,
     memory: Option<vk::DeviceMemory>,
+    image: Option<vk::Image>,
     texture: Texture,
 }
 
@@ -83,6 +84,7 @@ impl VideoFrame {
                 wgpu_device,
                 wgpu_backend,
                 memory: Some(image_with_memory.memory),
+                image: None,
                 texture,
             }
         }
@@ -142,6 +144,8 @@ impl VideoFrame {
                         d3d11_device,
                         d3d11_device_context,
                         frame_texture,
+                        frame.width(),
+                        frame.height(),
                         Some(index as u32),
                     )
                     .unwrap();
@@ -152,6 +156,7 @@ impl VideoFrame {
                         wgpu_device,
                         wgpu_backend,
                         memory: None,
+                        image: None,
                         texture,
                     }
                 }
@@ -161,6 +166,8 @@ impl VideoFrame {
                         d3d11_device,
                         d3d11_device_context,
                         frame_texture,
+                        frame.width(),
+                        frame.height(),
                         Some(index as u32),
                     )
                     .unwrap();
@@ -168,17 +175,21 @@ impl VideoFrame {
                     let texture = create_texture_from_vk_image(
                         &wgpu_device,
                         image_with_memory.raw_image,
-                        desc.size.width,
-                        desc.size.height,
+                        frame.width(),
+                        frame.height(),
                         desc.format,
                         true,
                         true,
                     );
 
+                    let ww = texture.width();
+                    let hh = texture.height();
+
                     VideoFrame {
                         wgpu_device,
                         wgpu_backend,
                         memory: Some(image_with_memory.memory),
+                        image: Some(image_with_memory.raw_image),
                         texture,
                     }
                 }
@@ -195,17 +206,20 @@ impl VideoFrame {
 impl Drop for VideoFrame {
     fn drop(&mut self) {
         if self.wgpu_backend == Backend::Vulkan {
-            if let Some(memory) = self.memory {
-                unsafe {
-                    self.wgpu_device.as_hal::<Vulkan, _, _>(|device| {
-                        device.map(|device| {
-                            let raw_device = device.raw_device();
+            unsafe {
+                self.wgpu_device.as_hal::<Vulkan, _, _>(|device| {
+                    device.map(|device| {
+                        let raw_device = device.raw_device();
+                        /*if let Some(image) = self.image {
+                            raw_device.destroy_image(image, None);
+                        }
 
-                            //raw_device.destroy_image(self.raw_image, None);
+                        if let Some(memory) = self.memory {
                             raw_device.free_memory(memory, None);
-                        })
-                    });
-                }
+                        }*/
+                    })
+                });
+
                 //dump_memory_info(&self.wgpu_device);
             }
         }

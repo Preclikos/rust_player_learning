@@ -16,6 +16,7 @@ use pollster::FutureExt;
 use re_mp4::{Mp4, StsdBoxContent};
 use renderers::audio::AudioRenderer;
 use renderers::video::VideoRenderer;
+use winit::dpi::PhysicalSize;
 use winit::window::Window;
 
 use std::error::Error;
@@ -81,7 +82,7 @@ async fn video_sync_producer(
             continue;
         }
 
-        _ = output_tx.render(frame);
+        _ = output_tx.render(frame).await;
     }
 }
 
@@ -653,10 +654,6 @@ impl Player {
         //}
     }
 
-    pub fn change_size(&self, width: u32, height: u32) {
-        self.video_renderer.change_size(width, height);
-    }
-
     pub fn play(&mut self) -> Result<JoinHandle<()>, Box<dyn Error>> {
         let video_representation = match &self.video_representation {
             Some(success) => success.clone(),
@@ -723,6 +720,13 @@ impl Player {
         let audio_renderer = self.audio_renderer.clone();
         tokio::spawn(async move {
             audio_renderer.volume(volume_diff).await;
+        });
+    }
+
+    pub fn resize(&self, size: PhysicalSize<u32>) {
+        let video_renderer: Arc<VideoRenderer> = self.video_renderer.clone();
+        tokio::spawn(async move {
+            video_renderer.resize(size).await;
         });
     }
 }

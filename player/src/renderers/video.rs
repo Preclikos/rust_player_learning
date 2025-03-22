@@ -1,7 +1,12 @@
 use ffmpeg_next::frame::Video;
+use tokio::sync::{
+    mpsc::{self, Receiver, Sender},
+    Mutex,
+};
 use video::VideoFrame;
 use wgpu::Backends;
 use wgpu::SurfaceConfiguration;
+use winit::dpi::PhysicalSize;
 
 mod video;
 #[cfg(target_os = "windows")]
@@ -95,13 +100,18 @@ pub struct VideoRenderer {
     queue: wgpu::Queue,
     size: winit::dpi::PhysicalSize<u32>,
     //frame_size: winit::dpi::PhysicalSize<u32>,
-    surface: wgpu::Surface<'static>,
+    surface: Arc<Mutex<wgpu::Surface<'static>>>,
     surface_format: TextureFormat,
-    surface_config: SurfaceConfiguration,
+    surface_config: Arc<Mutex<SurfaceConfiguration>>,
     sampler: Sampler,
-    vertex_buffer: wgpu::Buffer,
+    vertex_buffer: Arc<Mutex<wgpu::Buffer>>,
     texture_bind_group_layout: BindGroupLayout,
     render_pipeline: RenderPipeline,
+    command_sender: Sender<VideoRendererCommand>,
+}
+
+pub enum VideoRendererCommand {
+    Resize(PhysicalSize<u32>),
 }
 
 impl VideoRenderer {
@@ -210,8 +220,8 @@ impl VideoRenderer {
             format: surface_format,
             view_formats: vec![surface_format],
             alpha_mode: wgpu::CompositeAlphaMode::Auto,
-            width: size.width,
-            height: size.height,
+            width: 1920,
+            height: 1080,
             present_mode: wgpu::PresentMode::AutoVsync,
             desired_maximum_frame_latency: 10,
         };
@@ -264,38 +274,63 @@ impl VideoRenderer {
             usage: wgpu::BufferUsages::VERTEX,
         });
 
-        VideoRenderer {
+        let (command_sender, command_receiver) = mpsc::channel(4);
+
+        let renderer = VideoRenderer {
             window,
             device,
             backend,
             queue,
             size,
             //frame_size,
-            surface,
+            surface: Arc::new(Mutex::new(surface)),
             surface_format,
-            surface_config,
+            surface_config: Arc::new(Mutex::new(surface_config)),
             sampler,
-            vertex_buffer,
+            vertex_buffer: Arc::new(Mutex::new(vertex_buffer)),
             texture_bind_group_layout,
             render_pipeline,
-        }
+            command_sender,
+        };
+
+        renderer.spawn_command_thread(command_receiver);
+
+        renderer
+    }
+
+    fn spawn_command_thread(&self, mut command_receiver: Receiver<VideoRendererCommand>) {
+        let surface = Arc::clone(&self.surface);
+        let config = Arc::clone(&self.surface_config);
+        let device = self.device.clone();
+
+        tokio::spawn(async move {
+            while let Some(command) = command_receiver.recv().await {
+                match command {
+                    VideoRendererCommand::Resize(new_size) => {
+                        let surface_guard = surface.lock().await;
+                        let mut config_guard = config.lock().await;
+
+                        config_guard.width = new_size.width;
+                        config_guard.height = new_size.height;
+                        surface_guard.configure(&device, &config_guard);
+                    }
+                }
+            }
+        });
+    }
+
+    pub async fn resize(&self, new_size: PhysicalSize<u32>) {
+        _ = self
+            .command_sender
+            .send(VideoRendererCommand::Resize(new_size))
+            .await;
     }
 
     fn get_window(&self) -> &Window {
         &self.window
     }
 
-    pub fn change_size(&self, width: u32, height: u32) {
-        /*let old_config = self.surface_config.clone();
-        let surface_config = wgpu::SurfaceConfiguration {
-            width: width,
-            height: height,
-            ..old_config
-        };
-        self.surface.configure(&self.device, &surface_config);*/
-    }
-
-    pub fn render(&self, frame: Arc<Video>) {
+    pub async fn render(&self, frame: Arc<Video>) {
         let video_frame = VideoFrame::new(self.device.clone(), self.backend, frame);
 
         let texture = video_frame.get_texture();
@@ -357,6 +392,8 @@ impl VideoRenderer {
 
         let surface_texture = self
             .surface
+            .lock()
+            .await
             .get_current_texture()
             .expect("failed to acquire next swapchain texture");
 
@@ -387,7 +424,8 @@ impl VideoRenderer {
             render_pass.set_pipeline(&self.render_pipeline);
             render_pass.set_bind_group(0, &texture_bind_group, &[]);
 
-            render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+            let vertex_buffer = self.vertex_buffer.lock().await;
+            render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
 
             render_pass.draw(0..6, 0..1);
         }

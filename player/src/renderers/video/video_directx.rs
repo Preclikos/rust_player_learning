@@ -1,3 +1,5 @@
+use std::ptr::null_mut;
+
 use ash::vk::ImageLayout;
 use ash::vk::{self, ImageCreateInfo};
 use ffmpeg_sys_next::AVHWFramesContext;
@@ -78,17 +80,21 @@ impl DirectX11SharedTexture {
         &self,
         context: &ID3D11DeviceContext,
         tex: &ID3D11Texture2D,
+        width: u32,
+        height: u32,
         region: Option<u32>,
     ) -> windows::core::Result<()> {
-        self.synchronized_copy(context, tex, true, region)
+        self.synchronized_copy(context, tex, true, width, height, region)
     }
     pub fn synchronized_copy_to(
         &self,
         context: &ID3D11DeviceContext,
         tex: &ID3D11Texture2D,
+        width: u32,
+        height: u32,
         region: Option<u32>,
     ) -> windows::core::Result<()> {
-        self.synchronized_copy(context, tex, false, region)
+        self.synchronized_copy(context, tex, false, width, height, region)
     }
 
     fn synchronized_copy(
@@ -96,10 +102,20 @@ impl DirectX11SharedTexture {
         context: &ID3D11DeviceContext,
         texture: &ID3D11Texture2D,
         from: bool,
+        width: u32,
+        height: u32,
         region: Option<u32>,
     ) -> windows::core::Result<()> {
         unsafe {
             if let Ok(mutex) = self.intermediate_texture.cast::<IDXGIKeyedMutex>() {
+                let crop = D3D11_BOX {
+                    left: 0,
+                    top: 0,
+                    front: 0,
+                    right: width,
+                    bottom: height,
+                    back: 1,
+                };
                 mutex.AcquireSync(0, 500)?;
                 if from {
                     match region {
@@ -111,7 +127,7 @@ impl DirectX11SharedTexture {
                             0,
                             texture,
                             region,
-                            None,
+                            Some(&crop),
                         ),
                         None => context.CopyResource(&self.intermediate_texture, texture),
                     }
@@ -125,7 +141,7 @@ impl DirectX11SharedTexture {
                             0,
                             &self.intermediate_texture,
                             0,
-                            None,
+                            Some(&crop),
                         ),
                         None => context.CopyResource(texture, &self.intermediate_texture),
                     }
@@ -146,6 +162,8 @@ impl DirectX11SharedTexture {
 pub fn get_shared_texture_d3d11(
     device: &ID3D11Device,
     texture: &ID3D11Texture2D,
+    width: u32,
+    height: u32,
 ) -> Result<(HANDLE, DirectX11SharedTexture), Box<dyn std::error::Error>> {
     unsafe {
         // Try to open or create shared handle if possible
@@ -165,7 +183,8 @@ pub fn get_shared_texture_d3d11(
         // We need to create a new texture and use texture copy from our original one.
         let mut desc = D3D11_TEXTURE2D_DESC::default();
         texture.GetDesc(&mut desc);
-        //desc.Height = 858;
+        desc.Width = width;
+        desc.Height = height;
         desc.MiscFlags |= D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0 as u32
             | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX.0 as u32;
         desc.ArraySize = 1;
@@ -193,23 +212,96 @@ pub fn get_shared_texture_d3d11(
     }
 }
 
+fn get_dx11_shared_texture_pitch(
+    context: &ID3D11DeviceContext,
+    texture: &ID3D11Texture2D,
+) -> Result<u32, &'static str> {
+    unsafe {
+        let mut mapped_resource: D3D11_MAPPED_SUBRESOURCE = std::mem::zeroed();
+
+        let resource: ID3D11Resource = texture
+            .cast()
+            .map_err(|_| "Failed to cast to ID3D11Resource")?;
+
+        // Map the shared texture
+        let hr = context.Map(
+            &resource,
+            0,              // Mip level 0
+            D3D11_MAP_READ, // Read access
+            0,
+            Some(&mut mapped_resource),
+        );
+
+        if hr.is_err() {
+            return Err("Failed to map shared texture.");
+        }
+
+        let row_pitch = mapped_resource.RowPitch;
+
+        // Unmap the resource
+        context.Unmap(&resource, 0);
+
+        Ok(row_pitch)
+    }
+}
+
+fn get_vulkan_shared_texture_pitch(device: &ash::Device, image: vk::Image) -> u64 {
+    let subresource = vk::ImageSubresource {
+        aspect_mask: vk::ImageAspectFlags::PLANE_1, // Y plane (for YUV)
+        mip_level: 0,
+        array_layer: 0,
+    };
+
+    let layout = unsafe { device.get_image_subresource_layout(image, subresource) };
+    layout.row_pitch // Vulkan's expected row stride
+}
+
 pub fn create_vk_image_from_d3d11_texture(
     device: &wgpu::Device,
     d3d11_device: &ID3D11Device,
     d3d11_device_context: &ID3D11DeviceContext,
     texture: &ID3D11Texture2D,
+    width: u32,
+    height: u32,
     region: Option<u32>,
 ) -> Result<VkImageMemory, Box<dyn std::error::Error>> {
     unsafe {
-        let (handle, shared_texture) = get_shared_texture_d3d11(d3d11_device, texture)?;
+        let mut src_desc = D3D11_TEXTURE2D_DESC::default();
+        texture.GetDesc(&mut src_desc);
+
+        let (handle, shared_texture) =
+            get_shared_texture_d3d11(d3d11_device, texture, width, height)?;
 
         let mut desc = D3D11_TEXTURE2D_DESC::default();
         shared_texture.intermediate_texture.GetDesc(&mut desc);
 
-        _ = shared_texture.synchronized_copy_from(d3d11_device_context, texture, region);
+        _ = shared_texture.synchronized_copy_from(
+            d3d11_device_context,
+            texture,
+            width,
+            height,
+            region,
+        );
 
+        shared_texture.intermediate_texture.GetDesc(&mut desc);
         d3d11_device_context.Flush();
+        /*
+                let mut staging_texture = None;
+                let texture_desc = D3D11_TEXTURE2D_DESC {
+                    Usage: D3D11_USAGE_STAGING,
+                    BindFlags: 0,
+                    CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+                    MiscFlags: 0,
+                    ..Default::default()
+                };
+                let hr = d3d11_device.CreateTexture2D(&texture_desc, None, Some(&mut staging_texture));
 
+                let ss = staging_texture.unwrap();
+                d3d11_device_context.CopyResource(&ss, texture);
+
+                let dx_pitch = get_dx11_shared_texture_pitch(d3d11_device_context, &ss).unwrap();
+                println!("DX pitch: {}", dx_pitch);
+        */
         let raw_image = device
             .as_hal::<Vulkan, _, _>(|device| {
                 device.map(|device| {
@@ -277,6 +369,8 @@ pub fn create_vk_image_from_d3d11_texture(
 
                     let allocated_memory = raw_device.allocate_memory(&allocate_info, None)?;
 
+                    let pitch = get_vulkan_shared_texture_pitch(raw_device, raw_image);
+                    println!("Vulkan pitch: {}", pitch);
                     raw_device.bind_image_memory(raw_image, allocated_memory, 0)?;
 
                     let image_with_memory = VkImageMemory {
@@ -300,12 +394,21 @@ pub fn create_dx12_resource_from_d3d11_texture(
     d3d11_device: &ID3D11Device,
     d3d11_device_context: &ID3D11DeviceContext,
     texture: &ID3D11Texture2D,
+    width: u32,
+    height: u32,
     region: Option<u32>,
 ) -> Result<(Direct3D12::ID3D12Resource), Box<dyn std::error::Error>> {
     unsafe {
-        let (handle, shared_texture) = get_shared_texture_d3d11(d3d11_device, texture)?;
+        let (handle, shared_texture) =
+            get_shared_texture_d3d11(d3d11_device, texture, width, height)?;
 
-        _ = shared_texture.synchronized_copy_from(d3d11_device_context, texture, region);
+        _ = shared_texture.synchronized_copy_from(
+            d3d11_device_context,
+            texture,
+            width,
+            height,
+            region,
+        );
 
         let raw_image = device
             .as_hal::<Dx12, _, _>(|hdevice| {

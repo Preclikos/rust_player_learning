@@ -33,7 +33,7 @@ impl ApplicationHandler for App {
         tokio::spawn(async move {
             //tearsofsteel_
             let _ = player
-                .open_url("https://preclikos.cz/examples/tearsofsteel_raw/manifest.mpd")
+                .open_url("https://preclikos.cz/examples/long/manifest.mpd")
                 .await;
 
             let _ = player.prepare().await;
@@ -42,7 +42,7 @@ impl ApplicationHandler for App {
 
             let tracks = tracks.unwrap();
             let selected_video = tracks.video.first().unwrap();
-            let selected_video_representation = &selected_video.representations[2]; //.first().unwrap();
+            let selected_video_representation = &selected_video.representations[0]; //.first().unwrap();
 
             player.set_video_track(selected_video, selected_video_representation);
 
@@ -89,8 +89,7 @@ impl ApplicationHandler for App {
                 window.request_redraw();
             }
             WindowEvent::Resized(size) => {
-                player.change_size(size.width, size.height);
-                //state.resize(size);
+                player.resize(size);
             }
             WindowEvent::KeyboardInput {
                 device_id: _,

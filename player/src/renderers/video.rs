@@ -100,12 +100,12 @@ pub struct VideoRenderer {
     backend: wgpu::Backend,
     queue: wgpu::Queue,
     size: winit::dpi::PhysicalSize<u32>,
-    frame_size: Arc<Mutex<winit::dpi::PhysicalSize<u32>>>,
+    frame_size: Arc<RwLock<winit::dpi::PhysicalSize<u32>>>,
     surface: Arc<Mutex<wgpu::Surface<'static>>>,
     surface_format: TextureFormat,
-    surface_config: Arc<Mutex<SurfaceConfiguration>>,
+    surface_config: Arc<RwLock<SurfaceConfiguration>>,
     sampler: Sampler,
-    vertex_buffer: Arc<Mutex<wgpu::Buffer>>,
+    vertex_buffer: Arc<RwLock<wgpu::Buffer>>,
     texture_bind_group_layout: BindGroupLayout,
     render_pipeline: RenderPipeline,
     command_sender: Sender<VideoRendererCommand>,
@@ -283,12 +283,12 @@ impl VideoRenderer {
             backend,
             queue,
             size,
-            frame_size: Arc::new(Mutex::new(size)),
+            frame_size: Arc::new(RwLock::new(size)),
             surface: Arc::new(Mutex::new(surface)),
             surface_format,
-            surface_config: Arc::new(Mutex::new(surface_config)),
+            surface_config: Arc::new(RwLock::new(surface_config)),
             sampler,
-            vertex_buffer: Arc::new(Mutex::new(vertex_buffer)),
+            vertex_buffer: Arc::new(RwLock::new(vertex_buffer)),
             texture_bind_group_layout,
             render_pipeline,
             command_sender,
@@ -311,7 +311,7 @@ impl VideoRenderer {
                 match command {
                     VideoRendererCommand::Resize(new_size) => {
                         let surface_guard = surface.lock().await;
-                        let mut config_guard = config.lock().await;
+                        let mut config_guard = config.write().await;
 
                         config_guard.width = new_size.width;
                         config_guard.height = new_size.height;
@@ -319,7 +319,7 @@ impl VideoRenderer {
 
                         let window_size = window.inner_size();
                         let texture_aspect = {
-                            let frame_size_guard = frame_size.lock().await;
+                            let frame_size_guard = frame_size.read().await;
                             frame_size_guard.width as f32 / frame_size_guard.height as f32
                         };
                         let window_aspect = window_size.width as f32 / window_size.height as f32;
@@ -331,7 +331,7 @@ impl VideoRenderer {
                         };
 
                         {
-                            let mut vertex_buffer_guard = vertex_buffer.lock().await;
+                            let mut vertex_buffer_guard = vertex_buffer.write().await;
                             vertex_buffer_guard.destroy();
 
                             let vertices = generate_verticles(scale_x, scale_y);
@@ -366,7 +366,7 @@ impl VideoRenderer {
         let texture = video_frame.get_texture();
 
         {
-            let mut frame_size = self.frame_size.lock().await;
+            let mut frame_size = self.frame_size.write().await;
             if frame_size.width != frame.width() || frame_size.height != frame.height() {
                 /*let window_size = self.get_window().inner_size();
                 let texture_aspect = frame_size.width as f32 / frame_size.height as f32;
@@ -482,7 +482,7 @@ impl VideoRenderer {
             render_pass.set_pipeline(&self.render_pipeline);
             render_pass.set_bind_group(0, &texture_bind_group, &[]);
 
-            let vertex_buffer = self.vertex_buffer.lock().await;
+            let vertex_buffer = self.vertex_buffer.read().await;
             render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
 
             render_pass.draw(0..6, 0..1);

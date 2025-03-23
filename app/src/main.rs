@@ -34,7 +34,7 @@ impl ApplicationHandler for App {
         tokio::spawn(async move {
             //tearsofsteel_
             let _ = player
-                .open_url("https://preclikos.cz/examples/long/manifest.mpd")
+                .open_url("https://preclikos.cz/examples/tearsofsteel_raw/manifest.mpd")
                 .await;
 
             let _ = player.prepare().await;

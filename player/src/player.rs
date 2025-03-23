@@ -193,6 +193,9 @@ impl Player {
     ) {
         self.video_adaptation = Some(adaptation.clone());
         self.video_representation = Some(representation.clone());
+
+        let size = PhysicalSize::new(representation.width, representation.height);
+        self.change_frame_size(size);
     }
 
     pub fn set_audio_track(
@@ -727,6 +730,13 @@ impl Player {
         let video_renderer: Arc<VideoRenderer> = self.video_renderer.clone();
         tokio::spawn(async move {
             video_renderer.resize(size).await;
+        });
+    }
+
+    fn change_frame_size(&self, size: PhysicalSize<u32>) {
+        let video_renderer: Arc<VideoRenderer> = self.video_renderer.clone();
+        tokio::spawn(async move {
+            video_renderer.change_frame_size(size).await;
         });
     }
 }

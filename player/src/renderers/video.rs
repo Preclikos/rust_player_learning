@@ -1,8 +1,7 @@
 use ffmpeg_next::frame::Video;
-use quick_xml::se;
 use tokio::sync::{
     mpsc::{self, Receiver, Sender},
-    Mutex, MutexGuard, RwLock,
+    Mutex, RwLock,
 };
 use video::VideoFrame;
 use wgpu::Backends;
@@ -113,6 +112,7 @@ pub struct VideoRenderer {
 
 pub enum VideoRendererCommand {
     Resize(PhysicalSize<u32>),
+    ChangeFrameSize(PhysicalSize<u32>),
 }
 
 impl VideoRenderer {
@@ -309,23 +309,64 @@ impl VideoRenderer {
         tokio::spawn(async move {
             while let Some(command) = command_receiver.recv().await {
                 match command {
-                    VideoRendererCommand::Resize(new_size) => {
-                        let surface_guard = surface.lock().await;
-                        let mut config_guard = config.write().await;
-
-                        if new_size.width > 0 && new_size.height > 0 {
-                            config_guard.width = new_size.width;
-                            config_guard.height = new_size.height;
-                            surface_guard.configure(&device, &config_guard);
-
+                    VideoRendererCommand::ChangeFrameSize(new_frame_size) => {
+                        {
+                            let mut size = frame_size.write().await;
+                            *size = new_frame_size;
+                        }
+                        let window_size = window.inner_size();
+                        if window_size.width > 0 && window_size.height > 0 {
+                            let mut config_guard = config.write().await;
+                            config_guard.width = window_size.width;
+                            config_guard.height = window_size.height;
+                            {
+                                surface.lock().await.configure(&device, &config_guard);
+                            }
                             let window_size = window.inner_size();
-                            let texture_aspect = {
-                                let frame_size_guard = frame_size.read().await;
-                                frame_size_guard.width as f32 / frame_size_guard.height as f32
-                            };
+
                             let window_aspect =
                                 window_size.width as f32 / window_size.height as f32;
 
+                            let texture_aspect =
+                                new_frame_size.width as f32 / new_frame_size.height as f32;
+                            let (scale_x, scale_y) = if texture_aspect > window_aspect {
+                                (1.0, window_aspect / texture_aspect)
+                            } else {
+                                (texture_aspect / window_aspect, 1.0)
+                            };
+
+                            {
+                                let mut vertex_buffer_guard = vertex_buffer.write().await;
+                                vertex_buffer_guard.destroy();
+
+                                let vertices = generate_verticles(scale_x, scale_y);
+
+                                *vertex_buffer_guard =
+                                    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                                        label: Some("Vertex Buffer"),
+                                        contents: bytemuck::cast_slice(&vertices),
+                                        usage: wgpu::BufferUsages::VERTEX,
+                                    });
+                            }
+                        }
+                    }
+                    VideoRendererCommand::Resize(new_size) => {
+                        if new_size.width > 0 && new_size.height > 0 {
+                            let mut config_guard = config.write().await;
+                            config_guard.width = new_size.width;
+                            config_guard.height = new_size.height;
+                            {
+                                surface.lock().await.configure(&device, &config_guard);
+                            }
+                            let window_size = window.inner_size();
+
+                            let window_aspect =
+                                window_size.width as f32 / window_size.height as f32;
+
+                            let texture_aspect = {
+                                let frame_size = frame_size.read().await;
+                                frame_size.width as f32 / frame_size.height as f32
+                            };
                             let (scale_x, scale_y) = if texture_aspect > window_aspect {
                                 (1.0, window_aspect / texture_aspect)
                             } else {
@@ -359,6 +400,13 @@ impl VideoRenderer {
             .await;
     }
 
+    pub async fn change_frame_size(&self, new_size: PhysicalSize<u32>) {
+        _ = self
+            .command_sender
+            .send(VideoRendererCommand::ChangeFrameSize(new_size))
+            .await;
+    }
+
     fn get_window(&self) -> &Window {
         &self.window
     }
@@ -368,34 +416,6 @@ impl VideoRenderer {
 
         let texture = video_frame.get_texture();
 
-        {
-            let mut frame_size = self.frame_size.write().await;
-            if frame_size.width != frame.width() || frame_size.height != frame.height() {
-                /*let window_size = self.get_window().inner_size();
-                let texture_aspect = frame_size.width as f32 / frame_size.height as f32;
-                let window_aspect = window_size.width as f32 / window_size.height as f32;
-
-                let (scale_x, scale_y) = if texture_aspect > window_aspect {
-                    (1.0, window_aspect / texture_aspect)
-                } else {
-                    (texture_aspect / window_aspect, 1.0)
-                };
-
-                vertex_buffer.destroy();
-
-                let vertices = generate_verticles(scale_x, scale_y);
-
-                *vertex_buffer = self
-                    .device
-                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("Vertex Buffer"),
-                        contents: bytemuck::cast_slice(&vertices),
-                        usage: wgpu::BufferUsages::VERTEX,
-                    });*/
-
-                *frame_size = PhysicalSize::new(frame.width(), frame.height())
-            }
-        }
         let y_plane_view = match texture.format() {
             TextureFormat::P010 => {
                 texture.create_view(&wgpu::TextureViewDescriptor {
@@ -451,51 +471,50 @@ impl VideoRenderer {
             label: Some("texture_bind_group"),
         });
 
-        let surface_texture = self
-            .surface
-            .lock()
-            .await
-            .get_current_texture()
-            .expect("failed to acquire next swapchain texture");
-
-        let texture_view = surface_texture
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor {
-                format: Some(self.surface_format),
-                ..Default::default()
-            });
-
-        let mut encoder = self.device.create_command_encoder(&Default::default());
         {
-            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: None,
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &texture_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
+            let surface = self.surface.lock().await;
+            let surface_texture = surface
+                .get_current_texture()
+                .expect("failed to acquire next swapchain texture");
 
-            render_pass.set_pipeline(&self.render_pipeline);
-            render_pass.set_bind_group(0, &texture_bind_group, &[]);
+            let texture_view = surface_texture
+                .texture
+                .create_view(&wgpu::TextureViewDescriptor {
+                    format: Some(self.surface_format),
+                    ..Default::default()
+                });
 
-            let vertex_buffer = self.vertex_buffer.read().await;
-            render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+            let mut encoder = self.device.create_command_encoder(&Default::default());
+            {
+                let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: None,
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &texture_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
 
-            render_pass.draw(0..6, 0..1);
+                render_pass.set_pipeline(&self.render_pipeline);
+                render_pass.set_bind_group(0, &texture_bind_group, &[]);
+
+                let vertex_buffer = self.vertex_buffer.read().await;
+                render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+
+                render_pass.draw(0..6, 0..1);
+            }
+
+            // Submit the command in the queue to execute
+            self.queue.submit([encoder.finish()]);
+            self.window.pre_present_notify();
+            surface_texture.present();
         }
-
-        // Submit the command in the queue to execute
-        self.queue.submit([encoder.finish()]);
-        self.window.pre_present_notify();
-        surface_texture.present();
-
         //_ = CloseHandle(shared_handle);
 
         //drop(texture);

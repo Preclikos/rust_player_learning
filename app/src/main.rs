@@ -6,7 +6,6 @@ use pollster::FutureExt;
 use tokio::join;
 use tokio::time::Instant;
 use winit::application::ApplicationHandler;
-use winit::dpi::{PhysicalSize, Size};
 use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};

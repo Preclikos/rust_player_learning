@@ -182,9 +182,6 @@ impl VideoFrame {
                         true,
                     );
 
-                    let ww = texture.width();
-                    let hh = texture.height();
-
                     VideoFrame {
                         wgpu_device,
                         wgpu_backend,

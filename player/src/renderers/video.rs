@@ -3,14 +3,14 @@ use tokio::sync::{
     mpsc::{self, Receiver, Sender},
     Mutex, RwLock,
 };
-use video::VideoFrame;
+use video_frame::VideoFrame;
 use wgpu::{Backends, Buffer};
 use wgpu::{Device, SurfaceConfiguration};
 use winit::dpi::PhysicalSize;
 
-mod video;
 #[cfg(target_os = "windows")]
 mod video_directx;
+mod video_frame;
 #[cfg(target_os = "linux")]
 mod video_vaapi;
 mod video_vulkan;
@@ -98,7 +98,6 @@ pub struct VideoRenderer {
     device: wgpu::Device,
     backend: wgpu::Backend,
     queue: wgpu::Queue,
-    size: winit::dpi::PhysicalSize<u32>,
     frame_size: Arc<RwLock<winit::dpi::PhysicalSize<u32>>>,
     surface: Arc<Mutex<wgpu::Surface<'static>>>,
     surface_format: TextureFormat,
@@ -157,7 +156,7 @@ impl VideoRenderer {
             .await
             .unwrap();
 
-        let size = window.inner_size();
+        let size: PhysicalSize<u32> = window.inner_size();
 
         let preferred_formats = vec![
             TextureFormat::Rgb10a2Unorm,
@@ -221,8 +220,8 @@ impl VideoRenderer {
             format: surface_format,
             view_formats: vec![surface_format],
             alpha_mode: wgpu::CompositeAlphaMode::Auto,
-            width: 1920,
-            height: 1080,
+            width: size.width,
+            height: size.height,
             present_mode: wgpu::PresentMode::AutoVsync,
             desired_maximum_frame_latency: 10,
         };
@@ -282,7 +281,6 @@ impl VideoRenderer {
             device,
             backend,
             queue,
-            size,
             frame_size: Arc::new(RwLock::new(size)),
             surface: Arc::new(Mutex::new(surface)),
             surface_format,
@@ -397,10 +395,6 @@ impl VideoRenderer {
             .await;
     }
 
-    fn get_window(&self) -> &Window {
-        &self.window
-    }
-
     pub async fn render(&self, frame: Arc<Video>) {
         let video_frame = VideoFrame::new(self.device.clone(), self.backend, frame.clone());
 
@@ -506,10 +500,5 @@ impl VideoRenderer {
             self.window.pre_present_notify();
             surface_texture.present();
         }
-        //_ = CloseHandle(shared_handle);
-
-        //drop(texture);
-        //drop(frame);
-        //}
     }
 }

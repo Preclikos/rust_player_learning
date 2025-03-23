@@ -4,8 +4,8 @@ use tokio::sync::{
     Mutex, RwLock,
 };
 use video::VideoFrame;
-use wgpu::Backends;
-use wgpu::SurfaceConfiguration;
+use wgpu::{Backends, Buffer};
+use wgpu::{Device, SurfaceConfiguration};
 use winit::dpi::PhysicalSize;
 
 mod video;
@@ -299,6 +299,32 @@ impl VideoRenderer {
         renderer
     }
 
+    async fn change_vertex_buffer(
+        device: &Device,
+        window_size: PhysicalSize<u32>,
+        frame_size: PhysicalSize<u32>,
+        vertex_buffer: Arc<RwLock<Buffer>>,
+    ) {
+        let window_aspect = window_size.width as f32 / window_size.height as f32;
+
+        let texture_aspect = frame_size.width as f32 / frame_size.height as f32;
+        let (scale_x, scale_y) = if texture_aspect > window_aspect {
+            (1.0, window_aspect / texture_aspect)
+        } else {
+            (texture_aspect / window_aspect, 1.0)
+        };
+
+        let vertices = generate_verticles(scale_x, scale_y);
+        let mut vertex_buffer_guard = vertex_buffer.write().await;
+        vertex_buffer_guard.destroy();
+
+        *vertex_buffer_guard = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Vertex Buffer"),
+            contents: bytemuck::cast_slice(&vertices),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+    }
+
     fn spawn_command_thread(&self, mut command_receiver: Receiver<VideoRendererCommand>) {
         let surface = Arc::clone(&self.surface);
         let config = Arc::clone(&self.surface_config);
@@ -322,32 +348,13 @@ impl VideoRenderer {
                             {
                                 surface.lock().await.configure(&device, &config_guard);
                             }
-                            let window_size = window.inner_size();
-
-                            let window_aspect =
-                                window_size.width as f32 / window_size.height as f32;
-
-                            let texture_aspect =
-                                new_frame_size.width as f32 / new_frame_size.height as f32;
-                            let (scale_x, scale_y) = if texture_aspect > window_aspect {
-                                (1.0, window_aspect / texture_aspect)
-                            } else {
-                                (texture_aspect / window_aspect, 1.0)
-                            };
-
-                            {
-                                let mut vertex_buffer_guard = vertex_buffer.write().await;
-                                vertex_buffer_guard.destroy();
-
-                                let vertices = generate_verticles(scale_x, scale_y);
-
-                                *vertex_buffer_guard =
-                                    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                                        label: Some("Vertex Buffer"),
-                                        contents: bytemuck::cast_slice(&vertices),
-                                        usage: wgpu::BufferUsages::VERTEX,
-                                    });
-                            }
+                            Self::change_vertex_buffer(
+                                &device,
+                                window_size,
+                                new_frame_size,
+                                vertex_buffer.clone(),
+                            )
+                            .await;
                         }
                     }
                     VideoRendererCommand::Resize(new_size) => {
@@ -359,32 +366,15 @@ impl VideoRenderer {
                                 surface.lock().await.configure(&device, &config_guard);
                             }
                             let window_size = window.inner_size();
-
-                            let window_aspect =
-                                window_size.width as f32 / window_size.height as f32;
-
-                            let texture_aspect = {
+                            if window_size.width > 0 && window_size.height > 0 {
                                 let frame_size = frame_size.read().await;
-                                frame_size.width as f32 / frame_size.height as f32
-                            };
-                            let (scale_x, scale_y) = if texture_aspect > window_aspect {
-                                (1.0, window_aspect / texture_aspect)
-                            } else {
-                                (texture_aspect / window_aspect, 1.0)
-                            };
-
-                            {
-                                let mut vertex_buffer_guard = vertex_buffer.write().await;
-                                vertex_buffer_guard.destroy();
-
-                                let vertices = generate_verticles(scale_x, scale_y);
-
-                                *vertex_buffer_guard =
-                                    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                                        label: Some("Vertex Buffer"),
-                                        contents: bytemuck::cast_slice(&vertices),
-                                        usage: wgpu::BufferUsages::VERTEX,
-                                    });
+                                Self::change_vertex_buffer(
+                                    &device,
+                                    window_size,
+                                    *frame_size,
+                                    vertex_buffer.clone(),
+                                )
+                                .await;
                             }
                         }
                     }
@@ -473,6 +463,8 @@ impl VideoRenderer {
 
         {
             let surface = self.surface.lock().await;
+            let vertex_buffer = self.vertex_buffer.read().await;
+
             let surface_texture = surface
                 .get_current_texture()
                 .expect("failed to acquire next swapchain texture");
@@ -504,7 +496,6 @@ impl VideoRenderer {
                 render_pass.set_pipeline(&self.render_pipeline);
                 render_pass.set_bind_group(0, &texture_bind_group, &[]);
 
-                let vertex_buffer = self.vertex_buffer.read().await;
                 render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
 
                 render_pass.draw(0..6, 0..1);

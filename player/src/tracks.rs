@@ -80,16 +80,14 @@ impl Tracks {
 
             let end_time_u32 = (start + entry.subsegment_duration);
 
-            let start_time = Duration::from_secs((start / sidx.timescale) as u64);
-            let end_time = Duration::from_secs((end_time_u32 / sidx.timescale) as u64);
-
             let segment = Segment::new(
                 base_url,
                 file_url,
                 start_byte,
-                Some(start_time),
                 end,
-                Some(end_time),
+                Some(start),
+                Some(end_time_u32),
+                Some(sidx.timescale),
             )?;
             segments.push(segment);
 
@@ -163,9 +161,18 @@ impl Tracks {
         };
 
         let (init_start, init_end) = Self::parse_range(&base_segment.initialization.range)?;
-        let init_segment = Segment::new(&url_base, &file_url, init_start, None, init_end, None)?;
+        let init_segment =
+            Segment::new(&url_base, &file_url, init_start, init_end, None, None, None)?;
         let (index_start, index_end) = Self::parse_range(&base_segment.index_range)?;
-        let index_segment = Segment::new(&url_base, &file_url, index_start, None, index_end, None)?;
+        let index_segment = Segment::new(
+            &url_base,
+            &file_url,
+            index_start,
+            index_end,
+            None,
+            None,
+            None,
+        )?;
 
         let segments: Vec<Segment>;
 
@@ -245,9 +252,18 @@ impl Tracks {
         };
 
         let (init_start, init_end) = Self::parse_range(&base_segment.initialization.range)?;
-        let init_segment = Segment::new(&url_base, &file_url, init_start, None, init_end, None)?;
+        let init_segment =
+            Segment::new(&url_base, &file_url, init_start, init_end, None, None, None)?;
         let (index_start, index_end) = Self::parse_range(&base_segment.index_range)?;
-        let index_segment = Segment::new(&url_base, &file_url, index_start, None, index_end, None)?;
+        let index_segment = Segment::new(
+            &url_base,
+            &file_url,
+            index_start,
+            index_end,
+            None,
+            None,
+            None,
+        )?;
 
         let segments: Vec<Segment>;
 

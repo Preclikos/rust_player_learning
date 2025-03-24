@@ -9,9 +9,12 @@ pub struct Segment {
     base_url: String,
     file_url: String,
     start: u64,
-    start_time: Duration,
     end: u64,
+    start_time: Duration,
+    start_time_base: u32,
     end_time: Duration,
+    end_time_base: u32,
+    timescale: u32,
 }
 
 impl Segment {
@@ -19,27 +22,36 @@ impl Segment {
         base_url: &String,
         file_url: &String,
         start: u64,
-        start_time: Option<Duration>,
         end: u64,
-        end_time: Option<Duration>,
+        start_time_base: Option<u32>,
+        end_time_base: Option<u32>,
+        timescale: Option<u32>,
     ) -> Result<Self, Box<dyn Error>> {
-        let start_time = match start_time {
+        let timescale = match timescale {
             Some(time) => time,
-            None => Duration::from_secs(0),
+            None => 0,
         };
 
-        let end_time = match end_time {
-            Some(time) => time,
-            None => Duration::from_secs(0),
+        let start_time = match start_time_base {
+            Some(time) => (Duration::from_secs((time / timescale) as u64), time),
+            None => (Duration::from_secs(0), 0),
+        };
+
+        let end_time = match end_time_base {
+            Some(time) => (Duration::from_secs((time / timescale) as u64), time),
+            None => (Duration::from_secs(0), 0),
         };
 
         Ok(Segment {
             base_url: base_url.to_string(),
             file_url: file_url.to_string(),
             start,
-            start_time,
             end,
-            end_time,
+            start_time: start_time.0,
+            start_time_base: start_time.1,
+            end_time: end_time.0,
+            end_time_base: end_time.1,
+            timescale,
         })
     }
 

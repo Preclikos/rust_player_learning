@@ -2,29 +2,44 @@ use reqwest::{
     header::{HeaderValue, RANGE},
     Client,
 };
-use std::error::Error;
+use std::{error::Error, time::Duration};
 
 #[derive(Clone)]
 pub struct Segment {
     base_url: String,
     file_url: String,
     start: u64,
-    pub end: u64,
+    start_time: Duration,
+    end: u64,
+    end_time: Duration,
 }
 
 impl Segment {
     pub fn new(
         base_url: &String,
         file_url: &String,
-
         start: u64,
+        start_time: Option<Duration>,
         end: u64,
+        end_time: Option<Duration>,
     ) -> Result<Self, Box<dyn Error>> {
+        let start_time = match start_time {
+            Some(time) => time,
+            None => Duration::from_secs(0),
+        };
+
+        let end_time = match end_time {
+            Some(time) => time,
+            None => Duration::from_secs(0),
+        };
+
         Ok(Segment {
             base_url: base_url.to_string(),
             file_url: file_url.to_string(),
             start,
+            start_time,
             end,
+            end_time,
         })
     }
 

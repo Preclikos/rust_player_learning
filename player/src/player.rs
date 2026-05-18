@@ -979,7 +979,9 @@ impl Player {
         Duration::from_millis(self.position_ms.load(Ordering::Relaxed))
     }
 
-    pub async fn stop(&mut self) {
+    pub async fn stop(&self) {
+        self.stop_flag.store(true, Ordering::Relaxed);
+        self.stop.notify_waiters();
         self.audio_renderer.stop().await;
     }
 

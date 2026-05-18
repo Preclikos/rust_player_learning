@@ -89,8 +89,7 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => {
                 if let Some(player) = &self.player {
-                    let mut player_clone = player.clone();
-                    player_clone.stop().block_on();
+                    player.stop().block_on();
                 }
                 println!("The close button was pressed; stopping");
                 event_loop.exit();
@@ -119,7 +118,6 @@ impl ApplicationHandler for App {
                 (PhysicalKey::Code(KeyCode::Escape), ElementState::Pressed) => {
                     println!("Escape key pressed; exiting");
                     if let Some(player) = &self.player {
-                        let mut player = player.clone();
                         player.stop().block_on();
                     }
 
@@ -172,6 +170,10 @@ async fn main() {
         player: None,
     };
     _ = event_loop.run_app(&mut app);
+
+    // The play loop and stdin reader are tokio tasks that don't observe winit's exit.
+    // Skip the runtime's Drop wait — we've already stopped the audio device.
+    std::process::exit(0);
 }
 
 // Windows: Prevent sleep/screensaver

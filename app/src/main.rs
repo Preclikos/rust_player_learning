@@ -1,8 +1,10 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use player::Player;
 use pollster::FutureExt;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::join;
 use tokio::time::Instant;
 use winit::application::ApplicationHandler;
@@ -33,8 +35,21 @@ impl ApplicationHandler for App {
         tokio::spawn(async move {
             //tearsofsteel_
             let _ = player
-                .open_url("https://preclikos.cz/examples/tearsofsteel_raw/manifest.mpd")
+                .open_url("https://preclikos.cz/examples/encrypted/manifest.mpd")
                 .await;
+
+            let mut keys = HashMap::new();
+            keys.insert(
+                "0fd37dac41c0e987e68d43b801b1210c".to_string(),
+                "fd8d9f408c2bd702970afcd3b219e791".to_string(),
+            );
+            keys.insert(
+                "519af81ab2d284f52aa8257d96b5e4bd".to_string(),
+                "627ef72b42d98770dec20ecab46cd1f4".to_string(),
+            );
+            if let Err(e) = player.set_clearkey(keys) {
+                eprintln!("set_clearkey failed: {}", e);
+            }
 
             let _ = player.prepare().await;
 
@@ -42,7 +57,7 @@ impl ApplicationHandler for App {
 
             let tracks = tracks.unwrap();
             let selected_video = tracks.video.first().unwrap();
-            let selected_video_representation = &selected_video.representations[0]; //.first().unwrap();
+            let selected_video_representation = &selected_video.representations[5]; //.first().unwrap();
 
             player.set_video_track(selected_video, selected_video_representation);
 
@@ -51,10 +66,15 @@ impl ApplicationHandler for App {
 
             player.set_audio_track(selected_audio, selected_audio_representation);
 
-            loop {
-                let play = player.play();
-                _ = join!(play.unwrap());
-            }
+            let play_player = player.clone();
+            tokio::spawn(async move {
+                loop {
+                    let play = play_player.play();
+                    _ = join!(play.unwrap());
+                }
+            });
+
+            run_console(player).await;
         });
 
         self.window = Some(window.clone());
@@ -116,6 +136,12 @@ impl ApplicationHandler for App {
                 }
                 (PhysicalKey::Code(KeyCode::KeyZ), ElementState::Pressed) => {
                     player.volume(-0.05);
+                }
+                (PhysicalKey::Code(KeyCode::ArrowLeft), ElementState::Pressed) => {
+                    player.seek_relative(-10_000);
+                }
+                (PhysicalKey::Code(KeyCode::ArrowRight), ElementState::Pressed) => {
+                    player.seek_relative(10_000);
                 }
                 _ => {}
             },
@@ -209,4 +235,124 @@ mod platform {
     pub fn prevent_screensaver() {
         eprintln!("Screensaver prevention is not supported on this platform.");
     }
+}
+
+async fn run_console(player: Player) {
+    print_menu(&player);
+    println!("Commands: l = list, v <i> = video quality, a <i> = audio track");
+
+    let stdin = tokio::io::stdin();
+    let mut reader = BufReader::new(stdin).lines();
+
+    while let Ok(Some(line)) = reader.next_line().await {
+        let trimmed = line.trim();
+        let mut parts = trimmed.split_whitespace();
+        let cmd = parts.next().unwrap_or("");
+        let arg = parts.next();
+
+        match cmd {
+            "" => {}
+            "l" | "list" => print_menu(&player),
+            "v" => match arg.and_then(|s| s.parse::<usize>().ok()) {
+                Some(i) => pick_video(&player, i),
+                None => println!("usage: v <index>"),
+            },
+            "a" => match arg.and_then(|s| s.parse::<usize>().ok()) {
+                Some(i) => pick_audio(&player, i),
+                None => println!("usage: a <index>"),
+            },
+            other => println!("unknown command: {} (try l, v <i>, a <i>)", other),
+        }
+    }
+}
+
+fn print_menu(player: &Player) {
+    let tracks = match player.get_tracks() {
+        Ok(t) => t,
+        Err(e) => {
+            println!("no tracks: {}", e);
+            return;
+        }
+    };
+    let current_video_id = player.current_video_representation().map(|r| r.id);
+    let current_audio_id = player.current_audio_representation().map(|r| r.id);
+
+    println!("\n=== Available tracks ===");
+    println!("Video:");
+    let mut i = 0;
+    for adaptation in &tracks.video {
+        for repr in &adaptation.representations {
+            let marker = if Some(repr.id) == current_video_id {
+                " *"
+            } else {
+                ""
+            };
+            println!(
+                "  [{}] {}x{}  bw={}  {}{}",
+                i, repr.width, repr.height, repr.bandwidth, repr.codecs, marker
+            );
+            i += 1;
+        }
+    }
+    println!("Audio:");
+    let mut i = 0;
+    for adaptation in &tracks.audio {
+        for repr in &adaptation.representations {
+            let marker = if Some(repr.id) == current_audio_id {
+                " *"
+            } else {
+                ""
+            };
+            println!(
+                "  [{}] lang={}  bw={}  {}{}",
+                i, adaptation.lang, repr.bandwidth, repr.codecs, marker
+            );
+            i += 1;
+        }
+    }
+    println!("========================");
+}
+
+fn pick_video(player: &Player, index: usize) {
+    let tracks = match player.get_tracks() {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+    let mut i = 0;
+    for adaptation in &tracks.video {
+        for repr in &adaptation.representations {
+            if i == index {
+                println!(
+                    "switching video to [{}] {}x{} bw={}",
+                    i, repr.width, repr.height, repr.bandwidth
+                );
+                player.change_video_track(repr);
+                return;
+            }
+            i += 1;
+        }
+    }
+    println!("invalid video index");
+}
+
+fn pick_audio(player: &Player, index: usize) {
+    let tracks = match player.get_tracks() {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+    let mut i = 0;
+    for adaptation in &tracks.audio {
+        for repr in &adaptation.representations {
+            if i == index {
+                println!(
+                    "switching audio to [{}] lang={} bw={}",
+                    i, adaptation.lang, repr.bandwidth
+                );
+                player.change_audio_track(adaptation, repr);
+                return;
+            }
+            i += 1;
+        }
+    }
+    println!("invalid audio index");
 }

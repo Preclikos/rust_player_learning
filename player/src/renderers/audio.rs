@@ -1,4 +1,10 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
@@ -15,6 +21,7 @@ pub struct AudioRenderer {
     command_sender: Sender<AudioRendererCommand>,
     sample_sender: Sender<f32>,
     sample_rate: u32,
+    flush_flag: Arc<AtomicBool>,
 }
 
 enum AudioRendererCommand {
@@ -25,14 +32,17 @@ enum AudioRendererCommand {
 impl AudioRenderer {
     pub fn new() -> Self {
         let stop = Arc::new(Notify::new());
+        let flush_flag = Arc::new(AtomicBool::new(false));
 
         let (command_sender, command_receiver) = mpsc::channel(4);
-        let audio_thread = AudioRenderer::start_thread(command_receiver, stop);
+        let audio_thread =
+            AudioRenderer::start_thread(command_receiver, stop, flush_flag.clone());
 
         AudioRenderer {
             command_sender,
             sample_sender: audio_thread.0,
             sample_rate: audio_thread.1,
+            flush_flag,
         }
     }
 
@@ -42,6 +52,7 @@ impl AudioRenderer {
         config: SupportedStreamConfig,
         volume: Arc<RwLock<f32>>,
         stop: Arc<Notify>,
+        flush_flag: Arc<AtomicBool>,
     ) {
         let stream_config = StreamConfig {
             channels: config.channels(),
@@ -50,6 +61,9 @@ impl AudioRenderer {
         };
 
         let callback = move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+            if flush_flag.swap(false, Ordering::Relaxed) {
+                while sample_receiver.try_recv().is_ok() {}
+            }
             let vol = volume.blocking_read();
             for sample in data.iter_mut() {
                 let asample = sample_receiver.try_recv().unwrap_or(Sample::EQUILIBRIUM);
@@ -76,8 +90,9 @@ impl AudioRenderer {
     fn start_thread(
         mut command_receiver: Receiver<AudioRendererCommand>,
         stop: Arc<Notify>,
+        flush_flag: Arc<AtomicBool>,
     ) -> (Sender<f32>, u32) {
-        let (sample_sender, sample_receiver) = mpsc::channel::<f32>(8192);
+        let (sample_sender, sample_receiver) = mpsc::channel::<f32>(2048);
 
         let device = cpal::default_host()
             .default_output_device()
@@ -98,6 +113,7 @@ impl AudioRenderer {
             config_cpal,
             volume_cpal,
             stop_cpal,
+            flush_flag,
         ));
 
         let volume_handle = Arc::clone(&volume);
@@ -136,6 +152,10 @@ impl AudioRenderer {
 
     pub async fn stop(&self) {
         _ = self.command_sender.send(AudioRendererCommand::Stop).await;
+    }
+
+    pub fn flush(&self) {
+        self.flush_flag.store(true, Ordering::Relaxed);
     }
 
     pub async fn volume(&self, volume_diff: f32) {

@@ -223,7 +223,7 @@ impl VideoRenderer {
             width: size.width,
             height: size.height,
             present_mode: wgpu::PresentMode::AutoVsync,
-            desired_maximum_frame_latency: 10,
+            desired_maximum_frame_latency: 2,
         };
         surface.configure(&device, &surface_config);
 

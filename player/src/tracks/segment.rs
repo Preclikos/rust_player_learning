@@ -32,14 +32,22 @@ impl Segment {
             None => 0,
         };
 
+        let to_duration = |time: u32| -> Duration {
+            if timescale == 0 {
+                Duration::ZERO
+            } else {
+                Duration::from_micros((time as u64) * 1_000_000 / (timescale as u64))
+            }
+        };
+
         let start_time = match start_time_base {
-            Some(time) => (Duration::from_secs((time / timescale) as u64), time),
-            None => (Duration::from_secs(0), 0),
+            Some(time) => (to_duration(time), time),
+            None => (Duration::ZERO, 0),
         };
 
         let end_time = match end_time_base {
-            Some(time) => (Duration::from_secs((time / timescale) as u64), time),
-            None => (Duration::from_secs(0), 0),
+            Some(time) => (to_duration(time), time),
+            None => (Duration::ZERO, 0),
         };
 
         Ok(Segment {
@@ -53,6 +61,14 @@ impl Segment {
             end_time_base: end_time.1,
             timescale,
         })
+    }
+
+    pub fn start_time(&self) -> Duration {
+        self.start_time
+    }
+
+    pub fn end_time(&self) -> Duration {
+        self.end_time
     }
 
     pub async fn download(&self) -> Result<Vec<u8>, Box<dyn Error>> {

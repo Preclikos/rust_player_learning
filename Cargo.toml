@@ -1,6 +1,8 @@
 [workspace]
 members = [
     "app",
+    "app-android",
+    "app-ios",
     "player"
 ]
 resolver = "2"

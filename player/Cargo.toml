@@ -33,5 +33,6 @@ windows = { version = "0.58.0", features = [ "Win32_System_Com", "Win32_System_C
              "Win32_Security", "Win32_Security_Authorization", "Win32_System_WindowsProgramming", "Win32_System_Threading", "Win32_System_Registry",
              "Win32_Storage_Packaging_Appx", "Win32_Storage_FileSystem" ] }
 
-[target.'cfg(any(unix, linux))'.dependencies]
+# Desktop Linux only; cfg(unix) is true on Android/iOS too which we don't want here.
+[target.'cfg(all(target_os = "linux", not(target_os = "android")))'.dependencies]
 cros-libva = "0.0.13"

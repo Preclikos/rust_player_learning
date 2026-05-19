@@ -1,0 +1,85 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'cz.preclikos.rust_player'
+    compileSdk 34
+    ndkVersion '26.1.10909125'
+
+    defaultConfig {
+        applicationId 'cz.preclikos.rust_player'
+        minSdk 24             // Android 7.0 — required for AHardwareBuffer + HEVC HW decode
+        targetSdk 34
+        versionCode 1
+        versionName '0.1'
+
+        ndk {
+            // Start with arm64 only; add 'x86_64' for emulator if you need it.
+            abiFilters 'arm64-v8a'
+        }
+    }
+
+    buildTypes {
+        debug {
+            jniDebuggable true
+        }
+        release {
+            minifyEnabled false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    // The jniLibs directory is populated by the buildRust task below.
+    sourceSets {
+        main {
+            jniLibs.srcDirs = ['src/main/jniLibs']
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Rust integration
+//
+// Runs cargo-ndk to cross-compile the `app-android` crate's cdylib into
+// src/main/jniLibs/<abi>/libapp_android.so before Gradle assembles the APK.
+//
+// Prerequisites:
+//   - Android NDK installed and ANDROID_NDK_HOME (or ndkVersion above) set.
+//   - cargo-ndk:           cargo install cargo-ndk
+//   - aarch64 rust target: rustup target add aarch64-linux-android
+// ----------------------------------------------------------------------------
+
+def workspaceDir = file("${rootDir}/${project.workspaceDir}")
+def abi = 'arm64-v8a'
+
+task buildRustDebug(type: Exec) {
+    workingDir workspaceDir
+    commandLine 'cargo', 'ndk',
+            '-t', abi,
+            '-o', file("${projectDir}/src/main/jniLibs").absolutePath,
+            'build',
+            '-p', 'app-android'
+}
+
+task buildRustRelease(type: Exec) {
+    workingDir workspaceDir
+    commandLine 'cargo', 'ndk',
+            '-t', abi,
+            '-o', file("${projectDir}/src/main/jniLibs").absolutePath,
+            'build', '--release',
+            '-p', 'app-android'
+}
+
+afterEvaluate {
+    tasks.named('preDebugBuild').configure { dependsOn buildRustDebug }
+    tasks.named('preReleaseBuild').configure { dependsOn buildRustRelease }
+}
+
+clean.doFirst {
+    delete "${projectDir}/src/main/jniLibs"
+}

@@ -1,0 +1,19 @@
+[package]
+name = "app-android"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+# Dependencies are Android-only so this crate is a no-op on desktop/iOS
+# builds (cargo workspace still passes `cargo check` everywhere).
+[target.'cfg(target_os = "android")'.dependencies]
+player = { path = "../player" }
+winit = { version = "0.30.9", features = ["android-native-activity"] }
+android-activity = { version = "0.6", features = ["native-activity"] }
+android_logger = "0.14"
+log = "0.4"
+tokio = { version = "1.43.0", features = ["full"] }
+pollster = "0.4.0"

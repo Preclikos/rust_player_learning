@@ -1,0 +1,19 @@
+[package]
+name = "app-ios"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+# staticlib so an Xcode project can link the .a into its app bundle.
+crate-type = ["staticlib"]
+path = "src/lib.rs"
+
+# Dependencies are iOS-only so this crate is a no-op on desktop/Android
+# builds (workspace `cargo build` still passes).
+[target.'cfg(target_os = "ios")'.dependencies]
+player = { path = "../player" }
+winit = "0.30.9"
+tokio = { version = "1.43.0", features = ["full"] }
+pollster = "0.4.0"
+log = "0.4"
+oslog = "0.2"

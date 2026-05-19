@@ -1,4 +1,5 @@
 mod crypto;
+mod decoders;
 mod manifest;
 mod networking;
 mod parsers;

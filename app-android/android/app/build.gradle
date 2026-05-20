@@ -5,7 +5,7 @@ plugins {
 android {
     namespace 'cz.preclikos.rust_player'
     compileSdk 34
-    ndkVersion '26.0.10792818'
+    ndkVersion '29.0.13113456'
 
     defaultConfig {
         applicationId 'cz.preclikos.rust_player'

@@ -1164,12 +1164,23 @@ async fn play_loop_android(
         codec_specific_data: csd,
     })?;
 
-    // Helper: drain any ready decoded frames and render them.
+    // Anchor wall-clock to the playback timeline: at t=0 of playback
+    // (modulo any active seek), Instant::now() - start_time = seek_offset.
+    // Each decoded frame's pts is then directly comparable to elapsed.
+    let now = tokio::time::Instant::now();
+    let start_time = Arc::new(now.checked_sub(seek_offset).unwrap_or(now));
+
+    // Helper: drain any ready decoded frames and render them, pacing each
+    // frame against `start_time` so playback runs at real-time speed
+    // instead of as fast as MediaCodec can decode.
     async fn drain_and_render(
         decoder: &mut MediaCodecDecoder,
         video_renderer: &Arc<renderers::video::VideoRenderer>,
         position_ms: &Arc<AtomicU64>,
         stop_flag: &Arc<AtomicBool>,
+        start_time: &Arc<tokio::time::Instant>,
+        frame_count: &mut u64,
+        dropped_count: &mut u64,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         loop {
             if stop_flag.load(Ordering::Relaxed) {
@@ -1177,7 +1188,43 @@ async fn play_loop_android(
             }
             match decoder.try_recv()? {
                 Some(frame) => {
-                    position_ms.store((frame.pts_us / 1000) as u64, Ordering::Relaxed);
+                    let pts_ms = (frame.pts_us.max(0) as u64) / 1000;
+                    let elapsed_ms = start_time.elapsed().as_millis() as u64;
+
+                    // Past-due by more than 20ms — drop to catch up rather
+                    // than render late and accumulate lag.
+                    if pts_ms + 20 < elapsed_ms {
+                        *dropped_count += 1;
+                        if *dropped_count == 1 || *dropped_count % 30 == 0 {
+                            log::info!(
+                                "android: dropped late frame pts={}ms elapsed={}ms (total dropped={})",
+                                pts_ms,
+                                elapsed_ms,
+                                dropped_count
+                            );
+                        }
+                        position_ms.store(pts_ms, Ordering::Relaxed);
+                        continue;
+                    }
+
+                    // Future frame — sleep until its pts arrives.
+                    if pts_ms > elapsed_ms {
+                        let sleep_ms = pts_ms - elapsed_ms;
+                        tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+                        if stop_flag.load(Ordering::Relaxed) {
+                            return Ok(());
+                        }
+                    }
+
+                    *frame_count += 1;
+                    if *frame_count == 1 || *frame_count % 60 == 0 {
+                        log::info!(
+                            "android: rendered frame #{} pts={}ms",
+                            frame_count,
+                            pts_ms
+                        );
+                    }
+                    position_ms.store(pts_ms, Ordering::Relaxed);
                     if let PlatformFrame::HardwareBuffer(ahb) = frame.native {
                         video_renderer.render_android(ahb).await;
                     }
@@ -1186,7 +1233,10 @@ async fn play_loop_android(
             }
         }
     }
+    let mut frame_count: u64 = 0;
+    let mut dropped_count: u64 = 0;
 
+    let mut submit_count: u64 = 0;
     for seg_idx in start_index..video_repr.segments.len() {
         if stop_flag.load(Ordering::Relaxed) {
             break;
@@ -1239,12 +1289,14 @@ async fn play_loop_android(
             let sample_data = &data_vec[offset..offset + size];
 
             // mp4 mdat is length-prefixed NALUs; MediaCodec wants Annex-B
-            // (start-code-prefixed). Convert.
+            // (start-code-prefixed). `parse_hevc_nalu` already prepends the
+            // 00 00 00 01 start code to each NALU, so concatenate as-is —
+            // adding another would inject empty NALs between samples and the
+            // HW decoder will silently drop the whole bitstream.
             let nalus = parse_hevc_nalu(sample_data)
                 .map_err(|e| -> Box<dyn Error + Send + Sync> { format!("NALU parse: {}", e).into() })?;
             let mut annex_b = Vec::with_capacity(size + nalus.len() * 4);
             for n in nalus {
-                annex_b.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
                 annex_b.extend_from_slice(&n);
             }
 
@@ -1261,19 +1313,51 @@ async fn play_loop_android(
                     return Ok(());
                 }
                 match decoder.submit(&annex_b, pts_us) {
-                    Ok(()) => break,
+                    Ok(()) => {
+                        submit_count += 1;
+                        if submit_count == 1 {
+                            log::info!(
+                                "android: first sample submitted size={} pts={}ms",
+                                annex_b.len(),
+                                pts_us / 1000
+                            );
+                        }
+                        break;
+                    }
                     Err(_) => {
-                        drain_and_render(&mut decoder, &video_renderer, &position_ms, &stop_flag)
-                            .await?;
+                        drain_and_render(
+                            &mut decoder,
+                            &video_renderer,
+                            &position_ms,
+                            &stop_flag,
+                            &start_time,
+                            &mut frame_count,
+                            &mut dropped_count,
+                        )
+                        .await?;
                         tokio::time::sleep(Duration::from_millis(2)).await;
                     }
                 }
             }
 
             // Eagerly drain any newly-decoded frames.
-            drain_and_render(&mut decoder, &video_renderer, &position_ms, &stop_flag).await?;
+            drain_and_render(
+                &mut decoder,
+                &video_renderer,
+                &position_ms,
+                &stop_flag,
+                &start_time,
+                &mut frame_count,
+                &mut dropped_count,
+            )
+            .await?;
         }
     }
+
+    log::info!(
+        "android: segment loop done, frames_drained_so_far={}",
+        frame_count
+    );
 
     // Final drain: pull whatever's still queued out of the decoder.
     let drain_deadline = tokio::time::Instant::now() + Duration::from_millis(500);

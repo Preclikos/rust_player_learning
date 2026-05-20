@@ -126,8 +126,13 @@ impl VideoRenderer {
         let backend = Backends::DX12;
         #[cfg(target_os = "linux")]
         let backend = Backends::VULKAN;
+        // Android emulators on preview API levels sometimes ship a Vulkan
+        // ICD that rejects vkCreateInstance with ERROR_INITIALIZATION_FAILED.
+        // Keep GLES in the request set so the Instance can still come up
+        // (and Player::new doesn't panic). On real devices Vulkan wins, which
+        // is what render_android's AHB→VkImage zero-copy path requires.
         #[cfg(target_os = "android")]
-        let backend = Backends::VULKAN;
+        let backend = Backends::VULKAN | Backends::GL;
         #[cfg(target_os = "ios")]
         let backend = Backends::METAL;
 
@@ -153,12 +158,37 @@ impl VideoRenderer {
 
         let backend = adapter.get_info().backend;
 
+        // NV12 / 16BIT_NORM are only used by the Vulkan AHB / D3D11 import
+        // paths. GLES (Android emulator fallback) doesn't expose them and
+        // request_device fails with UnsupportedFeature if we ask anyway.
+        let is_hw_backend = backend == wgpu::Backend::Vulkan || backend == wgpu::Backend::Dx12;
+        let required_features = if is_hw_backend {
+            wgpu::Features::TEXTURE_FORMAT_NV12 | wgpu::Features::TEXTURE_FORMAT_16BIT_NORM
+        } else {
+            wgpu::Features::empty()
+        };
+        // Default limits require compute, which Android emulator GLES doesn't
+        // expose; fall back to downlevel limits so request_device succeeds.
+        // downlevel_defaults() still requires compute (ES 3.1); the
+        // Android emulator only exposes ES 3.0. Start from the no-compute
+        // WebGL2 baseline and lift max_texture_dimension_2d up to whatever
+        // the adapter actually exposes so we can configure a surface
+        // matching the device's screen resolution (1080×2400 etc.).
+        let required_limits = if is_hw_backend {
+            wgpu::Limits::default()
+        } else {
+            let adapter_limits = adapter.limits();
+            wgpu::Limits {
+                max_texture_dimension_2d: adapter_limits.max_texture_dimension_2d,
+                max_texture_dimension_1d: adapter_limits.max_texture_dimension_1d,
+                ..wgpu::Limits::downlevel_webgl2_defaults()
+            }
+        };
+
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
-                required_features:/* wgpu::Features::TEXTURE_FORMAT_P010 // Enable P010
-                    |*/  wgpu::Features::TEXTURE_FORMAT_NV12
-                    | wgpu::Features::TEXTURE_FORMAT_16BIT_NORM, // Enable NV12
-                required_limits: wgpu::Limits::default(),
+                required_features,
+                required_limits,
                 label: Some("Device with NV12 support"),
                 memory_hints: MemoryHints::Performance,
                 experimental_features: wgpu::ExperimentalFeatures::default(),
@@ -531,6 +561,65 @@ impl VideoRenderer {
         use video_mediacodec::create_vk_image_from_ahb;
         use video_vulkan::create_texture_from_vk_image;
 
+        // AHB→VkImage zero-copy import requires the Vulkan backend. On
+        // emulators that fall back to GLES, drop the frame's GPU import
+        // but still clear-and-present the surface so the swapchain keeps
+        // ticking and we can see the renderer is alive (otherwise the
+        // window stays black and looks frozen).
+        if self.backend != wgpu::Backend::Vulkan {
+            static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+            WARN_ONCE.call_once(|| {
+                log::warn!(
+                    "render_android: backend is {:?}, not Vulkan — AHB import unavailable, presenting clear color only",
+                    self.backend
+                );
+            });
+
+            let surface = self.surface.lock().await;
+            let surface_texture = match surface.get_current_texture() {
+                wgpu::CurrentSurfaceTexture::Success(t)
+                | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
+                other => {
+                    log::warn!("surface texture not available: {:?}", other);
+                    return;
+                }
+            };
+            let view = surface_texture
+                .texture
+                .create_view(&wgpu::TextureViewDescriptor {
+                    format: Some(self.surface_format),
+                    ..Default::default()
+                });
+            let mut encoder = self.device.create_command_encoder(&Default::default());
+            {
+                let _rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("android-fallback-clear"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color {
+                                r: 0.1,
+                                g: 0.2,
+                                b: 0.4,
+                                a: 1.0,
+                            }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+            }
+            self.queue.submit([encoder.finish()]);
+            self.window.pre_present_notify();
+            self.queue.present(surface_texture);
+            return;
+        }
+
         // `HardwareBuffer` is the unowned view; scope it tightly so the
         // !Send pointer doesn't outlive the import call (otherwise the
         // surrounding future loses its Send bound when we .await below).
@@ -644,15 +733,20 @@ impl VideoRenderer {
             self.queue.present(surface_texture);
         }
 
-        // Drop the texture (wgpu releases the VkImage), then free the
-        // imported VkDeviceMemory ourselves. `frame.buffer`'s HardwareBufferRef
-        // is dropped on return — at that point Vulkan still holds a ref
-        // until the queue completes, then the AHB is freed.
+        // Defer freeing the imported VkDeviceMemory until the GPU has
+        // finished with this submission. Freeing immediately after
+        // queue.present() races the GPU and poisons the next
+        // get_current_texture() with a validation error.
+        // on_submitted_work_done fires once the just-submitted batch
+        // (including this frame's NV12 sample reads) retires; subsequent
+        // queue.submit / device.poll calls drive it forward.
         drop(texture);
-        unsafe {
-            if let Some(raw_dev) = self.device.as_hal::<wgpu::hal::api::Vulkan>() {
-                raw_dev.raw_device().free_memory(img_mem.memory, None);
+        let device_for_free = self.device.clone();
+        let memory_to_free = img_mem.memory;
+        self.queue.on_submitted_work_done(move || unsafe {
+            if let Some(raw_dev) = device_for_free.as_hal::<wgpu::hal::api::Vulkan>() {
+                raw_dev.raw_device().free_memory(memory_to_free, None);
             }
-        }
+        });
     }
 }

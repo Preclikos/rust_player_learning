@@ -116,7 +116,7 @@ impl ApplicationHandler for App {
 #[no_mangle]
 fn android_main(app: AndroidApp) {
     android_logger::init_once(
-        android_logger::Config::default().with_max_level(log::LevelFilter::Info),
+        android_logger::Config::default().with_max_level(log::LevelFilter::Debug),
     );
     log::info!("android_main: starting");
 

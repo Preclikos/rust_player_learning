@@ -59,11 +59,30 @@ pub enum PlatformFrame {
     D3d11 { texture_ptr: *mut std::ffi::c_void, array_index: u32 },
     #[cfg(all(target_os = "linux", not(target_os = "android")))]
     Vaapi { surface_id: u32, display: *mut std::ffi::c_void },
+    /// Owned AHardwareBuffer produced by MediaCodec's output Surface.
+    /// The renderer imports it into Vulkan via
+    /// `VK_ANDROID_external_memory_android_hardware_buffer` for zero-copy
+    /// upload into wgpu. Held as `HardwareBufferRef` so the AHB stays
+    /// alive past `Image::Drop`; Vulkan's import adds its own refcount.
     #[cfg(target_os = "android")]
-    HardwareBuffer { ahb: *mut std::ffi::c_void },
+    HardwareBuffer(AndroidHardwareBufferFrame),
     #[cfg(target_os = "ios")]
     CvPixelBuffer { buffer: *mut std::ffi::c_void },
 }
+
+#[cfg(target_os = "android")]
+pub struct AndroidHardwareBufferFrame {
+    pub buffer: ndk::hardware_buffer::HardwareBufferRef,
+    pub width: u32,
+    pub height: u32,
+}
+
+// AHardwareBuffer's reference counting is thread-safe per the NDK docs;
+// the `ndk` crate just doesn't impl Send on its wrappers. The frame is
+// owned by a single async task at any time and only mutates the refcount
+// in Drop, which is safe to do from any thread.
+#[cfg(target_os = "android")]
+unsafe impl Send for AndroidHardwareBufferFrame {}
 
 // Raw native handles cross thread boundaries; the underlying objects are
 // refcounted by their platform APIs.

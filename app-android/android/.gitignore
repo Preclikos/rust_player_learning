@@ -1,0 +1,40 @@
+# Standard Android Studio gitignore, plus a couple of project-specific
+# entries.
+
+# Gradle
+.gradle/
+build/
+gradle/wrapper/gradle-wrapper.jar.tmp
+
+# Android Studio / IntelliJ
+.idea/
+*.iml
+.cxx/
+.externalNativeBuild/
+captures/
+
+# Local SDK / NDK path file (machine-specific)
+local.properties
+
+# Build outputs
+*.apk
+*.aab
+*.ap_
+*.dex
+*.class
+
+# Keystore (never commit signing material)
+*.jks
+*.keystore
+release/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Native libraries are produced by the buildRust* Gradle tasks
+# (cargo ndk → cdylib). Don't commit the generated .so files.
+app/src/main/jniLibs/

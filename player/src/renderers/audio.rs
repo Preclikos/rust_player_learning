@@ -10,6 +10,7 @@ use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
     Device, Sample, StreamConfig, SupportedStreamConfig,
 };
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 use ffmpeg_next::frame::Audio;
 use pollster::FutureExt;
 use tokio::sync::{
@@ -136,6 +137,7 @@ impl AudioRenderer {
         (sample_sender, config.sample_rate().0)
     }
 
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     pub async fn put_sample(&self, frame: Audio) {
         let expected_bytes =
             frame.samples() * frame.channels() as usize * std::mem::size_of::<f32>();

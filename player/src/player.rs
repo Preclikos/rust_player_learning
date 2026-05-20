@@ -12,12 +12,20 @@ use crypto::{
     parse_aac_config, parse_hvcc_nalus, parse_senc, parse_tenc, AacConfig, ClearKeyDecryptor,
     Decryptor, TrackCrypto,
 };
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 use ffmpeg_next::format::sample::Type;
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 use ffmpeg_next::frame::{Audio, Video};
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 use ffmpeg_next::software::resampling::Context;
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 use ffmpeg_next::{Packet, Rational};
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 use ffmpeg_sys_next::{av_hwdevice_ctx_create, AVBufferRef, AVHWDeviceContext, AVHWDeviceType};
-use parsers::mp4::{aac_sampling_frequency_index_to_u32, apped_hevc_header, parse_hevc_nalu};
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+use parsers::mp4::{aac_sampling_frequency_index_to_u32, apped_hevc_header};
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "android"))]
+use parsers::mp4::parse_hevc_nalu;
 use pollster::FutureExt;
 use re_mp4::{Mp4, StsdBoxContent};
 use renderers::audio::AudioRenderer;
@@ -81,6 +89,7 @@ pub struct Player {
     audio_renderer: Arc<AudioRenderer>,
 }
 
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 async fn video_sync_producer(
     start_time: Arc<Instant>,
     mut input_rx: mpsc::Receiver<Arc<Video>>,
@@ -122,6 +131,7 @@ async fn video_sync_producer(
     }
 }
 
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 async fn audio_sync_producer(
     start_time: Arc<Instant>,
     mut input_rx: mpsc::Receiver<Audio>,
@@ -221,6 +231,7 @@ impl Player {
     }
 
     pub async fn prepare(&mut self) -> Result<(), Box<dyn Error>> {
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
         ffmpeg_next::init()?;
         let manifest = match &self.manifest {
             Some(success) => success,
@@ -333,6 +344,7 @@ impl Player {
         Ok(())
     }
 
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     async fn video_decoder_task(
         mut receiver: Receiver<DataSegment>,
         sender: Sender<Arc<ffmpeg_next::util::frame::Video>>,
@@ -419,6 +431,7 @@ impl Player {
         Ok(())
     }
 
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     async fn audio_decoder_task(
         mut receiver: Receiver<DataSegment>,
         sender: Sender<Audio>,
@@ -496,6 +509,7 @@ impl Player {
         Ok(())
     }
 
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     async fn video_play(
         video_representation: VideoRepresenation,
         start_index: usize,
@@ -670,6 +684,7 @@ impl Player {
         Ok(())
     }
 
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     async fn audio_play(
         audio_representation: AudioRepresentation,
         start_index: usize,
@@ -817,6 +832,7 @@ impl Player {
         Ok(())
     }
 
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     async fn lifetime_handler(
         seek_offset: Duration,
         video_ready: Arc<Notify>,
@@ -864,6 +880,7 @@ impl Player {
         //}
     }
 
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     pub fn play(&self) -> Result<JoinHandle<()>, Box<dyn Error>> {
         let video_representation = match self.video_representation.lock().unwrap().as_ref() {
             Some(success) => success.clone(),
@@ -954,6 +971,47 @@ impl Player {
         Ok(play)
     }
 
+    /// Android playback pipeline: download → CENC decrypt → MediaCodec
+    /// (Surface output, NV12 AHardwareBuffer) → wgpu via
+    /// VK_ANDROID_external_memory_android_hardware_buffer. Video only;
+    /// audio comes in a follow-up.
+    #[cfg(target_os = "android")]
+    pub fn play(&self) -> Result<JoinHandle<()>, Box<dyn Error>> {
+        let video_repr = match self.video_representation.lock().unwrap().as_ref() {
+            Some(r) => r.clone(),
+            None => return Err("Video Track not set".into()),
+        };
+
+        let stop_flag = self.stop_flag.clone();
+        let seek_target = self.seek_target.clone();
+        let position_ms = self.position_ms.clone();
+        let video_renderer = self.video_renderer.clone();
+        let decryptor_snapshot = self.decryptor.lock().unwrap().clone();
+
+        let handle = tokio::spawn(async move {
+            if let Err(e) = play_loop_android(
+                video_repr,
+                stop_flag,
+                seek_target,
+                position_ms,
+                video_renderer,
+                decryptor_snapshot,
+            )
+            .await
+            {
+                log::error!("android play loop: {}", e);
+            }
+        });
+
+        Ok(handle)
+    }
+
+    /// iOS stub — VideoToolbox path lands later.
+    #[cfg(target_os = "ios")]
+    pub fn play(&self) -> Result<JoinHandle<()>, Box<dyn Error>> {
+        Err("Player::play is not yet implemented on iOS".into())
+    }
+
     pub fn seek(&self, target: Duration) {
         let seek_target = self.seek_target.clone();
         let stop = self.stop.clone();
@@ -1013,6 +1071,228 @@ struct DataSegment {
     id: usize,
     size: usize,   // Size in bytes
     data: Vec<u8>, // Simulated data
+}
+
+/// Android-only playback driver. Owns the MediaCodec decoder for the duration
+/// of one play() invocation. Video-only for now.
+#[cfg(target_os = "android")]
+async fn play_loop_android(
+    video_repr: tracks::video::VideoRepresenation,
+    stop_flag: Arc<AtomicBool>,
+    seek_target: Arc<RwLock<Option<Duration>>>,
+    position_ms: Arc<AtomicU64>,
+    video_renderer: Arc<renderers::video::VideoRenderer>,
+    decryptor: Option<Arc<dyn Decryptor>>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    use decoders::mediacodec::MediaCodecDecoder;
+    use decoders::{HwVideoDecoder, PlatformFrame, VideoCodec, VideoDecoderParams};
+    use re_mp4::Mp4;
+
+    // Consume the seek target and reset stop_flag — same atomic pattern as
+    // desktop play() so a seek triggered during init isn't lost.
+    let seek_offset = {
+        let mut t = seek_target.write().await;
+        stop_flag.store(false, Ordering::Relaxed);
+        t.take().unwrap_or(Duration::ZERO)
+    };
+
+    let start_index = find_segment_index(&video_repr.segments, seek_offset);
+    let snapped_offset = video_repr
+        .segments
+        .get(start_index)
+        .map(|s| s.start_time())
+        .unwrap_or(seek_offset);
+    position_ms.store(snapped_offset.as_millis() as u64, Ordering::Relaxed);
+    log::info!(
+        "android play: start_index={} snapped_offset={:?}",
+        start_index,
+        snapped_offset
+    );
+
+    // Init segment + CENC detection (same as desktop).
+    let init_data = video_repr
+        .segment_init
+        .download()
+        .await
+        .map_err(|e| -> Box<dyn Error + Send + Sync> {
+            format!("init download: {}", e).into()
+        })?;
+
+    let track_crypto = match parse_tenc(&init_data) {
+        Some(tenc) => {
+            log::info!(
+                "android: CENC encrypted KID={} iv_size={}",
+                hex::encode(tenc.default_kid),
+                tenc.default_iv_size
+            );
+            let dec = decryptor.ok_or_else(|| -> Box<dyn Error + Send + Sync> {
+                "track is CENC-encrypted but no decryptor configured".into()
+            })?;
+            Some(TrackCrypto {
+                decryptor: dec,
+                kid: tenc.default_kid,
+                iv_size: tenc.default_iv_size as usize,
+            })
+        }
+        None => {
+            log::info!("android: clear (no tenc)");
+            None
+        }
+    };
+
+    // Build HEVC csd-0 (VPS/SPS/PPS in Annex-B format with start codes).
+    let csd_nalus = parse_hvcc_nalus(&init_data).ok_or_else(|| -> Box<dyn Error + Send + Sync> {
+        "cannot parse hvcC from init segment".into()
+    })?;
+    let mut csd = Vec::new();
+    for n in &csd_nalus {
+        csd.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+        csd.extend_from_slice(n);
+    }
+    log::info!(
+        "android: built csd-0 of {} bytes from {} NALUs",
+        csd.len(),
+        csd_nalus.len()
+    );
+
+    // Set up MediaCodec.
+    let mut decoder = MediaCodecDecoder::new()?;
+    decoder.configure(VideoDecoderParams {
+        codec: VideoCodec::Hevc,
+        width: video_repr.width,
+        height: video_repr.height,
+        codec_specific_data: csd,
+    })?;
+
+    // Helper: drain any ready decoded frames and render them.
+    async fn drain_and_render(
+        decoder: &mut MediaCodecDecoder,
+        video_renderer: &Arc<renderers::video::VideoRenderer>,
+        position_ms: &Arc<AtomicU64>,
+        stop_flag: &Arc<AtomicBool>,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        loop {
+            if stop_flag.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            match decoder.try_recv()? {
+                Some(frame) => {
+                    position_ms.store((frame.pts_us / 1000) as u64, Ordering::Relaxed);
+                    if let PlatformFrame::HardwareBuffer(ahb) = frame.native {
+                        video_renderer.render_android(ahb).await;
+                    }
+                }
+                None => return Ok(()),
+            }
+        }
+    }
+
+    for seg_idx in start_index..video_repr.segments.len() {
+        if stop_flag.load(Ordering::Relaxed) {
+            break;
+        }
+
+        let seg_data = video_repr.segments[seg_idx]
+            .download()
+            .await
+            .map_err(|e| -> Box<dyn Error + Send + Sync> {
+                format!("segment {} download: {}", seg_idx, e).into()
+            })?;
+
+        // Build full data_vec (init + segment) and decrypt in place.
+        let mut data_vec = init_data.clone();
+        data_vec.extend_from_slice(&seg_data);
+        decrypt_segment_in_place(&mut data_vec, track_crypto.as_ref())?;
+
+        // Extract per-sample (offset, size, pts) — collect into owned data
+        // so we don't hold an Mp4 borrow across the decoder loop.
+        let sample_info: Vec<(usize, usize, i64, u64)> = {
+            let mp4 = Mp4::read_bytes(&data_vec)
+                .map_err(|e| -> Box<dyn Error + Send + Sync> { format!("mp4: {}", e).into() })?;
+            let (_id, track) = mp4
+                .tracks()
+                .first_key_value()
+                .ok_or_else(|| -> Box<dyn Error + Send + Sync> { "no track in segment".into() })?;
+            track
+                .samples
+                .iter()
+                .map(|s| {
+                    (
+                        s.offset as usize,
+                        s.size as usize,
+                        s.composition_timestamp,
+                        s.timescale,
+                    )
+                })
+                .collect()
+        };
+
+        for (offset, size, ts, ts_scale) in sample_info {
+            if stop_flag.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+
+            if offset + size > data_vec.len() {
+                log::warn!("sample bounds exceed data ({} + {} > {})", offset, size, data_vec.len());
+                continue;
+            }
+            let sample_data = &data_vec[offset..offset + size];
+
+            // mp4 mdat is length-prefixed NALUs; MediaCodec wants Annex-B
+            // (start-code-prefixed). Convert.
+            let nalus = parse_hevc_nalu(sample_data)
+                .map_err(|e| -> Box<dyn Error + Send + Sync> { format!("NALU parse: {}", e).into() })?;
+            let mut annex_b = Vec::with_capacity(size + nalus.len() * 4);
+            for n in nalus {
+                annex_b.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+                annex_b.extend_from_slice(&n);
+            }
+
+            let pts_us = if ts_scale > 0 {
+                ts * 1_000_000 / ts_scale as i64
+            } else {
+                0i64
+            };
+
+            // Submit. On back-pressure, drain output to free input buffers
+            // and retry. Yield to other tasks while waiting.
+            loop {
+                if stop_flag.load(Ordering::Relaxed) {
+                    return Ok(());
+                }
+                match decoder.submit(&annex_b, pts_us) {
+                    Ok(()) => break,
+                    Err(_) => {
+                        drain_and_render(&mut decoder, &video_renderer, &position_ms, &stop_flag)
+                            .await?;
+                        tokio::time::sleep(Duration::from_millis(2)).await;
+                    }
+                }
+            }
+
+            // Eagerly drain any newly-decoded frames.
+            drain_and_render(&mut decoder, &video_renderer, &position_ms, &stop_flag).await?;
+        }
+    }
+
+    // Final drain: pull whatever's still queued out of the decoder.
+    let drain_deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+    while tokio::time::Instant::now() < drain_deadline {
+        if stop_flag.load(Ordering::Relaxed) {
+            break;
+        }
+        match decoder.try_recv()? {
+            Some(frame) => {
+                position_ms.store((frame.pts_us / 1000) as u64, Ordering::Relaxed);
+                if let PlatformFrame::HardwareBuffer(ahb) = frame.native {
+                    video_renderer.render_android(ahb).await;
+                }
+            }
+            None => tokio::time::sleep(Duration::from_millis(5)).await,
+        }
+    }
+
+    Ok(())
 }
 
 fn log_task_result<T, E: std::fmt::Display>(

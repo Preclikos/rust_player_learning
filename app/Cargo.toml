@@ -8,7 +8,7 @@ player = { path = "../player" }
 tokio = { version = "1.43.0", features = ["full"] }
 winit = "0.30.9"
 pollster = "0.4.0"
-ffmpeg-next = {version = "7.1.0"}
+ffmpeg-next = {version = "8.1.0"}
 bytemuck ={ version =  "1.13.1" }
 cpal ={ version =  "0.15.3" }
 env_logger = "0.11.6"

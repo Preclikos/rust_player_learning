@@ -8,15 +8,14 @@ name = "player"
 path = "src/player.rs"
 
 [dependencies]
-reqwest = { version = "0.12.12", features = ["blocking"] }
+# TLS backend is target-specific (see [target.cfg.dependencies] below).
+reqwest = { version = "0.12.12", default-features = false, features = ["blocking", "http2", "charset"] }
 quick-xml = {version ="0.37.2", features = [ "serialize" ] }
 serde = { version = "1.0", features = ["derive"] }
 iso8601-duration = { version = "0.2" }
 url = { version = "2.5.4" }
 tokio = { version = "1.43.0", features = ["full"] }
 re_mp4 = { version = "0.3.0" }
-ffmpeg-next = { version = "7.1.0"}
-ffmpeg-sys-next = { version = "7.1.0"}
 hex = { version = "0.4" }
 aes = { version = "0.8" }
 ctr = { version = "0.9" }
@@ -26,6 +25,25 @@ pollster = "0.4.0"
 wgpu = { git = "https://github.com/Preclikos/wgpu.git" }
 winit = "0.30.9"
 ash = "0.38.0"
+log = "0.4"
+
+# FFmpeg is desktop-only; mobile uses MediaCodec (Android) / VideoToolbox (iOS).
+# Desktop uses native-tls (system OpenSSL/Schannel) for reqwest.
+# ffmpeg-next 8.x ships with a newer bindgen that works with LLVM 22+.
+[target.'cfg(any(target_os = "windows", target_os = "linux"))'.dependencies]
+ffmpeg-next = { version = "8.1.0"}
+ffmpeg-sys-next = { version = "8.1.0"}
+reqwest = { version = "0.12.12", default-features = false, features = ["default-tls"] }
+
+# Android-only: enable winit's NativeActivity backend, MediaCodec via the
+# ndk crate, JNI binding for future Java interop, and rustls so reqwest
+# doesn't need a cross-compiled OpenSSL.
+[target.'cfg(target_os = "android")'.dependencies]
+winit = { version = "0.30.9", features = ["android-native-activity"] }
+ndk = { version = "0.9", features = ["media", "api-level-29"] }
+ndk-sys = "0.6"
+jni = "0.21"
+reqwest = { version = "0.12.12", default-features = false, features = ["rustls-tls"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58.0", features = [ "Win32_System_Com", "Win32_System_Console", "Win32_System_SystemServices", "Win32_UI_Shell", "Win32_Foundation", "Wdk_Foundation", "Win32_System_LibraryLoader",

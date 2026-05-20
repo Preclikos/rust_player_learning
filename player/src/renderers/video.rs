@@ -1,8 +1,10 @@
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 use ffmpeg_next::frame::Video;
 use tokio::sync::{
     mpsc::{self, Receiver, Sender},
     Mutex, RwLock,
 };
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 use video_frame::VideoFrame;
 use wgpu::{Backends, Buffer};
 use wgpu::{Device, SurfaceConfiguration};
@@ -10,10 +12,14 @@ use winit::dpi::PhysicalSize;
 
 #[cfg(target_os = "windows")]
 mod video_directx;
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 mod video_frame;
 #[cfg(target_os = "linux")]
 mod video_vaapi;
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "android"))]
 mod video_vulkan;
+#[cfg(target_os = "android")]
+mod video_mediacodec;
 
 use std::sync::Arc;
 
@@ -125,6 +131,18 @@ impl VideoRenderer {
         #[cfg(target_os = "linux")]
         let instance = Instance::new(&InstanceDescriptor {
             backends: Backends::VULKAN,
+            ..Default::default()
+        });
+
+        #[cfg(target_os = "android")]
+        let instance = Instance::new(&InstanceDescriptor {
+            backends: Backends::VULKAN,
+            ..Default::default()
+        });
+
+        #[cfg(target_os = "ios")]
+        let instance = Instance::new(&InstanceDescriptor {
+            backends: Backends::METAL,
             ..Default::default()
         });
 
@@ -395,6 +413,7 @@ impl VideoRenderer {
             .await;
     }
 
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     pub async fn render(&self, frame: Arc<Video>) {
         let video_frame = VideoFrame::new(self.device.clone(), self.backend, frame.clone());
 
@@ -499,6 +518,136 @@ impl VideoRenderer {
             self.queue.submit([encoder.finish()]);
             self.window.pre_present_notify();
             surface_texture.present();
+        }
+    }
+
+    /// Android render path. Imports the MediaCodec-produced AHardwareBuffer
+    /// into Vulkan as a VkImage with `VK_FORMAT_G8_B8R8_2PLANE_420_UNORM`
+    /// (Vulkan NV12), wraps it as `wgpu::Texture`, samples Y + UV planes
+    /// through the same NV12 shader the desktop path uses. Zero-copy.
+    #[cfg(target_os = "android")]
+    pub async fn render_android(&self, frame: crate::decoders::AndroidHardwareBufferFrame) {
+        use ndk::hardware_buffer::HardwareBuffer;
+        use video_mediacodec::create_vk_image_from_ahb;
+        use video_vulkan::create_texture_from_vk_image;
+
+        // `HardwareBuffer` is the unowned view; scope it tightly so the
+        // !Send pointer doesn't outlive the import call (otherwise the
+        // surrounding future loses its Send bound when we .await below).
+        // The owned ref in `frame.buffer` keeps the AHB alive after the
+        // import — Vulkan adds its own refcount once the memory is allocated.
+        let img_mem = {
+            let hb_view = unsafe {
+                HardwareBuffer::from_ptr(std::ptr::NonNull::new(frame.buffer.as_ptr()).unwrap())
+            };
+            match create_vk_image_from_ahb(
+                &self.device,
+                &hb_view,
+                frame.width,
+                frame.height,
+            ) {
+                Ok(im) => im,
+                Err(e) => {
+                    log::warn!("AHB import failed: {}", e);
+                    return;
+                }
+            }
+        };
+
+        let texture = create_texture_from_vk_image(
+            &self.device,
+            img_mem.raw_image,
+            frame.width,
+            frame.height,
+            TextureFormat::NV12,
+            true,
+            true,
+        );
+
+        let y_plane_view = texture.create_view(&wgpu::TextureViewDescriptor {
+            format: Some(TextureFormat::R8Unorm),
+            aspect: wgpu::TextureAspect::Plane0,
+            ..Default::default()
+        });
+        let uv_plane_view = texture.create_view(&wgpu::TextureViewDescriptor {
+            format: Some(TextureFormat::Rg8Unorm),
+            aspect: wgpu::TextureAspect::Plane1,
+            ..Default::default()
+        });
+
+        let texture_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &self.texture_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&y_plane_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&uv_plane_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+            ],
+            label: Some("texture_bind_group_android"),
+        });
+
+        {
+            let surface = self.surface.lock().await;
+            let vertex_buffer = self.vertex_buffer.read().await;
+
+            let surface_texture = surface
+                .get_current_texture()
+                .expect("failed to acquire next swapchain texture");
+
+            let texture_view = surface_texture
+                .texture
+                .create_view(&wgpu::TextureViewDescriptor {
+                    format: Some(self.surface_format),
+                    ..Default::default()
+                });
+
+            let mut encoder = self.device.create_command_encoder(&Default::default());
+            {
+                let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: None,
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &texture_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+
+                render_pass.set_pipeline(&self.render_pipeline);
+                render_pass.set_bind_group(0, &texture_bind_group, &[]);
+                render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+                render_pass.draw(0..6, 0..1);
+            }
+
+            self.queue.submit([encoder.finish()]);
+            self.window.pre_present_notify();
+            surface_texture.present();
+        }
+
+        // Drop the texture (wgpu releases the VkImage), then free the
+        // imported VkDeviceMemory ourselves. `frame.buffer`'s HardwareBufferRef
+        // is dropped on return — at that point Vulkan still holds a ref
+        // until the queue completes, then the AHB is freed.
+        drop(texture);
+        unsafe {
+            self.device.as_hal::<wgpu::hal::api::Vulkan, _, _>(|d| {
+                if let Some(d) = d {
+                    d.raw_device().free_memory(img_mem.memory, None);
+                }
+            });
         }
     }
 }

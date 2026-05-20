@@ -4,7 +4,7 @@ use ffmpeg_sys_next::AVHWFramesContext;
 use std::sync::Arc;
 use wgpu::{wgc::api::Vulkan, Backend, Extent3d, Texture};
 
-use super::video_vulkan::{create_texture_from_vk_image, dump_memory_info};
+use super::video_vulkan::create_texture_from_vk_image;
 
 #[cfg(target_os = "linux")]
 use super::video_vaapi::*;
@@ -204,20 +204,11 @@ impl Drop for VideoFrame {
     fn drop(&mut self) {
         if self.wgpu_backend == Backend::Vulkan {
             unsafe {
-                self.wgpu_device.as_hal::<Vulkan, _, _>(|device| {
-                    device.map(|device| {
-                        let raw_device = device.raw_device();
-                        /*if let Some(image) = self.image {
-                            raw_device.destroy_image(image, None);
-                        }*/
-
-                        if let Some(memory) = self.memory {
-                            raw_device.free_memory(memory, None);
-                        }
-                    })
-                });
-
-                //dump_memory_info(&self.wgpu_device);
+                if let Some(raw_dev) = self.wgpu_device.as_hal::<Vulkan>() {
+                    if let Some(memory) = self.memory {
+                        raw_dev.raw_device().free_memory(memory, None);
+                    }
+                }
             }
         }
     }

@@ -123,27 +123,20 @@ pub enum VideoRendererCommand {
 impl VideoRenderer {
     pub async fn new(window: Arc<Window>) -> Self {
         #[cfg(target_os = "windows")]
-        let instance = Instance::new(&InstanceDescriptor {
-            backends: Backends::DX12,
-            ..Default::default()
-        });
-
+        let backend = Backends::DX12;
         #[cfg(target_os = "linux")]
-        let instance = Instance::new(&InstanceDescriptor {
-            backends: Backends::VULKAN,
-            ..Default::default()
-        });
-
+        let backend = Backends::VULKAN;
         #[cfg(target_os = "android")]
-        let instance = Instance::new(&InstanceDescriptor {
-            backends: Backends::VULKAN,
-            ..Default::default()
-        });
-
+        let backend = Backends::VULKAN;
         #[cfg(target_os = "ios")]
-        let instance = Instance::new(&InstanceDescriptor {
-            backends: Backends::METAL,
-            ..Default::default()
+        let backend = Backends::METAL;
+
+        let instance = Instance::new(InstanceDescriptor {
+            backends: backend,
+            flags: wgpu::InstanceFlags::default(),
+            memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+            backend_options: wgpu::BackendOptions::default(),
+            display: None,
         });
 
         let surface = instance.create_surface(window.clone()).unwrap();
@@ -153,6 +146,7 @@ impl VideoRenderer {
                 power_preference: wgpu::PowerPreference::default(),
                 compatible_surface: Some(&surface),
                 force_fallback_adapter: false,
+                apply_limit_buckets: false,
             })
             .await
             .unwrap();
@@ -160,17 +154,16 @@ impl VideoRenderer {
         let backend = adapter.get_info().backend;
 
         let (device, queue) = adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    required_features:/* wgpu::Features::TEXTURE_FORMAT_P010 // Enable P010
-                        |*/  wgpu::Features::TEXTURE_FORMAT_NV12
-                        | wgpu::Features::TEXTURE_FORMAT_16BIT_NORM, // Enable NV12
-                    required_limits: wgpu::Limits::default(),
-                    label: Some("Device with NV12 support"),
-                    memory_hints: MemoryHints::Performance,
-                },
-                None,
-            )
+            .request_device(&wgpu::DeviceDescriptor {
+                required_features:/* wgpu::Features::TEXTURE_FORMAT_P010 // Enable P010
+                    |*/  wgpu::Features::TEXTURE_FORMAT_NV12
+                    | wgpu::Features::TEXTURE_FORMAT_16BIT_NORM, // Enable NV12
+                required_limits: wgpu::Limits::default(),
+                label: Some("Device with NV12 support"),
+                memory_hints: MemoryHints::Performance,
+                experimental_features: wgpu::ExperimentalFeatures::default(),
+                trace: wgpu::Trace::Off,
+            })
             .await
             .unwrap();
 
@@ -254,8 +247,8 @@ impl VideoRenderer {
         // Create pipeline layout
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Pipeline Layout"),
-            bind_group_layouts: &[&texture_bind_group_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&texture_bind_group_layout)],
+            immediate_size: 0,
         });
 
         // Create render pipeline
@@ -265,7 +258,7 @@ impl VideoRenderer {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_main"),
-                buffers: &[Vertex::desc()],
+                buffers: &[Some(Vertex::desc())],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -281,7 +274,7 @@ impl VideoRenderer {
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -478,9 +471,14 @@ impl VideoRenderer {
             let surface = self.surface.lock().await;
             let vertex_buffer = self.vertex_buffer.read().await;
 
-            let surface_texture = surface
-                .get_current_texture()
-                .expect("failed to acquire next swapchain texture");
+            let surface_texture = match surface.get_current_texture() {
+                wgpu::CurrentSurfaceTexture::Success(t)
+                | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
+                other => {
+                    log::warn!("surface texture not available: {:?}", other);
+                    return;
+                }
+            };
 
             let texture_view = surface_texture
                 .texture
@@ -496,6 +494,7 @@ impl VideoRenderer {
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                         view: &texture_view,
                         resolve_target: None,
+                        depth_slice: None,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                             store: wgpu::StoreOp::Store,
@@ -504,6 +503,7 @@ impl VideoRenderer {
                     depth_stencil_attachment: None,
                     timestamp_writes: None,
                     occlusion_query_set: None,
+                    multiview_mask: None,
                 });
 
                 render_pass.set_pipeline(&self.render_pipeline);
@@ -517,7 +517,7 @@ impl VideoRenderer {
             // Submit the command in the queue to execute
             self.queue.submit([encoder.finish()]);
             self.window.pre_present_notify();
-            surface_texture.present();
+            self.queue.present(surface_texture);
         }
     }
 
@@ -598,9 +598,14 @@ impl VideoRenderer {
             let surface = self.surface.lock().await;
             let vertex_buffer = self.vertex_buffer.read().await;
 
-            let surface_texture = surface
-                .get_current_texture()
-                .expect("failed to acquire next swapchain texture");
+            let surface_texture = match surface.get_current_texture() {
+                wgpu::CurrentSurfaceTexture::Success(t)
+                | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
+                other => {
+                    log::warn!("surface texture not available: {:?}", other);
+                    return;
+                }
+            };
 
             let texture_view = surface_texture
                 .texture
@@ -616,6 +621,7 @@ impl VideoRenderer {
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                         view: &texture_view,
                         resolve_target: None,
+                        depth_slice: None,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                             store: wgpu::StoreOp::Store,
@@ -624,6 +630,7 @@ impl VideoRenderer {
                     depth_stencil_attachment: None,
                     timestamp_writes: None,
                     occlusion_query_set: None,
+                    multiview_mask: None,
                 });
 
                 render_pass.set_pipeline(&self.render_pipeline);
@@ -634,7 +641,7 @@ impl VideoRenderer {
 
             self.queue.submit([encoder.finish()]);
             self.window.pre_present_notify();
-            surface_texture.present();
+            self.queue.present(surface_texture);
         }
 
         // Drop the texture (wgpu releases the VkImage), then free the
@@ -643,11 +650,9 @@ impl VideoRenderer {
         // until the queue completes, then the AHB is freed.
         drop(texture);
         unsafe {
-            self.device.as_hal::<wgpu::hal::api::Vulkan, _, _>(|d| {
-                if let Some(d) = d {
-                    d.raw_device().free_memory(img_mem.memory, None);
-                }
-            });
+            if let Some(raw_dev) = self.device.as_hal::<wgpu::hal::api::Vulkan>() {
+                raw_dev.raw_device().free_memory(img_mem.memory, None);
+            }
         }
     }
 }

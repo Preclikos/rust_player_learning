@@ -134,7 +134,7 @@ impl AudioRenderer {
             }
         });
 
-        (sample_sender, config.sample_rate().0)
+        (sample_sender, config.sample_rate())
     }
 
     #[cfg(any(target_os = "windows", target_os = "linux"))]

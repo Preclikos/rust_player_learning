@@ -17,14 +17,26 @@ pub fn create_texture_from_vk_image(
     drop: bool,
 ) -> wgpu::Texture {
     let size = wgpu::Extent3d {
-        width: width,
-        height: height,
+        width,
+        height,
         depth_or_array_layers: 1,
     };
-    let drop_guard = Box::new(|| ());
+    let drop_guard: wgpu::hal::DropCallback = Box::new(|| ());
 
+    let hal_usage = if is_in {
+        wgpu::wgt::TextureUses::RESOURCE | wgpu::wgt::TextureUses::COPY_SRC
+    } else {
+        wgpu::wgt::TextureUses::COLOR_TARGET | wgpu::wgt::TextureUses::COPY_DST
+    };
+
+    // texture_from_raw is now a method on the hal Vulkan Device (4 args:
+    // image, descriptor, drop_callback, memory). We import external memory
+    // (AHB / DMA-BUF / D3D11 share) ourselves, so pass `TextureMemory::External`.
     let texture = unsafe {
-        <Vulkan as wgpu::hal::Api>::Device::texture_from_raw(
+        let raw_dev = device
+            .as_hal::<Vulkan>()
+            .expect("VideoRenderer expects a Vulkan-backend wgpu device");
+        raw_dev.texture_from_raw(
             image,
             &wgpu::hal::TextureDescriptor {
                 label: None,
@@ -34,15 +46,18 @@ pub fn create_texture_from_vk_image(
                 dimension: wgpu::TextureDimension::D2,
                 format,
                 view_formats: vec![],
-                usage: if is_in {
-                    wgpu::TextureUses::RESOURCE | wgpu::TextureUses::COPY_SRC
-                } else {
-                    wgpu::TextureUses::COLOR_TARGET | wgpu::TextureUses::COPY_DST
-                },
+                usage: hal_usage,
                 memory_flags: wgpu::hal::MemoryFlags::empty(),
             },
             if drop { None } else { Some(drop_guard) },
+            wgpu::hal::vulkan::TextureMemory::External,
         )
+    };
+
+    let api_usage = if is_in {
+        wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC
+    } else {
+        wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_DST
     };
 
     unsafe {
@@ -56,38 +71,9 @@ pub fn create_texture_from_vk_image(
                 dimension: wgpu::TextureDimension::D2,
                 format,
                 view_formats: &[],
-                usage: if is_in {
-                    wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC
-                } else {
-                    wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_DST
-                },
+                usage: api_usage,
             },
-        )
-    }
-}
-
-pub fn create_buffer_from_vk_buffer(
-    device: &Device,
-    buffer: vk::Buffer,
-    size: u64,
-    is_in: bool,
-) -> wgpu::Buffer {
-    let buffer = unsafe { <Vulkan as wgpu::hal::Api>::Device::buffer_from_raw(buffer) };
-
-    unsafe {
-        device.create_buffer_from_hal::<Vulkan>(
-            buffer,
-            &wgpu::BufferDescriptor {
-                label: None,
-                size,
-                mapped_at_creation: false,
-                usage: wgpu::BufferUsages::STORAGE
-                    | (if is_in {
-                        wgpu::BufferUsages::COPY_SRC
-                    } else {
-                        wgpu::BufferUsages::COPY_DST
-                    }),
-            },
+            hal_usage,
         )
     }
 }
@@ -226,33 +212,3 @@ pub fn format_wgpu_to_vulkan(format: wgpu::TextureFormat) -> vk::Format {
     }
 }
 
-pub unsafe fn dump_memory_info(device: &wgpu::Device) {
-    device.as_hal::<Vulkan, _, _>(|device| {
-        device.map(|device| {
-            let physical_device = device.raw_physical_device();
-            let instance = device.shared_instance().raw_instance();
-
-            let mut memory_budget_info = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
-            let mut memory_properties =
-                vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut memory_budget_info);
-
-            instance
-                .get_physical_device_memory_properties2(physical_device, &mut memory_properties);
-
-            println!("Vulkan Memory Usage:");
-            for (i, (usage, budget)) in memory_budget_info
-                .heap_usage
-                .iter()
-                .zip(memory_budget_info.heap_budget.iter())
-                .enumerate()
-            {
-                println!(
-                    "Heap {}: Used: {} MB, Budget: {} MB",
-                    i,
-                    usage / (1024 * 1024),
-                    budget / (1024 * 1024)
-                );
-            }
-        })
-    });
-}

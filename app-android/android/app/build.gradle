@@ -9,7 +9,7 @@ android {
 
     defaultConfig {
         applicationId 'cz.preclikos.rust_player'
-        minSdk 24             // Android 7.0 — required for AHardwareBuffer + HEVC HW decode
+        minSdk 26             // Android 8.0 — required for AAudio (cpal 0.17) + AHardwareBuffer + HEVC HW decode
         targetSdk 34
         versionCode 1
         versionName '0.1'
@@ -85,6 +85,9 @@ def resolveNdkDir = {
 def cargoNdkArgs = { boolean release ->
     def args = ['cargo', 'ndk']
     abis.each { args += ['-t', it] }
+    // --platform 26 matches the gradle android.defaultConfig.minSdk. AAudio
+    // (used by cpal 0.17) and AHardwareBuffer require API 26+.
+    args += ['--platform', '26']
     args += ['-o', file("${projectDir}/src/main/jniLibs").absolutePath, 'build']
     if (release) args += '--release'
     args += ['-p', 'app-android']

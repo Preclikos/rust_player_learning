@@ -1,28 +1,26 @@
 // Hardware video decoder abstraction.
 //
-// Today the pipeline in `player::player::video_play` hard-codes an FFmpeg
-// `decoder::Video` wired to D3D11VA (Windows) or VAAPI (Linux). To support
-// MediaCodec on Android and VideoToolbox on iOS without an explosion of cfg
-// blocks, all four sit behind this trait. Each backend takes compressed
-// samples in, produces decoded frames as platform-native handles out; the
-// renderer converts those handles into `wgpu::Texture` per-platform.
-//
-// Status: definition only. The existing FFmpeg pipeline still calls FFmpeg
-// directly. Migration plan:
-//   1. Wrap FFmpeg + D3D11VA in an `FfmpegHwDecoder` (Windows) and
-//      `FfmpegVaapiDecoder` (Linux) impl.
-//   2. Replace the inline calls in `video_play` / `video_decoder_task` with
-//      `Box<dyn HwVideoDecoder>`.
-//   3. Add `MediaCodecDecoder` (Android) and `VideoToolboxDecoder` (iOS).
+// Each platform implements HwVideoDecoder and AudioDecoder. The unified
+// play loop in player.rs uses Box<dyn HwVideoDecoder> / Box<dyn AudioDecoder>
+// so the same timing and sync logic works everywhere; only the concrete
+// types differ per platform.
 
 use std::error::Error;
 
 #[cfg(any(target_os = "windows", target_os = "linux"))]
+pub mod ffmpeg_audio;
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 pub mod ffmpeg_hw;
 #[cfg(target_os = "android")]
 pub mod mediacodec;
+#[cfg(target_os = "android")]
+pub mod mediacodec_audio;
 #[cfg(target_os = "ios")]
 pub mod videotoolbox;
+
+// ---------------------------------------------------------------------------
+// Video decoder types
+// ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug)]
 pub enum VideoCodec {
@@ -34,8 +32,9 @@ pub struct VideoDecoderParams {
     pub codec: VideoCodec,
     pub width: u32,
     pub height: u32,
-    /// Codec-private data: `hvcC` body for HEVC, `avcC` body for H.264.
-    pub codec_specific_data: Vec<u8>,
+    /// Raw NALU bytes (no length prefix, no start code) — VPS/SPS/PPS for HEVC,
+    /// extracted from the hvcC box in the init segment.
+    pub hvcc_nalus: Vec<Vec<u8>>,
 }
 
 pub struct DecodedVideoFrame {
@@ -46,24 +45,14 @@ pub struct DecodedVideoFrame {
 }
 
 /// Platform-native handle wrapping a decoded frame's GPU surface.
-///
-/// Each variant is the minimum information the renderer needs to import the
-/// frame into wgpu without an extra GPU copy:
-///   * Windows: shared `ID3D11Texture2D` (subresource index for arrays).
-///   * Linux:   VA-API surface that we export as a DMA-BUF.
-///   * Android: `AHardwareBuffer` (importable via Vulkan external memory).
-///   * iOS:     `CVPixelBufferRef` (importable via Metal IOSurface).
 #[non_exhaustive]
 pub enum PlatformFrame {
-    #[cfg(target_os = "windows")]
-    D3d11 { texture_ptr: *mut std::ffi::c_void, array_index: u32 },
-    #[cfg(all(target_os = "linux", not(target_os = "android")))]
-    Vaapi { surface_id: u32, display: *mut std::ffi::c_void },
+    /// Desktop (Windows + Linux): the raw decoded frame from FFmpeg, which
+    /// carries its own D3D11/VAAPI hw_frames_ctx pointer. The video renderer
+    /// imports the native surface via VideoFrame::new.
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    FfmpegVideo(std::sync::Arc<ffmpeg_next::frame::Video>),
     /// Owned AHardwareBuffer produced by MediaCodec's output Surface.
-    /// The renderer imports it into Vulkan via
-    /// `VK_ANDROID_external_memory_android_hardware_buffer` for zero-copy
-    /// upload into wgpu. Held as `HardwareBufferRef` so the AHB stays
-    /// alive past `Image::Drop`; Vulkan's import adds its own refcount.
     #[cfg(target_os = "android")]
     HardwareBuffer(AndroidHardwareBufferFrame),
     #[cfg(target_os = "ios")]
@@ -77,16 +66,38 @@ pub struct AndroidHardwareBufferFrame {
     pub height: u32,
 }
 
-// AHardwareBuffer's reference counting is thread-safe per the NDK docs;
-// the `ndk` crate just doesn't impl Send on its wrappers. The frame is
-// owned by a single async task at any time and only mutates the refcount
-// in Drop, which is safe to do from any thread.
 #[cfg(target_os = "android")]
 unsafe impl Send for AndroidHardwareBufferFrame {}
 
-// Raw native handles cross thread boundaries; the underlying objects are
-// refcounted by their platform APIs.
 unsafe impl Send for PlatformFrame {}
+
+// ---------------------------------------------------------------------------
+// Audio decoder types
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug)]
+pub enum AudioCodec {
+    Aac,
+}
+
+pub struct AudioDecoderParams {
+    pub codec: AudioCodec,
+    /// Native sample rate from the source stream (e.g. 44100 or 48000).
+    pub input_sample_rate: u32,
+    /// Channel count from the source stream.
+    pub input_channels: u16,
+    /// Target sample rate for the output device (from AudioRenderer::sample_rate()).
+    pub output_sample_rate: u32,
+    /// AudioSpecificConfig bytes (2 bytes for AAC LC).
+    pub codec_specific_data: Vec<u8>,
+}
+
+/// A decoded audio buffer: interleaved stereo f32 PCM samples at
+/// `output_sample_rate`, timestamped in milliseconds.
+pub struct DecodedAudioFrame {
+    pub pts_ms: i64,
+    pub samples: Vec<f32>,
+}
 
 pub type DecoderError = Box<dyn Error + Send + Sync>;
 
@@ -95,15 +106,33 @@ pub trait HwVideoDecoder: Send {
     fn configure(&mut self, params: VideoDecoderParams) -> Result<(), DecoderError>;
 
     /// Queue a compressed sample for decoding. `sample` is the raw mdat bytes
-    /// from the MP4 track (already CENC-decrypted if applicable).
+    /// (length-prefixed NALU format, CENC-decrypted). Each decoder impl handles
+    /// the format conversion (Annex-B etc.) internally.
     fn submit(&mut self, sample: &[u8], pts_us: i64) -> Result<(), DecoderError>;
 
     /// Pull the next decoded frame, if one is ready. Non-blocking: returns
-    /// `Ok(None)` when the decoder hasn't produced a frame yet.
+    /// `Ok(None)` when the decoder hasn't produced a frame yet. `pts_us` in
+    /// the returned `DecodedVideoFrame` is in microseconds.
     fn try_recv(&mut self) -> Result<Option<DecodedVideoFrame>, DecoderError>;
 
-    /// Drop in-flight state (used on seek). Default impl is a no-op for
-    /// decoders that tolerate out-of-order reset via codec-specific data.
+    fn flush(&mut self) -> Result<(), DecoderError> {
+        Ok(())
+    }
+}
+
+pub trait AudioDecoder: Send {
+    /// Install codec parameters. Called once before the first `submit`.
+    fn configure(&mut self, params: AudioDecoderParams) -> Result<(), DecoderError>;
+
+    /// Queue a compressed audio sample. `sample` is the raw mdat bytes for one
+    /// access unit (AAC frame, already CENC-decrypted). `pts_us` in microseconds.
+    fn submit(&mut self, sample: &[u8], pts_us: i64) -> Result<(), DecoderError>;
+
+    /// Pull the next decoded audio frame, if ready. Non-blocking.
+    /// Returned `DecodedAudioFrame.pts_ms` is in milliseconds;
+    /// `samples` is interleaved stereo f32 PCM at `output_sample_rate`.
+    fn try_recv(&mut self) -> Result<Option<DecodedAudioFrame>, DecoderError>;
+
     fn flush(&mut self) -> Result<(), DecoderError> {
         Ok(())
     }

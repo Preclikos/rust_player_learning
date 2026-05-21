@@ -76,7 +76,7 @@ impl ApplicationHandler for App {
                 }
             };
 
-            // Pick 720p HEVC for first cut — same as desktop's default.
+            // Pick 720p HEVC — index 5 matches the desktop default.
             let selected_video = tracks.video.first().unwrap();
             let selected_video_repr = &selected_video.representations[5];
             player.set_video_track(selected_video, selected_video_repr);
@@ -85,6 +85,16 @@ impl ApplicationHandler for App {
                 selected_video_repr.width,
                 selected_video_repr.height,
                 selected_video_repr.codecs
+            );
+
+            // Pick the first available audio representation.
+            let selected_audio = tracks.audio.first().unwrap();
+            let selected_audio_repr = selected_audio.representations.first().unwrap();
+            player.set_audio_track(selected_audio, selected_audio_repr);
+            log::info!(
+                "android: selected audio {} {}Hz",
+                selected_audio_repr.codecs,
+                selected_audio_repr.bandwidth,
             );
 
             loop {

@@ -148,6 +148,12 @@ impl AudioRenderer {
         }
     }
 
+    pub async fn put_samples_raw(&self, samples: &[f32]) {
+        for &s in samples {
+            let _ = self.sample_sender.send(s).await;
+        }
+    }
+
     pub fn sample_rate(&self) -> u32 {
         self.sample_rate
     }

@@ -436,6 +436,28 @@ impl VideoRenderer {
             .await;
     }
 
+    /// Unified render entry point used by the generic play loop.
+    /// Dispatches to the platform-specific render path based on the PlatformFrame variant.
+    pub async fn render_frame(&self, frame: crate::decoders::DecodedVideoFrame) {
+        use crate::decoders::PlatformFrame;
+        match frame.native {
+            #[cfg(any(target_os = "windows", target_os = "linux"))]
+            PlatformFrame::FfmpegVideo(ffmpeg_frame) => {
+                self.render(ffmpeg_frame).await;
+            }
+            #[cfg(target_os = "android")]
+            PlatformFrame::HardwareBuffer(ahb) => {
+                self.render_android(ahb).await;
+            }
+            #[cfg(target_os = "ios")]
+            PlatformFrame::CvPixelBuffer { .. } => {
+                log::warn!("render_frame: iOS CvPixelBuffer not implemented");
+            }
+            #[allow(unreachable_patterns)]
+            _ => {}
+        }
+    }
+
     #[cfg(any(target_os = "windows", target_os = "linux"))]
     pub async fn render(&self, frame: Arc<Video>) {
         let video_frame = VideoFrame::new(self.device.clone(), self.backend, frame.clone());

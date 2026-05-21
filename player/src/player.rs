@@ -9,25 +9,16 @@ mod utils;
 mod video;
 
 use crypto::{
-    parse_aac_config, parse_hvcc_nalus, parse_senc, parse_tenc, AacConfig, ClearKeyDecryptor,
+    parse_aac_config, parse_hvcc_nalus, parse_senc, parse_tenc, ClearKeyDecryptor,
     Decryptor, TrackCrypto,
 };
-#[cfg(any(target_os = "windows", target_os = "linux"))]
-use ffmpeg_next::format::sample::Type;
-#[cfg(any(target_os = "windows", target_os = "linux"))]
-use ffmpeg_next::frame::{Audio, Video};
-#[cfg(any(target_os = "windows", target_os = "linux"))]
-use ffmpeg_next::software::resampling::Context;
-#[cfg(any(target_os = "windows", target_os = "linux"))]
-use ffmpeg_next::{Packet, Rational};
-#[cfg(any(target_os = "windows", target_os = "linux"))]
-use ffmpeg_sys_next::{av_hwdevice_ctx_create, AVBufferRef, AVHWDeviceContext, AVHWDeviceType};
-#[cfg(any(target_os = "windows", target_os = "linux"))]
-use parsers::mp4::{aac_sampling_frequency_index_to_u32, apped_hevc_header};
-#[cfg(any(target_os = "windows", target_os = "linux", target_os = "android"))]
-use parsers::mp4::parse_hevc_nalu;
+use decoders::{
+    AudioCodec, AudioDecoder, AudioDecoderParams, DecodedAudioFrame, DecodedVideoFrame,
+    HwVideoDecoder, VideoCodec, VideoDecoderParams,
+};
+use parsers::mp4::aac_sampling_frequency_index_to_u32;
 use pollster::FutureExt;
-use re_mp4::{Mp4, StsdBoxContent};
+use re_mp4::Mp4;
 use renderers::audio::AudioRenderer;
 use renderers::video::VideoRenderer;
 use winit::dpi::PhysicalSize;
@@ -69,14 +60,9 @@ pub struct Player {
     audio_adaptation: Arc<StdMutex<Option<AudioAdaptation>>>,
     audio_representation: Arc<StdMutex<Option<AudioRepresentation>>>,
 
-    //frame_producer: Receiver<Video>,
-    //frame_consumer: Sender<Video>,
-
-    //play_handle: JoinHandle<()>,
     start_time: Arc<Instant>,
     video_ready: Arc<Notify>,
     audio_ready: Arc<Notify>,
-    //text_ready: Arc<Notify>,
     stop: Arc<Notify>,
     stop_flag: Arc<AtomicBool>,
 
@@ -89,11 +75,14 @@ pub struct Player {
     audio_renderer: Arc<AudioRenderer>,
 }
 
-#[cfg(any(target_os = "windows", target_os = "linux"))]
+// ---------------------------------------------------------------------------
+// Unified sync producers (same logic on all platforms)
+// ---------------------------------------------------------------------------
+
 async fn video_sync_producer(
     start_time: Arc<Instant>,
-    mut input_rx: mpsc::Receiver<Arc<Video>>,
-    output_tx: Arc<VideoRenderer>,
+    mut input_rx: mpsc::Receiver<DecodedVideoFrame>,
+    renderer: Arc<VideoRenderer>,
     position_ms: Arc<AtomicU64>,
     stop: Arc<Notify>,
     stop_flag: Arc<AtomicBool>,
@@ -109,10 +98,10 @@ async fn video_sync_producer(
             },
             _ = stop.notified() => break,
         };
+        let pts_ms = (frame.pts_us / 1000) as u64;
         let elapsed = start_time.elapsed().as_millis() as u64;
-        let pts = frame.pts().unwrap() as u64;
-        if pts > elapsed {
-            let sleep_dur = Duration::from_millis(pts - elapsed);
+        if pts_ms > elapsed {
+            let sleep_dur = Duration::from_millis(pts_ms - elapsed);
             tokio::select! {
                 _ = tokio::time::sleep(sleep_dur) => {}
                 _ = stop.notified() => break,
@@ -121,21 +110,18 @@ async fn video_sync_producer(
                 break;
             }
         }
-        if pts + 20 < elapsed {
-            println!("Video drift more then 20ms dropping frame");
+        if pts_ms + 20 < elapsed {
+            println!("Video drift more than 20ms, dropping frame");
             continue;
         }
-
-        position_ms.store(pts, Ordering::Relaxed);
-        _ = output_tx.render(frame).await;
+        position_ms.store(pts_ms, Ordering::Relaxed);
+        renderer.render_frame(frame).await;
     }
 }
 
-#[cfg(any(target_os = "windows", target_os = "linux"))]
 async fn audio_sync_producer(
-    start_time: Arc<Instant>,
-    mut input_rx: mpsc::Receiver<Audio>,
-    output_tx: Arc<AudioRenderer>,
+    mut input_rx: mpsc::Receiver<DecodedAudioFrame>,
+    audio_renderer: Arc<AudioRenderer>,
     stop: Arc<Notify>,
     stop_flag: Arc<AtomicBool>,
 ) {
@@ -150,17 +136,312 @@ async fn audio_sync_producer(
             },
             _ = stop.notified() => break,
         };
-        let elapsed = start_time.elapsed().as_millis() as u64;
-        let pts = frame.pts().unwrap() as u64;
-        if pts + 20 < elapsed {
-            println!("Audio drift more then 20ms dropping frame");
-            continue;
-        }
-        tokio::select! {
-            _ = output_tx.put_sample(frame) => {}
-            _ = stop.notified() => break,
+        // Audio timing is driven by cpal's output rate — never drop frames.
+        if !frame.samples.is_empty() {
+            tokio::select! {
+                _ = audio_renderer.put_samples_raw(&frame.samples) => {}
+                _ = stop.notified() => break,
+            }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Unified decoder tasks (same logic on all platforms)
+// ---------------------------------------------------------------------------
+
+async fn video_decoder_task(
+    mut receiver: Receiver<DataSegment>,
+    sender: Sender<DecodedVideoFrame>,
+    mut decoder: Box<dyn HwVideoDecoder>,
+    init_data: Vec<u8>,
+    video_ready: Arc<Notify>,
+    track_crypto: Option<TrackCrypto>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    while let Some(segment) = receiver.recv().await {
+        println!("Consuming video segment: {}", segment.id);
+
+        let mut data_vec = init_data.clone();
+        data_vec.extend_from_slice(&segment.data[..]);
+        decrypt_segment_in_place(&mut data_vec, track_crypto.as_ref())?;
+
+        let sample_info: Vec<(usize, usize, i64, u64)> = {
+            let mp4 = Mp4::read_bytes(&data_vec)
+                .map_err(|e| -> Box<dyn Error + Send + Sync> { format!("mp4: {}", e).into() })?;
+            let (_id, track) = mp4
+                .tracks()
+                .first_key_value()
+                .ok_or_else(|| -> Box<dyn Error + Send + Sync> { "no track".into() })?;
+            track
+                .samples
+                .iter()
+                .map(|s| (s.offset as usize, s.size as usize, s.composition_timestamp, s.timescale))
+                .collect()
+        };
+
+        for (offset, size, ts, ts_scale) in sample_info {
+            if offset + size > data_vec.len() {
+                continue;
+            }
+            let sample_data = &data_vec[offset..offset + size];
+            let pts_us = if ts_scale > 0 { ts * 1_000_000 / ts_scale as i64 } else { 0 };
+
+            // submit takes length-prefixed mdat bytes; each decoder impl handles
+            // the Annex-B conversion internally.
+            decoder.submit(sample_data, pts_us)?;
+            video_ready.notify_one();
+
+            // Drain all frames the decoder produced for this sample.
+            loop {
+                match decoder.try_recv()? {
+                    Some(frame) => {
+                        if sender.send(frame).await.is_err() {
+                            return Ok(());
+                        }
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn audio_decoder_task(
+    mut receiver: Receiver<DataSegment>,
+    sender: Sender<DecodedAudioFrame>,
+    mut decoder: Box<dyn AudioDecoder>,
+    init_data: Vec<u8>,
+    audio_ready: Arc<Notify>,
+    track_crypto: Option<TrackCrypto>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    while let Some(segment) = receiver.recv().await {
+        println!("Consuming audio segment: {}", segment.id);
+
+        let mut data_vec = init_data.clone();
+        data_vec.extend_from_slice(&segment.data[..]);
+        decrypt_segment_in_place(&mut data_vec, track_crypto.as_ref())?;
+
+        let sample_info: Vec<(usize, usize, i64, u64)> = {
+            let mp4 = Mp4::read_bytes(&data_vec)
+                .map_err(|e| -> Box<dyn Error + Send + Sync> { format!("mp4: {}", e).into() })?;
+            let (_id, track) = mp4
+                .tracks()
+                .first_key_value()
+                .ok_or_else(|| -> Box<dyn Error + Send + Sync> { "no track".into() })?;
+            track
+                .samples
+                .iter()
+                .map(|s| (s.offset as usize, s.size as usize, s.composition_timestamp, s.timescale))
+                .collect()
+        };
+
+        for (offset, size, ts, ts_scale) in sample_info {
+            if offset + size > data_vec.len() {
+                continue;
+            }
+            let sample_data = &data_vec[offset..offset + size];
+            let pts_us = if ts_scale > 0 { ts * 1_000_000 / ts_scale as i64 } else { 0 };
+
+            decoder.submit(sample_data, pts_us)?;
+            audio_ready.notify_one();
+
+            loop {
+                match decoder.try_recv()? {
+                    Some(frame) => {
+                        if sender.send(frame).await.is_err() {
+                            return Ok(());
+                        }
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Unified play pipeline builders
+// ---------------------------------------------------------------------------
+
+async fn video_play(
+    video_representation: VideoRepresenation,
+    start_index: usize,
+    video_ready: Arc<Notify>,
+    sender: Sender<DecodedVideoFrame>,
+    stop: Arc<Notify>,
+    stop_flag: Arc<AtomicBool>,
+    decryptor: Option<Arc<dyn Decryptor>>,
+    mut decoder: Box<dyn HwVideoDecoder>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let (download_tx, download_rx) = mpsc::channel::<DataSegment>(MAX_SEGMENTS);
+
+    let init_data = video_representation
+        .segment_init
+        .download()
+        .await
+        .map_err(|e| -> Box<dyn Error + Send + Sync> { format!("init download: {}", e).into() })?;
+
+    let hvcc_nalus = parse_hvcc_nalus(&init_data)
+        .ok_or_else(|| -> Box<dyn Error + Send + Sync> { "no hvcC in init segment".into() })?;
+
+    let track_crypto = match parse_tenc(&init_data) {
+        Some(tenc) => {
+            println!(
+                "video: CENC encrypted, KID={} iv_size={}",
+                hex::encode(tenc.default_kid),
+                tenc.default_iv_size
+            );
+            let dec = decryptor.ok_or(
+                "Track is CENC-encrypted but no decryptor configured (call Player::set_clearkey)",
+            )?;
+            Some(TrackCrypto {
+                decryptor: dec,
+                kid: tenc.default_kid,
+                iv_size: tenc.default_iv_size as usize,
+            })
+        }
+        None => {
+            println!("video: clear (no tenc box)");
+            None
+        }
+    };
+
+    decoder.configure(VideoDecoderParams {
+        codec: VideoCodec::Hevc,
+        width: video_representation.width,
+        height: video_representation.height,
+        hvcc_nalus,
+    })?;
+
+    let segments = video_representation.segments.clone();
+    let download_task =
+        task::spawn(Player::download_task(segments, start_index, download_tx, stop, stop_flag));
+    let decoder_task =
+        task::spawn(video_decoder_task(download_rx, sender, decoder, init_data, video_ready, track_crypto));
+
+    let (dl_res, dec_res) = join!(download_task, decoder_task);
+    log_task_result("video download_task", dl_res);
+    log_task_result("video decoder_task", dec_res);
+    Ok(())
+}
+
+async fn audio_play(
+    audio_representation: AudioRepresentation,
+    start_index: usize,
+    audio_ready: Arc<Notify>,
+    sender: Sender<DecodedAudioFrame>,
+    output_sample_rate: u32,
+    stop: Arc<Notify>,
+    stop_flag: Arc<AtomicBool>,
+    decryptor: Option<Arc<dyn Decryptor>>,
+    mut decoder: Box<dyn AudioDecoder>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let (download_tx, download_rx) = mpsc::channel::<DataSegment>(MAX_SEGMENTS);
+
+    let init_data = audio_representation
+        .segment_init
+        .download()
+        .await
+        .map_err(|e| -> Box<dyn Error + Send + Sync> { format!("audio init download: {}", e).into() })?;
+
+    let track_crypto = match parse_tenc(&init_data) {
+        Some(tenc) => {
+            println!(
+                "audio: CENC encrypted, KID={} iv_size={}",
+                hex::encode(tenc.default_kid),
+                tenc.default_iv_size
+            );
+            let dec = decryptor.ok_or(
+                "Audio track is CENC-encrypted but no decryptor configured (call Player::set_clearkey)",
+            )?;
+            Some(TrackCrypto {
+                decryptor: dec,
+                kid: tenc.default_kid,
+                iv_size: tenc.default_iv_size as usize,
+            })
+        }
+        None => {
+            println!("audio: clear (no tenc)");
+            None
+        }
+    };
+
+    let aac_config = parse_aac_config(&init_data)
+        .ok_or("Audio codec not supported (no AAC config in init segment)")?;
+
+    let input_sample_rate = aac_sampling_frequency_index_to_u32(aac_config.freq_index);
+    let input_channels = aac_config.chan_conf as u16;
+    let dsi: [u8; 2] = [
+        (aac_config.profile << 3) | (aac_config.freq_index >> 1),
+        ((aac_config.freq_index & 0x01) << 7) | (aac_config.chan_conf << 3),
+    ];
+
+    println!(
+        "audio: AAC profile={} freq_index={} (={}Hz) chan_conf={}",
+        aac_config.profile, aac_config.freq_index, input_sample_rate, aac_config.chan_conf
+    );
+
+    decoder.configure(AudioDecoderParams {
+        codec: AudioCodec::Aac,
+        input_sample_rate,
+        input_channels,
+        output_sample_rate,
+        codec_specific_data: dsi.to_vec(),
+    })?;
+
+    let segments = audio_representation.segments.clone();
+    let download_task =
+        task::spawn(Player::download_task(segments, start_index, download_tx, stop, stop_flag));
+    let decoder_task =
+        task::spawn(audio_decoder_task(download_rx, sender, decoder, init_data, audio_ready, track_crypto));
+
+    let (dl_res, dec_res) = join!(download_task, decoder_task);
+    log_task_result("audio download_task", dl_res);
+    log_task_result("audio decoder_task", dec_res);
+    Ok(())
+}
+
+async fn lifetime_handler(
+    seek_offset: Duration,
+    video_ready: Arc<Notify>,
+    video_rx: mpsc::Receiver<DecodedVideoFrame>,
+    video_tx: Arc<VideoRenderer>,
+    position_ms: Arc<AtomicU64>,
+    audio_ready: Arc<Notify>,
+    audio_rx: mpsc::Receiver<DecodedAudioFrame>,
+    audio_tx: Arc<AudioRenderer>,
+    stop: Arc<Notify>,
+    stop_flag: Arc<AtomicBool>,
+) {
+    tokio::select! {
+        _ = async { tokio::join!(video_ready.notified(), audio_ready.notified()); } => {}
+        _ = stop.notified() => {
+            stop.notify_waiters();
+            return;
+        }
+    }
+    let now = Instant::now();
+    let start_time = Arc::new(now.checked_sub(seek_offset).unwrap_or(now));
+    // Both sync producers must finish — if audio errors out early, video keeps playing.
+    let (_, _) = tokio::join!(
+        tokio::spawn(video_sync_producer(
+            start_time.clone(),
+            video_rx,
+            video_tx,
+            position_ms,
+            stop.clone(),
+            stop_flag.clone(),
+        )),
+        tokio::spawn(audio_sync_producer(
+            audio_rx,
+            audio_tx,
+            stop.clone(),
+            stop_flag.clone(),
+        )),
+    );
+    stop.notify_waiters();
 }
 
 impl Player {
@@ -201,8 +482,6 @@ impl Player {
         }
     }
 
-    /// Provide ClearKey decryption keys directly. `keys` maps KID (hex) to key (hex),
-    /// each 16 bytes / 32 hex chars. Replaces any previously configured decryptor.
     pub fn set_clearkey(&self, keys: HashMap<String, String>) -> Result<(), Box<dyn Error>> {
         let decryptor = ClearKeyDecryptor::from_hex(keys)?;
         *self.decryptor.lock().unwrap() = Some(Arc::new(decryptor));
@@ -211,53 +490,41 @@ impl Player {
 
     fn parse_base_url(full_url: &str) -> Result<String, Box<dyn Error>> {
         let mut url = Url::parse(full_url)?;
-
         url.path_segments_mut()
             .expect("Cannot modify path segments")
             .pop();
-
         Ok(url.to_string() + "/")
     }
 
     pub async fn open_url(&mut self, url: &str) -> Result<(), Box<dyn Error>> {
         let base_url = Self::parse_base_url(url)?;
         self.base_url = Some(base_url);
-
         let url = url.to_string();
         let manifest = Manifest::new(url).await?;
         self.manifest = Some(manifest);
-
         Ok(())
     }
 
     pub async fn prepare(&mut self) -> Result<(), Box<dyn Error>> {
         #[cfg(any(target_os = "windows", target_os = "linux"))]
         ffmpeg_next::init()?;
+
         let manifest = match &self.manifest {
-            Some(success) => success,
-            None => {
-                eprintln!("Manifest not loaded!");
-                return Err("Manifest not loaded!".into());
-            }
+            Some(m) => m,
+            None => return Err("Manifest not loaded!".into()),
         };
-
         let base_url = match &self.base_url {
-            Some(success) => success.to_string(),
-            None => {
-                eprintln!("BaseUrl not loaded!");
-                return Err("BaseUrl not loaded!".into());
-            }
+            Some(u) => u.to_string(),
+            None => return Err("BaseUrl not loaded!".into()),
         };
-
         let tracks = Tracks::new(base_url, &manifest.mpd).await?;
         *self.tracks.lock().unwrap() = Some(tracks);
-
         Ok(())
     }
 
     pub fn get_tracks(&self) -> Result<Tracks, Box<dyn Error>> {
         match self.tracks.lock().unwrap().as_ref() {
-            Some(success) => Ok(success.clone()),
+            Some(t) => Ok(t.clone()),
             None => Err("No parsed tracks - player not prepared".into()),
         }
     }
@@ -269,7 +536,6 @@ impl Player {
     ) {
         *self.video_adaptation.lock().unwrap() = Some(adaptation.clone());
         *self.video_representation.lock().unwrap() = Some(representation.clone());
-
         let size = PhysicalSize::new(representation.width, representation.height);
         self.change_frame_size(size);
     }
@@ -344,551 +610,15 @@ impl Player {
         Ok(())
     }
 
-    #[cfg(any(target_os = "windows", target_os = "linux"))]
-    async fn video_decoder_task(
-        mut receiver: Receiver<DataSegment>,
-        sender: Sender<Arc<ffmpeg_next::util::frame::Video>>,
-        mut decoder: ffmpeg_next::decoder::Video,
-        init_data: Vec<u8>,
-        video_ready: Arc<Notify>,
-        track_crypto: Option<TrackCrypto>,
-    ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        while let Some(segment) = receiver.recv().await {
-            println!("Consuming video segment: {}", segment.id);
-
-            let mut data_vec = init_data.clone();
-            data_vec.extend_from_slice(&segment.data[..]);
-
-            decrypt_segment_in_place(&mut data_vec, track_crypto.as_ref())?;
-
-            let data = &data_vec[..];
-
-            let mp4 = match Mp4::read_bytes(data) {
-                Ok(success) => success,
-                Err(e) => {
-                    return Err(format!("Parsing error {}", e).into());
-                }
-            };
-
-            let (_track_id, track) = mp4.tracks().first_key_value().unwrap();
-            let samples = &track.samples;
-
-            for sample in samples {
-                let sample_offset = sample.offset as usize;
-                let sample_size = sample.size as usize;
-
-                if sample_offset + sample_size > data.len() {
-                    eprintln!(
-                        "Sample at offset {} (size {}) exceeds mdat bounds (size {})",
-                        sample_offset,
-                        sample_size,
-                        data.len()
-                    );
-                    continue;
-                }
-
-                let sample_data = &data[sample_offset..sample_offset + sample_size];
-                let nalus = parse_hevc_nalu(sample_data).unwrap();
-
-                for nalu in nalus {
-                    let mut packet = Packet::new(nalu.len());
-                    let pts = sample.composition_timestamp * 1000 / (sample.timescale as i64);
-                    packet.set_pts(Some(pts));
-
-                    packet.data_mut().unwrap().clone_from_slice(&nalu[..]);
-
-                    if let Err(e) = decoder.send_packet(&packet) {
-                        return Err(format!("Error sending packet to decoder: {:?}", e).into());
-                    }
-                }
-
-                let mut frame = ffmpeg_next::util::frame::Video::empty();
-                //let mut cpu_frame = ffmpeg_next::util::frame::Video::empty();
-                video_ready.notify_waiters();
-
-                while let Ok(()) = decoder.receive_frame(&mut frame) {
-                    let frame_arc = Arc::new(frame);
-                    /*
-                        // Transfer the GPU frame to system memory
-                        let ret =
-                            av_hwframe_transfer_data(cpu_frame.as_mut_ptr(), frame.as_mut_ptr(), 0);
-                        if ret < 0 {
-                            panic!("Failed to transfer data from GPU to CPU: {}", ret);
-                        }
-                    }
-
-                    cpu_frame.set_pts(frame.pts());*/
-
-                    match sender.send(frame_arc).await {
-                        Ok(_success) => {}
-                        Err(e) => return Err(format!("Cannot send frame to channel {}", e).into()),
-                    };
-
-                    frame = ffmpeg_next::util::frame::Video::empty(); // Create a new empty frame
-                }
-            }
-        }
-        Ok(())
-    }
-
-    #[cfg(any(target_os = "windows", target_os = "linux"))]
-    async fn audio_decoder_task(
-        mut receiver: Receiver<DataSegment>,
-        sender: Sender<Audio>,
-        mut decoder: ffmpeg_next::decoder::Audio,
-        init_data: Vec<u8>,
-        audio_ready: Arc<Notify>,
-        mut resampler: Context,
-        track_crypto: Option<TrackCrypto>,
-        aac_config: AacConfig,
-    ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        let target_sample_rate = resampler.output().rate;
-        while let Some(segment) = receiver.recv().await {
-            println!("Consuming audio segment: {}", segment.id);
-
-            let mut data_vec = init_data.clone();
-            data_vec.extend_from_slice(&segment.data[..]);
-
-            decrypt_segment_in_place(&mut data_vec, track_crypto.as_ref())?;
-
-            let data = &data_vec[..];
-
-            let mp4 = match Mp4::read_bytes(data) {
-                Ok(success) => success,
-                Err(e) => {
-                    return Err(format!("Parsing error {}", e).into());
-                }
-            };
-
-            let (_track_id, track) = mp4.tracks().first_key_value().unwrap();
-            let samples = &track.samples;
-
-            for sample in samples {
-                let sample_offset = sample.offset as usize;
-                let sample_size = sample.size as usize;
-
-                if sample_offset + sample_size > data.len() {
-                    eprintln!(
-                        "Sample at offset {} (size {}) exceeds mdat bounds (size {})",
-                        sample_offset,
-                        sample_size,
-                        data.len()
-                    );
-                    continue;
-                }
-
-                let sample_data = &data[sample_offset..sample_offset + sample_size];
-
-                let mut packet = Packet::new(sample_data.len());
-                let pts = sample.composition_timestamp * 1000 / (target_sample_rate as i64);
-                packet.set_pts(Some(pts));
-                packet.set_time_base(Rational(1, target_sample_rate as i32));
-                packet.data_mut().unwrap().clone_from_slice(sample_data);
-
-                if let Err(e) = decoder.send_packet(&packet) {
-                    println!("Error sending packet to decoder: {:?}", e);
-                    return Err(format!("Error sending packet to decoder: {:?}", e).into());
-                }
-
-                let mut frame = ffmpeg_next::util::frame::Audio::empty();
-                let mut dst_frame = ffmpeg_next::util::frame::Audio::empty();
-
-                audio_ready.notify_waiters();
-                while let Ok(()) = decoder.receive_frame(&mut frame) {
-                    resampler.run(&frame, &mut dst_frame)?;
-                    dst_frame.set_pts(frame.pts());
-
-                    match sender.send(dst_frame.clone()).await {
-                        Ok(_success) => {}
-                        Err(e) => return Err(format!("Cannot send frame to channel {}", e).into()),
-                    };
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    #[cfg(any(target_os = "windows", target_os = "linux"))]
-    async fn video_play(
-        video_representation: VideoRepresenation,
-        start_index: usize,
-        video_ready: Arc<Notify>,
-        sender: Sender<Arc<Video>>,
-        stop: Arc<Notify>,
-        stop_flag: Arc<AtomicBool>,
-        decryptor: Option<Arc<dyn Decryptor>>,
-    ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        let (download_tx, download_rx) = mpsc::channel::<DataSegment>(MAX_SEGMENTS);
-        let init_data = match video_representation.segment_init.download().await {
-            Ok(data) => data,
-            Err(e) => return Err(format!("Error download init segment: {}", e).into()),
-        };
-
-        let mp4_info = match Mp4::read_bytes(&init_data[..]) {
-            Ok(success) => success,
-            Err(e) => return Err(format!("Error parsing mp4 Init {}", e).into()),
-        };
-
-        let (_track_id, track) = match mp4_info.tracks().first_key_value() {
-            Some(track_info) => track_info,
-            None => return Err("Cannot find any track".into()),
-        };
-
-        let codec_id = ffmpeg_next::codec::Id::HEVC;
-        let codec = match ffmpeg_next::decoder::find(codec_id) {
-            Some(codec) => codec,
-            None => return Err("Cannot find codec for track".into()),
-        };
-        let mut decoder = match ffmpeg_next::codec::Context::new_with_codec(codec)
-            .decoder()
-            .video()
-        {
-            Ok(context) => context,
-            Err(e) => return Err(format!("Cannot find decoder for codec {}", e).into()),
-        };
-
-        #[cfg(target_os = "windows")]
-        unsafe {
-            let mut hw_device_ctx: *mut AVBufferRef = std::ptr::null_mut();
-            let device_type = AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA;
-            let ret = av_hwdevice_ctx_create(
-                &mut hw_device_ctx,
-                device_type,
-                std::ptr::null(),
-                std::ptr::null_mut(),
-                0,
-            );
-            if ret < 0 {
-                panic!("Failed to create D3D11VA hardware device: {}", ret);
-            }
-
-            // Assign the device context to the codec context
-            let codec_ctx_ptr = decoder.as_mut_ptr();
-            (*codec_ctx_ptr).hw_device_ctx = hw_device_ctx;
-
-            println!("D3D11VA hardware device context created successfully.");
-        }
-
-        #[cfg(target_os = "linux")]
-        unsafe {
-            let mut hw_device_ctx: *mut AVBufferRef = std::ptr::null_mut();
-            let device_type = AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI;
-            let ret = av_hwdevice_ctx_create(
-                &mut hw_device_ctx,
-                device_type,
-                std::ptr::null(),
-                std::ptr::null_mut(),
-                0,
-            );
-            if ret < 0 {
-                panic!("Failed to create VAAPI hardware device: {}", ret);
-            }
-
-            // Assign the device context to the codec context
-            let codec_ctx_ptr = decoder.as_mut_ptr();
-            (*codec_ctx_ptr).hw_device_ctx = hw_device_ctx;
-
-            println!("VAAPI hardware device context created successfully.");
-        }
-
-        let track_crypto = match parse_tenc(&init_data) {
-            Some(tenc) => {
-                println!(
-                    "video: CENC encrypted, KID={} iv_size={}",
-                    hex::encode(tenc.default_kid),
-                    tenc.default_iv_size
-                );
-                let dec = decryptor.ok_or(
-                    "Track is CENC-encrypted but no decryptor configured (call Player::set_clearkey)",
-                )?;
-                Some(TrackCrypto {
-                    decryptor: dec,
-                    kid: tenc.default_kid,
-                    iv_size: tenc.default_iv_size as usize,
-                })
-            }
-            None => {
-                println!("video: clear (no tenc box)");
-                None
-            }
-        };
-
-        let feed_hvcc_nalus = |decoder: &mut ffmpeg_next::decoder::Video,
-                               nalus: Vec<Vec<u8>>|
-         -> Result<(), Box<dyn Error + Send + Sync>> {
-            for nalu_data in nalus {
-                let nalu = apped_hevc_header(nalu_data);
-                let mut packet = Packet::new(nalu.len());
-                packet.data_mut().unwrap().clone_from_slice(&nalu[..]);
-                if let Err(e) = decoder.send_packet(&packet) {
-                    return Err(format!("Error sending hvcC NALU to decoder: {:?}", e).into());
-                }
-            }
-            Ok(())
-        };
-
-        match track.trak(&mp4_info).mdia.minf.stbl.stsd.contents.clone() {
-            StsdBoxContent::Hvc1(hvc) => {
-                let nalus: Vec<Vec<u8>> = hvc
-                    .hvcc
-                    .arrays
-                    .clone()
-                    .into_iter()
-                    .flat_map(|a| a.nalus.into_iter().map(|n| n.data))
-                    .collect();
-                feed_hvcc_nalus(&mut decoder, nalus)?;
-            }
-            StsdBoxContent::Hev1(hev) => {
-                let nalus: Vec<Vec<u8>> = hev
-                    .hvcc
-                    .arrays
-                    .clone()
-                    .into_iter()
-                    .flat_map(|a| a.nalus.into_iter().map(|n| n.data))
-                    .collect();
-                feed_hvcc_nalus(&mut decoder, nalus)?;
-            }
-            _ => {
-                // Encrypted (encv/encf) or otherwise unrecognized — try the hvcC box directly.
-                let nalus = parse_hvcc_nalus(&init_data)
-                    .ok_or("Codec not supported (no hvcC in init segment)")?;
-                feed_hvcc_nalus(&mut decoder, nalus)?;
-            }
-        };
-
-        let video = video_representation;
-        let segments = video.segments.clone();
-
-        let download_task = task::spawn(Self::download_task(
-            segments,
-            start_index,
-            download_tx,
-            stop,
-            stop_flag,
-        ));
-
-        let decoder_task = task::spawn(Self::video_decoder_task(
-            download_rx,
-            sender,
-            decoder,
-            init_data,
-            video_ready,
-            track_crypto,
-        ));
-
-        let (dl_res, dec_res) = join!(download_task, decoder_task);
-        log_task_result("video download_task", dl_res);
-        log_task_result("video decoder_task", dec_res);
-
-        Ok(())
-    }
-
-    #[cfg(any(target_os = "windows", target_os = "linux"))]
-    async fn audio_play(
-        audio_representation: AudioRepresentation,
-        start_index: usize,
-        audio_ready: Arc<Notify>,
-        sender: Sender<Audio>,
-        sample_rate: u32,
-        stop: Arc<Notify>,
-        stop_flag: Arc<AtomicBool>,
-        decryptor: Option<Arc<dyn Decryptor>>,
-    ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        let (download_tx, download_rx) = mpsc::channel::<DataSegment>(MAX_SEGMENTS);
-        let init_data = match audio_representation.segment_init.download().await {
-            Ok(data) => data,
-            Err(e) => return Err(format!("Error download init segment: {}", e).into()),
-        };
-
-        let mp4_info = match Mp4::read_bytes(&init_data[..]) {
-            Ok(success) => success,
-            Err(e) => return Err(format!("Error parsing mp4 Init {}", e).into()),
-        };
-
-        let (_track_id, track) = match mp4_info.tracks().first_key_value() {
-            Some(track_info) => track_info,
-            None => return Err("Cannot find any track".into()),
-        };
-
-        let track_crypto = match parse_tenc(&init_data) {
-            Some(tenc) => {
-                println!(
-                    "audio: CENC encrypted, KID={} iv_size={}",
-                    hex::encode(tenc.default_kid),
-                    tenc.default_iv_size
-                );
-                let dec = decryptor.ok_or(
-                    "Audio track is CENC-encrypted but no decryptor configured (call Player::set_clearkey)",
-                )?;
-                Some(TrackCrypto {
-                    decryptor: dec,
-                    kid: tenc.default_kid,
-                    iv_size: tenc.default_iv_size as usize,
-                })
-            }
-            None => {
-                println!("audio: clear (no tenc box)");
-                None
-            }
-        };
-
-        // Prefer our own ASC parser over re_mp4's — independent of re_mp4's quirks.
-        let aac_config = parse_aac_config(&init_data)
-            .or_else(|| match track.trak(&mp4_info).mdia.minf.stbl.stsd.contents.clone() {
-                StsdBoxContent::Mp4a(mp4a) => {
-                    let esds = mp4a.esds?;
-                    Some(AacConfig {
-                        profile: esds.es_desc.dec_config.dec_specific.profile,
-                        freq_index: esds.es_desc.dec_config.dec_specific.freq_index,
-                        chan_conf: esds.es_desc.dec_config.dec_specific.chan_conf,
-                    })
-                }
-                _ => None,
-            })
-            .ok_or("Audio codec not supported (no AAC config in init segment)")?;
-
-        println!(
-            "audio: AAC profile={} freq_index={} (={} Hz) chan_conf={}",
-            aac_config.profile,
-            aac_config.freq_index,
-            aac_sampling_frequency_index_to_u32(aac_config.freq_index),
-            aac_config.chan_conf
-        );
-
-        let codec_id = ffmpeg_next::codec::Id::AAC;
-        let codec = match ffmpeg_next::decoder::find(codec_id) {
-            Some(codec) => codec,
-            None => return Err("Cannot find codec for track".into()),
-        };
-
-        let mut ctx = ffmpeg_next::codec::Context::new_with_codec(codec);
-
-        // Build the 2-byte AudioSpecificConfig from the parsed config and install
-        // it as the decoder's extradata. With this set, FFmpeg's AAC decoder reads
-        // codec parameters at open time and accepts raw mdat frames without ADTS.
-        let dsi: [u8; 2] = [
-            (aac_config.profile << 3) | (aac_config.freq_index >> 1),
-            ((aac_config.freq_index & 0x01) << 7) | (aac_config.chan_conf << 3),
-        ];
-        unsafe {
-            let ctx_ptr = ctx.as_mut_ptr();
-            let padding = ffmpeg_sys_next::AV_INPUT_BUFFER_PADDING_SIZE as usize;
-            let extradata = ffmpeg_sys_next::av_mallocz(dsi.len() + padding);
-            if extradata.is_null() {
-                return Err("av_mallocz failed for AAC extradata".into());
-            }
-            std::ptr::copy_nonoverlapping(dsi.as_ptr(), extradata as *mut u8, dsi.len());
-            (*ctx_ptr).extradata = extradata as *mut u8;
-            (*ctx_ptr).extradata_size = dsi.len() as i32;
-        }
-
-        let mut decoder = match ctx.decoder().audio() {
-            Ok(context) => context,
-            Err(e) => return Err(format!("Cannot find decoder for codec {}", e).into()),
-        };
-
-        let sample_rate_src = aac_sampling_frequency_index_to_u32(aac_config.freq_index);
-        let in_layout = match aac_config.chan_conf {
-            1 => ffmpeg_next::util::channel_layout::ChannelLayout::MONO,
-            2 => ffmpeg_next::util::channel_layout::ChannelLayout::STEREO,
-            n => ffmpeg_next::util::channel_layout::ChannelLayout::default(n as i32),
-        };
-
-        let resampler = Context::get(
-            ffmpeg_next::util::format::sample::Sample::F32(Type::Planar),
-            in_layout,
-            sample_rate_src,
-            ffmpeg_next::util::format::sample::Sample::F32(Type::Packed),
-            ffmpeg_next::util::channel_layout::ChannelLayout::STEREO,
-            sample_rate,
-        )?;
-
-        let audio = audio_representation;
-        let segments = audio.segments.clone();
-
-        let download_task = task::spawn(Self::download_task(
-            segments,
-            start_index,
-            download_tx,
-            stop,
-            stop_flag,
-        ));
-
-        let decoder_task = task::spawn(Self::audio_decoder_task(
-            download_rx,
-            sender,
-            decoder,
-            init_data,
-            audio_ready,
-            resampler,
-            track_crypto,
-            aac_config,
-        ));
-
-        let (dl_res, dec_res) = join!(download_task, decoder_task);
-        log_task_result("audio download_task", dl_res);
-        log_task_result("audio decoder_task", dec_res);
-        Ok(())
-    }
-
-    #[cfg(any(target_os = "windows", target_os = "linux"))]
-    async fn lifetime_handler(
-        seek_offset: Duration,
-        video_ready: Arc<Notify>,
-        video_rx: mpsc::Receiver<Arc<Video>>,
-        video_tx: Arc<VideoRenderer>,
-        position_ms: Arc<AtomicU64>,
-        audio_ready: Arc<Notify>,
-        audio_rx: mpsc::Receiver<Audio>,
-        audio_tx: Arc<AudioRenderer>,
-        stop: Arc<Notify>,
-        stop_flag: Arc<AtomicBool>,
-    ) {
-        //loop {
-        tokio::select! {
-            _ = async {
-                tokio::join!(video_ready.notified(), audio_ready.notified());
-            } => {}
-            _ = stop.notified() => {
-                stop.notify_waiters();
-                return;
-            }
-        }
-        let now = Instant::now();
-        let start_time = Arc::new(now.checked_sub(seek_offset).unwrap_or(now));
-        tokio::select! {
-            _ = tokio::spawn(video_sync_producer(
-                start_time.clone(),
-                video_rx,
-                video_tx,
-                position_ms,
-                stop.clone(),
-                stop_flag.clone(),
-            )) => { }
-            _ = tokio::spawn(audio_sync_producer(
-                start_time.clone(),
-                audio_rx,
-                audio_tx,
-                stop.clone(),
-                stop_flag.clone(),
-            )) => { }
-            /*_ = text_play => {
-            }*/
-        }
-        stop.notify_waiters();
-        //}
-    }
-
-    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    /// Single play() implementation for all platforms. Creates platform-specific
+    /// decoder instances and feeds them into the same generic pipeline.
     pub fn play(&self) -> Result<JoinHandle<()>, Box<dyn Error>> {
         let video_representation = match self.video_representation.lock().unwrap().as_ref() {
-            Some(success) => success.clone(),
+            Some(r) => r.clone(),
             None => return Err("Video Track not set".into()),
         };
-
         let audio_representation = match self.audio_representation.lock().unwrap().as_ref() {
-            Some(success) => success.clone(),
+            Some(r) => r.clone(),
             None => return Err("Audio Track not set".into()),
         };
 
@@ -896,14 +626,27 @@ impl Player {
         let audio_ready = self.audio_ready.clone();
         let stop = self.stop.clone();
         let stop_flag = self.stop_flag.clone();
-
         let video_renderer = self.video_renderer.clone();
         let audio_renderer = self.audio_renderer.clone();
-
         let seek_target = self.seek_target.clone();
         let position_ms = self.position_ms.clone();
-
         let decryptor_snapshot = self.decryptor.lock().unwrap().clone();
+
+        // Create platform-specific decoder instances. The rest of the pipeline
+        // (download tasks, sync producers, lifetime handler) is identical.
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        let video_decoder: Box<dyn HwVideoDecoder> =
+            Box::new(decoders::ffmpeg_hw::FfmpegHwDecoder::new());
+        #[cfg(target_os = "android")]
+        let video_decoder: Box<dyn HwVideoDecoder> =
+            Box::new(decoders::mediacodec::MediaCodecDecoder::new());
+
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        let audio_decoder: Box<dyn AudioDecoder> =
+            Box::new(decoders::ffmpeg_audio::FfmpegAudioDecoder::new());
+        #[cfg(target_os = "android")]
+        let audio_decoder: Box<dyn AudioDecoder> =
+            Box::new(decoders::mediacodec_audio::MediaCodecAudioDecoder::new());
 
         let play = tokio::spawn(async move {
             let seek_offset = {
@@ -922,12 +665,12 @@ impl Player {
                 .get(video_start_index)
                 .map(|s| s.start_time())
                 .unwrap_or(seek_offset);
-
             position_ms.store(snapped_seek_offset.as_millis() as u64, Ordering::Relaxed);
 
-            let (frame_sender, frame_receiver) = mpsc::channel::<Arc<Video>>(4);
-            let (sample_sender, sample_receiver) = mpsc::channel::<Audio>(32);
-            let play = tokio::spawn(Self::video_play(
+            let (frame_sender, frame_receiver) = mpsc::channel::<DecodedVideoFrame>(4);
+            let (sample_sender, sample_receiver) = mpsc::channel::<DecodedAudioFrame>(32);
+
+            let video = tokio::spawn(video_play(
                 video_representation,
                 video_start_index,
                 video_ready.clone(),
@@ -935,11 +678,11 @@ impl Player {
                 stop.clone(),
                 stop_flag.clone(),
                 decryptor_snapshot.clone(),
+                video_decoder,
             ));
 
             let sample_rate = audio_renderer.sample_rate();
-
-            let audio = tokio::spawn(Self::audio_play(
+            let audio = tokio::spawn(audio_play(
                 audio_representation,
                 audio_start_index,
                 audio_ready.clone(),
@@ -948,9 +691,10 @@ impl Player {
                 stop.clone(),
                 stop_flag.clone(),
                 decryptor_snapshot,
+                audio_decoder,
             ));
 
-            Self::lifetime_handler(
+            lifetime_handler(
                 snapped_seek_offset,
                 video_ready.clone(),
                 frame_receiver,
@@ -964,52 +708,11 @@ impl Player {
             )
             .await;
 
-            let (play_res, audio_res) = join!(play, audio);
+            let (play_res, audio_res) = join!(video, audio);
             log_task_result("video_play", play_res);
             log_task_result("audio_play", audio_res);
         });
         Ok(play)
-    }
-
-    /// Android playback pipeline: download → CENC decrypt → MediaCodec
-    /// (Surface output, NV12 AHardwareBuffer) → wgpu via
-    /// VK_ANDROID_external_memory_android_hardware_buffer. Video only;
-    /// audio comes in a follow-up.
-    #[cfg(target_os = "android")]
-    pub fn play(&self) -> Result<JoinHandle<()>, Box<dyn Error>> {
-        let video_repr = match self.video_representation.lock().unwrap().as_ref() {
-            Some(r) => r.clone(),
-            None => return Err("Video Track not set".into()),
-        };
-
-        let stop_flag = self.stop_flag.clone();
-        let seek_target = self.seek_target.clone();
-        let position_ms = self.position_ms.clone();
-        let video_renderer = self.video_renderer.clone();
-        let decryptor_snapshot = self.decryptor.lock().unwrap().clone();
-
-        let handle = tokio::spawn(async move {
-            if let Err(e) = play_loop_android(
-                video_repr,
-                stop_flag,
-                seek_target,
-                position_ms,
-                video_renderer,
-                decryptor_snapshot,
-            )
-            .await
-            {
-                log::error!("android play loop: {}", e);
-            }
-        });
-
-        Ok(handle)
-    }
-
-    /// iOS stub — VideoToolbox path lands later.
-    #[cfg(target_os = "ios")]
-    pub fn play(&self) -> Result<JoinHandle<()>, Box<dyn Error>> {
-        Err("Player::play is not yet implemented on iOS".into())
     }
 
     pub fn seek(&self, target: Duration) {
@@ -1066,317 +769,15 @@ impl Player {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Helpers (unchanged from before)
+// ---------------------------------------------------------------------------
+
 #[derive(Debug, Clone)]
 struct DataSegment {
     id: usize,
-    size: usize,   // Size in bytes
-    data: Vec<u8>, // Simulated data
-}
-
-/// Android-only playback driver. Owns the MediaCodec decoder for the duration
-/// of one play() invocation. Video-only for now.
-#[cfg(target_os = "android")]
-async fn play_loop_android(
-    video_repr: tracks::video::VideoRepresenation,
-    stop_flag: Arc<AtomicBool>,
-    seek_target: Arc<RwLock<Option<Duration>>>,
-    position_ms: Arc<AtomicU64>,
-    video_renderer: Arc<renderers::video::VideoRenderer>,
-    decryptor: Option<Arc<dyn Decryptor>>,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
-    use decoders::mediacodec::MediaCodecDecoder;
-    use decoders::{HwVideoDecoder, PlatformFrame, VideoCodec, VideoDecoderParams};
-    use re_mp4::Mp4;
-
-    // Consume the seek target and reset stop_flag — same atomic pattern as
-    // desktop play() so a seek triggered during init isn't lost.
-    let seek_offset = {
-        let mut t = seek_target.write().await;
-        stop_flag.store(false, Ordering::Relaxed);
-        t.take().unwrap_or(Duration::ZERO)
-    };
-
-    let start_index = find_segment_index(&video_repr.segments, seek_offset);
-    let snapped_offset = video_repr
-        .segments
-        .get(start_index)
-        .map(|s| s.start_time())
-        .unwrap_or(seek_offset);
-    position_ms.store(snapped_offset.as_millis() as u64, Ordering::Relaxed);
-    log::info!(
-        "android play: start_index={} snapped_offset={:?}",
-        start_index,
-        snapped_offset
-    );
-
-    // Init segment + CENC detection (same as desktop).
-    let init_data = video_repr
-        .segment_init
-        .download()
-        .await
-        .map_err(|e| -> Box<dyn Error + Send + Sync> {
-            format!("init download: {}", e).into()
-        })?;
-
-    let track_crypto = match parse_tenc(&init_data) {
-        Some(tenc) => {
-            log::info!(
-                "android: CENC encrypted KID={} iv_size={}",
-                hex::encode(tenc.default_kid),
-                tenc.default_iv_size
-            );
-            let dec = decryptor.ok_or_else(|| -> Box<dyn Error + Send + Sync> {
-                "track is CENC-encrypted but no decryptor configured".into()
-            })?;
-            Some(TrackCrypto {
-                decryptor: dec,
-                kid: tenc.default_kid,
-                iv_size: tenc.default_iv_size as usize,
-            })
-        }
-        None => {
-            log::info!("android: clear (no tenc)");
-            None
-        }
-    };
-
-    // Build HEVC csd-0 (VPS/SPS/PPS in Annex-B format with start codes).
-    let csd_nalus = parse_hvcc_nalus(&init_data).ok_or_else(|| -> Box<dyn Error + Send + Sync> {
-        "cannot parse hvcC from init segment".into()
-    })?;
-    let mut csd = Vec::new();
-    for n in &csd_nalus {
-        csd.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
-        csd.extend_from_slice(n);
-    }
-    log::info!(
-        "android: built csd-0 of {} bytes from {} NALUs",
-        csd.len(),
-        csd_nalus.len()
-    );
-
-    // Set up MediaCodec.
-    let mut decoder = MediaCodecDecoder::new()?;
-    decoder.configure(VideoDecoderParams {
-        codec: VideoCodec::Hevc,
-        width: video_repr.width,
-        height: video_repr.height,
-        codec_specific_data: csd,
-    })?;
-
-    // Anchor wall-clock to the playback timeline: at t=0 of playback
-    // (modulo any active seek), Instant::now() - start_time = seek_offset.
-    // Each decoded frame's pts is then directly comparable to elapsed.
-    let now = tokio::time::Instant::now();
-    let start_time = Arc::new(now.checked_sub(seek_offset).unwrap_or(now));
-
-    // Helper: drain any ready decoded frames and render them, pacing each
-    // frame against `start_time` so playback runs at real-time speed
-    // instead of as fast as MediaCodec can decode.
-    async fn drain_and_render(
-        decoder: &mut MediaCodecDecoder,
-        video_renderer: &Arc<renderers::video::VideoRenderer>,
-        position_ms: &Arc<AtomicU64>,
-        stop_flag: &Arc<AtomicBool>,
-        start_time: &Arc<tokio::time::Instant>,
-        frame_count: &mut u64,
-        dropped_count: &mut u64,
-    ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        loop {
-            if stop_flag.load(Ordering::Relaxed) {
-                return Ok(());
-            }
-            match decoder.try_recv()? {
-                Some(frame) => {
-                    let pts_ms = (frame.pts_us.max(0) as u64) / 1000;
-                    let elapsed_ms = start_time.elapsed().as_millis() as u64;
-
-                    // Past-due by more than 20ms — drop to catch up rather
-                    // than render late and accumulate lag.
-                    if pts_ms + 20 < elapsed_ms {
-                        *dropped_count += 1;
-                        if *dropped_count == 1 || *dropped_count % 30 == 0 {
-                            log::info!(
-                                "android: dropped late frame pts={}ms elapsed={}ms (total dropped={})",
-                                pts_ms,
-                                elapsed_ms,
-                                dropped_count
-                            );
-                        }
-                        position_ms.store(pts_ms, Ordering::Relaxed);
-                        continue;
-                    }
-
-                    // Future frame — sleep until its pts arrives.
-                    if pts_ms > elapsed_ms {
-                        let sleep_ms = pts_ms - elapsed_ms;
-                        tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
-                        if stop_flag.load(Ordering::Relaxed) {
-                            return Ok(());
-                        }
-                    }
-
-                    *frame_count += 1;
-                    if *frame_count == 1 || *frame_count % 60 == 0 {
-                        log::info!(
-                            "android: rendered frame #{} pts={}ms",
-                            frame_count,
-                            pts_ms
-                        );
-                    }
-                    position_ms.store(pts_ms, Ordering::Relaxed);
-                    if let PlatformFrame::HardwareBuffer(ahb) = frame.native {
-                        video_renderer.render_android(ahb).await;
-                    }
-                }
-                None => return Ok(()),
-            }
-        }
-    }
-    let mut frame_count: u64 = 0;
-    let mut dropped_count: u64 = 0;
-
-    let mut submit_count: u64 = 0;
-    for seg_idx in start_index..video_repr.segments.len() {
-        if stop_flag.load(Ordering::Relaxed) {
-            break;
-        }
-
-        let seg_data = video_repr.segments[seg_idx]
-            .download()
-            .await
-            .map_err(|e| -> Box<dyn Error + Send + Sync> {
-                format!("segment {} download: {}", seg_idx, e).into()
-            })?;
-
-        // Build full data_vec (init + segment) and decrypt in place.
-        let mut data_vec = init_data.clone();
-        data_vec.extend_from_slice(&seg_data);
-        decrypt_segment_in_place(&mut data_vec, track_crypto.as_ref())?;
-
-        // Extract per-sample (offset, size, pts) — collect into owned data
-        // so we don't hold an Mp4 borrow across the decoder loop.
-        let sample_info: Vec<(usize, usize, i64, u64)> = {
-            let mp4 = Mp4::read_bytes(&data_vec)
-                .map_err(|e| -> Box<dyn Error + Send + Sync> { format!("mp4: {}", e).into() })?;
-            let (_id, track) = mp4
-                .tracks()
-                .first_key_value()
-                .ok_or_else(|| -> Box<dyn Error + Send + Sync> { "no track in segment".into() })?;
-            track
-                .samples
-                .iter()
-                .map(|s| {
-                    (
-                        s.offset as usize,
-                        s.size as usize,
-                        s.composition_timestamp,
-                        s.timescale,
-                    )
-                })
-                .collect()
-        };
-
-        for (offset, size, ts, ts_scale) in sample_info {
-            if stop_flag.load(Ordering::Relaxed) {
-                return Ok(());
-            }
-
-            if offset + size > data_vec.len() {
-                log::warn!("sample bounds exceed data ({} + {} > {})", offset, size, data_vec.len());
-                continue;
-            }
-            let sample_data = &data_vec[offset..offset + size];
-
-            // mp4 mdat is length-prefixed NALUs; MediaCodec wants Annex-B
-            // (start-code-prefixed). `parse_hevc_nalu` already prepends the
-            // 00 00 00 01 start code to each NALU, so concatenate as-is —
-            // adding another would inject empty NALs between samples and the
-            // HW decoder will silently drop the whole bitstream.
-            let nalus = parse_hevc_nalu(sample_data)
-                .map_err(|e| -> Box<dyn Error + Send + Sync> { format!("NALU parse: {}", e).into() })?;
-            let mut annex_b = Vec::with_capacity(size + nalus.len() * 4);
-            for n in nalus {
-                annex_b.extend_from_slice(&n);
-            }
-
-            let pts_us = if ts_scale > 0 {
-                ts * 1_000_000 / ts_scale as i64
-            } else {
-                0i64
-            };
-
-            // Submit. On back-pressure, drain output to free input buffers
-            // and retry. Yield to other tasks while waiting.
-            loop {
-                if stop_flag.load(Ordering::Relaxed) {
-                    return Ok(());
-                }
-                match decoder.submit(&annex_b, pts_us) {
-                    Ok(()) => {
-                        submit_count += 1;
-                        if submit_count == 1 {
-                            log::info!(
-                                "android: first sample submitted size={} pts={}ms",
-                                annex_b.len(),
-                                pts_us / 1000
-                            );
-                        }
-                        break;
-                    }
-                    Err(_) => {
-                        drain_and_render(
-                            &mut decoder,
-                            &video_renderer,
-                            &position_ms,
-                            &stop_flag,
-                            &start_time,
-                            &mut frame_count,
-                            &mut dropped_count,
-                        )
-                        .await?;
-                        tokio::time::sleep(Duration::from_millis(2)).await;
-                    }
-                }
-            }
-
-            // Eagerly drain any newly-decoded frames.
-            drain_and_render(
-                &mut decoder,
-                &video_renderer,
-                &position_ms,
-                &stop_flag,
-                &start_time,
-                &mut frame_count,
-                &mut dropped_count,
-            )
-            .await?;
-        }
-    }
-
-    log::info!(
-        "android: segment loop done, frames_drained_so_far={}",
-        frame_count
-    );
-
-    // Final drain: pull whatever's still queued out of the decoder.
-    let drain_deadline = tokio::time::Instant::now() + Duration::from_millis(500);
-    while tokio::time::Instant::now() < drain_deadline {
-        if stop_flag.load(Ordering::Relaxed) {
-            break;
-        }
-        match decoder.try_recv()? {
-            Some(frame) => {
-                position_ms.store((frame.pts_us / 1000) as u64, Ordering::Relaxed);
-                if let PlatformFrame::HardwareBuffer(ahb) = frame.native {
-                    video_renderer.render_android(ahb).await;
-                }
-            }
-            None => tokio::time::sleep(Duration::from_millis(5)).await,
-        }
-    }
-
-    Ok(())
+    size: usize,
+    data: Vec<u8>,
 }
 
 fn log_task_result<T, E: std::fmt::Display>(
@@ -1390,9 +791,6 @@ fn log_task_result<T, E: std::fmt::Display>(
     }
 }
 
-/// Decrypt the samples in `data_vec` in place, if a `TrackCrypto` is configured.
-/// Parses the segment's `senc` box for per-sample IVs and subsample maps, then runs
-/// AES-CTR (or whatever the [`Decryptor`] implementation provides) on the encrypted bytes.
 fn decrypt_segment_in_place(
     data_vec: &mut Vec<u8>,
     track_crypto: Option<&TrackCrypto>,
@@ -1405,8 +803,6 @@ fn decrypt_segment_in_place(
     let senc_entries = parse_senc(data_vec, tc.iv_size)
         .ok_or("Encrypted track but segment has no parseable senc box")?;
 
-    // Collect (offset, size) per sample from re_mp4, drop the parser to release the borrow,
-    // then decrypt the matching ranges of `data_vec` in place.
     let sample_ranges: Vec<(usize, usize)> = {
         let mp4 = Mp4::read_bytes(&data_vec[..])
             .map_err(|e| format!("Decrypt: mp4 parse error {}", e))?;
@@ -1429,7 +825,6 @@ fn decrypt_segment_in_place(
         tc.decryptor
             .decrypt_sample(&tc.kid, &entry.iv, &mut data_vec[*offset..end], &entry.subsamples)?;
     }
-
     Ok(())
 }
 
@@ -1451,16 +846,13 @@ async fn download_and_queue(
     sender: Sender<DataSegment>,
 ) -> Result<(), Box<dyn Error>> {
     let downloaded_data = segment.download().await?;
-
     let data_segment = DataSegment {
         id: index,
         size: downloaded_data.len(),
         data: downloaded_data,
     };
-
     if let Err(e) = sender.send(data_segment).await {
         return Err(format!("downstream receiver dropped: {:?}", e).into());
     }
-
     Ok(())
 }

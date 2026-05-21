@@ -28,6 +28,8 @@ use ndk::media::media_codec::{
 };
 use ndk::media::media_format::MediaFormat;
 
+use crate::parsers::mp4::parse_hevc_nalu;
+
 use super::{
     AndroidHardwareBufferFrame, DecodedVideoFrame, DecoderError, HwVideoDecoder, PlatformFrame,
     VideoCodec, VideoDecoderParams,
@@ -48,13 +50,13 @@ pub struct MediaCodecDecoder {
 unsafe impl Send for MediaCodecDecoder {}
 
 impl MediaCodecDecoder {
-    pub fn new() -> Result<Self, DecoderError> {
-        Ok(Self {
+    pub fn new() -> Self {
+        Self {
             reader: None,
             codec: None,
             width: 0,
             height: 0,
-        })
+        }
     }
 }
 
@@ -95,11 +97,14 @@ impl HwVideoDecoder for MediaCodecDecoder {
         format.set_str("mime", mime);
         format.set_i32("width", params.width as i32);
         format.set_i32("height", params.height as i32);
-        if !params.codec_specific_data.is_empty() {
-            // HEVC csd-0 = hvcC body framed as Annex-B (start-code-prefixed
-            // VPS/SPS/PPS). The caller of `configure` is responsible for
-            // assembling this; we feed it through verbatim.
-            format.set_buffer("csd-0", &params.codec_specific_data);
+        if !params.hvcc_nalus.is_empty() {
+            // Build Annex-B csd-0: start-code prefix + raw NALU body for each NALU.
+            let mut csd = Vec::new();
+            for n in &params.hvcc_nalus {
+                csd.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+                csd.extend_from_slice(n);
+            }
+            format.set_buffer("csd-0", &csd);
         }
 
         codec
@@ -128,6 +133,15 @@ impl HwVideoDecoder for MediaCodecDecoder {
             .as_ref()
             .ok_or_else(|| -> DecoderError { "submit before configure".into() })?;
 
+        // `sample` is length-prefixed NALU (raw mdat). Convert to Annex-B
+        // (start-code prefixed) — MediaCodec expects this for HEVC/H.264.
+        let nalus = parse_hevc_nalu(sample)
+            .map_err(|e| -> DecoderError { format!("NALU parse: {}", e).into() })?;
+        let mut annex_b = Vec::with_capacity(sample.len() + nalus.len() * 4);
+        for n in nalus {
+            annex_b.extend_from_slice(&n);
+        }
+
         let input = codec
             .dequeue_input_buffer(Duration::ZERO)
             .map_err(|e| -> DecoderError { format!("dequeue_input_buffer: {:?}", e).into() })?;
@@ -140,9 +154,13 @@ impl HwVideoDecoder for MediaCodecDecoder {
         };
 
         let dst = input_buf.buffer_mut();
-        let copy_len = sample.len().min(dst.len());
+        let copy_len = annex_b.len().min(dst.len());
         unsafe {
-            std::ptr::copy_nonoverlapping(sample.as_ptr(), dst.as_mut_ptr() as *mut u8, copy_len);
+            std::ptr::copy_nonoverlapping(
+                annex_b.as_ptr(),
+                dst.as_mut_ptr() as *mut u8,
+                copy_len,
+            );
         }
 
         codec

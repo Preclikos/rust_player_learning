@@ -8,8 +8,6 @@ use super::video_vulkan::create_texture_from_vk_image;
 
 #[cfg(target_os = "linux")]
 use super::video_vaapi::*;
-#[cfg(target_os = "linux")]
-use cros_libva::VASurfaceID;
 
 #[cfg(target_os = "windows")]
 use super::video_directx::*;

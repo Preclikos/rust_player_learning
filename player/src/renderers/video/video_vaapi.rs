@@ -2,8 +2,20 @@ use std::mem::MaybeUninit;
 use std::os::fd::RawFd;
 
 use ash::vk::{self, ImageCreateInfo};
-use cros_libva::{VADisplay, VASurfaceID};
 use wgpu::hal::api::Vulkan;
+
+pub type VADisplay = *mut std::ffi::c_void;
+pub type VASurfaceID = u32;
+
+extern "C" {
+    fn vaExportSurfaceHandle(
+        dpy: VADisplay,
+        surface_id: VASurfaceID,
+        mem_type: u32,
+        flags: u32,
+        descriptor: *mut std::ffi::c_void,
+    ) -> i32;
+}
 
 use super::video_vulkan::VkImageMemory;
 
@@ -118,7 +130,7 @@ pub unsafe fn export_shared_handle(
 ) -> PrimeSurfaceDescriptor {
     let mut descriptor: MaybeUninit<PrimeSurfaceDescriptor> = MaybeUninit::uninit();
 
-    let status = cros_libva::vaExportSurfaceHandle(
+    let status = vaExportSurfaceHandle(
         va_display,
         va_surface_id,
         0x40000000, //For DMA-BUF
@@ -138,84 +150,68 @@ pub fn create_vk_image_from_dma_fd(
     va_shared_prime_descriptor: PrimeSurfaceDescriptor,
 ) -> Result<VkImageMemory, Box<dyn std::error::Error>> {
     unsafe {
-        let raw_image = device
-            .as_hal::<Vulkan, _, _>(|device| {
-                device.map(|device| {
-                    let raw_device = device.raw_device();
-                    let physical_device = device.raw_physical_device();
-                    let instance = device.shared_instance().raw_instance();
+        let raw_dev = device
+            .as_hal::<Vulkan>()
+            .ok_or("device is not a Vulkan backend")?;
 
-                    let handle_type = vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT; // D3D12_RESOURCE_KHR
+        let raw_device = raw_dev.raw_device();
+        let physical_device = raw_dev.raw_physical_device();
+        let instance = raw_dev.shared_instance().raw_instance();
 
-                    let mut import_memory_info = vk::ImportMemoryFdInfoKHR::default()
-                        .handle_type(handle_type)
-                        .fd(va_shared_prime_descriptor.objects[0].fd);
+        let handle_type = vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT;
 
-                    let mut ext_create_info =
-                        vk::ExternalMemoryImageCreateInfo::default().handle_types(handle_type);
+        let mut import_memory_info = vk::ImportMemoryFdInfoKHR::default()
+            .handle_type(handle_type)
+            .fd(va_shared_prime_descriptor.objects[0].fd);
 
-                    let image_create_info = ImageCreateInfo::default()
-                        .push_next(&mut ext_create_info)
-                        .image_type(vk::ImageType::TYPE_2D)
-                        .format(vk::Format::G8_B8R8_2PLANE_420_UNORM)
-                        .extent(vk::Extent3D {
-                            width: va_shared_prime_descriptor.width,
-                            height: va_shared_prime_descriptor.height,
-                            depth: 1,
-                        })
-                        .mip_levels(1)
-                        .flags(vk::ImageCreateFlags::ALIAS | vk::ImageCreateFlags::MUTABLE_FORMAT)
-                        .array_layers(1)
-                        .samples(vk::SampleCountFlags::TYPE_1)
-                        .tiling(vk::ImageTiling::OPTIMAL)
-                        .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC)
-                        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let mut ext_create_info =
+            vk::ExternalMemoryImageCreateInfo::default().handle_types(handle_type);
 
-                    let raw_image = raw_device.create_image(&image_create_info, None)?;
-
-                    let mem_requirements = raw_device.get_image_memory_requirements(raw_image);
-
-                    let mem_properties =
-                        instance.get_physical_device_memory_properties(physical_device);
-
-                    let index =
-                        mem_properties
-                            .memory_types
-                            .iter()
-                            .enumerate()
-                            .position(|(i, t)| {
-                                ((1 << i) & mem_requirements.memory_type_bits) != 0
-                                    && t.property_flags
-                                        .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
-                            });
-
-                    let index = match index {
-                        None => {
-                            panic!("Failed to get DEVICE_LOCAL memory index")
-                        }
-                        Some(index) => index,
-                    };
-
-                    let allocate_info = vk::MemoryAllocateInfo::default()
-                        .allocation_size(mem_requirements.size)
-                        .push_next(&mut import_memory_info)
-                        .memory_type_index(index as u32);
-
-                    let allocated_memory = raw_device.allocate_memory(&allocate_info, None)?;
-
-                    raw_device
-                        .bind_image_memory(raw_image, allocated_memory, 0)
-                        .unwrap();
-
-                    let image = VkImageMemory {
-                        raw_image,
-                        memory: allocated_memory,
-                    };
-                    Ok::<VkImageMemory, vk::Result>(image)
-                })
+        let image_create_info = ImageCreateInfo::default()
+            .push_next(&mut ext_create_info)
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(vk::Format::G8_B8R8_2PLANE_420_UNORM)
+            .extent(vk::Extent3D {
+                width: va_shared_prime_descriptor.width,
+                height: va_shared_prime_descriptor.height,
+                depth: 1,
             })
-            .unwrap()?; // TODO: unwrap
+            .mip_levels(1)
+            .flags(vk::ImageCreateFlags::ALIAS | vk::ImageCreateFlags::MUTABLE_FORMAT)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
 
-        Ok(raw_image)
+        let raw_image = raw_device.create_image(&image_create_info, None)?;
+
+        let mem_requirements = raw_device.get_image_memory_requirements(raw_image);
+
+        let mem_properties = instance.get_physical_device_memory_properties(physical_device);
+
+        let index = mem_properties
+            .memory_types
+            .iter()
+            .enumerate()
+            .position(|(i, t)| {
+                ((1 << i) & mem_requirements.memory_type_bits) != 0
+                    && t.property_flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+            })
+            .ok_or("Failed to get DEVICE_LOCAL memory index")?;
+
+        let allocate_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(mem_requirements.size)
+            .push_next(&mut import_memory_info)
+            .memory_type_index(index as u32);
+
+        let allocated_memory = raw_device.allocate_memory(&allocate_info, None)?;
+
+        raw_device.bind_image_memory(raw_image, allocated_memory, 0)?;
+
+        Ok(VkImageMemory {
+            raw_image,
+            memory: allocated_memory,
+        })
     }
 }

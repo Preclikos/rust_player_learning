@@ -398,23 +398,21 @@ impl VideoRenderer {
                     }
                     VideoRendererCommand::Resize(new_size) => {
                         if new_size.width > 0 && new_size.height > 0 {
+                            log::info!("[renderer] resize {}x{}", new_size.width, new_size.height);
                             let mut config_guard = config.write().await;
                             config_guard.width = new_size.width;
                             config_guard.height = new_size.height;
                             {
                                 surface.lock().await.configure(&device, &config_guard);
                             }
-                            let window_size = window.inner_size();
-                            if window_size.width > 0 && window_size.height > 0 {
-                                let frame_size = frame_size.read().await;
-                                Self::change_vertex_buffer(
-                                    &device,
-                                    window_size,
-                                    *frame_size,
-                                    vertex_buffer.clone(),
-                                )
-                                .await;
-                            }
+                            let frame_size = frame_size.read().await;
+                            Self::change_vertex_buffer(
+                                &device,
+                                new_size,
+                                *frame_size,
+                                vertex_buffer.clone(),
+                            )
+                            .await;
                         }
                     }
                 }
@@ -524,8 +522,13 @@ impl VideoRenderer {
             let vertex_buffer = self.vertex_buffer.read().await;
 
             let surface_texture = match surface.get_current_texture() {
-                wgpu::CurrentSurfaceTexture::Success(t)
-                | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
+                wgpu::CurrentSurfaceTexture::Success(t) => t,
+                wgpu::CurrentSurfaceTexture::Suboptimal(_) => {
+                    let _ = self.command_sender.try_send(
+                        VideoRendererCommand::Resize(self.window.inner_size()),
+                    );
+                    return;
+                }
                 other => {
                     log::warn!("surface texture not available: {:?}", other);
                     return;
@@ -672,7 +675,7 @@ impl VideoRenderer {
             frame.height,
             TextureFormat::NV12,
             true,
-            true,
+            false,
         );
 
         let y_plane_view = texture.create_view(&wgpu::TextureViewDescriptor {
@@ -710,8 +713,13 @@ impl VideoRenderer {
             let vertex_buffer = self.vertex_buffer.read().await;
 
             let surface_texture = match surface.get_current_texture() {
-                wgpu::CurrentSurfaceTexture::Success(t)
-                | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
+                wgpu::CurrentSurfaceTexture::Success(t) => t,
+                wgpu::CurrentSurfaceTexture::Suboptimal(_) => {
+                    let _ = self.command_sender.try_send(
+                        VideoRendererCommand::Resize(self.window.inner_size()),
+                    );
+                    return;
+                }
                 other => {
                     log::warn!("surface texture not available: {:?}", other);
                     return;
@@ -755,20 +763,30 @@ impl VideoRenderer {
             self.queue.present(surface_texture);
         }
 
-        // Defer freeing the imported VkDeviceMemory until the GPU has
-        // finished with this submission. Freeing immediately after
-        // queue.present() races the GPU and poisons the next
-        // get_current_texture() with a validation error.
-        // on_submitted_work_done fires once the just-submitted batch
-        // (including this frame's NV12 sample reads) retires; subsequent
-        // queue.submit / device.poll calls drive it forward.
-        drop(texture);
-        let device_for_free = self.device.clone();
-        let memory_to_free = img_mem.memory;
+        // Destroy VkImage + VkDeviceMemory once the GPU finishes this frame.
+        // We do NOT call poll(Wait) here — blocking the sync task for a full
+        // GPU frame (~16ms) would make rendering slower than 24fps and cause
+        // the "stutter then smooth" pattern. Instead, on_submitted_work_done
+        // fires asynchronously from wgpu's background poller after the
+        // submitted work retires.
+        //
+        // The AHB (frame.buffer) can safely drop when this function returns:
+        // vkAllocateMemory with ImportAndroidHardwareBufferInfoANDROID adds
+        // Vulkan's own AHB reference, which stays alive until vkFreeMemory.
+        let raw_image = img_mem.raw_image;
+        let raw_memory = img_mem.memory;
+        let device_for_cleanup = self.device.clone();
         self.queue.on_submitted_work_done(move || unsafe {
-            if let Some(raw_dev) = device_for_free.as_hal::<wgpu::hal::api::Vulkan>() {
-                raw_dev.raw_device().free_memory(memory_to_free, None);
+            if let Some(raw_dev) = device_for_cleanup.as_hal::<wgpu::hal::api::Vulkan>() {
+                let d = raw_dev.raw_device();
+                d.free_memory(raw_memory, None);
+                d.destroy_image(raw_image, None);
             }
         });
+
+        // Process any callbacks for GPU work that completed since the last
+        // frame (frees VkImage/VkDeviceMemory from 1-2 frames ago).
+        // Non-blocking: returns immediately if no work has finished yet.
+        let _ = self.device.poll(wgpu::PollType::Poll);
     }
 }

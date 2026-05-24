@@ -22,14 +22,39 @@ use super::{AudioCodec, AudioDecoder, AudioDecoderParams, DecodedAudioFrame, Dec
 
 pub struct MediaCodecAudioDecoder {
     codec: Option<MediaCodec>,
+    input_rate: u32,
+    output_rate: u32,
+    channels: usize,
 }
 
 unsafe impl Send for MediaCodecAudioDecoder {}
 
 impl MediaCodecAudioDecoder {
     pub fn new() -> Self {
-        Self { codec: None }
+        Self { codec: None, input_rate: 44100, output_rate: 44100, channels: 2 }
     }
+}
+
+fn resample_linear(input: &[f32], channels: usize, from_rate: u32, to_rate: u32) -> Vec<f32> {
+    if from_rate == to_rate || input.is_empty() {
+        return input.to_vec();
+    }
+    let in_frames = input.len() / channels;
+    let ratio = from_rate as f64 / to_rate as f64;
+    let out_frames = (in_frames as f64 / ratio).ceil() as usize;
+    let mut out = Vec::with_capacity(out_frames * channels);
+    for i in 0..out_frames {
+        let pos = i as f64 * ratio;
+        let idx0 = pos as usize;
+        let idx1 = (idx0 + 1).min(in_frames - 1);
+        let frac = (pos - idx0 as f64) as f32;
+        for ch in 0..channels {
+            let s0 = input[idx0 * channels + ch];
+            let s1 = input[idx1 * channels + ch];
+            out.push(s0 + (s1 - s0) * frac);
+        }
+    }
+    out
 }
 
 impl AudioDecoder for MediaCodecAudioDecoder {
@@ -65,6 +90,9 @@ impl AudioDecoder for MediaCodecAudioDecoder {
             params.input_channels
         );
         self.codec = Some(codec);
+        self.input_rate = params.input_sample_rate;
+        self.output_rate = params.output_sample_rate;
+        self.channels = params.input_channels as usize;
         Ok(())
     }
 
@@ -74,14 +102,15 @@ impl AudioDecoder for MediaCodecAudioDecoder {
             .as_ref()
             .ok_or_else(|| -> DecoderError { "submit before configure".into() })?;
 
-        let input = codec
-            .dequeue_input_buffer(Duration::ZERO)
-            .map_err(|e| -> DecoderError { format!("audio dequeue_input: {:?}", e).into() })?;
-
-        let mut input_buf = match input {
-            DequeuedInputBufferResult::Buffer(b) => b,
-            DequeuedInputBufferResult::TryAgainLater => {
-                return Err("no audio input buffer; retry".into());
+        let mut input_buf = loop {
+            match codec
+                .dequeue_input_buffer(Duration::from_millis(5))
+                .map_err(|e| -> DecoderError { format!("audio dequeue_input: {:?}", e).into() })?
+            {
+                DequeuedInputBufferResult::Buffer(b) => break b,
+                DequeuedInputBufferResult::TryAgainLater => {
+                    std::thread::yield_now();
+                }
             }
         };
 
@@ -125,7 +154,9 @@ impl AudioDecoder for MediaCodecAudioDecoder {
                     let pcm = &buf[offset..offset + size];
                     // Cast &[u8] → &[i16] (little-endian, 2 bytes per sample).
                     let pcm_i16: &[i16] = bytemuck::cast_slice(pcm);
-                    pcm_i16.iter().map(|&s| s as f32 / 32768.0_f32).collect::<Vec<f32>>()
+                    let samples_f32: Vec<f32> =
+                        pcm_i16.iter().map(|&s| s as f32 / 32768.0_f32).collect();
+                    resample_linear(&samples_f32, self.channels, self.input_rate, self.output_rate)
                 };
 
                 codec

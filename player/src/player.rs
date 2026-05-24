@@ -87,6 +87,9 @@ async fn video_sync_producer(
     stop: Arc<Notify>,
     stop_flag: Arc<AtomicBool>,
 ) {
+    let mut last_pts_ms = 0u64;
+    let mut frame_idx: u64 = 0;
+    let mut last_render_elapsed: u64 = 0;
     loop {
         if stop_flag.load(Ordering::Relaxed) {
             break;
@@ -100,6 +103,12 @@ async fn video_sync_producer(
         };
         let pts_ms = (frame.pts_us / 1000) as u64;
         let elapsed = start_time.elapsed().as_millis() as u64;
+
+        if pts_ms < last_pts_ms {
+            log::warn!("[vsync] BACKWARD #{} pts={}ms last={}ms Δ=-{}ms elapsed={}ms",
+                frame_idx, pts_ms, last_pts_ms, last_pts_ms - pts_ms, elapsed);
+        }
+
         if pts_ms > elapsed {
             let sleep_dur = Duration::from_millis(pts_ms - elapsed);
             tokio::select! {
@@ -109,13 +118,31 @@ async fn video_sync_producer(
             if stop_flag.load(Ordering::Relaxed) {
                 break;
             }
+        } else {
+            let late_ms = elapsed - pts_ms;
+            if late_ms > 80 {
+                log::warn!("[vsync] LATE #{} pts={}ms elapsed={}ms late={}ms",
+                    frame_idx, pts_ms, elapsed, late_ms);
+            }
         }
-        if pts_ms + 20 < elapsed {
-            println!("Video drift more than 20ms, dropping frame");
-            continue;
-        }
+
+        let render_start = start_time.elapsed().as_millis() as u64;
+        let interval_ms = if last_render_elapsed > 0 { render_start - last_render_elapsed } else { 0 };
+        let delta_pts = if pts_ms >= last_pts_ms { pts_ms - last_pts_ms } else { 0 };
+
+        last_pts_ms = pts_ms;
+        last_render_elapsed = render_start;
+        frame_idx += 1;
+
         position_ms.store(pts_ms, Ordering::Relaxed);
         renderer.render_frame(frame).await;
+
+        let render_done = start_time.elapsed().as_millis() as u64;
+        let render_ms = render_done - render_start;
+
+        // Log every frame: frame#, pts, wall when render started, how long render took, display interval
+        log::info!("[vsync] #{} pts={}ms wall={}ms render={}ms interval={}ms Δpts={}ms",
+            frame_idx - 1, pts_ms, render_start, render_ms, interval_ms, delta_pts);
     }
 }
 
@@ -136,7 +163,6 @@ async fn audio_sync_producer(
             },
             _ = stop.notified() => break,
         };
-        // Audio timing is driven by cpal's output rate — never drop frames.
         if !frame.samples.is_empty() {
             tokio::select! {
                 _ = audio_renderer.put_samples_raw(&frame.samples) => {}
@@ -158,6 +184,12 @@ async fn video_decoder_task(
     video_ready: Arc<Notify>,
     track_crypto: Option<TrackCrypto>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    // Fire video_ready only after the first frame is actually decoded, not on
+    // first submit. Hardware decoders (MediaCodec HEVC) have a pipeline warmup
+    // of ~8 frames during which try_recv returns nothing. If we signal ready on
+    // submit, start_time is set ~333ms before any frame is available, and all
+    // warmup-latency frames render instantly at max speed — visible as a jump.
+    let mut first_frame_signaled = false;
     while let Some(segment) = receiver.recv().await {
         println!("Consuming video segment: {}", segment.id);
 
@@ -179,22 +211,26 @@ async fn video_decoder_task(
                 .collect()
         };
 
+        let mut first_pts_us: Option<i64> = None;
+        let mut last_pts_us: i64 = 0;
         for (offset, size, ts, ts_scale) in sample_info {
             if offset + size > data_vec.len() {
                 continue;
             }
             let sample_data = &data_vec[offset..offset + size];
             let pts_us = if ts_scale > 0 { ts * 1_000_000 / ts_scale as i64 } else { 0 };
+            if first_pts_us.is_none() { first_pts_us = Some(pts_us); }
+            last_pts_us = pts_us;
 
-            // submit takes length-prefixed mdat bytes; each decoder impl handles
-            // the Annex-B conversion internally.
             decoder.submit(sample_data, pts_us)?;
-            video_ready.notify_one();
 
-            // Drain all frames the decoder produced for this sample.
             loop {
                 match decoder.try_recv()? {
                     Some(frame) => {
+                        if !first_frame_signaled {
+                            video_ready.notify_one();
+                            first_frame_signaled = true;
+                        }
                         if sender.send(frame).await.is_err() {
                             return Ok(());
                         }
@@ -202,6 +238,9 @@ async fn video_decoder_task(
                     None => break,
                 }
             }
+        }
+        if let Some(first) = first_pts_us {
+            log::info!("[dec] seg done: pts {}..{}ms", first / 1000, last_pts_us / 1000);
         }
     }
     Ok(())
@@ -415,6 +454,11 @@ async fn lifetime_handler(
     stop: Arc<Notify>,
     stop_flag: Arc<AtomicBool>,
 ) {
+    // Wait for both decoders to produce their first output before setting
+    // start_time. This ensures A/V sync is established from a common wall-clock
+    // origin. The audio channel is sized large enough (256 frames) that
+    // audio_decoder_task won't block waiting for lifetime_handler even if
+    // video download is slow.
     tokio::select! {
         _ = async { tokio::join!(video_ready.notified(), audio_ready.notified()); } => {}
         _ = stop.notified() => {
@@ -667,8 +711,8 @@ impl Player {
                 .unwrap_or(seek_offset);
             position_ms.store(snapped_seek_offset.as_millis() as u64, Ordering::Relaxed);
 
-            let (frame_sender, frame_receiver) = mpsc::channel::<DecodedVideoFrame>(4);
-            let (sample_sender, sample_receiver) = mpsc::channel::<DecodedAudioFrame>(32);
+            let (frame_sender, frame_receiver) = mpsc::channel::<DecodedVideoFrame>(64);
+            let (sample_sender, sample_receiver) = mpsc::channel::<DecodedAudioFrame>(256);
 
             let video = tokio::spawn(video_play(
                 video_representation,

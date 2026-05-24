@@ -65,6 +65,11 @@ impl HwVideoDecoder for FfmpegHwDecoder {
         }
         unsafe {
             (*ctx.as_mut_ptr()).hw_device_ctx = self.hw_device_ctx;
+            // D3D11/VAAPI pools default to ~20 surfaces. The video channel
+            // holds up to 64 decoded frames, so we need a pool large enough
+            // to cover them all. extra_hw_frames enlarges the fixed pool by
+            // this amount on top of FFmpeg's inferred minimum.
+            (*ctx.as_mut_ptr()).extra_hw_frames = 64;
         }
 
         let mut decoder = ctx

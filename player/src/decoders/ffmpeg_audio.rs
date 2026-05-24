@@ -106,15 +106,13 @@ impl AudioDecoder for FfmpegAudioDecoder {
         match decoder.receive_frame(&mut frame) {
             Ok(()) => {
                 let pts_ms = frame.pts().unwrap_or(0) as i64;
+
                 let mut dst = ffmpeg_next::util::frame::Audio::empty();
                 resampler
                     .run(&frame, &mut dst)
                     .map_err(|e| -> DecoderError { format!("resample: {}", e).into() })?;
 
-                // Packed stereo F32: all interleaved data is in plane 0.
-                // n_channels is always 2 (output is hardcoded to STEREO in configure).
-                let n_samples = dst.samples();
-                if n_samples == 0 {
+                if dst.samples() == 0 {
                     // Resampler may buffer; flush to drain any pending output.
                     resampler
                         .flush(&mut dst)

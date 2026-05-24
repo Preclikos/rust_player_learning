@@ -87,9 +87,18 @@ impl ApplicationHandler for App {
                 selected_video_repr.codecs
             );
 
-            // Pick the first available audio representation.
-            let selected_audio = tracks.audio.first().unwrap();
-            let selected_audio_repr = selected_audio.representations.first().unwrap();
+            // Pick the first AAC (mp4a) audio representation — skip EC-3/other codecs
+            // that have no esds box and aren't supported by MediaCodec audio/mp4a-latm.
+            let selected_audio = tracks
+                .audio
+                .iter()
+                .find(|a| a.representations.iter().any(|r| r.codecs.starts_with("mp4a")))
+                .unwrap_or_else(|| tracks.audio.first().unwrap());
+            let selected_audio_repr = selected_audio
+                .representations
+                .iter()
+                .find(|r| r.codecs.starts_with("mp4a"))
+                .unwrap_or_else(|| selected_audio.representations.first().unwrap());
             player.set_audio_track(selected_audio, selected_audio_repr);
             log::info!(
                 "android: selected audio {} {}Hz",
@@ -113,6 +122,12 @@ impl ApplicationHandler for App {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::Resized(new_size) => {
+                log::info!("window resized: {}x{}", new_size.width, new_size.height);
+                if let Some(player) = &self.player {
+                    player.resize(new_size);
+                }
+            }
             WindowEvent::RedrawRequested => {
                 if let Some(w) = self.window.as_ref() {
                     w.request_redraw();

@@ -43,6 +43,8 @@ pub struct MediaCodecDecoder {
     codec: Option<MediaCodec>,
     width: u32,
     height: u32,
+    last_decoded_pts_us: i64,
+    decoded_frame_idx: u64,
 }
 
 // MediaCodec/ImageReader wrap NonNull pointers and aren't auto-Send.
@@ -56,6 +58,8 @@ impl MediaCodecDecoder {
             codec: None,
             width: 0,
             height: 0,
+            last_decoded_pts_us: -1,
+            decoded_frame_idx: 0,
         }
     }
 }
@@ -67,10 +71,17 @@ impl HwVideoDecoder for MediaCodecDecoder {
             VideoCodec::H264 => "video/avc",
         };
 
-        // Maximum images in flight. MediaCodec's output buffer count is
-        // typically 4–8 on Android; pick something in that range so we
-        // don't immediately back-pressure the decoder.
-        let max_images = 4;
+        // 16 physical NV12 surfaces ≈ 667 ms of buffer at 24 fps.
+        // With max_images = 4 (the old value), 4 frames in the channel
+        // exhausted the surface pool and stalled MediaCodec: the decoder
+        // spun in dequeue_input_buffer while the sync-producer drained the
+        // 4 frames, then a burst of past-due frames rendered at max speed.
+        // 16 > warmup depth (~8 frames / ~333 ms), so the sync-producer
+        // never starves during a segment-boundary I-frame warmup.
+        // Memory cost: 16 × ~3 MB (1080p NV12) ≈ 48 MB, acceptable on
+        // modern Android (4 GB+ RAM). Vulkan holds 2 surfaces in its
+        // pipeline (freed by on_submitted_work_done), leaving ~14 live.
+        let max_images = 16;
 
         // YUV_420_888 gives us an AHardwareBuffer with a defined NV12-ish
         // layout (Y plane + interleaved CbCr plane) that Vulkan can
@@ -142,14 +153,26 @@ impl HwVideoDecoder for MediaCodecDecoder {
             annex_b.extend_from_slice(&n);
         }
 
-        let input = codec
-            .dequeue_input_buffer(Duration::ZERO)
-            .map_err(|e| -> DecoderError { format!("dequeue_input_buffer: {:?}", e).into() })?;
-
-        let mut input_buf = match input {
-            DequeuedInputBufferResult::Buffer(b) => b,
-            DequeuedInputBufferResult::TryAgainLater => {
-                return Err("no input buffer available; retry".into());
+        // Retry until an input slot is free. Each wait is 5 ms; the codec
+        // typically frees a slot within one frame interval (~33ms at 24fps).
+        // If we stall here for a long time it means all output surfaces are
+        // occupied (AHBs in the video channel), starving MediaCodec of buffers.
+        let mut input_buf = {
+            let mut retries = 0u32;
+            loop {
+                match codec
+                    .dequeue_input_buffer(Duration::from_millis(5))
+                    .map_err(|e| -> DecoderError { format!("dequeue_input_buffer: {:?}", e).into() })?
+                {
+                    DequeuedInputBufferResult::Buffer(b) => break b,
+                    DequeuedInputBufferResult::TryAgainLater => {
+                        retries += 1;
+                        if retries % 20 == 0 {
+                            log::warn!("[mc] dequeue_input stall {}x5ms={} ms pts={}", retries, retries * 5, pts_us / 1000);
+                        }
+                        std::thread::yield_now();
+                    }
+                }
             }
         };
 
@@ -190,6 +213,17 @@ impl HwVideoDecoder for MediaCodecDecoder {
         let pts_us = match dequeued {
             DequeuedOutputBufferInfoResult::Buffer(out) => {
                 let pts = out.info().presentation_time_us();
+                let idx = self.decoded_frame_idx;
+                let delta = if self.last_decoded_pts_us >= 0 { pts - self.last_decoded_pts_us } else { 0 };
+                if self.last_decoded_pts_us >= 0 && pts < self.last_decoded_pts_us {
+                    log::warn!("[mc] BACKWARD #{} pts={}ms last={}ms Δ={}ms",
+                        idx, pts / 1000, self.last_decoded_pts_us / 1000, delta / 1000);
+                } else {
+                    log::info!("[mc] decoded #{} pts={}ms Δ={}ms",
+                        idx, pts / 1000, delta / 1000);
+                }
+                self.last_decoded_pts_us = pts;
+                self.decoded_frame_idx += 1;
                 codec
                     .release_output_buffer(out, /* render = */ true)
                     .map_err(|e| -> DecoderError {
@@ -210,18 +244,34 @@ impl HwVideoDecoder for MediaCodecDecoder {
             DequeuedOutputBufferInfoResult::OutputBuffersChanged => return Ok(None),
         };
 
-        // Pull the freshly-rendered image off the surface.
-        let acquired = reader
-            .acquire_latest_image()
-            .map_err(|e| -> DecoderError { format!("acquire_latest_image: {:?}", e).into() })?;
-        let image = match acquired {
-            AcquireResult::Image(img) => img,
-            AcquireResult::NoBufferAvailable => return Ok(None),
-            // MAX_IMAGES_ACQUIRED means the consumer (us) is holding too
-            // many; should be impossible because we drop after import.
-            AcquireResult::MaxImagesAcquired => {
-                log::warn!("acquire_latest_image: MAX_IMAGES_ACQUIRED");
-                return Ok(None);
+        // Pull the freshly-rendered image off the surface in FIFO order.
+        // release_output_buffer(render=true) is nearly synchronous for
+        // ImageReader but may need a few retries. We MUST NOT return None
+        // here after having consumed a MediaCodec output slot — doing so
+        // leaves a frame stranded in ImageReader, and the next try_recv
+        // would pair the next MediaCodec PTS with the stale image, causing
+        // visible content to be displayed at the wrong timestamp.
+        let mut acquire_retries = 0u32;
+        let image = loop {
+            match reader
+                .acquire_next_image()
+                .map_err(|e| -> DecoderError { format!("acquire_next_image: {:?}", e).into() })?
+            {
+                AcquireResult::Image(img) => break img,
+                AcquireResult::MaxImagesAcquired => {
+                    // All surfaces are held by AHB refs in the video channel.
+                    // The sync producer (on another thread) must render+drop frames
+                    // to free slots. Yield and retry — do NOT return None, which
+                    // would strand this rendered frame and cause PTS/content mismatch.
+                    acquire_retries += 1;
+                    if acquire_retries % 100 == 0 {
+                        log::warn!("[mc] MAX_IMAGES_ACQUIRED spin {}x pts={}", acquire_retries, pts_us / 1000);
+                    }
+                    std::thread::yield_now();
+                }
+                AcquireResult::NoBufferAvailable => {
+                    std::thread::yield_now();
+                }
             }
         };
 
@@ -251,6 +301,8 @@ impl HwVideoDecoder for MediaCodecDecoder {
                 .flush()
                 .map_err(|e| -> DecoderError { format!("MediaCodec::flush: {:?}", e).into() })?;
         }
+        self.last_decoded_pts_us = -1;
+        self.decoded_frame_idx = 0;
         Ok(())
     }
 }

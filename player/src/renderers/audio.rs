@@ -93,7 +93,7 @@ impl AudioRenderer {
         stop: Arc<Notify>,
         flush_flag: Arc<AtomicBool>,
     ) -> (Sender<f32>, u32) {
-        let (sample_sender, sample_receiver) = mpsc::channel::<f32>(2048);
+        let (sample_sender, sample_receiver) = mpsc::channel::<f32>(192_000);
 
         let device = cpal::default_host()
             .default_output_device()

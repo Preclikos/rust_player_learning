@@ -14,6 +14,39 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// Hints to SurfaceFlinger that this window produces 24fps content.
+/// The OS then selects a display refresh rate that is an integer multiple of
+/// 24Hz (typically 120Hz on Galaxy S = 5 vsyncs/frame, perfect cadence).
+/// Uses dlsym so this is a no-op on API < 30 without a hard link failure.
+fn set_frame_rate_24fps(window: &winit::window::Window) {
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let Ok(handle) = window.window_handle() else { return };
+    let native_ptr = match handle.as_raw() {
+        RawWindowHandle::AndroidNdk(h) => h.a_native_window.as_ptr(),
+        _ => return,
+    };
+
+    // ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE = 1
+    // ANATIVEWINDOW_CHANGE_FRAME_RATE_ALWAYS = 0
+    const FIXED_SOURCE: i8 = 1;
+    const ALWAYS: i8 = 0;
+
+    unsafe {
+        let sym = libc::dlsym(
+            libc::RTLD_DEFAULT,
+            b"ANativeWindow_setFrameRate\0".as_ptr() as *const libc::c_char,
+        );
+        if sym.is_null() {
+            log::info!("ANativeWindow_setFrameRate unavailable (API < 30), skipping");
+            return;
+        }
+        type Fn = unsafe extern "C" fn(*mut libc::c_void, f32, i8, i8) -> libc::c_int;
+        let f: Fn = std::mem::transmute(sym);
+        let ret = f(native_ptr.cast(), 24.0, FIXED_SOURCE, ALWAYS);
+        log::info!("ANativeWindow_setFrameRate(24.0, FIXED_SOURCE, ALWAYS) = {}", ret);
+    }
+}
+
 use android_activity::AndroidApp;
 use player::Player;
 use tokio::join;
@@ -33,6 +66,13 @@ impl ApplicationHandler for App {
         let attrs = Window::default_attributes();
         let window = Arc::new(event_loop.create_window(attrs).unwrap());
         let mut player = Player::new(window.clone());
+
+        // Tell SurfaceFlinger this surface produces 24fps content so it locks
+        // the display to a compatible multiple of 24Hz (e.g. 120Hz on Galaxy S)
+        // and stops adaptive refresh rate switching mid-playback, which causes
+        // visible judder (each rate switch changes the vsync cadence abruptly).
+        set_frame_rate_24fps(&window);
+
         self.window = Some(window);
         self.player = Some(player.clone());
         log::info!("window + player created");

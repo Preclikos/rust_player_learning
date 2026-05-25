@@ -78,6 +78,12 @@ pub fn create_vk_image_from_ahb(
         } else {
             vk::Format::G8_B8R8_2PLANE_420_UNORM
         };
+        log::info!("[ahb] VK reported_format={:?} external_format={:#x} image_format={:?} alloc={}",
+            reported_format,
+            format_props.external_format,
+            image_format,
+            allocation_size,
+        );
 
         let extent = vk::Extent3D {
             width,

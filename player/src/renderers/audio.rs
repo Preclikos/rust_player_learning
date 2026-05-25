@@ -173,3 +173,25 @@ impl AudioRenderer {
             .await;
     }
 }
+
+impl super::AudioSink for AudioRenderer {
+    fn put_samples<'a>(&'a self, samples: &'a [f32]) -> impl std::future::Future<Output = ()> + Send + 'a {
+        self.put_samples_raw(samples)
+    }
+
+    fn sample_rate(&self) -> u32 {
+        AudioRenderer::sample_rate(self)
+    }
+
+    fn flush(&self) {
+        AudioRenderer::flush(self)
+    }
+
+    fn stop(&self) -> impl std::future::Future<Output = ()> + Send + '_ {
+        AudioRenderer::stop(self)
+    }
+
+    fn volume(&self, diff: f32) -> impl std::future::Future<Output = ()> + Send + '_ {
+        AudioRenderer::volume(self, diff)
+    }
+}

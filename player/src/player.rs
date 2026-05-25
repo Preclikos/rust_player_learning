@@ -21,6 +21,7 @@ use pollster::FutureExt;
 use re_mp4::Mp4;
 use renderers::audio::AudioRenderer;
 use renderers::video::VideoRenderer;
+use renderers::{AudioSink, VideoSink};
 use winit::dpi::PhysicalSize;
 use winit::window::Window;
 
@@ -48,8 +49,7 @@ use manifest::Manifest;
 
 const MAX_SEGMENTS: usize = 2;
 
-#[derive(Clone)]
-pub struct Player {
+pub struct Player<V: VideoSink = VideoRenderer, A: AudioSink = AudioRenderer> {
     base_url: Option<String>,
     manifest: Option<Manifest>,
     tracks: Arc<StdMutex<Option<Tracks>>>,
@@ -71,18 +71,42 @@ pub struct Player {
 
     decryptor: Arc<StdMutex<Option<Arc<dyn Decryptor>>>>,
 
-    video_renderer: Arc<VideoRenderer>,
-    audio_renderer: Arc<AudioRenderer>,
+    video_renderer: Arc<V>,
+    audio_renderer: Arc<A>,
+}
+
+impl<V: VideoSink, A: AudioSink> Clone for Player<V, A> {
+    fn clone(&self) -> Self {
+        Player {
+            base_url: self.base_url.clone(),
+            manifest: self.manifest.clone(),
+            tracks: Arc::clone(&self.tracks),
+            video_adaptation: Arc::clone(&self.video_adaptation),
+            video_representation: Arc::clone(&self.video_representation),
+            audio_adaptation: Arc::clone(&self.audio_adaptation),
+            audio_representation: Arc::clone(&self.audio_representation),
+            start_time: Arc::clone(&self.start_time),
+            video_ready: Arc::clone(&self.video_ready),
+            audio_ready: Arc::clone(&self.audio_ready),
+            stop: Arc::clone(&self.stop),
+            stop_flag: Arc::clone(&self.stop_flag),
+            seek_target: Arc::clone(&self.seek_target),
+            position_ms: Arc::clone(&self.position_ms),
+            decryptor: Arc::clone(&self.decryptor),
+            video_renderer: Arc::clone(&self.video_renderer),
+            audio_renderer: Arc::clone(&self.audio_renderer),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Unified sync producers (same logic on all platforms)
+// A/V sync loop — identical on all platforms, generic over sink traits
 // ---------------------------------------------------------------------------
 
-async fn video_sync_producer(
+async fn video_sync_loop<V: VideoSink>(
     start_time: Arc<Instant>,
     mut input_rx: mpsc::Receiver<DecodedVideoFrame>,
-    renderer: Arc<VideoRenderer>,
+    renderer: Arc<V>,
     position_ms: Arc<AtomicU64>,
     stop: Arc<Notify>,
     stop_flag: Arc<AtomicBool>,
@@ -94,14 +118,14 @@ async fn video_sync_producer(
         if stop_flag.load(Ordering::Relaxed) {
             break;
         }
-        let frame = tokio::select! {
+        let mut frame = tokio::select! {
             maybe = input_rx.recv() => match maybe {
                 Some(f) => f,
                 None => break,
             },
             _ = stop.notified() => break,
         };
-        let pts_ms = (frame.pts_us / 1000) as u64;
+        let mut pts_ms = (frame.pts_us / 1000) as u64;
         let elapsed = start_time.elapsed().as_millis() as u64;
 
         if pts_ms < last_pts_ms {
@@ -123,6 +147,18 @@ async fn video_sync_producer(
             if late_ms > 80 {
                 log::warn!("[vsync] LATE #{} pts={}ms elapsed={}ms late={}ms",
                     frame_idx, pts_ms, elapsed, late_ms);
+                // Drain buffered late frames — keep only the newest one so we
+                // catch up in a single step instead of playing all late frames
+                // back-to-back at display-vsync speed (visible as fast-forward).
+                loop {
+                    match input_rx.try_recv() {
+                        Ok(newer) => {
+                            frame = newer;
+                            pts_ms = (frame.pts_us / 1000) as u64;
+                        }
+                        Err(_) => break,
+                    }
+                }
             }
         }
 
@@ -140,15 +176,14 @@ async fn video_sync_producer(
         let render_done = start_time.elapsed().as_millis() as u64;
         let render_ms = render_done - render_start;
 
-        // Log every frame: frame#, pts, wall when render started, how long render took, display interval
         log::info!("[vsync] #{} pts={}ms wall={}ms render={}ms interval={}ms Δpts={}ms",
             frame_idx - 1, pts_ms, render_start, render_ms, interval_ms, delta_pts);
     }
 }
 
-async fn audio_sync_producer(
+async fn audio_sync_loop<A: AudioSink>(
     mut input_rx: mpsc::Receiver<DecodedAudioFrame>,
-    audio_renderer: Arc<AudioRenderer>,
+    sink: Arc<A>,
     stop: Arc<Notify>,
     stop_flag: Arc<AtomicBool>,
 ) {
@@ -165,15 +200,59 @@ async fn audio_sync_producer(
         };
         if !frame.samples.is_empty() {
             tokio::select! {
-                _ = audio_renderer.put_samples_raw(&frame.samples) => {}
+                _ = sink.put_samples(&frame.samples) => {}
                 _ = stop.notified() => break,
             }
         }
     }
 }
 
+async fn av_sync_handler<V: VideoSink, A: AudioSink>(
+    seek_offset: Duration,
+    video_ready: Arc<Notify>,
+    video_rx: mpsc::Receiver<DecodedVideoFrame>,
+    video_sink: Arc<V>,
+    position_ms: Arc<AtomicU64>,
+    audio_ready: Arc<Notify>,
+    audio_rx: mpsc::Receiver<DecodedAudioFrame>,
+    audio_sink: Arc<A>,
+    stop: Arc<Notify>,
+    stop_flag: Arc<AtomicBool>,
+) {
+    // Wait for both decoders to produce their first output before setting
+    // start_time. This ensures A/V sync is established from a common wall-clock
+    // origin. The audio channel is sized large enough (256 frames) that
+    // the audio decoder task won't block even if video download is slow.
+    tokio::select! {
+        _ = async { tokio::join!(video_ready.notified(), audio_ready.notified()); } => {}
+        _ = stop.notified() => {
+            stop.notify_waiters();
+            return;
+        }
+    }
+    let now = Instant::now();
+    let start_time = Arc::new(now.checked_sub(seek_offset).unwrap_or(now));
+    let (_, _) = tokio::join!(
+        tokio::spawn(video_sync_loop(
+            start_time.clone(),
+            video_rx,
+            video_sink,
+            position_ms,
+            stop.clone(),
+            stop_flag.clone(),
+        )),
+        tokio::spawn(audio_sync_loop(
+            audio_rx,
+            audio_sink,
+            stop.clone(),
+            stop_flag.clone(),
+        )),
+    );
+    stop.notify_waiters();
+}
+
 // ---------------------------------------------------------------------------
-// Unified decoder tasks (same logic on all platforms)
+// Decoder tasks (platform-generic, communicate via channels)
 // ---------------------------------------------------------------------------
 
 async fn video_decoder_task(
@@ -301,7 +380,7 @@ async fn audio_decoder_task(
 }
 
 // ---------------------------------------------------------------------------
-// Unified play pipeline builders
+// Download + decode pipeline builders (renderer-agnostic)
 // ---------------------------------------------------------------------------
 
 async fn video_play(
@@ -356,7 +435,7 @@ async fn video_play(
 
     let segments = video_representation.segments.clone();
     let download_task =
-        task::spawn(Player::download_task(segments, start_index, download_tx, stop, stop_flag));
+        task::spawn(download_task(segments, start_index, download_tx, stop, stop_flag));
     let decoder_task =
         task::spawn(video_decoder_task(download_rx, sender, decoder, init_data, video_ready, track_crypto));
 
@@ -432,7 +511,7 @@ async fn audio_play(
 
     let segments = audio_representation.segments.clone();
     let download_task =
-        task::spawn(Player::download_task(segments, start_index, download_tx, stop, stop_flag));
+        task::spawn(download_task(segments, start_index, download_tx, stop, stop_flag));
     let decoder_task =
         task::spawn(audio_decoder_task(download_rx, sender, decoder, init_data, audio_ready, track_crypto));
 
@@ -442,53 +521,11 @@ async fn audio_play(
     Ok(())
 }
 
-async fn lifetime_handler(
-    seek_offset: Duration,
-    video_ready: Arc<Notify>,
-    video_rx: mpsc::Receiver<DecodedVideoFrame>,
-    video_tx: Arc<VideoRenderer>,
-    position_ms: Arc<AtomicU64>,
-    audio_ready: Arc<Notify>,
-    audio_rx: mpsc::Receiver<DecodedAudioFrame>,
-    audio_tx: Arc<AudioRenderer>,
-    stop: Arc<Notify>,
-    stop_flag: Arc<AtomicBool>,
-) {
-    // Wait for both decoders to produce their first output before setting
-    // start_time. This ensures A/V sync is established from a common wall-clock
-    // origin. The audio channel is sized large enough (256 frames) that
-    // audio_decoder_task won't block waiting for lifetime_handler even if
-    // video download is slow.
-    tokio::select! {
-        _ = async { tokio::join!(video_ready.notified(), audio_ready.notified()); } => {}
-        _ = stop.notified() => {
-            stop.notify_waiters();
-            return;
-        }
-    }
-    let now = Instant::now();
-    let start_time = Arc::new(now.checked_sub(seek_offset).unwrap_or(now));
-    // Both sync producers must finish — if audio errors out early, video keeps playing.
-    let (_, _) = tokio::join!(
-        tokio::spawn(video_sync_producer(
-            start_time.clone(),
-            video_rx,
-            video_tx,
-            position_ms,
-            stop.clone(),
-            stop_flag.clone(),
-        )),
-        tokio::spawn(audio_sync_producer(
-            audio_rx,
-            audio_tx,
-            stop.clone(),
-            stop_flag.clone(),
-        )),
-    );
-    stop.notify_waiters();
-}
+// ---------------------------------------------------------------------------
+// Player — constructs default (platform-native) sinks
+// ---------------------------------------------------------------------------
 
-impl Player {
+impl Player<VideoRenderer, AudioRenderer> {
     pub fn new(window: Arc<Window>) -> Self {
         let start_time = Arc::new(Instant::now());
 
@@ -525,7 +562,13 @@ impl Player {
             audio_renderer,
         }
     }
+}
 
+// ---------------------------------------------------------------------------
+// Player — generic methods, work with any VideoSink + AudioSink
+// ---------------------------------------------------------------------------
+
+impl<V: VideoSink, A: AudioSink> Player<V, A> {
     pub fn set_clearkey(&self, keys: HashMap<String, String>) -> Result<(), Box<dyn Error>> {
         let decryptor = ClearKeyDecryptor::from_hex(keys)?;
         *self.decryptor.lock().unwrap() = Some(Arc::new(decryptor));
@@ -618,44 +661,9 @@ impl Player {
         self.seek(self.position());
     }
 
-    async fn download_task(
-        segments: Vec<Segment>,
-        start_index: usize,
-        segment_sender: Sender<DataSegment>,
-        stop: Arc<Notify>,
-        stop_flag: Arc<AtomicBool>,
-    ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        let segment_slice = &segments[..];
-        for i in start_index..segment_slice.len() {
-            if stop_flag.load(Ordering::Relaxed) {
-                break;
-            }
-            let sender = segment_sender.clone();
-            let seg = &segment_slice[i];
-            let mut should_break = false;
-            tokio::select! {
-                res = download_and_queue(i, seg, sender) => {
-                    match res {
-                        Ok(()) => println!("Producing segment {}", i),
-                        Err(e) => {
-                            eprintln!("download_task: segment {} failed: {}", i, e);
-                            should_break = true;
-                        }
-                    }
-                }
-                _ = stop.notified() => {
-                    should_break = true;
-                }
-            }
-            if should_break {
-                break;
-            }
-        }
-        Ok(())
-    }
-
-    /// Single play() implementation for all platforms. Creates platform-specific
-    /// decoder instances and feeds them into the same generic pipeline.
+    /// Start playback. Creates platform-specific decoders and feeds them into
+    /// the generic A/V sync loop. Only the concrete decoder types differ per
+    /// platform; the rest of the pipeline is identical.
     pub fn play(&self) -> Result<JoinHandle<()>, Box<dyn Error>> {
         let video_representation = match self.video_representation.lock().unwrap().as_ref() {
             Some(r) => r.clone(),
@@ -670,14 +678,12 @@ impl Player {
         let audio_ready = self.audio_ready.clone();
         let stop = self.stop.clone();
         let stop_flag = self.stop_flag.clone();
-        let video_renderer = self.video_renderer.clone();
-        let audio_renderer = self.audio_renderer.clone();
+        let video_sink = self.video_renderer.clone();
+        let audio_sink = self.audio_renderer.clone();
         let seek_target = self.seek_target.clone();
         let position_ms = self.position_ms.clone();
         let decryptor_snapshot = self.decryptor.lock().unwrap().clone();
 
-        // Create platform-specific decoder instances. The rest of the pipeline
-        // (download tasks, sync producers, lifetime handler) is identical.
         #[cfg(any(target_os = "windows", target_os = "linux"))]
         let video_decoder: Box<dyn HwVideoDecoder> =
             Box::new(decoders::ffmpeg_hw::FfmpegHwDecoder::new());
@@ -725,7 +731,7 @@ impl Player {
                 video_decoder,
             ));
 
-            let sample_rate = audio_renderer.sample_rate();
+            let sample_rate = audio_sink.sample_rate();
             let audio = tokio::spawn(audio_play(
                 audio_representation,
                 audio_start_index,
@@ -738,15 +744,15 @@ impl Player {
                 audio_decoder,
             ));
 
-            lifetime_handler(
+            av_sync_handler(
                 snapped_seek_offset,
                 video_ready.clone(),
                 frame_receiver,
-                video_renderer,
+                video_sink,
                 position_ms,
                 audio_ready.clone(),
                 sample_receiver,
-                audio_renderer,
+                audio_sink,
                 stop.clone(),
                 stop_flag.clone(),
             )
@@ -763,14 +769,14 @@ impl Player {
         let seek_target = self.seek_target.clone();
         let stop = self.stop.clone();
         let stop_flag = self.stop_flag.clone();
-        let audio_renderer = self.audio_renderer.clone();
+        let audio_sink = self.audio_renderer.clone();
         tokio::spawn(async move {
             {
                 let mut slot = seek_target.write().await;
                 *slot = Some(target);
                 stop_flag.store(true, Ordering::Relaxed);
             }
-            audio_renderer.flush();
+            audio_sink.flush();
             stop.notify_waiters();
         });
     }
@@ -792,30 +798,66 @@ impl Player {
     }
 
     pub fn volume(&self, volume_diff: f32) {
-        let audio_renderer = self.audio_renderer.clone();
+        let audio_sink = self.audio_renderer.clone();
         tokio::spawn(async move {
-            audio_renderer.volume(volume_diff).await;
+            audio_sink.volume(volume_diff).await;
         });
     }
 
     pub fn resize(&self, size: PhysicalSize<u32>) {
-        let video_renderer: Arc<VideoRenderer> = self.video_renderer.clone();
+        let video_sink = self.video_renderer.clone();
         tokio::spawn(async move {
-            video_renderer.resize(size).await;
+            video_sink.resize(size).await;
         });
     }
 
     fn change_frame_size(&self, size: PhysicalSize<u32>) {
-        let video_renderer: Arc<VideoRenderer> = self.video_renderer.clone();
+        let video_sink = self.video_renderer.clone();
         tokio::spawn(async move {
-            video_renderer.change_frame_size(size).await;
+            video_sink.change_frame_size(size).await;
         });
     }
 }
 
 // ---------------------------------------------------------------------------
-// Helpers (unchanged from before)
+// Helpers
 // ---------------------------------------------------------------------------
+
+async fn download_task(
+    segments: Vec<Segment>,
+    start_index: usize,
+    segment_sender: Sender<DataSegment>,
+    stop: Arc<Notify>,
+    stop_flag: Arc<AtomicBool>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let segment_slice = &segments[..];
+    for i in start_index..segment_slice.len() {
+        if stop_flag.load(Ordering::Relaxed) {
+            break;
+        }
+        let sender = segment_sender.clone();
+        let seg = &segment_slice[i];
+        let mut should_break = false;
+        tokio::select! {
+            res = download_and_queue(i, seg, sender) => {
+                match res {
+                    Ok(()) => println!("Producing segment {}", i),
+                    Err(e) => {
+                        eprintln!("download_task: segment {} failed: {}", i, e);
+                        should_break = true;
+                    }
+                }
+            }
+            _ = stop.notified() => {
+                should_break = true;
+            }
+        }
+        if should_break {
+            break;
+        }
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone)]
 struct DataSegment {

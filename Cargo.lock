@@ -220,6 +220,7 @@ version = "0.1.0"
 dependencies = [
  "android-activity",
  "android_logger",
+ "libc",
  "log",
  "player",
  "pollster",
@@ -2259,6 +2260,7 @@ dependencies = [
  "ctr",
  "ffmpeg-next",
  "ffmpeg-sys-next",
+ "glow",
  "hex",
  "iso8601-duration",
  "jni",

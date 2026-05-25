@@ -16,10 +16,10 @@ mod video_directx;
 mod video_frame;
 #[cfg(target_os = "linux")]
 mod video_vaapi;
-#[cfg(any(target_os = "windows", target_os = "linux", target_os = "android"))]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 mod video_vulkan;
 #[cfg(target_os = "android")]
-mod video_mediacodec;
+mod video_gles_egl;
 
 use std::sync::Arc;
 
@@ -60,15 +60,18 @@ impl Vertex {
     }
 }
 
-fn generate_verticles(scale_x: f32, scale_y: f32) -> [Vertex; 6] {
+// tex_y_max: normally 1.0; set to content_height/buffer_height (<1.0) when
+// the codec produces a taller buffer than the visible frame (e.g. 736 for 720p
+// HEVC on Exynos) so we don't sample codec-alignment padding rows.
+fn generate_verticles(scale_x: f32, scale_y: f32, tex_y_max: f32) -> [Vertex; 6] {
     [
         Vertex {
             position: [-1. * scale_x, -1. * scale_y, 0.0],
-            tex_coords: [0., 1.],
+            tex_coords: [0., tex_y_max],
         }, // A
         Vertex {
             position: [1. * scale_x, -1. * scale_y, 0.0],
-            tex_coords: [1., 1.],
+            tex_coords: [1., tex_y_max],
         }, // B
         Vertex {
             position: [-1. * scale_x, 1. * scale_y, 0.0],
@@ -80,7 +83,7 @@ fn generate_verticles(scale_x: f32, scale_y: f32) -> [Vertex; 6] {
         }, // D
         Vertex {
             position: [1. * scale_x, -1. * scale_y, 0.0],
-            tex_coords: [1., 1.],
+            tex_coords: [1., tex_y_max],
         }, // E
         Vertex {
             position: [1. * scale_x, 1. * scale_y, 0.0],
@@ -103,16 +106,36 @@ pub struct VideoRenderer {
     window: Arc<Window>,
     device: wgpu::Device,
     backend: wgpu::Backend,
+    // True only when the adapter exposed TEXTURE_FORMAT_NV12 (required for AHB
+    // import on Android). PowerVR Rogue on Google TV does not; falls back to
+    // blue-screen clear so the renderer survives without crashing.
+    has_nv12_feature: bool,
     queue: wgpu::Queue,
     frame_size: Arc<RwLock<winit::dpi::PhysicalSize<u32>>>,
+    // Crop factor for the texture V-axis: content_height / buffer_height.
+    // Always 1.0 on desktop; set to <1.0 on Android when the hardware codec
+    // pads the output buffer taller than the visible frame (e.g. 736 for 720p).
+    tex_y_max: Arc<RwLock<f32>>,
     surface: Arc<Mutex<wgpu::Surface<'static>>>,
     surface_format: TextureFormat,
     surface_config: Arc<RwLock<SurfaceConfiguration>>,
     sampler: Sampler,
-    vertex_buffer: Arc<RwLock<wgpu::Buffer>>,
-    texture_bind_group_layout: BindGroupLayout,
-    render_pipeline: RenderPipeline,
+    // None on devices where NV12 is unavailable (e.g. MT8696 Vulkan on Google
+    // TV). Creating the NV12 shader/pipeline on those drivers triggers a crash
+    // inside the driver's SPIR-V parser. The clear-color fallback path never
+    // uses the pipeline, so skipping creation avoids the crash entirely.
+    vertex_buffer: Option<Arc<RwLock<wgpu::Buffer>>>,
+    texture_bind_group_layout: Option<BindGroupLayout>,
+    render_pipeline: Option<RenderPipeline>,
     command_sender: Sender<VideoRendererCommand>,
+    // GLES zero-copy OES renderer for devices without working Vulkan (e.g. Google TV MT8696).
+    // Arc so the renderer can be shared with the present hook closure.
+    #[cfg(target_os = "android")]
+    gles_oes_renderer: Option<Arc<video_gles_egl::GlesOesRenderer>>,
+    // Per-frame data written by render_android_gles() and consumed by the present hook.
+    // std::sync::Mutex (not tokio) because the hook fires synchronously inside present().
+    #[cfg(target_os = "android")]
+    gles_oes_pending: Arc<std::sync::Mutex<Option<video_gles_egl::GlesOesPendingFrame>>>,
 }
 
 pub enum VideoRendererCommand {
@@ -126,13 +149,12 @@ impl VideoRenderer {
         let backend = Backends::DX12;
         #[cfg(target_os = "linux")]
         let backend = Backends::VULKAN;
-        // Android emulators on preview API levels sometimes ship a Vulkan
-        // ICD that rejects vkCreateInstance with ERROR_INITIALIZATION_FAILED.
-        // Keep GLES in the request set so the Instance can still come up
-        // (and Player::new doesn't panic). On real devices Vulkan wins, which
-        // is what render_android's AHB→VkImage zero-copy path requires.
+        // Android: always use GLES. The AHB zero-copy path works directly with
+        // GL_TEXTURE_EXTERNAL_OES — no Vulkan AHB import needed. This avoids
+        // device-specific Vulkan driver bugs (MT8696 abort in BILParseStream,
+        // emulator vkCreateInstance failures) and follows the recommended path.
         #[cfg(target_os = "android")]
-        let backend = Backends::VULKAN | Backends::GL;
+        let backend = Backends::GL;
         #[cfg(target_os = "ios")]
         let backend = Backends::METAL;
 
@@ -146,6 +168,16 @@ impl VideoRenderer {
 
         let surface = instance.create_surface(window.clone()).unwrap();
 
+        #[cfg(target_os = "android")]
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                compatible_surface: Some(&surface),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        #[cfg(not(target_os = "android"))]
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::default(),
@@ -161,9 +193,14 @@ impl VideoRenderer {
         // NV12 / 16BIT_NORM are only used by the Vulkan AHB / D3D11 import
         // paths. GLES (Android emulator fallback) doesn't expose them and
         // request_device fails with UnsupportedFeature if we ask anyway.
+        // Some Vulkan GPUs (e.g. PowerVR Rogue on Google TV) also don't expose
+        // NV12, so intersect with what the adapter actually supports rather than
+        // requesting blindly and unwrapping into a panic.
         let is_hw_backend = backend == wgpu::Backend::Vulkan || backend == wgpu::Backend::Dx12;
         let required_features = if is_hw_backend {
-            wgpu::Features::TEXTURE_FORMAT_NV12 | wgpu::Features::TEXTURE_FORMAT_16BIT_NORM
+            let desired = wgpu::Features::TEXTURE_FORMAT_NV12
+                | wgpu::Features::TEXTURE_FORMAT_16BIT_NORM;
+            adapter.features() & desired
         } else {
             wgpu::Features::empty()
         };
@@ -175,7 +212,16 @@ impl VideoRenderer {
         // the adapter actually exposes so we can configure a surface
         // matching the device's screen resolution (1080×2400 etc.).
         let required_limits = if is_hw_backend {
-            wgpu::Limits::default()
+            // Cap texture-dimension limits to what the adapter actually exposes.
+            // wgpu::Limits::default() asks for max_texture_dimension_2d = 8192,
+            // but some embedded Vulkan GPUs (e.g. PowerVR Rogue on Google TV)
+            // only support 4096 and cause request_device to fail outright.
+            let adapter_limits = adapter.limits();
+            wgpu::Limits {
+                max_texture_dimension_2d: adapter_limits.max_texture_dimension_2d,
+                max_texture_dimension_1d: adapter_limits.max_texture_dimension_1d,
+                ..wgpu::Limits::default()
+            }
         } else {
             let adapter_limits = adapter.limits();
             wgpu::Limits {
@@ -184,6 +230,14 @@ impl VideoRenderer {
                 ..wgpu::Limits::downlevel_webgl2_defaults()
             }
         };
+
+        let has_nv12_feature = required_features.contains(wgpu::Features::TEXTURE_FORMAT_NV12);
+        log::info!(
+            "[renderer] backend={:?} nv12={} adapter={}",
+            backend,
+            has_nv12_feature,
+            adapter.get_info().name,
+        );
 
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
@@ -223,39 +277,6 @@ impl VideoRenderer {
             ..Default::default()
         });
 
-        let texture_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
-                    },
-                ],
-                label: Some("texture_bind_group_layout"),
-            });
-
         let surface_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
@@ -268,69 +289,177 @@ impl VideoRenderer {
         };
         surface.configure(&device, &surface_config);
 
-        let shader: wgpu::ShaderModule =
-            device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
+        // Skip shader/pipeline/vertex-buffer creation when NV12 is unavailable.
+        // On such devices (MT8696 Vulkan, GLES emulators) the driver crashes
+        // inside its SPIR-V parser during vkCreateGraphicsPipeline. Since the
+        // clear-color fallback path never touches these objects, omitting them
+        // is safe and avoids the native abort.
+        let (texture_bind_group_layout, render_pipeline, vertex_buffer) = if has_nv12_feature {
+            let layout =
+                device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 2,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                            count: None,
+                        },
+                    ],
+                    label: Some("texture_bind_group_layout"),
+                });
 
-        /*let shader: wgpu::ShaderModule =
-                    device.create_shader_module(wgpu::include_wgsl!("shader_hdr.wgsl"));
-        */
-        // Create pipeline layout
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Pipeline Layout"),
-            bind_group_layouts: &[Some(&texture_bind_group_layout)],
-            immediate_size: 0,
-        });
+            let shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
 
-        // Create render pipeline
-        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Render Pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                buffers: &[Some(Vertex::desc())],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: surface_format,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
+            let pipeline_layout =
+                device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("Pipeline Layout"),
+                    bind_group_layouts: &[Some(&layout)],
+                    immediate_size: 0,
+                });
 
-        let vertices = generate_verticles(1., 1.);
-        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Vertex Buffer"),
-            contents: bytemuck::cast_slice(&vertices),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
+            let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("Render Pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[Some(Vertex::desc())],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: surface_format,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            });
+
+            let vertices = generate_verticles(1., 1., 1.);
+            let vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Vertex Buffer"),
+                contents: bytemuck::cast_slice(&vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+
+            (Some(layout), Some(pipeline), Some(Arc::new(RwLock::new(vb))))
+        } else {
+            (None, None, None)
+        };
 
         let (command_sender, command_receiver) = mpsc::channel(4);
+
+        // On Android GLES path (no working Vulkan), build the OES renderer now while
+        // the EGL context is available. We do this by accessing the hal device and
+        // locking the EGL context to run the GL setup calls.
+        #[cfg(target_os = "android")]
+        let gles_oes_renderer = if backend == wgpu::Backend::Gl {
+            unsafe {
+                device.as_hal::<wgpu::hal::api::Gles>().and_then(|dev| {
+                    let ctx = dev.context();
+                    let gl = ctx.lock(); // makes EGL context current
+                    match video_gles_egl::GlesOesRenderer::new(&gl) {
+                        Ok(r) => Some(Arc::new(r)),
+                        Err(e) => {
+                            log::warn!("[renderer] GLES OES init failed: {}", e);
+                            None
+                        }
+                    }
+                })
+            }
+        } else {
+            None
+        };
+
+        #[cfg(target_os = "android")]
+        let gles_oes_pending = Arc::new(std::sync::Mutex::new(
+            None::<video_gles_egl::GlesOesPendingFrame>,
+        ));
+
+        // Install the present hook on the GLES surface so OES rendering happens
+        // directly into FBO 0 (window surface) instead of into the swapchain renderbuffer.
+        // The hook fires inside wgpu's present() after make_current(window_surface),
+        // bypassing the PowerVR driver bug where rendering to sc.renderbuffer via a
+        // PBuffer context silently produces no output.
+        #[cfg(target_os = "android")]
+        if backend == wgpu::Backend::Gl {
+            if let Some(oes) = &gles_oes_renderer {
+                let oes_arc = Arc::clone(oes);
+                let pending_clone = Arc::clone(&gles_oes_pending);
+                if let Some(s) = unsafe { surface.as_hal::<wgpu::hal::api::Gles>() } {
+                    use std::ops::Deref;
+                    let s_ref: &wgpu::hal::gles::Surface = s.deref();
+                    s_ref.set_present_hook(Box::new(move |gl, w, h| {
+                        let frame = pending_clone.lock().unwrap().take();
+                        if let Some(f) = frame {
+                            if let Err(e) = unsafe {
+                                oes_arc.render(
+                                    gl,
+                                    f.ahb_ptr as *mut std::ffi::c_void,
+                                    w as i32,
+                                    h as i32,
+                                    f.scale_x,
+                                    f.scale_y,
+                                    f.tex_y_max,
+                                )
+                            } {
+                                log::warn!("[gles_oes] hook render failed: {}", e);
+                            }
+                        }
+                    }));
+                    log::info!("[gles_oes] present hook installed");
+                }
+            }
+        }
 
         let renderer = VideoRenderer {
             window,
             device,
             backend,
+            has_nv12_feature,
             queue,
             frame_size: Arc::new(RwLock::new(size)),
+            tex_y_max: Arc::new(RwLock::new(1.0_f32)),
             surface: Arc::new(Mutex::new(surface)),
             surface_format,
             surface_config: Arc::new(RwLock::new(surface_config)),
             sampler,
-            vertex_buffer: Arc::new(RwLock::new(vertex_buffer)),
+            vertex_buffer,
             texture_bind_group_layout,
             render_pipeline,
             command_sender,
+            #[cfg(target_os = "android")]
+            gles_oes_renderer,
+            #[cfg(target_os = "android")]
+            gles_oes_pending,
         };
 
         renderer.spawn_command_thread(command_receiver);
@@ -342,6 +471,7 @@ impl VideoRenderer {
         device: &Device,
         window_size: PhysicalSize<u32>,
         frame_size: PhysicalSize<u32>,
+        tex_y_max: f32,
         vertex_buffer: Arc<RwLock<Buffer>>,
     ) {
         let window_aspect = window_size.width as f32 / window_size.height as f32;
@@ -353,7 +483,7 @@ impl VideoRenderer {
             (texture_aspect / window_aspect, 1.0)
         };
 
-        let vertices = generate_verticles(scale_x, scale_y);
+        let vertices = generate_verticles(scale_x, scale_y, tex_y_max);
         let mut vertex_buffer_guard = vertex_buffer.write().await;
         vertex_buffer_guard.destroy();
 
@@ -368,7 +498,8 @@ impl VideoRenderer {
         let surface = Arc::clone(&self.surface);
         let config = Arc::clone(&self.surface_config);
         let frame_size = Arc::clone(&self.frame_size);
-        let vertex_buffer = Arc::clone(&self.vertex_buffer);
+        let tex_y_max = Arc::clone(&self.tex_y_max);
+        let vertex_buffer = self.vertex_buffer.clone(); // Option<Arc<...>>
         let device = self.device.clone();
         let window = self.window.clone();
         tokio::spawn(async move {
@@ -387,13 +518,17 @@ impl VideoRenderer {
                             {
                                 surface.lock().await.configure(&device, &config_guard);
                             }
-                            Self::change_vertex_buffer(
-                                &device,
-                                window_size,
-                                new_frame_size,
-                                vertex_buffer.clone(),
-                            )
-                            .await;
+                            if let Some(vb) = &vertex_buffer {
+                                let ty_max = *tex_y_max.read().await;
+                                Self::change_vertex_buffer(
+                                    &device,
+                                    window_size,
+                                    new_frame_size,
+                                    ty_max,
+                                    vb.clone(),
+                                )
+                                .await;
+                            }
                         }
                     }
                     VideoRendererCommand::Resize(new_size) => {
@@ -405,14 +540,18 @@ impl VideoRenderer {
                             {
                                 surface.lock().await.configure(&device, &config_guard);
                             }
-                            let frame_size = frame_size.read().await;
-                            Self::change_vertex_buffer(
-                                &device,
-                                new_size,
-                                *frame_size,
-                                vertex_buffer.clone(),
-                            )
-                            .await;
+                            if let Some(vb) = &vertex_buffer {
+                                let frame_size = frame_size.read().await;
+                                let ty_max = *tex_y_max.read().await;
+                                Self::change_vertex_buffer(
+                                    &device,
+                                    new_size,
+                                    *frame_size,
+                                    ty_max,
+                                    vb.clone(),
+                                )
+                                .await;
+                            }
                         }
                     }
                 }
@@ -498,8 +637,10 @@ impl VideoRenderer {
             _ => panic!("Not supported"),
         };
 
+        // Desktop path always has NV12 feature, so pipeline/buffer are always Some.
+        let layout = self.texture_bind_group_layout.as_ref().expect("no bind group layout");
         let texture_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: &self.texture_bind_group_layout,
+            layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
@@ -519,15 +660,22 @@ impl VideoRenderer {
 
         {
             let surface = self.surface.lock().await;
-            let vertex_buffer = self.vertex_buffer.read().await;
+            let vb_arc = self.vertex_buffer.as_ref().expect("no vertex buffer");
+            let vertex_buffer = vb_arc.read().await;
+            let render_pipeline = self.render_pipeline.as_ref().expect("no render pipeline");
 
             let surface_texture = match surface.get_current_texture() {
                 wgpu::CurrentSurfaceTexture::Success(t) => t,
-                wgpu::CurrentSurfaceTexture::Suboptimal(_) => {
+                wgpu::CurrentSurfaceTexture::Suboptimal(t) => {
+                    // Suboptimal: surface is valid but swapchain config no longer
+                    // perfectly matches (e.g. display transform changed). Render
+                    // to it anyway to avoid dropping the frame; queue a resize so
+                    // the config is corrected before the next frame.
+                    log::warn!("[renderer] suboptimal surface — queuing resize, rendering anyway");
                     let _ = self.command_sender.try_send(
                         VideoRendererCommand::Resize(self.window.inner_size()),
                     );
-                    return;
+                    t
                 }
                 other => {
                     log::warn!("surface texture not available: {:?}", other);
@@ -561,11 +709,9 @@ impl VideoRenderer {
                     multiview_mask: None,
                 });
 
-                render_pass.set_pipeline(&self.render_pipeline);
+                render_pass.set_pipeline(render_pipeline);
                 render_pass.set_bind_group(0, &texture_bind_group, &[]);
-
                 render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
-
                 render_pass.draw(0..6, 0..1);
             }
 
@@ -576,39 +722,54 @@ impl VideoRenderer {
         }
     }
 
-    /// Android render path. Imports the MediaCodec-produced AHardwareBuffer
-    /// into Vulkan as a VkImage with `VK_FORMAT_G8_B8R8_2PLANE_420_UNORM`
-    /// (Vulkan NV12), wraps it as `wgpu::Texture`, samples Y + UV planes
-    /// through the same NV12 shader the desktop path uses. Zero-copy.
+    /// GLES zero-copy path: stores per-frame AHB data then calls queue.present().
+    /// The present hook (installed once during VideoRenderer::new()) fires inside
+    /// wgpu's present() after make_current(window_surface), draws the OES quad
+    /// directly to FBO 0, then eglSwapBuffers presents it.
+    /// Falls back to a blue-screen clear when the OES renderer is unavailable.
     #[cfg(target_os = "android")]
-    pub async fn render_android(&self, frame: crate::decoders::AndroidHardwareBufferFrame) {
-        use ndk::hardware_buffer::HardwareBuffer;
-        use video_mediacodec::create_vk_image_from_ahb;
-        use video_vulkan::create_texture_from_vk_image;
+    async fn render_android_gles(&self, frame: crate::decoders::AndroidHardwareBufferFrame) {
+        // Update tex_y_max when the codec buffer is taller than the visible content
+        // (e.g. PowerVR alignment padding: 1088-row buffer for 720p content).
+        // Only fire when buffer > content (stored.height < frame.height): if stored.height
+        // is still the window height (1080) and frame.height is content height (720),
+        // the condition would be inverted and produce tex_y_max > 1.0 which corrupts output.
+        {
+            let stored = self.frame_size.read().await;
+            if stored.height > 0 && frame.height > 0 && stored.height < frame.height {
+                let new_ty = stored.height as f32 / frame.height as f32;
+                let mut ty = self.tex_y_max.write().await;
+                if (*ty - new_ty).abs() > 0.001 {
+                    log::info!(
+                        "[gles_oes] codec padding: content={}px buffer={}px tex_y_max={:.4}",
+                        stored.height,
+                        frame.height,
+                        new_ty
+                    );
+                    *ty = new_ty;
+                }
+            }
+        }
 
-        // AHB→VkImage zero-copy import requires the Vulkan backend. On
-        // emulators that fall back to GLES, drop the frame's GPU import
-        // but still clear-and-present the surface so the swapchain keeps
-        // ticking and we can see the renderer is alive (otherwise the
-        // window stays black and looks frozen).
-        if self.backend != wgpu::Backend::Vulkan {
+        let surface = self.surface.lock().await;
+        let surface_texture = match surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(t)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
+            other => {
+                log::warn!("[gles_oes] surface not available: {:?}", other);
+                return;
+            }
+        };
+
+        // OES renderer absent → fallback blue clear (OES init failed at startup).
+        let Some(_oes) = &self.gles_oes_renderer else {
             static WARN_ONCE: std::sync::Once = std::sync::Once::new();
             WARN_ONCE.call_once(|| {
                 log::warn!(
-                    "render_android: backend is {:?}, not Vulkan — AHB import unavailable, presenting clear color only",
+                    "[gles_oes] OES renderer unavailable (backend={:?}) — blue clear fallback",
                     self.backend
                 );
             });
-
-            let surface = self.surface.lock().await;
-            let surface_texture = match surface.get_current_texture() {
-                wgpu::CurrentSurfaceTexture::Success(t)
-                | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
-                other => {
-                    log::warn!("surface texture not available: {:?}", other);
-                    return;
-                }
-            };
             let view = surface_texture
                 .texture
                 .create_view(&wgpu::TextureViewDescriptor {
@@ -618,7 +779,7 @@ impl VideoRenderer {
             let mut encoder = self.device.create_command_encoder(&Default::default());
             {
                 let _rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("android-fallback-clear"),
+                    label: Some("gles-fallback-clear"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                         view: &view,
                         resolve_target: None,
@@ -643,150 +804,58 @@ impl VideoRenderer {
             self.window.pre_present_notify();
             self.queue.present(surface_texture);
             return;
-        }
-
-        // `HardwareBuffer` is the unowned view; scope it tightly so the
-        // !Send pointer doesn't outlive the import call (otherwise the
-        // surrounding future loses its Send bound when we .await below).
-        // The owned ref in `frame.buffer` keeps the AHB alive after the
-        // import — Vulkan adds its own refcount once the memory is allocated.
-        let img_mem = {
-            let hb_view = unsafe {
-                HardwareBuffer::from_ptr(std::ptr::NonNull::new(frame.buffer.as_ptr()).unwrap())
-            };
-            match create_vk_image_from_ahb(
-                &self.device,
-                &hb_view,
-                frame.width,
-                frame.height,
-            ) {
-                Ok(im) => im,
-                Err(e) => {
-                    log::warn!("AHB import failed: {}", e);
-                    return;
-                }
-            }
         };
 
-        let texture = create_texture_from_vk_image(
-            &self.device,
-            img_mem.raw_image,
-            frame.width,
-            frame.height,
-            TextureFormat::NV12,
-            true,
-            false,
-        );
-
-        let y_plane_view = texture.create_view(&wgpu::TextureViewDescriptor {
-            format: Some(TextureFormat::R8Unorm),
-            aspect: wgpu::TextureAspect::Plane0,
-            ..Default::default()
-        });
-        let uv_plane_view = texture.create_view(&wgpu::TextureViewDescriptor {
-            format: Some(TextureFormat::Rg8Unorm),
-            aspect: wgpu::TextureAspect::Plane1,
-            ..Default::default()
-        });
-
-        let texture_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: &self.texture_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&y_plane_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&uv_plane_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
-            ],
-            label: Some("texture_bind_group_android"),
-        });
-
-        {
-            let surface = self.surface.lock().await;
-            let vertex_buffer = self.vertex_buffer.read().await;
-
-            let surface_texture = match surface.get_current_texture() {
-                wgpu::CurrentSurfaceTexture::Success(t) => t,
-                wgpu::CurrentSurfaceTexture::Suboptimal(_) => {
-                    let _ = self.command_sender.try_send(
-                        VideoRendererCommand::Resize(self.window.inner_size()),
-                    );
-                    return;
-                }
-                other => {
-                    log::warn!("surface texture not available: {:?}", other);
-                    return;
-                }
-            };
-
-            let texture_view = surface_texture
-                .texture
-                .create_view(&wgpu::TextureViewDescriptor {
-                    format: Some(self.surface_format),
-                    ..Default::default()
-                });
-
-            let mut encoder = self.device.create_command_encoder(&Default::default());
-            {
-                let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: None,
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &texture_view,
-                        resolve_target: None,
-                        depth_slice: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                });
-
-                render_pass.set_pipeline(&self.render_pipeline);
-                render_pass.set_bind_group(0, &texture_bind_group, &[]);
-                render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
-                render_pass.draw(0..6, 0..1);
+        // Compute aspect-ratio-preserving scale factors.
+        let window_size = self.window.inner_size();
+        let frame_size = *self.frame_size.read().await;
+        let tex_y_max = *self.tex_y_max.read().await;
+        let (scale_x, scale_y) = if frame_size.width > 0 && frame_size.height > 0 {
+            let wa = window_size.width as f32 / window_size.height as f32;
+            let fa = frame_size.width as f32 / frame_size.height as f32;
+            if fa > wa {
+                (1.0_f32, wa / fa)
+            } else {
+                (fa / wa, 1.0_f32)
             }
+        } else {
+            (1.0_f32, 1.0_f32)
+        };
 
-            self.queue.submit([encoder.finish()]);
-            self.window.pre_present_notify();
-            self.queue.present(surface_texture);
+        // Publish frame data for the present hook to consume.
+        {
+            let mut pending = self.gles_oes_pending.lock().unwrap();
+            *pending = Some(video_gles_egl::GlesOesPendingFrame {
+                ahb_ptr: frame.buffer.as_ptr() as usize,
+                scale_x,
+                scale_y,
+                tex_y_max,
+            });
         }
 
-        // Destroy VkImage + VkDeviceMemory once the GPU finishes this frame.
-        // We do NOT call poll(Wait) here — blocking the sync task for a full
-        // GPU frame (~16ms) would make rendering slower than 24fps and cause
-        // the "stutter then smooth" pattern. Instead, on_submitted_work_done
-        // fires asynchronously from wgpu's background poller after the
-        // submitted work retires.
-        //
-        // The AHB (frame.buffer) can safely drop when this function returns:
-        // vkAllocateMemory with ImportAndroidHardwareBufferInfoANDROID adds
-        // Vulkan's own AHB reference, which stays alive until vkFreeMemory.
-        let raw_image = img_mem.raw_image;
-        let raw_memory = img_mem.memory;
-        let device_for_cleanup = self.device.clone();
-        self.queue.on_submitted_work_done(move || unsafe {
-            if let Some(raw_dev) = device_for_cleanup.as_hal::<wgpu::hal::api::Vulkan>() {
-                let d = raw_dev.raw_device();
-                d.free_memory(raw_memory, None);
-                d.destroy_image(raw_image, None);
-            }
-        });
+        // Submit empty wgpu work to keep the frame-tracking state machine consistent,
+        // then present — the hook fires inside present() and draws the OES quad.
+        self.queue.submit([]);
+        self.window.pre_present_notify();
+        self.queue.present(surface_texture);
+    }
 
-        // Process any callbacks for GPU work that completed since the last
-        // frame (frees VkImage/VkDeviceMemory from 1-2 frames ago).
-        // Non-blocking: returns immediately if no work has finished yet.
-        let _ = self.device.poll(wgpu::PollType::Poll);
+    #[cfg(target_os = "android")]
+    pub async fn render_android(&self, frame: crate::decoders::AndroidHardwareBufferFrame) {
+        self.render_android_gles(frame).await;
+    }
+}
+
+impl super::VideoSink for VideoRenderer {
+    fn render_frame(&self, frame: crate::decoders::DecodedVideoFrame) -> impl std::future::Future<Output = ()> + Send + '_ {
+        VideoRenderer::render_frame(self, frame)
+    }
+
+    fn resize(&self, size: winit::dpi::PhysicalSize<u32>) -> impl std::future::Future<Output = ()> + Send + '_ {
+        VideoRenderer::resize(self, size)
+    }
+
+    fn change_frame_size(&self, size: winit::dpi::PhysicalSize<u32>) -> impl std::future::Future<Output = ()> + Send + '_ {
+        VideoRenderer::change_frame_size(self, size)
     }
 }

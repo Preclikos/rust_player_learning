@@ -16,6 +16,8 @@ pub mod mediacodec;
 #[cfg(target_os = "android")]
 pub mod mediacodec_audio;
 #[cfg(target_os = "ios")]
+pub mod audiotoolbox;
+#[cfg(target_os = "ios")]
 pub mod videotoolbox;
 
 // ---------------------------------------------------------------------------
@@ -102,6 +104,8 @@ unsafe impl Send for PlatformFrame {}
 #[derive(Clone, Copy, Debug)]
 pub enum AudioCodec {
     Aac,
+    Ac3,
+    Eac3,
 }
 
 pub struct AudioDecoderParams {
@@ -112,7 +116,10 @@ pub struct AudioDecoderParams {
     pub input_channels: u16,
     /// Target sample rate for the output device (from AudioRenderer::sample_rate()).
     pub output_sample_rate: u32,
-    /// AudioSpecificConfig bytes (2 bytes for AAC LC).
+    /// Codec-specific extradata. For AAC this is the 2-byte AudioSpecificConfig
+    /// from `esds`. For AC-3 / EAC-3 it is empty — those formats are
+    /// self-describing (each frame carries its own syncinfo header), so neither
+    /// FFmpeg nor MediaCodec needs csd-0 to initialise.
     pub codec_specific_data: Vec<u8>,
 }
 

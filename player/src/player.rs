@@ -699,27 +699,52 @@ async fn audio_play(
         }
     };
 
-    let aac_config = parse_aac_config(&init_data)
-        .ok_or("Audio codec not supported (no AAC config in init segment)")?;
+    let codecs_str = audio_representation.codecs.as_str();
+    let codec = if codecs_str.starts_with("mp4a") {
+        AudioCodec::Aac
+    } else if codecs_str == "ec-3" {
+        AudioCodec::Eac3
+    } else if codecs_str == "ac-3" {
+        AudioCodec::Ac3
+    } else {
+        return Err(format!("Unsupported audio codec: {}", codecs_str).into());
+    };
 
-    let input_sample_rate = aac_sampling_frequency_index_to_u32(aac_config.freq_index);
-    let input_channels = aac_config.chan_conf as u16;
-    let dsi: [u8; 2] = [
-        (aac_config.profile << 3) | (aac_config.freq_index >> 1),
-        ((aac_config.freq_index & 0x01) << 7) | (aac_config.chan_conf << 3),
-    ];
-
-    log::info!(
-        "audio: AAC profile={} freq_index={} (={}Hz) chan_conf={}",
-        aac_config.profile, aac_config.freq_index, input_sample_rate, aac_config.chan_conf
-    );
+    // AAC carries its codec params in `esds` (AudioSpecificConfig), and both
+    // FFmpeg and MediaCodec want those 2 bytes as extradata / csd-0 to open
+    // the decoder. AC-3 and EAC-3 are self-describing (each frame begins with
+    // a syncinfo header), so the decoder just needs the MIME plus the
+    // sample-rate/channel hints from the DASH manifest.
+    let (input_sample_rate, input_channels, codec_specific_data) = match codec {
+        AudioCodec::Aac => {
+            let aac_config = parse_aac_config(&init_data)
+                .ok_or("Audio codec not supported (no AAC config in init segment)")?;
+            let rate = aac_sampling_frequency_index_to_u32(aac_config.freq_index);
+            let ch = aac_config.chan_conf as u16;
+            let dsi: [u8; 2] = [
+                (aac_config.profile << 3) | (aac_config.freq_index >> 1),
+                ((aac_config.freq_index & 0x01) << 7) | (aac_config.chan_conf << 3),
+            ];
+            log::info!(
+                "audio: AAC profile={} freq_index={} (={}Hz) chan_conf={}",
+                aac_config.profile, aac_config.freq_index, rate, aac_config.chan_conf
+            );
+            (rate, ch, dsi.to_vec())
+        }
+        AudioCodec::Ac3 | AudioCodec::Eac3 => {
+            let rate = audio_representation.audio_sampling_rate;
+            let ch = audio_representation.channels.unwrap_or(2) as u16;
+            log::info!("audio: {:?} {}Hz {}ch", codec, rate, ch);
+            (rate, ch, Vec::new())
+        }
+    };
 
     decoder.configure(AudioDecoderParams {
-        codec: AudioCodec::Aac,
+        codec,
         input_sample_rate,
         input_channels,
         output_sample_rate,
-        codec_specific_data: dsi.to_vec(),
+        codec_specific_data,
     })?;
 
     let segments = audio_representation.segments.clone();

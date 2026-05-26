@@ -23,9 +23,12 @@ impl AudioDecoder for FfmpegAudioDecoder {
     fn configure(&mut self, params: AudioDecoderParams) -> Result<(), DecoderError> {
         let codec_id = match params.codec {
             AudioCodec::Aac => ffmpeg_next::codec::Id::AAC,
+            AudioCodec::Ac3 => ffmpeg_next::codec::Id::AC3,
+            AudioCodec::Eac3 => ffmpeg_next::codec::Id::EAC3,
         };
-        let codec = ffmpeg_next::decoder::find(codec_id)
-            .ok_or_else(|| -> DecoderError { "cannot find FFmpeg AAC decoder".into() })?;
+        let codec = ffmpeg_next::decoder::find(codec_id).ok_or_else(|| -> DecoderError {
+            format!("cannot find FFmpeg decoder for {:?}", params.codec).into()
+        })?;
 
         let mut ctx = ffmpeg_next::codec::Context::new_with_codec(codec);
 

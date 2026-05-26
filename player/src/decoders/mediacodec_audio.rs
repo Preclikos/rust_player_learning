@@ -61,6 +61,8 @@ impl AudioDecoder for MediaCodecAudioDecoder {
     fn configure(&mut self, params: AudioDecoderParams) -> Result<(), DecoderError> {
         let mime = match params.codec {
             AudioCodec::Aac => "audio/mp4a-latm",
+            AudioCodec::Ac3 => "audio/ac3",
+            AudioCodec::Eac3 => "audio/eac3",
         };
 
         let codec =

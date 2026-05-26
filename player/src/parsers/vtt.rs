@@ -120,13 +120,20 @@ fn parse_cue_block(block: &str) -> Option<VttCue> {
         first
     };
 
-    let (timings, settings) = match timing.split_once("-->") {
+    let (timings, rest) = match timing.split_once("-->") {
         Some(x) => x,
         None => return None,
     };
-    let (end_part, settings) = match settings.split_once(' ') {
-        Some((e, s)) => (e.trim(), s.trim().to_string()),
-        None => (settings.trim(), String::new()),
+    // `rest` typically starts with whitespace (`-->` and the end time
+    // are space-separated). Trim FIRST, then split on the next
+    // whitespace boundary to peel off the end time from any cue
+    // settings. The previous version split before trimming, hit the
+    // leading space, and ended up with `end_part = ""` — every cue
+    // failed to parse and the whole file became zero cues.
+    let rest = rest.trim_start();
+    let (end_part, settings) = match rest.split_once(char::is_whitespace) {
+        Some((e, s)) => (e, s.trim().to_string()),
+        None => (rest, String::new()),
     };
 
     let start_ms = parse_timestamp(timings.trim())?;

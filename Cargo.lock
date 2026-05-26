@@ -2264,6 +2264,7 @@ dependencies = [
  "hex",
  "iso8601-duration",
  "jni",
+ "libc",
  "log",
  "ndk",
  "ndk-sys",

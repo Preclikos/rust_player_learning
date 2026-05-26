@@ -43,6 +43,12 @@ type FnEglDestroyImageKHR = unsafe extern "system" fn(*mut c_void, *mut c_void) 
 // glEGLImageTargetTexture2DOES(target, image)
 type FnGlEglImageTargetTexture2DOES = unsafe extern "system" fn(u32, *mut c_void);
 
+// eglPresentationTimeANDROID(dpy, surface, time_ns) → EGL_TRUE/FALSE
+// Sets the desired presentation time (CLOCK_MONOTONIC ns) for the next eglSwapBuffers.
+// The compositor holds the frame until the VSync nearest to time_ns.
+type FnEglPresentationTimeANDROID =
+    unsafe extern "system" fn(*mut c_void, *mut c_void, i64) -> u32;
+
 // Vertex layout: (x, y, u, v)
 //
 // OES texture Y=0 is the TOP of the AHB frame (Android convention).
@@ -83,13 +89,16 @@ void main() {
 
 // libEGL.so is always present on Android.
 // eglGetProcAddress loads EGL/GL extension entry points at runtime.
-// eglGetCurrentDisplay returns the EGLDisplay for whichever context is current.
+// eglGetCurrentDisplay/eglGetCurrentSurface return the EGL display/surface for
+// whichever context is current.
 #[link(name = "EGL")]
 extern "C" {
     fn eglGetProcAddress(procname: *const i8) -> Option<unsafe extern "system" fn()>;
     fn eglGetCurrentDisplay() -> *mut c_void;
+    fn eglGetCurrentSurface(which: i32) -> *mut c_void;
     fn eglGetError() -> u32;
 }
+const EGL_DRAW: i32 = 0x3059;
 
 /// Frame data passed from the render thread to the present hook.
 /// Stored as primitive types so the struct is Send (raw pointers are stored as usize).
@@ -98,6 +107,9 @@ pub struct GlesOesPendingFrame {
     pub scale_x: f32,
     pub scale_y: f32,
     pub tex_y_max: f32,
+    /// CLOCK_MONOTONIC nanoseconds when this frame should appear on screen.
+    /// Passed to eglPresentationTimeANDROID; 0 = no constraint.
+    pub desired_present_ns: i64,
 }
 
 /// Renders AHardwareBuffer frames directly to FBO 0 (window surface) via GL_TEXTURE_EXTERNAL_OES.
@@ -113,10 +125,11 @@ pub struct GlesOesRenderer {
     scale_y_loc: Option<glow::UniformLocation>,
     tex_y_max_loc: Option<glow::UniformLocation>,
     // EGL extension function pointers stored as usize (makes the struct Send + Sync).
-    fn_get_native_client_buffer: usize, // eglGetNativeClientBufferANDROID
-    fn_egl_create_image: usize,         // eglCreateImageKHR
-    fn_egl_destroy_image: usize,        // eglDestroyImageKHR
+    fn_get_native_client_buffer: usize,  // eglGetNativeClientBufferANDROID
+    fn_egl_create_image: usize,          // eglCreateImageKHR
+    fn_egl_destroy_image: usize,         // eglDestroyImageKHR
     fn_gl_egl_image_target_texture: usize, // glEGLImageTargetTexture2DOES
+    fn_egl_presentation_time: usize,     // eglPresentationTimeANDROID (0 = unavailable)
     // Raw EGLDisplay pointer captured at init time.
     egl_display: usize,
 }
@@ -142,6 +155,17 @@ impl GlesOesRenderer {
         let fn_create = load_fn!("eglCreateImageKHR");
         let fn_destroy = load_fn!("eglDestroyImageKHR");
         let fn_target = load_fn!("glEGLImageTargetTexture2DOES");
+        // EGL_ANDROID_presentation_time: available on API 21+. Not fatal if absent.
+        let fn_presentation_time: usize = {
+            let sym = concat!("eglPresentationTimeANDROID", "\0");
+            match eglGetProcAddress(sym.as_ptr() as *const i8) {
+                Some(f) => f as usize,
+                None => {
+                    log::warn!("[gles_oes] eglPresentationTimeANDROID unavailable — VSync jitter not corrected");
+                    0
+                }
+            }
+        };
 
         // Capture the EGLDisplay while the context is current.
         let display = eglGetCurrentDisplay() as usize;
@@ -151,9 +175,10 @@ impl GlesOesRenderer {
 
         log::info!(
             "[gles_oes] init: eglGetNativeClientBufferANDROID={:#x} \
-             eglCreateImageKHR={:#x} display={:#x}",
+             eglCreateImageKHR={:#x} eglPresentationTimeANDROID={:#x} display={:#x}",
             fn_get_client,
             fn_create,
+            fn_presentation_time,
             display
         );
 
@@ -219,6 +244,7 @@ impl GlesOesRenderer {
             fn_egl_create_image: fn_create,
             fn_egl_destroy_image: fn_destroy,
             fn_gl_egl_image_target_texture: fn_target,
+            fn_egl_presentation_time: fn_presentation_time,
             egl_display: display,
         })
     }
@@ -237,6 +263,7 @@ impl GlesOesRenderer {
         scale_x: f32,
         scale_y: f32,
         tex_y_max: f32,
+        desired_present_ns: i64,     // CLOCK_MONOTONIC ns for this frame; 0 = unconstrained
     ) -> Result<(), String> {
         let get_client: FnEglGetNativeClientBufferANDROID =
             std::mem::transmute(self.fn_get_native_client_buffer);
@@ -322,7 +349,18 @@ impl GlesOesRenderer {
             log::warn!("[gles_oes] GL error after draw_arrays: {:#x}", gl_err);
         }
 
-        // Step 4: cleanup. eglSwapBuffers (called by wgpu right after the hook returns)
+        // Step 4: Set presentation timestamp so the compositor holds this
+        // frame until the VSync at or after desired_present_ns.
+        if self.fn_egl_presentation_time != 0 && desired_present_ns > 0 {
+            let fn_pt: FnEglPresentationTimeANDROID =
+                std::mem::transmute(self.fn_egl_presentation_time);
+            let surface = eglGetCurrentSurface(EGL_DRAW);
+            if !surface.is_null() {
+                fn_pt(display, surface, desired_present_ns);
+            }
+        }
+
+        // Step 5: cleanup. eglSwapBuffers (called by wgpu right after the hook returns)
         // handles GPU sync; no explicit gl.finish() needed here.
         gl.bind_texture(GL_TEXTURE_EXTERNAL_OES, None);
         egl_destroy(display, egl_image);

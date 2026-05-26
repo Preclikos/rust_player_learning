@@ -28,6 +28,8 @@ use winit::window::Window;
 use std::collections::HashMap;
 use std::error::Error;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(target_os = "android")]
+use libc;
 use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 use tokio::sync::{Notify, RwLock};
@@ -103,6 +105,17 @@ impl<V: VideoSink, A: AudioSink> Clone for Player<V, A> {
 // A/V sync loop — identical on all platforms, generic over sink traits
 // ---------------------------------------------------------------------------
 
+// Returns current CLOCK_MONOTONIC time in nanoseconds.
+// Used to compute absolute presentation timestamps for eglPresentationTimeANDROID.
+#[cfg(target_os = "android")]
+fn clock_monotonic_ns() -> i64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    ts.tv_sec as i64 * 1_000_000_000 + ts.tv_nsec as i64
+}
+#[cfg(not(target_os = "android"))]
+fn clock_monotonic_ns() -> i64 { 0 }
+
 async fn video_sync_loop<V: VideoSink>(
     start_time: Arc<Instant>,
     mut input_rx: mpsc::Receiver<DecodedVideoFrame>,
@@ -111,9 +124,19 @@ async fn video_sync_loop<V: VideoSink>(
     stop: Arc<Notify>,
     stop_flag: Arc<AtomicBool>,
 ) {
+    // Start rendering this many ms before the target PTS so the GPU has time
+    // to finish before the VSync deadline. The compositor (via
+    // eglPresentationTimeANDROID) then holds the frame until the exact VSync.
+    const RENDER_BUDGET_MS: u64 = 20;
+
     let mut last_pts_ms = 0u64;
     let mut frame_idx: u64 = 0;
     let mut last_render_elapsed: u64 = 0;
+    // BMDT (base media decode time) offset: DASH content timestamps are absolute
+    // (e.g. ~7979ms for segment 0) while our wall clock starts at 0. Calibrated
+    // on the first frame as (raw_pts - elapsed), making frame 0 render immediately
+    // and all subsequent frames at their correct relative positions.
+    let mut pts_base: Option<u64> = None;
     loop {
         if stop_flag.load(Ordering::Relaxed) {
             break;
@@ -125,42 +148,70 @@ async fn video_sync_loop<V: VideoSink>(
             },
             _ = stop.notified() => break,
         };
-        let mut pts_ms = (frame.pts_us / 1000) as u64;
+        let raw_pts_ms = (frame.pts_us / 1000) as u64;
         let elapsed = start_time.elapsed().as_millis() as u64;
+
+        let base = *pts_base.get_or_insert(raw_pts_ms.saturating_sub(elapsed));
+        let mut pts_ms = raw_pts_ms.saturating_sub(base);
 
         if pts_ms < last_pts_ms {
             log::warn!("[vsync] BACKWARD #{} pts={}ms last={}ms Δ=-{}ms elapsed={}ms",
                 frame_idx, pts_ms, last_pts_ms, last_pts_ms - pts_ms, elapsed);
         }
 
-        if pts_ms > elapsed {
-            let sleep_dur = Duration::from_millis(pts_ms - elapsed);
-            tokio::select! {
-                _ = tokio::time::sleep(sleep_dur) => {}
-                _ = stop.notified() => break,
-            }
-            if stop_flag.load(Ordering::Relaxed) {
-                break;
-            }
-        } else {
+        if elapsed > pts_ms {
             let late_ms = elapsed - pts_ms;
             if late_ms > 80 {
                 log::warn!("[vsync] LATE #{} pts={}ms elapsed={}ms late={}ms",
                     frame_idx, pts_ms, elapsed, late_ms);
-                // Drain buffered late frames — keep only the newest one so we
-                // catch up in a single step instead of playing all late frames
-                // back-to-back at display-vsync speed (visible as fast-forward).
+                // Drain only as many frames as needed to catch up.
+                // Draining ALL buffered frames would skip seconds of content
+                // (the channel can hold 64 frames = 2.7 s) causing a jarring
+                // jump. Draining exactly late_ms/frame_interval frames brings
+                // pts ≈ elapsed with no overshoot and no content skip.
+                let max_drain = (late_ms / 42).saturating_sub(1) as usize;
+                let mut drained = 0usize;
                 loop {
+                    if drained >= max_drain { break; }
                     match input_rx.try_recv() {
                         Ok(newer) => {
                             frame = newer;
-                            pts_ms = (frame.pts_us / 1000) as u64;
+                            pts_ms = ((frame.pts_us / 1000) as u64).saturating_sub(base);
+                            drained += 1;
                         }
                         Err(_) => break,
                     }
                 }
             }
+        } else {
+            // Sleep until RENDER_BUDGET_MS before the target PTS so the GPU
+            // draws the frame early. The compositor then displays it at exactly
+            // pts_ms thanks to eglPresentationTimeANDROID.
+            let target_wake_ms = pts_ms.saturating_sub(RENDER_BUDGET_MS);
+            if target_wake_ms > elapsed {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(target_wake_ms - elapsed)) => {}
+                    _ = stop.notified() => break,
+                }
+                if stop_flag.load(Ordering::Relaxed) {
+                    break;
+                }
+            }
         }
+
+        // Compute the absolute CLOCK_MONOTONIC time at which this frame should
+        // appear on screen. The renderer passes this to eglPresentationTimeANDROID
+        // so the compositor schedules the frame at the correct VSync even if the
+        // GPU finishes slightly earlier or later than expected.
+        // Use microseconds (not ms) to preserve the sub-millisecond fraction —
+        // 23.976fps frames are 41.708µs apart, and ms-truncation here would drift
+        // across VSync boundaries every ~24 frames, causing irregular pulldown.
+        let raw_pts_us = frame.pts_us;
+        let base_us = base as i64 * 1_000;
+        let pts_us_rel = (raw_pts_us - base_us).max(0);
+        let elapsed_us = start_time.elapsed().as_micros() as i64;
+        let pts_to_go_ns = (pts_us_rel - elapsed_us).max(0) * 1_000;
+        frame.desired_present_ns = clock_monotonic_ns() + pts_to_go_ns;
 
         let render_start = start_time.elapsed().as_millis() as u64;
         let interval_ms = if last_render_elapsed > 0 { render_start - last_render_elapsed } else { 0 };
@@ -263,12 +314,20 @@ async fn video_decoder_task(
     video_ready: Arc<Notify>,
     track_crypto: Option<TrackCrypto>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    // Fire video_ready only after the first frame is actually decoded, not on
-    // first submit. Hardware decoders (MediaCodec HEVC) have a pipeline warmup
-    // of ~8 frames during which try_recv returns nothing. If we signal ready on
-    // submit, start_time is set ~333ms before any frame is available, and all
-    // warmup-latency frames render instantly at max speed — visible as a jump.
     let mut first_frame_signaled = false;
+
+    // Reorder buffer to fix two sources of non-monotonic PTS:
+    //   1. HEVC B-frames: hardware decoders may output in decode order, not
+    //      display order, so composition timestamps are non-monotonic.
+    //   2. Segment boundaries: the last N frames of segment K may arrive from
+    //      the MediaCodec pipeline *after* the first frames of segment K+1,
+    //      causing PTS to jump backward every ~4 seconds.
+    // We always emit the lowest-PTS frame from the buffer. video_ready fires
+    // on the first send so start_time is calibrated to when frames are
+    // actually available (avoids a timing hole at startup).
+    const REORDER_DEPTH: usize = 4;
+    let mut reorder_buf: Vec<DecodedVideoFrame> = Vec::with_capacity(REORDER_DEPTH + 1);
+
     while let Some(segment) = receiver.recv().await {
         println!("Consuming video segment: {}", segment.id);
 
@@ -306,12 +365,20 @@ async fn video_decoder_task(
             loop {
                 match decoder.try_recv()? {
                     Some(frame) => {
-                        if !first_frame_signaled {
-                            video_ready.notify_one();
-                            first_frame_signaled = true;
-                        }
-                        if sender.send(frame).await.is_err() {
-                            return Ok(());
+                        reorder_buf.push(frame);
+                        if reorder_buf.len() > REORDER_DEPTH {
+                            let min_idx = reorder_buf.iter().enumerate()
+                                .min_by_key(|(_, f)| f.pts_us)
+                                .map(|(i, _)| i)
+                                .unwrap();
+                            let to_send = reorder_buf.swap_remove(min_idx);
+                            if !first_frame_signaled {
+                                video_ready.notify_one();
+                                first_frame_signaled = true;
+                            }
+                            if sender.send(to_send).await.is_err() {
+                                return Ok(());
+                            }
                         }
                     }
                     None => break,
@@ -322,6 +389,19 @@ async fn video_decoder_task(
             log::info!("[dec] seg done: pts {}..{}ms", first / 1000, last_pts_us / 1000);
         }
     }
+
+    // Flush remaining frames in PTS order.
+    reorder_buf.sort_by_key(|f| f.pts_us);
+    for frame in reorder_buf.drain(..) {
+        if !first_frame_signaled {
+            video_ready.notify_one();
+            first_frame_signaled = true;
+        }
+        if sender.send(frame).await.is_err() {
+            return Ok(());
+        }
+    }
+
     Ok(())
 }
 

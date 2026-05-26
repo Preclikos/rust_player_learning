@@ -43,6 +43,7 @@ winit = { version = "0.30.9", features = ["android-native-activity"] }
 ndk = { version = "0.9", features = ["media", "api-level-29"] }
 ndk-sys = "0.6"
 jni = "0.21"
+libc = "0.2"
 reqwest = { version = "0.12.12", default-features = false, features = ["rustls-tls"] }
 glow = "0.17"
 

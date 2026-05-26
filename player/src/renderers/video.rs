@@ -136,6 +136,14 @@ pub struct VideoRenderer {
     // std::sync::Mutex (not tokio) because the hook fires synchronously inside present().
     #[cfg(target_os = "android")]
     gles_oes_pending: Arc<std::sync::Mutex<Option<video_gles_egl::GlesOesPendingFrame>>>,
+    // Ring buffer of recently-rendered AHardwareBuffer refs. eglSwapBuffers
+    // returns before the GPU has finished sampling the OES texture; if we drop
+    // the AHB immediately, MediaCodec recycles it for a new frame while the
+    // GPU is still reading from it — the display shows torn / wrong-frame
+    // content that looks like time-travel jumps. Keeping the last N AHBs
+    // alive guarantees the GPU is done with each by the time it's dropped.
+    #[cfg(target_os = "android")]
+    ahb_keepalive: Arc<std::sync::Mutex<std::collections::VecDeque<Arc<crate::decoders::SendableAhb>>>>,
 }
 
 pub enum VideoRendererCommand {
@@ -404,6 +412,11 @@ impl VideoRenderer {
             None::<video_gles_egl::GlesOesPendingFrame>,
         ));
 
+        #[cfg(target_os = "android")]
+        let ahb_keepalive = Arc::new(std::sync::Mutex::new(
+            std::collections::VecDeque::<Arc<crate::decoders::SendableAhb>>::with_capacity(4),
+        ));
+
         // Install the present hook on the GLES surface so OES rendering happens
         // directly into FBO 0 (window surface) instead of into the swapchain renderbuffer.
         // The hook fires inside wgpu's present() after make_current(window_surface),
@@ -429,6 +442,7 @@ impl VideoRenderer {
                                     f.scale_x,
                                     f.scale_y,
                                     f.tex_y_max,
+                                    f.desired_present_ns,
                                 )
                             } {
                                 log::warn!("[gles_oes] hook render failed: {}", e);
@@ -460,6 +474,8 @@ impl VideoRenderer {
             gles_oes_renderer,
             #[cfg(target_os = "android")]
             gles_oes_pending,
+            #[cfg(target_os = "android")]
+            ahb_keepalive,
         };
 
         renderer.spawn_command_thread(command_receiver);
@@ -577,6 +593,7 @@ impl VideoRenderer {
     /// Dispatches to the platform-specific render path based on the PlatformFrame variant.
     pub async fn render_frame(&self, frame: crate::decoders::DecodedVideoFrame) {
         use crate::decoders::PlatformFrame;
+        let desired_present_ns = frame.desired_present_ns;
         match frame.native {
             #[cfg(any(target_os = "windows", target_os = "linux"))]
             PlatformFrame::FfmpegVideo(ffmpeg_frame) => {
@@ -584,7 +601,7 @@ impl VideoRenderer {
             }
             #[cfg(target_os = "android")]
             PlatformFrame::HardwareBuffer(ahb) => {
-                self.render_android(ahb).await;
+                self.render_android(ahb, desired_present_ns).await;
             }
             #[cfg(target_os = "ios")]
             PlatformFrame::CvPixelBuffer { .. } => {
@@ -728,7 +745,7 @@ impl VideoRenderer {
     /// directly to FBO 0, then eglSwapBuffers presents it.
     /// Falls back to a blue-screen clear when the OES renderer is unavailable.
     #[cfg(target_os = "android")]
-    async fn render_android_gles(&self, frame: crate::decoders::AndroidHardwareBufferFrame) {
+    async fn render_android_gles(&self, frame: crate::decoders::AndroidHardwareBufferFrame, desired_present_ns: i64) {
         // Update tex_y_max when the codec buffer is taller than the visible content
         // (e.g. PowerVR alignment padding: 1088-row buffer for 720p content).
         // Only fire when buffer > content (stored.height < frame.height): if stored.height
@@ -830,6 +847,7 @@ impl VideoRenderer {
                 scale_x,
                 scale_y,
                 tex_y_max,
+                desired_present_ns,
             });
         }
 
@@ -838,11 +856,26 @@ impl VideoRenderer {
         self.queue.submit([]);
         self.window.pre_present_notify();
         self.queue.present(surface_texture);
+
+        // Keep this AHB alive for one extra frame. The GPU may still be sampling
+        // from the OES texture after eglSwapBuffers returns; if we drop the AHB
+        // immediately, MediaCodec recycles it while the GPU reads it and the
+        // display shows torn content. By the time the *next* render arrives,
+        // wgpu has flushed the previous frame's GPU work, so dropping it then
+        // is safe. Holding only 1 (not more) avoids starving MediaCodec's
+        // 32-slot ImageReader pool at segment boundaries.
+        {
+            let mut keep = self.ahb_keepalive.lock().unwrap();
+            keep.push_back(Arc::clone(&frame.buffer));
+            while keep.len() > 1 {
+                keep.pop_front();
+            }
+        }
     }
 
     #[cfg(target_os = "android")]
-    pub async fn render_android(&self, frame: crate::decoders::AndroidHardwareBufferFrame) {
-        self.render_android_gles(frame).await;
+    pub async fn render_android(&self, frame: crate::decoders::AndroidHardwareBufferFrame, desired_present_ns: i64) {
+        self.render_android_gles(frame, desired_present_ns).await;
     }
 }
 

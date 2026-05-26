@@ -32,7 +32,7 @@ use crate::parsers::mp4::parse_hevc_nalu;
 
 use super::{
     AndroidHardwareBufferFrame, DecodedVideoFrame, DecoderError, HwVideoDecoder, PlatformFrame,
-    VideoCodec, VideoDecoderParams,
+    SendableAhb, VideoCodec, VideoDecoderParams,
 };
 
 pub struct MediaCodecDecoder {
@@ -71,17 +71,17 @@ impl HwVideoDecoder for MediaCodecDecoder {
             VideoCodec::H264 => "video/avc",
         };
 
-        // 16 physical NV12 surfaces ≈ 667 ms of buffer at 24 fps.
-        // With max_images = 4 (the old value), 4 frames in the channel
-        // exhausted the surface pool and stalled MediaCodec: the decoder
-        // spun in dequeue_input_buffer while the sync-producer drained the
-        // 4 frames, then a burst of past-due frames rendered at max speed.
-        // 16 > warmup depth (~8 frames / ~333 ms), so the sync-producer
-        // never starves during a segment-boundary I-frame warmup.
-        // Memory cost: 16 × ~3 MB (1080p NV12) ≈ 48 MB, acceptable on
-        // modern Android (4 GB+ RAM). Vulkan holds 2 surfaces in its
-        // pipeline (freed by on_submitted_work_done), leaving ~14 live.
-        let max_images = 16;
+        // 32 physical NV12 surfaces ≈ 1.33 s of buffer at 24 fps.
+        // Segment boundaries cause a ~1.5 s decoder stall (MediaCodec IDR
+        // warmup + segment parse). With 16 images the 667 ms buffer drained
+        // before the stall ended, triggering LATE + an aggressive drain that
+        // skipped 2.7 s of content — visible freeze-then-jump every 6 s.
+        // 32 images nearly covers the stall; combined with proportional
+        // frame drain in player.rs the recovery is smooth.
+        // 64 caused a device-level SIGABRT on the MT8696 (PowerVR driver
+        // has a hard limit on AImageReader max_images for YUV_420_888).
+        // Memory cost: 32 × ~1.4 MB (720p NV12) ≈ 45 MB.
+        let max_images = 32;
 
         // YUV_420_888 gives us an AHardwareBuffer with a defined NV12-ish
         // layout (Y plane + interleaved CbCr plane) that Vulkan can
@@ -280,7 +280,7 @@ impl HwVideoDecoder for MediaCodecDecoder {
         let hb_unowned = image
             .hardware_buffer()
             .map_err(|e| -> DecoderError { format!("Image::hardware_buffer: {:?}", e).into() })?;
-        let buffer = hb_unowned.acquire();
+        let buffer = Arc::new(SendableAhb(hb_unowned.acquire()));
         // image is dropped here; the AHB stays alive via `buffer`.
 
         Ok(Some(DecodedVideoFrame {
@@ -292,6 +292,7 @@ impl HwVideoDecoder for MediaCodecDecoder {
                 width: self.width,
                 height: self.height,
             }),
+            desired_present_ns: 0,
         }))
     }
 

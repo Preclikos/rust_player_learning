@@ -42,6 +42,9 @@ pub struct DecodedVideoFrame {
     pub width: u32,
     pub height: u32,
     pub native: PlatformFrame,
+    /// CLOCK_MONOTONIC nanoseconds when this frame should be displayed.
+    /// Set by the A/V sync loop; 0 = no constraint (display ASAP).
+    pub desired_present_ns: i64,
 }
 
 /// Platform-native handle wrapping a decoded frame's GPU surface.
@@ -60,8 +63,29 @@ pub enum PlatformFrame {
 }
 
 #[cfg(target_os = "android")]
+pub struct SendableAhb(pub ndk::hardware_buffer::HardwareBufferRef);
+
+// HardwareBufferRef wraps NonNull<AHardwareBuffer>. AHardwareBuffer itself is
+// reference-counted (AHardwareBuffer_acquire/release) and thread-safe per
+// Android docs, so it's safe to share refs across threads.
+#[cfg(target_os = "android")]
+unsafe impl Send for SendableAhb {}
+#[cfg(target_os = "android")]
+unsafe impl Sync for SendableAhb {}
+
+#[cfg(target_os = "android")]
+impl SendableAhb {
+    pub fn as_ptr(&self) -> *mut ndk_sys::AHardwareBuffer {
+        self.0.as_ptr()
+    }
+}
+
+#[cfg(target_os = "android")]
 pub struct AndroidHardwareBufferFrame {
-    pub buffer: ndk::hardware_buffer::HardwareBufferRef,
+    /// Arc so the renderer can clone a reference into its keepalive queue;
+    /// the underlying AHB is only released back to MediaCodec's ImageReader
+    /// pool when both this frame and all keepalive clones are dropped.
+    pub buffer: std::sync::Arc<SendableAhb>,
     pub width: u32,
     pub height: u32,
 }

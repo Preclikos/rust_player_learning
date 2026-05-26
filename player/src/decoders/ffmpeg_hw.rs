@@ -132,6 +132,7 @@ impl HwVideoDecoder for FfmpegHwDecoder {
                     width,
                     height,
                     native: PlatformFrame::FfmpegVideo(Arc::new(frame)),
+                    desired_present_ns: 0,
                 }))
             }
             Err(ffmpeg_next::Error::Other { errno }) if errno == ffmpeg_sys_next::EAGAIN => {

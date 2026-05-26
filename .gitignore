@@ -1,1 +1,10 @@
 /target
+
+# Local test recordings / extracted frames (kept out of repo)
+captures/
+frames*/
+play*.mp4
+playback*.mp4
+
+# Stale build output location (real output goes to app-android/android/app/src/main/jniLibs)
+app-android/src/main/jniLibs/

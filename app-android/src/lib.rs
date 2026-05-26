@@ -14,10 +14,21 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// Sets FLAG_KEEP_SCREEN_ON on the NativeActivity window so the screen stays
+/// on during video playback without needing a WakeLock.
+fn keep_screen_on(app: &android_activity::AndroidApp) {
+    use android_activity::WindowManagerFlags;
+    app.set_window_flags(WindowManagerFlags::KEEP_SCREEN_ON, WindowManagerFlags::empty());
+    log::info!("keep-screen-on: FLAG_KEEP_SCREEN_ON set");
+}
+
 /// Hints to SurfaceFlinger that this window produces 24fps content.
-/// The OS then selects a display refresh rate that is an integer multiple of
-/// 24Hz (typically 120Hz on Galaxy S = 5 vsyncs/frame, perfect cadence).
-/// Uses dlsym so this is a no-op on API < 30 without a hard link failure.
+/// SurfaceFlinger then selects a display refresh rate that is an integer
+/// multiple of 24Hz (e.g. 48Hz, 120Hz) for perfect cadence.
+///
+/// On modern Android the linker uses per-library namespaces, so
+/// dlsym(RTLD_DEFAULT) doesn't find symbols in libandroid.so even on
+/// API 34. We must dlopen the library explicitly.
 fn set_frame_rate_24fps(window: &winit::window::Window) {
     use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
     let Ok(handle) = window.window_handle() else { return };
@@ -32,18 +43,29 @@ fn set_frame_rate_24fps(window: &winit::window::Window) {
     const ALWAYS: i8 = 0;
 
     unsafe {
-        let sym = libc::dlsym(
-            libc::RTLD_DEFAULT,
-            b"ANativeWindow_setFrameRate\0".as_ptr() as *const libc::c_char,
-        );
+        // libandroid.so is loaded by the system but in a private namespace;
+        // RTLD_DEFAULT can't see it. dlopen with RTLD_NOLOAD grabs the already-
+        // loaded handle without a second load; fall back to a fresh dlopen.
+        let lib = {
+            let name = b"libandroid.so\0".as_ptr() as *const libc::c_char;
+            let h = libc::dlopen(name, libc::RTLD_NOW | libc::RTLD_NOLOAD);
+            if h.is_null() { libc::dlopen(name, libc::RTLD_NOW) } else { h }
+        };
+        if lib.is_null() {
+            log::warn!("set_frame_rate_24fps: dlopen(libandroid.so) failed");
+            return;
+        }
+        let sym = libc::dlsym(lib, b"ANativeWindow_setFrameRate\0".as_ptr() as *const libc::c_char);
         if sym.is_null() {
-            log::info!("ANativeWindow_setFrameRate unavailable (API < 30), skipping");
+            log::info!("ANativeWindow_setFrameRate unavailable (API < 30)");
+            libc::dlclose(lib);
             return;
         }
         type Fn = unsafe extern "C" fn(*mut libc::c_void, f32, i8, i8) -> libc::c_int;
         let f: Fn = std::mem::transmute(sym);
         let ret = f(native_ptr.cast(), 24.0, FIXED_SOURCE, ALWAYS);
         log::info!("ANativeWindow_setFrameRate(24.0, FIXED_SOURCE, ALWAYS) = {}", ret);
+        libc::dlclose(lib);
     }
 }
 
@@ -162,6 +184,15 @@ impl ApplicationHandler for App {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::KeyboardInput { event, .. } => {
+                use winit::keyboard::{Key, NamedKey};
+                if let Key::Named(NamedKey::GoBack) = &event.logical_key {
+                    if event.state == winit::event::ElementState::Released {
+                        log::info!("back button: exiting");
+                        event_loop.exit();
+                    }
+                }
+            }
             WindowEvent::Resized(new_size) => {
                 log::info!("window resized: {}x{}", new_size.width, new_size.height);
                 if let Some(player) = &self.player {
@@ -184,6 +215,8 @@ fn android_main(app: AndroidApp) {
         android_logger::Config::default().with_max_level(log::LevelFilter::Debug),
     );
     log::info!("android_main: starting");
+
+    keep_screen_on(&app);
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

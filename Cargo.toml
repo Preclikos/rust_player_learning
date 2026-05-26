@@ -6,3 +6,25 @@ members = [
     "player"
 ]
 resolver = "2"
+
+# Optimize crypto crates even in dev builds. Without this, AES-CTR decryption
+# of a 2 MB DASH segment takes ~4s in debug mode (~0.5 MB/s) — even with
+# hardware AES intrinsics enabled — because the surrounding loop/cipher
+# state code isn't inlined or vectorized. With opt-level=3 these crates hit
+# >100 MB/s, so a segment decrypts in ~20ms instead of 4s.
+[profile.dev.package.aes]
+opt-level = 3
+[profile.dev.package.ctr]
+opt-level = 3
+[profile.dev.package.cipher]
+opt-level = 3
+[profile.dev.package.crypto-common]
+opt-level = 3
+[profile.dev.package.cpufeatures]
+opt-level = 3
+# Also optimize the player crate: the per-sample decryption loop calls
+# cipher.apply_keystream() many times per segment, and without inlining the
+# loop overhead dominates even optimized AES. With opt-level=3 here the
+# whole pipeline gets vectorized.
+[profile.dev.package.player]
+opt-level = 3

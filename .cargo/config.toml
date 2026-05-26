@@ -1,0 +1,8 @@
+# Enable hardware AES on Android ARMv8. Without these target features, the
+# `aes` crate falls back to a portable software implementation that runs at
+# ~0.5 MB/s — slow enough to make CENC decryption of a single 2 MB segment
+# take ~4 seconds, causing the playback pipeline to stall at every segment
+# boundary. With +aes+neon, the cipher uses ARMv8 cryptographic extensions
+# and decrypts at ~1 GB/s.
+[target.aarch64-linux-android]
+rustflags = ["-C", "target-feature=+aes,+neon", "--cfg", "aes_armv8"]

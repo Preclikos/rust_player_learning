@@ -64,7 +64,16 @@ use tokio::task::{self, JoinHandle};
 
 use manifest::Manifest;
 
-const MAX_SEGMENTS: usize = 2;
+/// Default target buffer in seconds — how far ahead the download path is
+/// allowed to run from the renderer. Higher = more resilience against
+/// network jitter, lower = less RAM (each queued segment holds ~1-4 MB).
+/// Configurable per Player via `set_buffer_target_secs`.
+const DEFAULT_BUFFER_TARGET_SECS: u32 = 8;
+
+/// Assumed average segment duration when converting buffer-target-seconds
+/// into segments-in-flight capacity. DASH segments are typically 2-4 s;
+/// 2 is a conservative floor that biases the cap upward.
+const ASSUMED_SEGMENT_SECS: u32 = 2;
 
 /// Shared counters surfaced via `PlayerEvent::Stats`. Created once in
 /// `Player::new` and cloned into every play() pipeline so the stats keep
@@ -80,12 +89,19 @@ struct StatsState {
     /// EWMA of segment download throughput in bits-per-second, surfaced via
     /// `Position.bandwidth_bps` and consumed by the ABR engine.
     bandwidth_bps_ewma: AtomicU64,
-    /// Highest PTS (in ms) we've pulled from the video decoder — whether
-    /// it's already been rendered or is still parked in the av_sync mpsc
-    /// channel. `Position.buffered_ahead_secs` is computed as
-    /// `max(0, this - current_pts_ms) / 1000`, so the default 0 reads as
-    /// "no buffer" until the first frame lands.
+    /// Highest PTS (in ms) we've pulled from the **video** decoder —
+    /// whether it's already been rendered or is still parked in the
+    /// av_sync mpsc channel. Read together with `audio_last_decoded_pts_ms`
+    /// to compute `Position.buffered_ahead_secs = min(video, audio)`,
+    /// which is the actually-safe-to-play horizon (whichever runs out
+    /// first stalls playback).
     last_decoded_pts_ms: std::sync::atomic::AtomicI64,
+    /// Highest PTS (in ms) we've pulled from the **audio** decoder.
+    /// Same semantics as `last_decoded_pts_ms`. Audio segments often run
+    /// slightly ahead of video on the same wallclock (smaller frames,
+    /// faster decode), so video tends to be the bottleneck — but a small
+    /// initial buffer or a slow audio decoder can flip that.
+    audio_last_decoded_pts_ms: std::sync::atomic::AtomicI64,
     /// Name of the currently-active video decoder backend
     /// (`"D3D11VA (FFmpeg)"`, `"MediaCodec"`, …). Plumbed in at play().
     decoder_name: StdMutex<String>,
@@ -150,6 +166,12 @@ pub struct Player<V: VideoSink = VideoRenderer, A: AudioSink = AudioRenderer> {
     /// `None` between play() calls — the setter is a no-op then.
     video_switch_tx: Arc<StdMutex<Option<tokio::sync::watch::Sender<Option<VideoRepresenation>>>>>,
 
+    /// How many seconds of media the player tries to keep buffered ahead
+    /// of the renderer. Affects the segments-in-flight capacity of the
+    /// download → decode channel. Takes effect at the next `play()` call
+    /// — the running pipeline holds whatever it was given at spawn time.
+    buffer_target_secs: Arc<AtomicU32>,
+
     video_renderer: Arc<V>,
     audio_renderer: Arc<A>,
 }
@@ -179,6 +201,7 @@ impl<V: VideoSink, A: AudioSink> Clone for Player<V, A> {
             stats: Arc::clone(&self.stats),
             abr_strategy: Arc::clone(&self.abr_strategy),
             video_switch_tx: Arc::clone(&self.video_switch_tx),
+            buffer_target_secs: Arc::clone(&self.buffer_target_secs),
             video_renderer: Arc::clone(&self.video_renderer),
             audio_renderer: Arc::clone(&self.audio_renderer),
         }
@@ -370,15 +393,16 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
 
         stats.video_frames_decoded.fetch_add(1, Ordering::Relaxed);
 
-        // Rate-limited Position emission (≤ 4 Hz). Bandwidth comes from
-        // the download EWMA; the buffer head from the decoder task's
-        // high-water-mark, clamped at zero so an out-of-order frame can't
-        // briefly drive the gauge negative.
+        // Rate-limited Position emission (≤ 4 Hz). The buffer head is the
+        // min of video + audio decode high-water-marks — whichever runs
+        // out first stalls playback, so that's what "safe to play" really
+        // means. Clamped at zero so an out-of-order frame can't briefly
+        // drive the gauge negative.
         if last_position_emit.elapsed() >= Duration::from_millis(250) {
-            let decoded = stats
-                .last_decoded_pts_ms
-                .load(Ordering::Relaxed);
-            let ahead_ms = (decoded - pts_ms as i64).max(0);
+            let video_decoded = stats.last_decoded_pts_ms.load(Ordering::Relaxed);
+            let audio_decoded = stats.audio_last_decoded_pts_ms.load(Ordering::Relaxed);
+            let bottleneck = video_decoded.min(audio_decoded);
+            let ahead_ms = (bottleneck - pts_ms as i64).max(0);
             let _ = events.send(PlayerEvent::Position {
                 position: Duration::from_millis(pts_ms),
                 duration: media_duration,
@@ -625,6 +649,7 @@ async fn audio_decoder_task(
     init_data: Vec<u8>,
     audio_ready: Arc<Notify>,
     track_crypto: Option<TrackCrypto>,
+    stats: Arc<StatsState>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     while let Some(segment) = receiver.recv().await {
         log::debug!("[dec] consuming audio segment: {}", segment.id);
@@ -660,6 +685,15 @@ async fn audio_decoder_task(
             loop {
                 match decoder.try_recv()? {
                     Some(frame) => {
+                        let pts_ms = frame.pts_ms;
+                        let prev = stats
+                            .audio_last_decoded_pts_ms
+                            .load(Ordering::Relaxed);
+                        if pts_ms > prev {
+                            stats
+                                .audio_last_decoded_pts_ms
+                                .store(pts_ms, Ordering::Relaxed);
+                        }
                         if sender.send(frame).await.is_err() {
                             return Ok(());
                         }
@@ -687,8 +721,9 @@ async fn video_play(
     mut decoder: Box<dyn HwVideoDecoder>,
     http: Arc<HttpClient>,
     stats: Arc<StatsState>,
+    segments_in_flight: usize,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let (download_tx, download_rx) = mpsc::channel::<DataSegment>(MAX_SEGMENTS);
+    let (download_tx, download_rx) = mpsc::channel::<DataSegment>(segments_in_flight);
 
     let init_dl = video_representation
         .segment_init
@@ -774,8 +809,10 @@ async fn audio_play(
     decryptor: Option<Arc<dyn Decryptor>>,
     mut decoder: Box<dyn AudioDecoder>,
     http: Arc<HttpClient>,
+    stats: Arc<StatsState>,
+    segments_in_flight: usize,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let (download_tx, download_rx) = mpsc::channel::<DataSegment>(MAX_SEGMENTS);
+    let (download_tx, download_rx) = mpsc::channel::<DataSegment>(segments_in_flight);
 
     let init_dl = audio_representation
         .segment_init
@@ -867,10 +904,17 @@ async fn audio_play(
         stop,
         stop_flag,
         http,
-        None,
+        Some(Arc::clone(&stats)),
     ));
-    let decoder_task =
-        task::spawn(audio_decoder_task(download_rx, sender, decoder, init_data, audio_ready, track_crypto));
+    let decoder_task = task::spawn(audio_decoder_task(
+        download_rx,
+        sender,
+        decoder,
+        init_data,
+        audio_ready,
+        track_crypto,
+        stats,
+    ));
 
     let (dl_res, dec_res) = join!(download_task, decoder_task);
     log_task_result("audio download_task", dl_res);
@@ -915,6 +959,7 @@ async fn video_supervisor(
     mut switch_rx: tokio::sync::watch::Receiver<Option<VideoRepresenation>>,
     position_ms: Arc<AtomicU64>,
     events: Arc<broadcast::Sender<PlayerEvent>>,
+    segments_in_flight: usize,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut current_repr = initial_repr;
     let mut current_start = initial_start_index;
@@ -936,6 +981,7 @@ async fn video_supervisor(
             decoder_factory(),
             Arc::clone(&http),
             Arc::clone(&stats),
+            segments_in_flight,
         ));
 
         // Race the global stop against a switch signal. `changed()` returns
@@ -1061,6 +1107,7 @@ impl Player<VideoRenderer, AudioRenderer> {
             stats: Arc::new(StatsState::default()),
             abr_strategy: Arc::new(ArcSwap::from_pointee(AbrStrategy::default())),
             video_switch_tx: Arc::new(StdMutex::new(None)),
+            buffer_target_secs: Arc::new(AtomicU32::new(DEFAULT_BUFFER_TARGET_SECS)),
 
             video_renderer,
             audio_renderer,
@@ -1375,6 +1422,32 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         **self.abr_strategy.load()
     }
 
+    /// How many seconds of media the player tries to keep buffered ahead
+    /// of the renderer. Default is `DEFAULT_BUFFER_TARGET_SECS` (8s).
+    /// Bumping this trades RAM for resilience against network jitter
+    /// — each queued segment holds roughly bandwidth × segment-duration
+    /// bytes. Takes effect at the next `play()`; the running pipeline
+    /// keeps its current capacity until it restarts.
+    ///
+    /// Clamped to at least 2s so the channel always has room for one
+    /// segment ahead of the decoder.
+    pub fn set_buffer_target_secs(&self, secs: u32) {
+        self.buffer_target_secs.store(secs.max(2), Ordering::Relaxed);
+    }
+
+    pub fn buffer_target_secs(&self) -> u32 {
+        self.buffer_target_secs.load(Ordering::Relaxed)
+    }
+
+    /// Convert the configured `buffer_target_secs` into a channel capacity
+    /// (segments-in-flight) using the conservative segment-duration estimate.
+    /// Floored at 2 so even with a tiny buffer target the decoder has room
+    /// for the next segment behind the one currently being processed.
+    fn segments_in_flight(&self) -> usize {
+        let secs = self.buffer_target_secs.load(Ordering::Relaxed).max(2);
+        ((secs / ASSUMED_SEGMENT_SECS) as usize).max(2)
+    }
+
     /// One ABR reconsideration. Called from the per-second tick spawned in
     /// `play()`. No-op when the strategy is `Manual` or when the current
     /// adaptation has fewer than two representations to choose between.
@@ -1524,6 +1597,14 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
 
         let stats = Arc::clone(&self.stats);
         let abr_player = self.clone();
+        // Capture the configured buffer target at play() time so the
+        // spawned pipeline stays consistent across its lifetime even if
+        // the consumer flips set_buffer_target_secs mid-play.
+        let seg_in_flight = self.segments_in_flight();
+        log::info!(
+            "play(): buffer target {}s -> {} segments in flight",
+            self.buffer_target_secs.load(Ordering::Relaxed), seg_in_flight
+        );
 
         let play = tokio::spawn(async move {
             // ABR tick: runs alongside the playback pipeline. Each second,
@@ -1568,6 +1649,9 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             stats
                 .last_decoded_pts_ms
                 .store(snapped_seek_offset.as_millis() as i64, Ordering::Relaxed);
+            stats
+                .audio_last_decoded_pts_ms
+                .store(snapped_seek_offset.as_millis() as i64, Ordering::Relaxed);
 
             let (frame_sender, frame_receiver) = mpsc::channel::<DecodedVideoFrame>(64);
             let (sample_sender, sample_receiver) = mpsc::channel::<DecodedAudioFrame>(256);
@@ -1587,6 +1671,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                 switch_rx,
                 position_ms.clone(),
                 events_for_supervisor,
+                seg_in_flight,
             ));
 
             let sample_rate = audio_sink.sample_rate();
@@ -1601,6 +1686,8 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                 decryptor_snapshot,
                 audio_decoder,
                 http_audio,
+                Arc::clone(&stats),
+                seg_in_flight,
             ));
 
             av_sync_handler(

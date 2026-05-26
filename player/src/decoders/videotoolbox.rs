@@ -20,6 +20,10 @@ impl VideoToolboxDecoder {
 }
 
 impl HwVideoDecoder for VideoToolboxDecoder {
+    fn name(&self) -> &'static str {
+        "VideoToolbox"
+    }
+
     fn configure(&mut self, _params: VideoDecoderParams) -> Result<(), DecoderError> {
         Err("VideoToolboxDecoder::configure not yet implemented".into())
     }

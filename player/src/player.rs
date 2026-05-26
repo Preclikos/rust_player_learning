@@ -1,3 +1,4 @@
+mod abr;
 mod crypto;
 mod decoders;
 mod events;
@@ -12,6 +13,7 @@ mod video;
 // Public re-exports so downstream consumers (BlackZone Console etc.) can
 // implement RequestInterceptor / LicenseResolver against the player's
 // canonical types — see PLAYER_INTEGRATION.md.
+pub use abr::AbrStrategy;
 pub use events::{
     BufferingReason, Fps, PlayerErrorKind, PlayerEvent, TrackInfo, TrackKind,
 };
@@ -37,9 +39,10 @@ use renderers::{AudioSink, VideoSink};
 use winit::dpi::PhysicalSize;
 use winit::window::Window;
 
+use arc_swap::ArcSwap;
 use std::collections::HashMap;
 use std::error::Error;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 #[cfg(target_os = "android")]
 use libc;
 use std::sync::Mutex as StdMutex;
@@ -62,6 +65,25 @@ use tokio::task::{self, JoinHandle};
 use manifest::Manifest;
 
 const MAX_SEGMENTS: usize = 2;
+
+/// Shared counters surfaced via `PlayerEvent::Stats`. Created once in
+/// `Player::new` and cloned into every play() pipeline so the stats keep
+/// accumulating across seek / track-switch boundaries.
+#[derive(Default)]
+struct StatsState {
+    video_frames_decoded: AtomicU64,
+    video_frames_dropped: AtomicU64,
+    audio_underruns: AtomicU64,
+    /// Wall-clock ms the download path was blocked waiting on network in
+    /// the trailing second.
+    net_stall_ms: AtomicU64,
+    /// EWMA of segment download throughput in bits-per-second, surfaced via
+    /// `Position.bandwidth_bps` and consumed by the ABR engine.
+    bandwidth_bps_ewma: AtomicU64,
+    /// Name of the currently-active video decoder backend
+    /// (`"D3D11VA (FFmpeg)"`, `"MediaCodec"`, …). Plumbed in at play().
+    decoder_name: StdMutex<String>,
+}
 
 pub struct Player<V: VideoSink = VideoRenderer, A: AudioSink = AudioRenderer> {
     base_url: Option<String>,
@@ -105,6 +127,15 @@ pub struct Player<V: VideoSink = VideoRenderer, A: AudioSink = AudioRenderer> {
     /// `set_license_resolver` call.
     decryptor: Arc<StdMutex<Option<Arc<ClearKeyDecryptor>>>>,
 
+    /// Counters + decoder-name surface for `PlayerEvent::Stats` and the
+    /// ABR engine. Single instance shared by every play() pipeline.
+    stats: Arc<StatsState>,
+
+    /// ABR policy. `Manual` by default. Mutated by `set_abr_strategy`,
+    /// and reset to `Manual` whenever the consumer explicitly calls
+    /// `change_video_track` so a user override always sticks.
+    abr_strategy: Arc<ArcSwap<AbrStrategy>>,
+
     video_renderer: Arc<V>,
     audio_renderer: Arc<A>,
 }
@@ -131,6 +162,8 @@ impl<V: VideoSink, A: AudioSink> Clone for Player<V, A> {
             seek_target: Arc::clone(&self.seek_target),
             position_ms: Arc::clone(&self.position_ms),
             decryptor: Arc::clone(&self.decryptor),
+            stats: Arc::clone(&self.stats),
+            abr_strategy: Arc::clone(&self.abr_strategy),
             video_renderer: Arc::clone(&self.video_renderer),
             audio_renderer: Arc::clone(&self.audio_renderer),
         }
@@ -152,10 +185,11 @@ fn clock_monotonic_ns() -> i64 {
 #[cfg(not(target_os = "android"))]
 fn clock_monotonic_ns() -> i64 { 0 }
 
-async fn video_sync_loop<V: VideoSink>(
+async fn video_sync_loop<V: VideoSink, A: AudioSink>(
     start_time: Arc<Instant>,
     mut input_rx: mpsc::Receiver<DecodedVideoFrame>,
     renderer: Arc<V>,
+    audio_sink: Arc<A>,
     position_ms: Arc<AtomicU64>,
     stop: Arc<Notify>,
     stop_flag: Arc<AtomicBool>,
@@ -163,6 +197,7 @@ async fn video_sync_loop<V: VideoSink>(
     media_duration: Duration,
     paused: Arc<AtomicBool>,
     pause_notify: Arc<Notify>,
+    stats: Arc<StatsState>,
 ) {
     // While paused, real time keeps advancing but media time must NOT.
     // We accumulate the wall-clock duration spent paused and subtract
@@ -180,6 +215,8 @@ async fn video_sync_loop<V: VideoSink>(
     let mut last_render_elapsed: u64 = 0;
     // Position event rate-limit: ≤ 4 Hz per PLAYER_INTEGRATION.md §4.2.
     let mut last_position_emit = Instant::now() - Duration::from_secs(1);
+    // Stats event rate-limit: ≤ 1 Hz per PLAYER_INTEGRATION.md §4.1.
+    let mut last_stats_emit = Instant::now() - Duration::from_secs(1);
     let mut emitted_playing = false;
     // BMDT (base media decode time) offset: DASH content timestamps are absolute
     // (e.g. ~7979ms for segment 0) while our wall clock starts at 0. Calibrated
@@ -247,6 +284,11 @@ async fn video_sync_loop<V: VideoSink>(
                         Err(_) => break,
                     }
                 }
+                if drained > 0 {
+                    stats
+                        .video_frames_dropped
+                        .fetch_add(drained as u64, Ordering::Relaxed);
+                }
             }
         } else {
             // Sleep until RENDER_BUDGET_MS before the target PTS so the GPU
@@ -301,6 +343,8 @@ async fn video_sync_loop<V: VideoSink>(
             emitted_playing = true;
         }
 
+        let frame_w = frame.width;
+        let frame_h = frame.height;
         renderer.render_frame(frame).await;
 
         let render_done = start_time
@@ -309,17 +353,35 @@ async fn video_sync_loop<V: VideoSink>(
             .as_millis() as u64;
         let render_ms = render_done - render_start;
 
-        // Rate-limited Position emission (≤ 4 Hz). Bandwidth + buffered
-        // ahead are 0 in this slice — populated in P2 when we instrument
-        // the download/decoder tasks.
+        stats.video_frames_decoded.fetch_add(1, Ordering::Relaxed);
+
+        // Rate-limited Position emission (≤ 4 Hz). Bandwidth comes from the
+        // EWMA the download task feeds. `buffered_ahead_secs` is still
+        // approximate — populated when we instrument the decoder queue.
         if last_position_emit.elapsed() >= Duration::from_millis(250) {
             let _ = events.send(PlayerEvent::Position {
                 position: Duration::from_millis(pts_ms),
                 duration: media_duration,
                 buffered_ahead_secs: 0.0,
-                bandwidth_bps: 0,
+                bandwidth_bps: stats.bandwidth_bps_ewma.load(Ordering::Relaxed),
             });
             last_position_emit = Instant::now();
+        }
+
+        // Rate-limited Stats emission (≤ 1 Hz). net_stall_ms is swap-reset
+        // so consumers see "ms blocked in the last second", not cumulative.
+        if last_stats_emit.elapsed() >= Duration::from_secs(1) {
+            let decoder_name = stats.decoder_name.lock().unwrap().clone();
+            let _ = events.send(PlayerEvent::Stats {
+                video_frames_decoded: stats.video_frames_decoded.load(Ordering::Relaxed),
+                video_frames_dropped: stats.video_frames_dropped.load(Ordering::Relaxed),
+                audio_underruns: stats.audio_underruns.load(Ordering::Relaxed),
+                net_stall_ms: stats.net_stall_ms.swap(0, Ordering::Relaxed),
+                decoder_name,
+                current_resolution: Some((frame_w, frame_h)),
+                audio_peak_db: audio_sink.last_peak_db(),
+            });
+            last_stats_emit = Instant::now();
         }
 
         log::trace!("[vsync] #{} pts={}ms wall={}ms render={}ms interval={}ms Δpts={}ms",
@@ -368,6 +430,7 @@ async fn av_sync_handler<V: VideoSink, A: AudioSink>(
     media_duration: Duration,
     paused: Arc<AtomicBool>,
     pause_notify: Arc<Notify>,
+    stats: Arc<StatsState>,
 ) {
     // Emit Buffering{Initial} immediately so the consumer can show "buffering"
     // while the first segments download.
@@ -393,6 +456,7 @@ async fn av_sync_handler<V: VideoSink, A: AudioSink>(
             start_time.clone(),
             video_rx,
             video_sink,
+            audio_sink.clone(),
             position_ms,
             stop.clone(),
             stop_flag.clone(),
@@ -400,6 +464,7 @@ async fn av_sync_handler<V: VideoSink, A: AudioSink>(
             media_duration,
             paused,
             pause_notify,
+            stats,
         )),
         tokio::spawn(audio_sync_loop(
             audio_rx,
@@ -589,6 +654,7 @@ async fn video_play(
     decryptor: Option<Arc<dyn Decryptor>>,
     mut decoder: Box<dyn HwVideoDecoder>,
     http: Arc<HttpClient>,
+    stats: Arc<StatsState>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let (download_tx, download_rx) = mpsc::channel::<DataSegment>(MAX_SEGMENTS);
 
@@ -640,8 +706,15 @@ async fn video_play(
     })?;
 
     let segments = video_representation.segments.clone();
-    let download_task =
-        task::spawn(download_task(segments, start_index, download_tx, stop, stop_flag, http));
+    let download_task = task::spawn(download_task(
+        segments,
+        start_index,
+        download_tx,
+        stop,
+        stop_flag,
+        http,
+        Some(stats),
+    ));
     let decoder_task =
         task::spawn(video_decoder_task(download_rx, sender, decoder, init_data, video_ready, track_crypto));
 
@@ -748,8 +821,15 @@ async fn audio_play(
     })?;
 
     let segments = audio_representation.segments.clone();
-    let download_task =
-        task::spawn(download_task(segments, start_index, download_tx, stop, stop_flag, http));
+    let download_task = task::spawn(download_task(
+        segments,
+        start_index,
+        download_tx,
+        stop,
+        stop_flag,
+        http,
+        None,
+    ));
     let decoder_task =
         task::spawn(audio_decoder_task(download_rx, sender, decoder, init_data, audio_ready, track_crypto));
 
@@ -806,6 +886,9 @@ impl Player<VideoRenderer, AudioRenderer> {
             position_ms: Arc::new(AtomicU64::new(0)),
 
             decryptor: Arc::new(StdMutex::new(None)),
+
+            stats: Arc::new(StatsState::default()),
+            abr_strategy: Arc::new(ArcSwap::from_pointee(AbrStrategy::default())),
 
             video_renderer,
             audio_renderer,
@@ -1029,11 +1112,116 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         self.audio_representation.lock().unwrap().clone()
     }
 
+    /// User-facing track switch. Treated as an explicit override: flips
+    /// the ABR strategy back to `Manual` so the user's pick sticks until
+    /// they re-arm ABR with `set_abr_strategy(BandwidthEwma { .. })`.
     pub fn change_video_track(&self, representation: &VideoRepresenation) {
+        // Explicit user override — pin to Manual.
+        self.abr_strategy
+            .store(Arc::new(AbrStrategy::Manual));
+        self.apply_video_representation(representation, true);
+    }
+
+    /// Internal: same effect as `change_video_track` but does NOT touch the
+    /// ABR strategy. Used by the ABR tick task to perform a rate-driven
+    /// switch without flipping itself off.
+    fn apply_video_representation(
+        &self,
+        representation: &VideoRepresenation,
+        emit_track_changed: bool,
+    ) {
+        let already = self
+            .video_representation
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|r| r.id == representation.id)
+            .unwrap_or(false);
+        if already {
+            return;
+        }
         *self.video_representation.lock().unwrap() = Some(representation.clone());
         let size = PhysicalSize::new(representation.width, representation.height);
         self.change_frame_size(size);
+        if emit_track_changed {
+            let _ = self.events.send(PlayerEvent::TrackChanged {
+                kind: TrackKind::Video,
+                info: video_track_info(representation),
+            });
+        }
+        // Restart the pipeline from the current playback position. In
+        // DASH SAP-1 streams (the configuration this player consumes —
+        // SegmentBase + sidx with `starts_with_sap = 1`), each subsegment
+        // begins with a keyframe, so the next downloaded segment IS the
+        // next keyframe and the switch is keyframe-aligned by construction.
         self.seek(self.position());
+    }
+
+    /// Install an ABR strategy. `Manual` (the default) leaves track
+    /// selection entirely to the consumer. `BandwidthEwma` runs a 1Hz
+    /// reconsideration against the measured throughput EWMA.
+    ///
+    /// `change_video_track` resets this back to `Manual` so user picks
+    /// always win — call `set_abr_strategy` again to re-arm ABR.
+    pub fn set_abr_strategy(&self, strategy: AbrStrategy) {
+        self.abr_strategy.store(Arc::new(strategy));
+    }
+
+    /// Returns the active ABR strategy. Useful for UIs that want to render
+    /// an "Auto" indicator next to the manually-picked rung.
+    pub fn abr_strategy(&self) -> AbrStrategy {
+        **self.abr_strategy.load()
+    }
+
+    /// One ABR reconsideration. Called from the per-second tick spawned in
+    /// `play()`. No-op when the strategy is `Manual` or when the current
+    /// adaptation has fewer than two representations to choose between.
+    fn abr_tick(&self) {
+        let strategy = **self.abr_strategy.load();
+        let safety = match strategy {
+            AbrStrategy::Manual => return,
+            AbrStrategy::BandwidthEwma { safety_factor } => safety_factor,
+        };
+
+        let adaptation = match self.video_adaptation.lock().unwrap().clone() {
+            Some(a) => a,
+            None => return,
+        };
+        if adaptation.representations.len() < 2 {
+            return;
+        }
+        let current_id = self
+            .video_representation
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|r| r.id);
+
+        let ewma_bps = self.stats.bandwidth_bps_ewma.load(Ordering::Relaxed);
+        // Warmup: don't switch until we have *some* sample. Otherwise the
+        // very first tick would always pick the lowest rung.
+        if ewma_bps == 0 {
+            return;
+        }
+
+        let bws: Vec<u64> = adaptation
+            .representations
+            .iter()
+            .map(|r| r.bandwidth)
+            .collect();
+        let pick_idx = match abr::pick_representation(&bws, ewma_bps, safety) {
+            Some(i) => i,
+            None => return,
+        };
+        let picked = &adaptation.representations[pick_idx];
+        if Some(picked.id) == current_id {
+            return;
+        }
+        log::info!(
+            "[abr] switch repr {:?} -> {} (ewma={}bps safety={})",
+            current_id, picked.id, ewma_bps, safety
+        );
+        self.apply_video_representation(picked, true);
     }
 
     pub fn change_audio_track(
@@ -1096,6 +1284,10 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         let video_decoder: Box<dyn HwVideoDecoder> =
             Box::new(decoders::mediacodec::MediaCodecDecoder::new());
 
+        // Capture the decoder name once per play() cycle so the Stats event
+        // can carry it without holding a reference to the boxed decoder.
+        *self.stats.decoder_name.lock().unwrap() = video_decoder.name().to_string();
+
         #[cfg(any(target_os = "windows", target_os = "linux"))]
         let audio_decoder: Box<dyn AudioDecoder> =
             Box::new(decoders::ffmpeg_audio::FfmpegAudioDecoder::new());
@@ -1103,7 +1295,27 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         let audio_decoder: Box<dyn AudioDecoder> =
             Box::new(decoders::mediacodec_audio::MediaCodecAudioDecoder::new());
 
+        let stats = Arc::clone(&self.stats);
+        let abr_player = self.clone();
+
         let play = tokio::spawn(async move {
+            // ABR tick: runs alongside the playback pipeline. Each second,
+            // if the strategy is BandwidthEwma, re-evaluate which video
+            // representation fits the measured throughput. Quiet on Manual.
+            let abr_stop_flag = abr_player.stop_flag.clone();
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(Duration::from_secs(1));
+                ticker.set_missed_tick_behavior(
+                    tokio::time::MissedTickBehavior::Skip,
+                );
+                loop {
+                    ticker.tick().await;
+                    if abr_stop_flag.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    abr_player.abr_tick();
+                }
+            });
             let seek_offset = {
                 let mut target = seek_target.write().await;
                 stop_flag.store(false, Ordering::Relaxed);
@@ -1135,6 +1347,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                 decryptor_snapshot.clone(),
                 video_decoder,
                 http_video,
+                Arc::clone(&stats),
             ));
 
             let sample_rate = audio_sink.sample_rate();
@@ -1166,6 +1379,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                 media_duration,
                 paused,
                 pause_notify,
+                stats,
             )
             .await;
 
@@ -1241,6 +1455,7 @@ async fn download_task(
     stop: Arc<Notify>,
     stop_flag: Arc<AtomicBool>,
     http: Arc<HttpClient>,
+    stats: Option<Arc<StatsState>>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let segment_slice = &segments[..];
     for i in start_index..segment_slice.len() {
@@ -1250,8 +1465,9 @@ async fn download_task(
         let sender = segment_sender.clone();
         let seg = &segment_slice[i];
         let mut should_break = false;
+        let started = Instant::now();
         tokio::select! {
-            res = download_and_queue(i, seg, sender, &http) => {
+            res = download_and_queue(i, seg, sender, &http, stats.as_ref()) => {
                 match res {
                     Ok(()) => log::debug!("[dl] produced segment {}", i),
                     Err(e) => {
@@ -1262,6 +1478,14 @@ async fn download_task(
             }
             _ = stop.notified() => {
                 should_break = true;
+            }
+        }
+        if let Some(s) = stats.as_ref() {
+            // Anything longer than ~250 ms blocked on a single segment counts
+            // as net stall — the decoder downstream is starving.
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            if elapsed_ms > 250 {
+                s.net_stall_ms.fetch_add(elapsed_ms - 250, Ordering::Relaxed);
             }
         }
         if should_break {
@@ -1326,6 +1550,25 @@ fn decrypt_segment_in_place(
     Ok(())
 }
 
+/// Build a `TrackInfo` snapshot from a video representation. Used by
+/// `TrackChanged` events on both user-driven and ABR-driven switches.
+fn video_track_info(repr: &VideoRepresenation) -> TrackInfo {
+    TrackInfo {
+        representation_id: repr.id,
+        codec: repr.codec_short().to_string(),
+        bitrate_bps: repr.bandwidth,
+        width: Some(repr.width),
+        height: Some(repr.height),
+        fps: None,
+        channels: None,
+        sample_rate_hz: None,
+        language: None,
+        label: repr.label(),
+        hdr10: repr.is_hdr10(),
+        dolby_vision: repr.is_dolby_vision(),
+    }
+}
+
 fn find_segment_index(segments: &[Segment], target: Duration) -> usize {
     if segments.is_empty() {
         return 0;
@@ -1343,6 +1586,7 @@ async fn download_and_queue(
     segment: &Segment,
     sender: Sender<DataSegment>,
     http: &HttpClient,
+    stats: Option<&Arc<StatsState>>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let dl = segment
         .download(http, RequestKind::Segment)
@@ -1350,6 +1594,9 @@ async fn download_and_queue(
         .map_err(|e| -> Box<dyn Error + Send + Sync> {
             format!("segment download: {}", e).into()
         })?;
+    if let Some(s) = stats {
+        update_bandwidth_ewma(&s.bandwidth_bps_ewma, dl.data.len(), dl.elapsed);
+    }
     let data_segment = DataSegment {
         id: index,
         size: dl.data.len(),
@@ -1359,4 +1606,24 @@ async fn download_and_queue(
         return Err(format!("downstream receiver dropped: {:?}", e).into());
     }
     Ok(())
+}
+
+/// EWMA with smoothing factor ~1/8 (last 8 samples weight equivalent). The
+/// instantaneous rate per segment is `bytes * 8 / elapsed_secs`; we fold it
+/// into the running estimate so single fast/slow segments don't whipsaw
+/// ABR. `Relaxed` is fine — readers tolerate stale-by-one values.
+fn update_bandwidth_ewma(ewma: &AtomicU64, bytes: usize, elapsed: Duration) {
+    let secs = elapsed.as_secs_f64();
+    if secs <= 0.0 || bytes == 0 {
+        return;
+    }
+    let instant_bps = (bytes as f64 * 8.0 / secs) as u64;
+    let prev = ewma.load(Ordering::Relaxed);
+    let next = if prev == 0 {
+        instant_bps
+    } else {
+        // alpha = 1/8
+        ((prev as u128 * 7 + instant_bps as u128) / 8) as u64
+    };
+    ewma.store(next, Ordering::Relaxed);
 }

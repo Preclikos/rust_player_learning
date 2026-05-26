@@ -50,6 +50,17 @@ impl Drop for FfmpegHwDecoder {
 }
 
 impl HwVideoDecoder for FfmpegHwDecoder {
+    fn name(&self) -> &'static str {
+        #[cfg(target_os = "windows")]
+        {
+            "D3D11VA (FFmpeg)"
+        }
+        #[cfg(target_os = "linux")]
+        {
+            "VAAPI (FFmpeg)"
+        }
+    }
+
     fn configure(&mut self, params: VideoDecoderParams) -> Result<(), DecoderError> {
         let codec_id = match params.codec {
             VideoCodec::Hevc => ffmpeg_next::codec::Id::HEVC,

@@ -27,4 +27,11 @@ pub trait AudioSink: Send + Sync + 'static {
     /// `Player::pause()` calls this so the cpal stream halts and we don't
     /// burn through whatever was already queued.
     fn set_paused(&self, paused: bool);
+
+    /// Latest L/R peak in dB (range roughly -120..=0). `None` before the
+    /// first audio frame has been pushed. Surfaced via `PlayerEvent::Stats`
+    /// so the TUI can draw a tiny VU meter.
+    fn last_peak_db(&self) -> Option<[f32; 2]> {
+        None
+    }
 }

@@ -514,17 +514,31 @@ impl Tracks {
     }
 
     fn parse_text_adaptation(
-        base_url: &str,
+        _base_url: &str,
         adaptation: &AdaptationSet,
     ) -> Result<TextAdaptation, Box<dyn Error>> {
         let mut text_representations: Vec<TextRepresenation> = vec![];
 
-        let representations = &adaptation.representations;
-        for representation in representations {
-            text_representations.push(TextRepresenation {});
+        for representation in &adaptation.representations {
+            text_representations.push(TextRepresenation {
+                id: representation.id,
+                codecs: representation.codecs.clone().unwrap_or_default(),
+                mime_type: representation.mime_type.clone(),
+                bandwidth: representation.bandwidth,
+            });
         }
 
+        let lang = adaptation.lang.clone().unwrap_or_default();
+        let roles = adaptation
+            .roles
+            .iter()
+            .filter_map(|p| p.value.clone())
+            .collect();
+
         Ok(TextAdaptation {
+            id: adaptation.id,
+            lang,
+            roles,
             representations: text_representations,
         })
     }

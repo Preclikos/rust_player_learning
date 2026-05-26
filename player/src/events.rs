@@ -54,6 +54,15 @@ pub enum PlayerEvent {
         /// Wall-clock ms the decoder was blocked waiting on network in
         /// the last second (0 = healthy).
         net_stall_ms: u64,
+        /// Human-readable decoder backend name, e.g. `"D3D11VA HEVC"`,
+        /// `"MediaCodec H.264"`. Known to the player internally.
+        decoder_name: String,
+        /// What is actually being rendered post-ABR (matches the current
+        /// representation). `None` before the first frame.
+        current_resolution: Option<(u32, u32)>,
+        /// Last-frame L/R peak in dB (range typically -60..=0).
+        /// `None` until at least one audio frame has been mixed.
+        audio_peak_db: Option<[f32; 2]>,
     },
     /// End of media reached.
     EndOfStream,

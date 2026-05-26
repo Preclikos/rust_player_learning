@@ -65,6 +65,10 @@ impl MediaCodecDecoder {
 }
 
 impl HwVideoDecoder for MediaCodecDecoder {
+    fn name(&self) -> &'static str {
+        "MediaCodec"
+    }
+
     fn configure(&mut self, params: VideoDecoderParams) -> Result<(), DecoderError> {
         let mime = match params.codec {
             VideoCodec::Hevc => "video/hevc",

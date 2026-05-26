@@ -133,6 +133,13 @@ pub struct DecodedAudioFrame {
 pub type DecoderError = Box<dyn Error + Send + Sync>;
 
 pub trait HwVideoDecoder: Send {
+    /// Human-readable backend identifier surfaced via `PlayerEvent::Stats`.
+    /// Example: `"D3D11VA HEVC"`, `"MediaCodec H.264"`, `"VideoToolbox"`.
+    /// Concrete impls override; default keeps tests / shells compiling.
+    fn name(&self) -> &'static str {
+        "unknown"
+    }
+
     /// Install codec parameters. Called once before the first `submit`.
     fn configure(&mut self, params: VideoDecoderParams) -> Result<(), DecoderError>;
 

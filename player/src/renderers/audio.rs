@@ -1,6 +1,6 @@
 use std::{
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         Arc,
     },
     time::Duration,
@@ -24,6 +24,12 @@ pub struct AudioRenderer {
     sample_rate: u32,
     flush_flag: Arc<AtomicBool>,
     paused_flag: Arc<AtomicBool>,
+    /// Last-frame peak dB per channel (f32 bits stored in AtomicU32).
+    /// `peak_seen` flips on first push so we can return `None` until data
+    /// is actually flowing — avoids reporting `-inf` at startup.
+    peak_l_db: Arc<AtomicU32>,
+    peak_r_db: Arc<AtomicU32>,
+    peak_seen: Arc<AtomicBool>,
 }
 
 enum AudioRendererCommand {
@@ -47,7 +53,33 @@ impl AudioRenderer {
             sample_rate: audio_thread.1,
             flush_flag,
             paused_flag,
+            peak_l_db: Arc::new(AtomicU32::new(0)),
+            peak_r_db: Arc::new(AtomicU32::new(0)),
+            peak_seen: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Compute interleaved-stereo peak in dB and stash it for the next
+    /// `last_peak_db()` poll. Cheap — one abs+max per sample.
+    fn update_peaks(&self, samples: &[f32]) {
+        if samples.is_empty() {
+            return;
+        }
+        let mut max_l = 0.0_f32;
+        let mut max_r = 0.0_f32;
+        for chunk in samples.chunks_exact(2) {
+            max_l = max_l.max(chunk[0].abs());
+            max_r = max_r.max(chunk[1].abs());
+        }
+        // 20 * log10(|s|). Floor at -120 dB to avoid log(0) = -inf.
+        let to_db = |v: f32| -> f32 {
+            if v <= 1.0e-6 { -120.0 } else { 20.0 * v.log10() }
+        };
+        self.peak_l_db
+            .store(to_db(max_l).to_bits(), Ordering::Relaxed);
+        self.peak_r_db
+            .store(to_db(max_r).to_bits(), Ordering::Relaxed);
+        self.peak_seen.store(true, Ordering::Relaxed);
     }
 
     async fn start_audio(
@@ -163,9 +195,21 @@ impl AudioRenderer {
     }
 
     pub async fn put_samples_raw(&self, samples: &[f32]) {
+        self.update_peaks(samples);
         for &s in samples {
             let _ = self.sample_sender.send(s).await;
         }
+    }
+
+    /// Returns the last computed L/R peak in dB, or `None` before the
+    /// first audio frame has been pushed.
+    pub fn last_peak_db(&self) -> Option<[f32; 2]> {
+        if !self.peak_seen.load(Ordering::Relaxed) {
+            return None;
+        }
+        let l = f32::from_bits(self.peak_l_db.load(Ordering::Relaxed));
+        let r = f32::from_bits(self.peak_r_db.load(Ordering::Relaxed));
+        Some([l, r])
     }
 
     pub fn sample_rate(&self) -> u32 {
@@ -215,5 +259,9 @@ impl super::AudioSink for AudioRenderer {
 
     fn set_paused(&self, paused: bool) {
         AudioRenderer::set_paused(self, paused)
+    }
+
+    fn last_peak_db(&self) -> Option<[f32; 2]> {
+        AudioRenderer::last_peak_db(self)
     }
 }

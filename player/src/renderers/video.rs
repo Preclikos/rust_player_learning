@@ -721,6 +721,18 @@ impl VideoRenderer {
                     ..Default::default()
                 });
 
+            // Resolve overlay + surface dims BEFORE begin_render_pass so
+            // no async/mutex hazard happens inside the render-pass scope.
+            let overlay_snapshot = self
+                .subtitle_overlay
+                .lock()
+                .unwrap()
+                .clone();
+            let (surface_w, surface_h) = {
+                let cfg = self.surface_config.read().await;
+                (cfg.width, cfg.height)
+            };
+
             let mut encoder = self.device.create_command_encoder(&Default::default());
             {
                 let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -745,15 +757,8 @@ impl VideoRenderer {
                 render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
                 render_pass.draw(0..6, 0..1);
 
-                // Subtitle overlay on top of the video. The overlay
-                // resolves the active cue from its internal PTS state
-                // and draws nothing when no cue is active or no font
-                // has been provided.
-                if let Some(overlay) =
-                    self.subtitle_overlay.lock().unwrap().clone()
-                {
-                    let cfg = self.surface_config.read().await;
-                    overlay.draw_into(&mut render_pass, cfg.width, cfg.height);
+                if let Some(overlay) = overlay_snapshot {
+                    overlay.draw_into(&mut render_pass, surface_w, surface_h);
                 }
             }
 

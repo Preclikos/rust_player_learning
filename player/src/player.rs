@@ -1082,10 +1082,14 @@ async fn video_supervisor(
             Arc::clone(&stats),
             segments_in_flight,
         ));
+        tokio::pin!(vp_handle);
 
-        // Race the global stop against a switch signal. `changed()` returns
-        // Err only if the sender is dropped — treat that as "no more
-        // switches", but still honour the play-level stop.
+        // Race three outcomes: play-level stop, video_play finishing on
+        // its own (natural EOF), or a switch_rx update requesting a soft
+        // swap. The natural-EOF arm is essential: if we kept the
+        // keepalive frame_sender alive forever after the last segment
+        // was decoded, the av_sync video_rx would never observe channel
+        // close and `PlayerEvent::EndOfStream` would never fire.
         let mut pending: Option<VideoRepresenation> = None;
         loop {
             tokio::select! {
@@ -1093,6 +1097,15 @@ async fn video_supervisor(
                     local_stop_flag.store(true, Ordering::Relaxed);
                     local_stop.notify_waiters();
                     let _ = vp_handle.await;
+                    return Ok(());
+                }
+                _ = &mut vp_handle => {
+                    // video_play returned without us asking. Either it
+                    // ran out of segments (EOF) or it errored. Either
+                    // way, exit the supervisor so the keepalive
+                    // frame_sender drops, the video channel closes, and
+                    // av_sync can fire EndOfStream.
+                    log::info!("[video] supervisor: video_play exited naturally; closing pipeline");
                     return Ok(());
                 }
                 _ = async {

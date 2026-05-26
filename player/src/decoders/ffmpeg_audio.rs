@@ -32,15 +32,23 @@ impl AudioDecoder for FfmpegAudioDecoder {
 
         let mut ctx = ffmpeg_next::codec::Context::new_with_codec(codec);
 
-        // Install the 2-byte AudioSpecificConfig as extradata so FFmpeg can
-        // parse codec parameters at open time and accept raw mdat frames.
-        if !params.codec_specific_data.is_empty() {
-            unsafe {
-                let ctx_ptr = ctx.as_mut_ptr();
+        let in_layout = match params.input_channels {
+            1 => ffmpeg_next::util::channel_layout::ChannelLayout::MONO,
+            2 => ffmpeg_next::util::channel_layout::ChannelLayout::STEREO,
+            n => ffmpeg_next::util::channel_layout::ChannelLayout::default(n as i32),
+        };
+
+        unsafe {
+            let ctx_ptr = ctx.as_mut_ptr();
+
+            // Install codec-specific extradata for codecs that need it
+            // (AAC's 2-byte AudioSpecificConfig). AC-3 / EAC-3 don't —
+            // their decoders read params from each frame's syncinfo.
+            if !params.codec_specific_data.is_empty() {
                 let padding = ffmpeg_sys_next::AV_INPUT_BUFFER_PADDING_SIZE as usize;
                 let extra = ffmpeg_sys_next::av_mallocz(params.codec_specific_data.len() + padding);
                 if extra.is_null() {
-                    return Err("av_mallocz failed for AAC extradata".into());
+                    return Err("av_mallocz failed for audio extradata".into());
                 }
                 std::ptr::copy_nonoverlapping(
                     params.codec_specific_data.as_ptr(),
@@ -50,18 +58,24 @@ impl AudioDecoder for FfmpegAudioDecoder {
                 (*ctx_ptr).extradata = extra as *mut u8;
                 (*ctx_ptr).extradata_size = params.codec_specific_data.len() as i32;
             }
+
+            // Seed sample_rate / channel layout from the manifest so the
+            // decoder opens with sane defaults. AC-3 / EAC-3 carry their
+            // own params in syncinfo and will overwrite these on the first
+            // decoded packet — but several FFmpeg audio decoders refuse to
+            // open with sample_rate=0, which is what we'd get without this.
+            (*ctx_ptr).sample_rate = params.input_sample_rate as i32;
+            (*ctx_ptr).ch_layout = in_layout.into();
         }
 
-        let decoder = ctx
+        let mut decoder = ctx
             .decoder()
             .audio()
             .map_err(|e| -> DecoderError { format!("audio decoder open: {}", e).into() })?;
 
-        let in_layout = match params.input_channels {
-            1 => ffmpeg_next::util::channel_layout::ChannelLayout::MONO,
-            2 => ffmpeg_next::util::channel_layout::ChannelLayout::STEREO,
-            n => ffmpeg_next::util::channel_layout::ChannelLayout::default(n as i32),
-        };
+        // Most FFmpeg audio decoders output planar float natively, but
+        // ask explicitly so we don't have to branch on sample_fmt later.
+        decoder.request_format(ffmpeg_next::util::format::sample::Sample::F32(Type::Planar));
 
         let resampler = ResampleCtx::get(
             ffmpeg_next::util::format::sample::Sample::F32(Type::Planar),
@@ -73,6 +87,13 @@ impl AudioDecoder for FfmpegAudioDecoder {
         )
         .map_err(|e| -> DecoderError { format!("resampler init: {}", e).into() })?;
 
+        log::info!(
+            "FfmpegAudioDecoder: {:?} {}Hz {}ch -> stereo {}Hz",
+            params.codec,
+            params.input_sample_rate,
+            params.input_channels,
+            params.output_sample_rate,
+        );
         self.decoder = Some(decoder);
         self.resampler = Some(resampler);
         Ok(())

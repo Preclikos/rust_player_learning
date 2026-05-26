@@ -136,6 +136,14 @@ pub struct Player<V: VideoSink = VideoRenderer, A: AudioSink = AudioRenderer> {
     /// `change_video_track` so a user override always sticks.
     abr_strategy: Arc<ArcSwap<AbrStrategy>>,
 
+    /// Watch channel the running `play()` supervisor listens on for
+    /// mid-flight representation swaps. Each `play()` call installs a
+    /// fresh sender; sending `Some(repr)` triggers a soft swap (tear
+    /// down current video pipeline, spin up a new one from the next
+    /// segment after current playback PTS, audio keeps playing).
+    /// `None` between play() calls — the setter is a no-op then.
+    video_switch_tx: Arc<StdMutex<Option<tokio::sync::watch::Sender<Option<VideoRepresenation>>>>>,
+
     video_renderer: Arc<V>,
     audio_renderer: Arc<A>,
 }
@@ -164,6 +172,7 @@ impl<V: VideoSink, A: AudioSink> Clone for Player<V, A> {
             decryptor: Arc::clone(&self.decryptor),
             stats: Arc::clone(&self.stats),
             abr_strategy: Arc::clone(&self.abr_strategy),
+            video_switch_tx: Arc::clone(&self.video_switch_tx),
             video_renderer: Arc::clone(&self.video_renderer),
             audio_renderer: Arc::clone(&self.audio_renderer),
         }
@@ -840,6 +849,138 @@ async fn audio_play(
 }
 
 // ---------------------------------------------------------------------------
+// Video supervisor — owns the video pipeline lifecycle within one play()
+// ---------------------------------------------------------------------------
+
+/// Factory closure that produces a fresh `HwVideoDecoder`. The supervisor
+/// invokes it once per spawned `video_play` (i.e. once per representation),
+/// so the platform-specific decoder type stays out of this module.
+type VideoDecoderFactory = Arc<dyn Fn() -> Box<dyn HwVideoDecoder> + Send + Sync>;
+
+/// Long-lived task that owns the video pipeline for a single `play()` call.
+/// It spawns one `video_play` at a time and respawns on representation swap.
+///
+/// Soft-switch flow on receiving a new representation:
+///   1. Tell the current `video_play` to stop via a local notify+flag pair
+///      (separate from the play-level `stop` so audio + av_sync survive).
+///   2. Await its termination, dropping its decoder cleanly.
+///   3. Compute the next segment in the new representation that's *after*
+///      the current playback PTS, so the first new frame can't land before
+///      the last old frame on the timeline.
+///   4. Spawn a fresh `video_play` with the new representation, the same
+///      shared frame `Sender` (so av_sync keeps consuming from one source).
+///
+/// Audio keeps playing throughout — only the video pipeline is touched.
+async fn video_supervisor(
+    initial_repr: VideoRepresenation,
+    initial_start_index: usize,
+    frame_sender: Sender<DecodedVideoFrame>,
+    video_ready: Arc<Notify>,
+    stop: Arc<Notify>,
+    stop_flag: Arc<AtomicBool>,
+    decryptor: Option<Arc<dyn Decryptor>>,
+    decoder_factory: VideoDecoderFactory,
+    http: Arc<HttpClient>,
+    stats: Arc<StatsState>,
+    mut switch_rx: tokio::sync::watch::Receiver<Option<VideoRepresenation>>,
+    position_ms: Arc<AtomicU64>,
+    events: Arc<broadcast::Sender<PlayerEvent>>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let mut current_repr = initial_repr;
+    let mut current_start = initial_start_index;
+    loop {
+        // Per-iteration stop signal — only fires on representation swap,
+        // not on play-level stop. Keeping it separate means `seek()`
+        // semantics (play-level stop) still work as before.
+        let local_stop = Arc::new(Notify::new());
+        let local_stop_flag = Arc::new(AtomicBool::new(false));
+
+        let vp_handle = task::spawn(video_play(
+            current_repr.clone(),
+            current_start,
+            video_ready.clone(),
+            frame_sender.clone(),
+            local_stop.clone(),
+            local_stop_flag.clone(),
+            decryptor.clone(),
+            decoder_factory(),
+            Arc::clone(&http),
+            Arc::clone(&stats),
+        ));
+
+        // Race the global stop against a switch signal. `changed()` returns
+        // Err only if the sender is dropped — treat that as "no more
+        // switches", but still honour the play-level stop.
+        let mut pending: Option<VideoRepresenation> = None;
+        loop {
+            tokio::select! {
+                _ = stop.notified() => {
+                    local_stop_flag.store(true, Ordering::Relaxed);
+                    local_stop.notify_waiters();
+                    let _ = vp_handle.await;
+                    return Ok(());
+                }
+                _ = async {
+                    if stop_flag.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let _ = switch_rx.changed().await;
+                } => {
+                    if stop_flag.load(Ordering::Relaxed) {
+                        local_stop_flag.store(true, Ordering::Relaxed);
+                        local_stop.notify_waiters();
+                        let _ = vp_handle.await;
+                        return Ok(());
+                    }
+                    if let Some(new) = switch_rx.borrow_and_update().clone() {
+                        pending = Some(new);
+                        break;
+                    }
+                    // Spurious None — keep waiting.
+                }
+            }
+        }
+
+        let new_repr = match pending.take() {
+            Some(r) => r,
+            None => continue,
+        };
+
+        // Avoid swapping to the same representation (the ABR engine guards
+        // this too, but explicit is cheap and idempotent).
+        if new_repr.id == current_repr.id {
+            continue;
+        }
+
+        // Tear down the OLD pipeline cleanly.
+        local_stop_flag.store(true, Ordering::Relaxed);
+        local_stop.notify_waiters();
+        let _ = vp_handle.await;
+
+        // Pick the segment in the new representation that *starts after*
+        // the current playback position. This guarantees the first frame
+        // emitted by the NEW pipeline has PTS > the last frame from the
+        // OLD pipeline, so the av_sync receiver doesn't see backward PTS.
+        let pos = Duration::from_millis(position_ms.load(Ordering::Relaxed));
+        let mut new_start = find_segment_index(&new_repr.segments, pos);
+        if new_start + 1 < new_repr.segments.len() {
+            new_start = new_start.saturating_add(1);
+        }
+        log::info!(
+            "[abr] soft switch: repr {} -> {} from seg {} (pos {}ms)",
+            current_repr.id, new_repr.id, new_start, pos.as_millis()
+        );
+        let _ = events.send(PlayerEvent::TrackChanged {
+            kind: TrackKind::Video,
+            info: video_track_info(&new_repr),
+        });
+        current_repr = new_repr;
+        current_start = new_start;
+        // Next iteration spawns the new video_play.
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Player — constructs default (platform-native) sinks
 // ---------------------------------------------------------------------------
 
@@ -889,6 +1030,7 @@ impl Player<VideoRenderer, AudioRenderer> {
 
             stats: Arc::new(StatsState::default()),
             abr_strategy: Arc::new(ArcSwap::from_pointee(AbrStrategy::default())),
+            video_switch_tx: Arc::new(StdMutex::new(None)),
 
             video_renderer,
             audio_renderer,
@@ -1143,18 +1285,34 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         *self.video_representation.lock().unwrap() = Some(representation.clone());
         let size = PhysicalSize::new(representation.width, representation.height);
         self.change_frame_size(size);
-        if emit_track_changed {
+
+        // Soft switch: if a play() pipeline is currently running, hand the
+        // new representation to its video supervisor over the watch
+        // channel. The supervisor stops only the video sub-pipeline, awaits
+        // its termination, and respawns it from the next segment after the
+        // current playback PTS. Audio + av_sync keep running uninterrupted.
+        //
+        // If no pipeline is running (play() not yet called, or just
+        // returned), the watch sender is None. The new representation is
+        // already stored in `self.video_representation`; the next play()
+        // call will start with it. Emit TrackChanged only in the soft-switch
+        // case — the supervisor emits it as part of its handover so we
+        // don't double up.
+        let supervisor_running = {
+            let guard = self.video_switch_tx.lock().unwrap();
+            if let Some(tx) = guard.as_ref() {
+                let _ = tx.send(Some(representation.clone()));
+                true
+            } else {
+                false
+            }
+        };
+        if !supervisor_running && emit_track_changed {
             let _ = self.events.send(PlayerEvent::TrackChanged {
                 kind: TrackKind::Video,
                 info: video_track_info(representation),
             });
         }
-        // Restart the pipeline from the current playback position. In
-        // DASH SAP-1 streams (the configuration this player consumes —
-        // SegmentBase + sidx with `starts_with_sap = 1`), each subsegment
-        // begins with a keyframe, so the next downloaded segment IS the
-        // next keyframe and the switch is keyframe-aligned by construction.
-        self.seek(self.position());
     }
 
     /// Install an ABR strategy. `Manual` (the default) leaves track
@@ -1277,16 +1435,34 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             .map(|t| t.duration)
             .unwrap_or(Duration::ZERO);
 
-        #[cfg(any(target_os = "windows", target_os = "linux"))]
-        let video_decoder: Box<dyn HwVideoDecoder> =
-            Box::new(decoders::ffmpeg_hw::FfmpegHwDecoder::new());
-        #[cfg(target_os = "android")]
-        let video_decoder: Box<dyn HwVideoDecoder> =
-            Box::new(decoders::mediacodec::MediaCodecDecoder::new());
+        // Video decoder factory — the supervisor calls this once per spawned
+        // video_play (one for the initial repr, again for every ABR swap).
+        let video_decoder_factory: VideoDecoderFactory = {
+            #[cfg(any(target_os = "windows", target_os = "linux"))]
+            {
+                Arc::new(|| Box::new(decoders::ffmpeg_hw::FfmpegHwDecoder::new()))
+            }
+            #[cfg(target_os = "android")]
+            {
+                Arc::new(|| Box::new(decoders::mediacodec::MediaCodecDecoder::new()))
+            }
+            #[cfg(target_os = "ios")]
+            {
+                Arc::new(|| {
+                    let d = decoders::videotoolbox::VideoToolboxDecoder::new()
+                        .expect("VideoToolboxDecoder::new");
+                    Box::new(d) as Box<dyn HwVideoDecoder>
+                })
+            }
+        };
 
-        // Capture the decoder name once per play() cycle so the Stats event
-        // can carry it without holding a reference to the boxed decoder.
-        *self.stats.decoder_name.lock().unwrap() = video_decoder.name().to_string();
+        // Capture the decoder name once per play() cycle. The first
+        // factory() call is cheap (no platform resources allocated until
+        // configure() runs inside video_play) so we drop the temporary.
+        {
+            let probe = video_decoder_factory();
+            *self.stats.decoder_name.lock().unwrap() = probe.name().to_string();
+        }
 
         #[cfg(any(target_os = "windows", target_os = "linux"))]
         let audio_decoder: Box<dyn AudioDecoder> =
@@ -1294,6 +1470,13 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         #[cfg(target_os = "android")]
         let audio_decoder: Box<dyn AudioDecoder> =
             Box::new(decoders::mediacodec_audio::MediaCodecAudioDecoder::new());
+
+        // Install a fresh per-play switch channel so apply_video_representation
+        // can route ABR swaps into the supervisor. Dropped at end of play().
+        let (switch_tx, switch_rx) =
+            tokio::sync::watch::channel::<Option<VideoRepresenation>>(None);
+        *self.video_switch_tx.lock().unwrap() = Some(switch_tx);
+        let video_switch_slot = Arc::clone(&self.video_switch_tx);
 
         let stats = Arc::clone(&self.stats);
         let abr_player = self.clone();
@@ -1337,17 +1520,21 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             let (frame_sender, frame_receiver) = mpsc::channel::<DecodedVideoFrame>(64);
             let (sample_sender, sample_receiver) = mpsc::channel::<DecodedAudioFrame>(256);
 
-            let video = tokio::spawn(video_play(
+            let events_for_supervisor = Arc::clone(&events);
+            let video = tokio::spawn(video_supervisor(
                 video_representation,
                 video_start_index,
-                video_ready.clone(),
                 frame_sender,
+                video_ready.clone(),
                 stop.clone(),
                 stop_flag.clone(),
                 decryptor_snapshot.clone(),
-                video_decoder,
+                video_decoder_factory,
                 http_video,
                 Arc::clone(&stats),
+                switch_rx,
+                position_ms.clone(),
+                events_for_supervisor,
             ));
 
             let sample_rate = audio_sink.sample_rate();
@@ -1384,8 +1571,12 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             .await;
 
             let (play_res, audio_res) = join!(video, audio);
-            log_task_result("video_play", play_res);
+            log_task_result("video_supervisor", play_res);
             log_task_result("audio_play", audio_res);
+
+            // Drop the watch sender so a stale apply_video_representation
+            // between play() calls becomes a no-op until the next play().
+            *video_switch_slot.lock().unwrap() = None;
         });
         Ok(play)
     }

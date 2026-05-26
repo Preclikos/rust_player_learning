@@ -80,6 +80,12 @@ struct StatsState {
     /// EWMA of segment download throughput in bits-per-second, surfaced via
     /// `Position.bandwidth_bps` and consumed by the ABR engine.
     bandwidth_bps_ewma: AtomicU64,
+    /// Highest PTS (in ms) we've pulled from the video decoder — whether
+    /// it's already been rendered or is still parked in the av_sync mpsc
+    /// channel. `Position.buffered_ahead_secs` is computed as
+    /// `max(0, this - current_pts_ms) / 1000`, so the default 0 reads as
+    /// "no buffer" until the first frame lands.
+    last_decoded_pts_ms: std::sync::atomic::AtomicI64,
     /// Name of the currently-active video decoder backend
     /// (`"D3D11VA (FFmpeg)"`, `"MediaCodec"`, …). Plumbed in at play().
     decoder_name: StdMutex<String>,
@@ -364,14 +370,19 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
 
         stats.video_frames_decoded.fetch_add(1, Ordering::Relaxed);
 
-        // Rate-limited Position emission (≤ 4 Hz). Bandwidth comes from the
-        // EWMA the download task feeds. `buffered_ahead_secs` is still
-        // approximate — populated when we instrument the decoder queue.
+        // Rate-limited Position emission (≤ 4 Hz). Bandwidth comes from
+        // the download EWMA; the buffer head from the decoder task's
+        // high-water-mark, clamped at zero so an out-of-order frame can't
+        // briefly drive the gauge negative.
         if last_position_emit.elapsed() >= Duration::from_millis(250) {
+            let decoded = stats
+                .last_decoded_pts_ms
+                .load(Ordering::Relaxed);
+            let ahead_ms = (decoded - pts_ms as i64).max(0);
             let _ = events.send(PlayerEvent::Position {
                 position: Duration::from_millis(pts_ms),
                 duration: media_duration,
-                buffered_ahead_secs: 0.0,
+                buffered_ahead_secs: ahead_ms as f32 / 1000.0,
                 bandwidth_bps: stats.bandwidth_bps_ewma.load(Ordering::Relaxed),
             });
             last_position_emit = Instant::now();
@@ -503,6 +514,7 @@ async fn video_decoder_task(
     init_data: Vec<u8>,
     video_ready: Arc<Notify>,
     track_crypto: Option<TrackCrypto>,
+    stats: Arc<StatsState>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut first_frame_signaled = false;
 
@@ -555,6 +567,17 @@ async fn video_decoder_task(
             loop {
                 match decoder.try_recv()? {
                     Some(frame) => {
+                        // Track the high-water-mark of decoded PTS so the
+                        // av_sync loop can publish `buffered_ahead_secs`.
+                        // Includes frames still in the reorder buffer — they
+                        // are already decoded and will be rendered shortly.
+                        let pts_ms = frame.pts_us / 1000;
+                        let prev = stats.last_decoded_pts_ms.load(Ordering::Relaxed);
+                        if pts_ms > prev {
+                            stats
+                                .last_decoded_pts_ms
+                                .store(pts_ms, Ordering::Relaxed);
+                        }
                         reorder_buf.push(frame);
                         if reorder_buf.len() > REORDER_DEPTH {
                             let min_idx = reorder_buf.iter().enumerate()
@@ -722,10 +745,17 @@ async fn video_play(
         stop,
         stop_flag,
         http,
-        Some(stats),
+        Some(Arc::clone(&stats)),
     ));
-    let decoder_task =
-        task::spawn(video_decoder_task(download_rx, sender, decoder, init_data, video_ready, track_crypto));
+    let decoder_task = task::spawn(video_decoder_task(
+        download_rx,
+        sender,
+        decoder,
+        init_data,
+        video_ready,
+        track_crypto,
+        stats,
+    ));
 
     let (dl_res, dec_res) = join!(download_task, decoder_task);
     log_task_result("video download_task", dl_res);
@@ -1530,6 +1560,14 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                 .map(|s| s.start_time())
                 .unwrap_or(seek_offset);
             position_ms.store(snapped_seek_offset.as_millis() as u64, Ordering::Relaxed);
+            // Snap the decode high-water-mark to the new position so the
+            // buffer gauge reads 0 until the fresh pipeline produces its
+            // first frames. Otherwise a stale value from the previous
+            // pipeline would inflate (or after a backward seek, mislead)
+            // the gauge for the first second.
+            stats
+                .last_decoded_pts_ms
+                .store(snapped_seek_offset.as_millis() as i64, Ordering::Relaxed);
 
             let (frame_sender, frame_receiver) = mpsc::channel::<DecodedVideoFrame>(64);
             let (sample_sender, sample_receiver) = mpsc::channel::<DecodedAudioFrame>(256);

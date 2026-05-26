@@ -1254,24 +1254,52 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         self.audio_representation.lock().unwrap().clone()
     }
 
-    /// User-facing track switch. Treated as an explicit override: flips
-    /// the ABR strategy back to `Manual` so the user's pick sticks until
-    /// they re-arm ABR with `set_abr_strategy(BandwidthEwma { .. })`.
+    /// User-facing track switch. Treated as an explicit override:
+    ///   - Flips the ABR strategy back to `Manual` so the user's pick
+    ///     sticks until they re-arm ABR.
+    ///   - Performs a **hard** switch: tears the whole pipeline down via
+    ///     `seek(current_position)` and restarts on the new representation
+    ///     from the current playback PTS. The user paid for a click — they
+    ///     should see the chosen quality NOW, not at the next segment
+    ///     boundary like the soft path does. Brief A/V resync (~100-200ms)
+    ///     is the price, intentional.
     pub fn change_video_track(&self, representation: &VideoRepresenation) {
-        // Explicit user override — pin to Manual.
-        self.abr_strategy
-            .store(Arc::new(AbrStrategy::Manual));
-        self.apply_video_representation(representation, true);
+        let already = self
+            .video_representation
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|r| r.id == representation.id)
+            .unwrap_or(false);
+        if already {
+            // Still flip strategy — calling change_video_track on the
+            // current rung is the natural way to "lock in" the manual mode.
+            self.abr_strategy.store(Arc::new(AbrStrategy::Manual));
+            return;
+        }
+        self.abr_strategy.store(Arc::new(AbrStrategy::Manual));
+        *self.video_representation.lock().unwrap() = Some(representation.clone());
+        let size = PhysicalSize::new(representation.width, representation.height);
+        self.change_frame_size(size);
+        let _ = self.events.send(PlayerEvent::TrackChanged {
+            kind: TrackKind::Video,
+            info: video_track_info(representation),
+        });
+        // Hard restart — seek() flips stop_flag, the user-level play()
+        // loop respawns with the freshly-stored representation.
+        self.seek(self.position());
     }
 
-    /// Internal: same effect as `change_video_track` but does NOT touch the
-    /// ABR strategy. Used by the ABR tick task to perform a rate-driven
-    /// switch without flipping itself off.
-    fn apply_video_representation(
-        &self,
-        representation: &VideoRepresenation,
-        emit_track_changed: bool,
-    ) {
+    /// ABR-driven swap. Soft: hands the new representation to the running
+    /// video supervisor over a watch channel; only the video sub-pipeline
+    /// restarts, audio + av_sync stay alive. Falls back to a no-op when
+    /// the supervisor isn't running (between play() calls) — the stored
+    /// representation gets picked up by the next play().
+    ///
+    /// Never called for user-driven switches: those go through
+    /// `change_video_track` which is intentionally hard so the user sees
+    /// the picked quality immediately.
+    fn apply_video_representation_soft(&self, representation: &VideoRepresenation) {
         let already = self
             .video_representation
             .lock()
@@ -1286,28 +1314,14 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         let size = PhysicalSize::new(representation.width, representation.height);
         self.change_frame_size(size);
 
-        // Soft switch: if a play() pipeline is currently running, hand the
-        // new representation to its video supervisor over the watch
-        // channel. The supervisor stops only the video sub-pipeline, awaits
-        // its termination, and respawns it from the next segment after the
-        // current playback PTS. Audio + av_sync keep running uninterrupted.
-        //
-        // If no pipeline is running (play() not yet called, or just
-        // returned), the watch sender is None. The new representation is
-        // already stored in `self.video_representation`; the next play()
-        // call will start with it. Emit TrackChanged only in the soft-switch
-        // case — the supervisor emits it as part of its handover so we
-        // don't double up.
-        let supervisor_running = {
-            let guard = self.video_switch_tx.lock().unwrap();
-            if let Some(tx) = guard.as_ref() {
-                let _ = tx.send(Some(representation.clone()));
-                true
-            } else {
-                false
-            }
-        };
-        if !supervisor_running && emit_track_changed {
+        let guard = self.video_switch_tx.lock().unwrap();
+        if let Some(tx) = guard.as_ref() {
+            // Supervisor running — hands over without tearing audio down.
+            // Supervisor emits TrackChanged itself once the handover lands.
+            let _ = tx.send(Some(representation.clone()));
+        } else {
+            // No live pipeline; just emit the event so consumers see the
+            // selection update. Next play() will use the stored repr.
             let _ = self.events.send(PlayerEvent::TrackChanged {
                 kind: TrackKind::Video,
                 info: video_track_info(representation),
@@ -1379,7 +1393,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             "[abr] switch repr {:?} -> {} (ewma={}bps safety={})",
             current_id, picked.id, ewma_bps, safety
         );
-        self.apply_video_representation(picked, true);
+        self.apply_video_representation_soft(picked);
     }
 
     pub fn change_audio_track(

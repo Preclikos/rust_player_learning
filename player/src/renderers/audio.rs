@@ -41,7 +41,16 @@ impl AudioRenderer {
     pub fn new() -> Self {
         let stop = Arc::new(Notify::new());
         let flush_flag = Arc::new(AtomicBool::new(false));
-        let paused_flag = Arc::new(AtomicBool::new(false));
+        // Start paused so cpal emits silence (without draining the
+        // mpsc) until av_sync_handler is ready to start playback. Once
+        // the av_sync handler observes both decoders' first frame, it
+        // sets the wall-clock start_time and unpauses audio in lock-
+        // step. Without this, cpal would consume samples the moment
+        // the decoder produced them — making the speaker output begin
+        // BEFORE video showed its first frame, perceived as audio
+        // leading or (after the decoder queue fills) lagging by an
+        // unpredictable amount.
+        let paused_flag = Arc::new(AtomicBool::new(true));
 
         let (command_sender, command_receiver) = mpsc::channel(4);
         let audio_thread =

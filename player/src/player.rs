@@ -506,6 +506,15 @@ async fn av_sync_handler<V: VideoSink, A: AudioSink>(
     }
     let now = Instant::now();
     let start_time = Arc::new(now.checked_sub(seek_offset).unwrap_or(now));
+    // Unpause the audio device in lock-step with the wall-clock origin.
+    // AudioRenderer starts paused at construction (cpal would otherwise
+    // pull from an empty mpsc and play silence while the audio decoder
+    // warmed up, then "catch up" once real samples arrived — perceived
+    // as audio leading or lagging by an unpredictable amount). seek()
+    // re-pauses + flushes; this restores playback for the new pipeline.
+    if !paused.load(Ordering::Relaxed) {
+        audio_sink.set_paused(false);
+    }
     let (_, _) = tokio::join!(
         tokio::spawn(video_sync_loop(
             start_time.clone(),
@@ -662,6 +671,13 @@ async fn audio_decoder_task(
     track_crypto: Option<TrackCrypto>,
     stats: Arc<StatsState>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    // Mirror the video pattern: fire audio_ready only once we've
+    // actually produced + queued a real PCM frame, not on the first
+    // submit. Firing too early made av_sync_handler set start_time
+    // before any audio was in cpal's queue, so the speaker only
+    // started hearing real samples 20-200 ms after video began
+    // rendering — perceived as constant audio lag.
+    let mut first_audio_signaled = false;
     while let Some(segment) = receiver.recv().await {
         log::debug!("[dec] consuming audio segment: {}", segment.id);
 
@@ -691,7 +707,6 @@ async fn audio_decoder_task(
             let pts_us = if ts_scale > 0 { ts * 1_000_000 / ts_scale as i64 } else { 0 };
 
             decoder.submit(sample_data, pts_us)?;
-            audio_ready.notify_one();
 
             loop {
                 match decoder.try_recv()? {
@@ -707,6 +722,10 @@ async fn audio_decoder_task(
                         }
                         if sender.send(frame).await.is_err() {
                             return Ok(());
+                        }
+                        if !first_audio_signaled {
+                            audio_ready.notify_one();
+                            first_audio_signaled = true;
                         }
                     }
                     None => break,
@@ -1968,6 +1987,11 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                 stop_flag.store(true, Ordering::Relaxed);
             }
             audio_sink.flush();
+            // Pause cpal so the NEXT pipeline's first audio sample can
+            // be re-aligned with the new start_time by av_sync_handler.
+            // Otherwise cpal would consume whatever lands in the mpsc
+            // first, racing ahead of the rebuilt video pipeline.
+            audio_sink.set_paused(true);
             stop.notify_waiters();
         });
     }

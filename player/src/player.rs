@@ -379,6 +379,11 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
         frame_idx += 1;
 
         position_ms.store(pts_ms, Ordering::Relaxed);
+        // Subtitle overlay needs media-timeline-relative PTS (0-based
+        // from start of content) so it can pick the right cue from the
+        // VTT timestamps. Use `pts_ms` here, NOT frame.pts_us — the
+        // latter still carries the DASH BMDT offset.
+        renderer.set_subtitle_pts(pts_ms as i64);
 
         // Emit `Playing` once on the first rendered frame after a sync
         // loop (re)starts. Buffering→Playing transition.

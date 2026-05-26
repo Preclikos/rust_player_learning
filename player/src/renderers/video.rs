@@ -601,12 +601,10 @@ impl VideoRenderer {
     /// Dispatches to the platform-specific render path based on the PlatformFrame variant.
     pub async fn render_frame(&self, frame: crate::decoders::DecodedVideoFrame) {
         use crate::decoders::PlatformFrame;
-        // Feed the current PTS into the subtitle overlay (if any) so
-        // its active-cue picker stays in lockstep with the rendered
-        // frame. Cheap: no-op when no overlay was constructed.
-        if let Some(ov) = self.subtitle_overlay.lock().unwrap().clone() {
-            ov.set_pts_ms(frame.pts_us / 1000);
-        }
+        // NB: subtitle PTS is updated separately via set_subtitle_pts
+        // by the video sync loop using the BMDT-adjusted timeline.
+        // The raw frame.pts_us here would be off by the segment-base
+        // offset (commonly several seconds in real DASH streams).
         let desired_present_ns = frame.desired_present_ns;
         match frame.native {
             #[cfg(any(target_os = "windows", target_os = "linux"))]
@@ -956,6 +954,12 @@ impl super::VideoSink for VideoRenderer {
     fn clear_subtitles(&self) {
         if let Some(ov) = self.subtitle_overlay.lock().unwrap().as_ref() {
             ov.clear();
+        }
+    }
+
+    fn set_subtitle_pts(&self, pts_ms: i64) {
+        if let Some(ov) = self.subtitle_overlay.lock().unwrap().clone() {
+            ov.set_pts_ms(pts_ms);
         }
     }
 }

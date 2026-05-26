@@ -29,6 +29,15 @@ pub trait VideoSink: Send + Sync + 'static {
     /// Wipe any queued cues + cached rasterizations. Called on subtitle
     /// track switch or when the consumer disables subtitles.
     fn clear_subtitles(&self) {}
+
+    /// Feed the current media-timeline PTS (ms, 0-based since start of
+    /// content) into the subtitle overlay so its active-cue picker
+    /// matches the cues' own timestamps. Called by the video sync loop
+    /// each frame. MUST be the BMDT-adjusted PTS, not the raw DASH
+    /// timestamp — otherwise cues fire at the wrong moment by however
+    /// much the segment timeline is shifted (commonly 7-60 s in real
+    /// streams).
+    fn set_subtitle_pts(&self, _pts_ms: i64) {}
 }
 
 /// Receives decoded PCM audio and feeds it to the output device.

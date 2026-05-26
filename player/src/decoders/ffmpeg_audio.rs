@@ -2,20 +2,65 @@
 
 use ffmpeg_next::format::sample::Type;
 use ffmpeg_next::software::resampling::Context as ResampleCtx;
+use ffmpeg_next::util::channel_layout::ChannelLayout;
 use ffmpeg_next::Packet;
 
 use super::{AudioCodec, AudioDecoder, AudioDecoderParams, DecodedAudioFrame, DecoderError};
 
 pub struct FfmpegAudioDecoder {
     decoder: Option<ffmpeg_next::decoder::Audio>,
+    /// Built lazily from the FIRST decoded frame's actual format. Manifest
+    /// hints (channel count, sample rate) lie often enough for AC-3 / EAC-3
+    /// — `AudioChannelConfiguration` may be missing or wrong, and the
+    /// bitstream layout is authoritative. Rebuilt if the format changes
+    /// mid-stream (e.g. dependent EAC-3 substream comes online).
     resampler: Option<ResampleCtx>,
+    /// Cached resampler input definition so we can detect when a new frame
+    /// no longer matches and trigger a rebuild.
+    resampler_in_rate: u32,
+    resampler_in_layout_bits: u64,
+    /// Target output rate (cpal device rate) passed in at configure time.
+    output_sample_rate: u32,
 }
 
 unsafe impl Send for FfmpegAudioDecoder {}
 
 impl FfmpegAudioDecoder {
     pub fn new() -> Self {
-        Self { decoder: None, resampler: None }
+        Self {
+            decoder: None,
+            resampler: None,
+            resampler_in_rate: 0,
+            resampler_in_layout_bits: 0,
+            output_sample_rate: 0,
+        }
+    }
+
+    /// (Re)build the resampler so its input matches the decoded frame's
+    /// actual `rate` + `layout`, and its output is fixed stereo at the
+    /// device rate. Called lazily on first frame and whenever the input
+    /// format drifts.
+    fn build_resampler(&mut self, in_rate: u32, in_layout: ChannelLayout) -> Result<(), DecoderError> {
+        let resampler = ResampleCtx::get(
+            ffmpeg_next::util::format::sample::Sample::F32(Type::Planar),
+            in_layout,
+            in_rate,
+            ffmpeg_next::util::format::sample::Sample::F32(Type::Packed),
+            ChannelLayout::STEREO,
+            self.output_sample_rate,
+        )
+        .map_err(|e| -> DecoderError {
+            format!("resampler init ({}Hz {}ch -> {}Hz stereo): {}",
+                in_rate, in_layout.channels(), self.output_sample_rate, e).into()
+        })?;
+        self.resampler_in_rate = in_rate;
+        self.resampler_in_layout_bits = in_layout.bits();
+        self.resampler = Some(resampler);
+        log::info!(
+            "FfmpegAudioDecoder: resampler {}Hz {}ch -> {}Hz stereo",
+            in_rate, in_layout.channels(), self.output_sample_rate
+        );
+        Ok(())
     }
 }
 
@@ -77,25 +122,16 @@ impl AudioDecoder for FfmpegAudioDecoder {
         // ask explicitly so we don't have to branch on sample_fmt later.
         decoder.request_format(ffmpeg_next::util::format::sample::Sample::F32(Type::Planar));
 
-        let resampler = ResampleCtx::get(
-            ffmpeg_next::util::format::sample::Sample::F32(Type::Planar),
-            in_layout,
-            params.input_sample_rate,
-            ffmpeg_next::util::format::sample::Sample::F32(Type::Packed),
-            ffmpeg_next::util::channel_layout::ChannelLayout::STEREO,
-            params.output_sample_rate,
-        )
-        .map_err(|e| -> DecoderError { format!("resampler init: {}", e).into() })?;
-
         log::info!(
-            "FfmpegAudioDecoder: {:?} {}Hz {}ch -> stereo {}Hz",
+            "FfmpegAudioDecoder: opened {:?} (manifest hint: {}Hz {}ch -> stereo {}Hz). \
+             Resampler will be built lazily from the first decoded frame.",
             params.codec,
             params.input_sample_rate,
             params.input_channels,
             params.output_sample_rate,
         );
         self.decoder = Some(decoder);
-        self.resampler = Some(resampler);
+        self.output_sample_rate = params.output_sample_rate;
         Ok(())
     }
 
@@ -110,9 +146,16 @@ impl AudioDecoder for FfmpegAudioDecoder {
         packet.set_pts(Some(pts_us / 1000));
         packet.data_mut().unwrap().clone_from_slice(sample);
 
-        decoder
-            .send_packet(&packet)
-            .map_err(|e| -> DecoderError { format!("audio send_packet: {}", e).into() })?;
+        // Log + swallow per-packet errors so one bad EAC-3 frame (e.g. a
+        // segment-boundary sync glitch) doesn't kill the audio task for
+        // the rest of playback. The decoder typically resyncs on the next
+        // packet that lands on a syncword.
+        if let Err(e) = decoder.send_packet(&packet) {
+            log::warn!(
+                "audio send_packet failed (pts={}ms, {} bytes): {}",
+                pts_us / 1000, sample.len(), e
+            );
+        }
         Ok(())
     }
 
@@ -121,15 +164,30 @@ impl AudioDecoder for FfmpegAudioDecoder {
             .decoder
             .as_mut()
             .ok_or_else(|| -> DecoderError { "try_recv before configure".into() })?;
-        let resampler = self
-            .resampler
-            .as_mut()
-            .ok_or_else(|| -> DecoderError { "try_recv before configure".into() })?;
 
         let mut frame = ffmpeg_next::util::frame::Audio::empty();
         match decoder.receive_frame(&mut frame) {
             Ok(()) => {
                 let pts_ms = frame.pts().unwrap_or(0) as i64;
+
+                // Authoritative input format comes from the frame itself.
+                // For EAC-3 in particular, the manifest hint is unreliable —
+                // syncinfo in the bitstream is the ground truth.
+                let in_rate = frame.rate();
+                let mut in_layout = frame.channel_layout();
+                if in_layout.bits() == 0 && frame.channels() > 0 {
+                    // Some decoders leave channel_layout = 0 and only
+                    // populate channels. Fall back to the default layout.
+                    in_layout = ChannelLayout::default(frame.channels() as i32);
+                }
+
+                let needs_rebuild = self.resampler.is_none()
+                    || self.resampler_in_rate != in_rate
+                    || self.resampler_in_layout_bits != in_layout.bits();
+                if needs_rebuild {
+                    self.build_resampler(in_rate, in_layout)?;
+                }
+                let resampler = self.resampler.as_mut().unwrap();
 
                 let mut dst = ffmpeg_next::util::frame::Audio::empty();
                 resampler

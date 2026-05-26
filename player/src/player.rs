@@ -172,6 +172,11 @@ pub struct Player<V: VideoSink = VideoRenderer, A: AudioSink = AudioRenderer> {
     /// — the running pipeline holds whatever it was given at spawn time.
     buffer_target_secs: Arc<AtomicU32>,
 
+    /// Currently-selected subtitle representation. `None` means
+    /// subtitles disabled — text_play won't spawn. Consumer toggles via
+    /// `set_subtitle_track` / `clear_subtitle_track`.
+    subtitle_representation: Arc<StdMutex<Option<tracks::text::TextRepresenation>>>,
+
     video_renderer: Arc<V>,
     audio_renderer: Arc<A>,
 }
@@ -202,6 +207,7 @@ impl<V: VideoSink, A: AudioSink> Clone for Player<V, A> {
             abr_strategy: Arc::clone(&self.abr_strategy),
             video_switch_tx: Arc::clone(&self.video_switch_tx),
             buffer_target_secs: Arc::clone(&self.buffer_target_secs),
+            subtitle_representation: Arc::clone(&self.subtitle_representation),
             video_renderer: Arc::clone(&self.video_renderer),
             audio_renderer: Arc::clone(&self.audio_renderer),
         }
@@ -923,6 +929,99 @@ async fn audio_play(
 }
 
 // ---------------------------------------------------------------------------
+// Subtitle (WebVTT) pipeline
+// ---------------------------------------------------------------------------
+
+/// Fetch + parse the selected subtitle representation, push cues into
+/// the video sink so the wgpu overlay can render them.
+///
+/// Two delivery patterns are supported:
+///   1. Single-file VTT (the common "external .vtt per language"
+///      pattern) — `single_file_url` set, segments empty. Download
+///      whole file once, parse as raw WebVTT, hand off, done.
+///   2. ISO BMFF VTT in CMAF — `segment_init` + `segments` populated.
+///      Stream segments through the normal download path, parse each
+///      as `vttc` boxes, push cues incrementally.
+///
+/// Both paths skip silently if the representation isn't decodable
+/// (TTML for now).
+async fn text_play<V: VideoSink>(
+    text_representation: tracks::text::TextRepresenation,
+    stop: Arc<Notify>,
+    stop_flag: Arc<AtomicBool>,
+    http: Arc<HttpClient>,
+    video_sink: Arc<V>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    if !text_representation.is_webvtt() {
+        log::info!(
+            "[subs] representation {} is not WebVTT ({}/{}) — skipping",
+            text_representation.id,
+            text_representation.codecs,
+            text_representation.mime_type,
+        );
+        return Ok(());
+    }
+
+    // ---- single-file delivery ----
+    if let Some(url) = &text_representation.single_file_url {
+        log::info!("[subs] downloading single-file VTT: {}", url);
+        let dl_fut = http.get(url.clone(), RequestKind::InitSegment);
+        let bytes = tokio::select! {
+            r = dl_fut => match r {
+                Ok(b) => b,
+                Err(e) => {
+                    log::warn!("[subs] single-file download failed: {}", e);
+                    return Ok(());
+                }
+            },
+            _ = stop.notified() => return Ok(()),
+        };
+        let cues = crate::parsers::vtt::parse_segment(&bytes, 0);
+        log::info!("[subs] parsed {} cues from single VTT file", cues.len());
+        video_sink.queue_subtitle_cues(cues);
+        return Ok(());
+    }
+
+    // ---- ISO BMFF CMAF delivery ----
+    let init = match &text_representation.segment_init {
+        Some(s) => s,
+        None => {
+            log::info!("[subs] representation {} has no segments and no single-file URL", text_representation.id);
+            return Ok(());
+        }
+    };
+    // Init segment is fetched but currently unused by the cue parser
+    // (each sample carries its own VTT box). Still download it so any
+    // server-side cache priming behaves like the audio/video tracks.
+    let _ = init.download(&http, RequestKind::InitSegment).await;
+
+    for (i, seg) in text_representation.segments.iter().enumerate() {
+        if stop_flag.load(Ordering::Relaxed) {
+            break;
+        }
+        let dl_fut = seg.download(&http, RequestKind::Segment);
+        let dl = tokio::select! {
+            r = dl_fut => r,
+            _ = stop.notified() => break,
+        };
+        match dl {
+            Ok(d) => {
+                let pts_ms = seg.start_time().as_millis() as i64;
+                let cues = crate::parsers::vtt::parse_segment(&d.data, pts_ms);
+                if !cues.is_empty() {
+                    log::debug!("[subs] segment {} produced {} cues", i, cues.len());
+                    video_sink.queue_subtitle_cues(cues);
+                }
+            }
+            Err(e) => {
+                log::warn!("[subs] segment {} download failed: {}", i, e);
+            }
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Video supervisor — owns the video pipeline lifecycle within one play()
 // ---------------------------------------------------------------------------
 
@@ -1108,6 +1207,7 @@ impl Player<VideoRenderer, AudioRenderer> {
             abr_strategy: Arc::new(ArcSwap::from_pointee(AbrStrategy::default())),
             video_switch_tx: Arc::new(StdMutex::new(None)),
             buffer_target_secs: Arc::new(AtomicU32::new(DEFAULT_BUFFER_TARGET_SECS)),
+            subtitle_representation: Arc::new(StdMutex::new(None)),
 
             video_renderer,
             audio_renderer,
@@ -1439,6 +1539,46 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         self.buffer_target_secs.load(Ordering::Relaxed)
     }
 
+    /// Provide a TTF/OTF font for subtitle rendering. Until this is
+    /// called, the cue pipeline still parses and tracks cues but the
+    /// wgpu overlay draws nothing. Reasonable choices per platform:
+    /// `/system/fonts/Roboto-Regular.ttf` on Android, any system font
+    /// on desktop, or bundle one with your app.
+    pub fn set_subtitle_font(&self, bytes: Vec<u8>) -> Result<(), Box<dyn Error>> {
+        self.video_renderer
+            .set_subtitle_font(bytes)
+            .map_err(|e| -> Box<dyn Error> { format!("subtitle font: {}", e).into() })?;
+        Ok(())
+    }
+
+    /// Select a subtitle track. If `play()` is already running, the new
+    /// representation's cue pipeline spawns immediately and starts
+    /// pushing into the overlay. Otherwise the selection is stored and
+    /// the next `play()` picks it up.
+    pub fn set_subtitle_track(&self, representation: &tracks::text::TextRepresenation) {
+        *self.subtitle_representation.lock().unwrap() = Some(representation.clone());
+        // Wipe any cues from the previous track so they don't bleed
+        // across the switch.
+        self.video_renderer.clear_subtitles();
+        log::info!(
+            "[subs] selected representation id={} codecs={} mime={}",
+            representation.id, representation.codecs, representation.mime_type
+        );
+    }
+
+    /// Disable subtitles. Wipes the overlay's queued cues and prevents
+    /// the next `play()` from spawning a text_play task. Currently
+    /// running text_play tasks finish their in-flight segment then
+    /// drain on the play-level stop.
+    pub fn clear_subtitle_track(&self) {
+        *self.subtitle_representation.lock().unwrap() = None;
+        self.video_renderer.clear_subtitles();
+    }
+
+    pub fn current_subtitle_representation(&self) -> Option<tracks::text::TextRepresenation> {
+        self.subtitle_representation.lock().unwrap().clone()
+    }
+
     /// Convert the configured `buffer_target_secs` into a channel capacity
     /// (segments-in-flight) using the conservative segment-duration estimate.
     /// Floored at 2 so even with a tiny buffer target the decoder has room
@@ -1605,6 +1745,13 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             "play(): buffer target {}s -> {} segments in flight",
             self.buffer_target_secs.load(Ordering::Relaxed), seg_in_flight
         );
+        // Snapshot the subtitle representation at play() time. Mid-play
+        // track switches go through set_subtitle_track which already
+        // calls clear_subtitles + stores the new repr; the next play()
+        // cycle picks it up.
+        let subtitle_repr_snapshot = self.subtitle_representation.lock().unwrap().clone();
+        let http_subs = Arc::clone(&self.http);
+        let video_sink_for_subs = self.video_renderer.clone();
 
         let play = tokio::spawn(async move {
             // ABR tick: runs alongside the playback pipeline. Each second,
@@ -1689,6 +1836,24 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                 Arc::clone(&stats),
                 seg_in_flight,
             ));
+
+            // Optional subtitle pipeline. Single-shot for single-file
+            // VTT, streaming for ISO BMFF. The task self-terminates when
+            // its work is done, so we don't keep it in the join set.
+            if let Some(repr) = subtitle_repr_snapshot.clone() {
+                let stop_subs = stop.clone();
+                let stop_flag_subs = stop_flag.clone();
+                tokio::spawn(async move {
+                    let _ = text_play(
+                        repr,
+                        stop_subs,
+                        stop_flag_subs,
+                        http_subs,
+                        video_sink_for_subs,
+                    )
+                    .await;
+                });
+            }
 
             av_sync_handler(
                 snapped_seek_offset,

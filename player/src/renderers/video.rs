@@ -111,6 +111,13 @@ pub struct VideoRenderer {
     // blue-screen clear so the renderer survives without crashing.
     has_nv12_feature: bool,
     queue: wgpu::Queue,
+    /// Optional WebVTT subtitle overlay. Built lazily on the first
+    /// `set_subtitle_font` call so the wgpu pipeline (which needs the
+    /// surface format known at construction time) is created with the
+    /// right target format. Drawn inside the desktop render pass after
+    /// the main video quad. Android's GLES OES path doesn't call it
+    /// yet — subtitle rendering there is a separate follow-up.
+    subtitle_overlay: Arc<std::sync::Mutex<Option<Arc<super::subtitle::SubtitleOverlay>>>>,
     frame_size: Arc<RwLock<winit::dpi::PhysicalSize<u32>>>,
     // Crop factor for the texture V-axis: content_height / buffer_height.
     // Always 1.0 on desktop; set to <1.0 on Android when the hardware codec
@@ -470,6 +477,7 @@ impl VideoRenderer {
             texture_bind_group_layout,
             render_pipeline,
             command_sender,
+            subtitle_overlay: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(target_os = "android")]
             gles_oes_renderer,
             #[cfg(target_os = "android")]
@@ -593,6 +601,12 @@ impl VideoRenderer {
     /// Dispatches to the platform-specific render path based on the PlatformFrame variant.
     pub async fn render_frame(&self, frame: crate::decoders::DecodedVideoFrame) {
         use crate::decoders::PlatformFrame;
+        // Feed the current PTS into the subtitle overlay (if any) so
+        // its active-cue picker stays in lockstep with the rendered
+        // frame. Cheap: no-op when no overlay was constructed.
+        if let Some(ov) = self.subtitle_overlay.lock().unwrap().clone() {
+            ov.set_pts_ms(frame.pts_us / 1000);
+        }
         let desired_present_ns = frame.desired_present_ns;
         match frame.native {
             #[cfg(any(target_os = "windows", target_os = "linux"))]
@@ -730,6 +744,17 @@ impl VideoRenderer {
                 render_pass.set_bind_group(0, &texture_bind_group, &[]);
                 render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
                 render_pass.draw(0..6, 0..1);
+
+                // Subtitle overlay on top of the video. The overlay
+                // resolves the active cue from its internal PTS state
+                // and draws nothing when no cue is active or no font
+                // has been provided.
+                if let Some(overlay) =
+                    self.subtitle_overlay.lock().unwrap().clone()
+                {
+                    let cfg = self.surface_config.read().await;
+                    overlay.draw_into(&mut render_pass, cfg.width, cfg.height);
+                }
             }
 
             // Submit the command in the queue to execute
@@ -879,6 +904,24 @@ impl VideoRenderer {
     }
 }
 
+impl VideoRenderer {
+    fn ensure_subtitle_overlay(&self) -> Arc<super::subtitle::SubtitleOverlay> {
+        let mut slot = self.subtitle_overlay.lock().unwrap();
+        if let Some(ov) = slot.as_ref() {
+            return ov.clone();
+        }
+        // Lazy first construction. Device + queue are clones of the
+        // same underlying wgpu objects we use for video rendering.
+        let overlay = Arc::new(super::subtitle::SubtitleOverlay::new(
+            Arc::new(self.device.clone()),
+            Arc::new(self.queue.clone()),
+            self.surface_format,
+        ));
+        *slot = Some(overlay.clone());
+        overlay
+    }
+}
+
 impl super::VideoSink for VideoRenderer {
     fn render_frame(&self, frame: crate::decoders::DecodedVideoFrame) -> impl std::future::Future<Output = ()> + Send + '_ {
         VideoRenderer::render_frame(self, frame)
@@ -890,5 +933,24 @@ impl super::VideoSink for VideoRenderer {
 
     fn change_frame_size(&self, size: winit::dpi::PhysicalSize<u32>) -> impl std::future::Future<Output = ()> + Send + '_ {
         VideoRenderer::change_frame_size(self, size)
+    }
+
+    fn set_subtitle_font(&self, bytes: Vec<u8>) -> Result<(), String> {
+        let overlay = self.ensure_subtitle_overlay();
+        overlay.set_font(bytes)
+    }
+
+    fn queue_subtitle_cues(&self, cues: Vec<crate::parsers::vtt::VttCue>) {
+        if cues.is_empty() {
+            return;
+        }
+        let overlay = self.ensure_subtitle_overlay();
+        overlay.queue_cues(cues);
+    }
+
+    fn clear_subtitles(&self) {
+        if let Some(ov) = self.subtitle_overlay.lock().unwrap().as_ref() {
+            ov.clear();
+        }
     }
 }

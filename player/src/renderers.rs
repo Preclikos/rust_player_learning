@@ -1,9 +1,11 @@
 pub mod audio;
+pub mod subtitle;
 pub mod video;
 
 use std::future::Future;
 
 use crate::decoders::DecodedVideoFrame;
+use crate::parsers::vtt::VttCue;
 use winit::dpi::PhysicalSize;
 
 /// Receives decoded video frames and presents them to the display.
@@ -12,6 +14,21 @@ pub trait VideoSink: Send + Sync + 'static {
     fn render_frame(&self, frame: DecodedVideoFrame) -> impl Future<Output = ()> + Send + '_;
     fn resize(&self, size: PhysicalSize<u32>) -> impl Future<Output = ()> + Send + '_;
     fn change_frame_size(&self, size: PhysicalSize<u32>) -> impl Future<Output = ()> + Send + '_;
+
+    /// Install a font for subtitle rendering. No-op on sinks that don't
+    /// render subtitles themselves. Returns Err on invalid font bytes.
+    fn set_subtitle_font(&self, _bytes: Vec<u8>) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Queue parsed cues for rendering. The sink keeps an internal list
+    /// and picks the one active at the current playback PTS. Called by
+    /// the text_play pipeline as cues arrive.
+    fn queue_subtitle_cues(&self, _cues: Vec<VttCue>) {}
+
+    /// Wipe any queued cues + cached rasterizations. Called on subtitle
+    /// track switch or when the consumer disables subtitles.
+    fn clear_subtitles(&self) {}
 }
 
 /// Receives decoded PCM audio and feeds it to the output device.

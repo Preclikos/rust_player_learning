@@ -30,6 +30,10 @@ wgpu = { git = "https://github.com/Preclikos/wgpu.git" }
 winit = "0.30.9"
 ash = "0.38.0"
 log = "0.4"
+# Subtitle font rasterization. Pure-Rust, no system deps. Used by the
+# wgpu-based subtitle overlay to bake cue text into RGBA bitmaps that
+# get uploaded as textures and drawn over the video surface.
+fontdue = "0.9"
 
 # FFmpeg is desktop-only; mobile uses MediaCodec (Android) / VideoToolbox (iOS).
 # Desktop uses native-tls (system OpenSSL/Schannel) for reqwest.

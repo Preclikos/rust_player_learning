@@ -511,18 +511,84 @@ impl Tracks {
         })
     }
 
-    fn parse_text_adaptation(
-        _base_url: &str,
+    async fn parse_text_adaptation(
+        base_url: &str,
         adaptation: &AdaptationSet,
+        http: &HttpClient,
     ) -> Result<TextAdaptation, Box<dyn Error>> {
         let mut text_representations: Vec<TextRepresenation> = vec![];
 
         for representation in &adaptation.representations {
+            let url_base = base_url.to_string();
+            let file_url = representation.base_url.value.to_string();
+
+            let mut segment_init = None;
+            let mut segment_range = None;
+            let mut segments: Vec<Segment> = Vec::new();
+            let mut single_file_url: Option<String> = None;
+
+            match &representation.segment_base {
+                Some(sb) => {
+                    // CMAF text track: init + sidx-driven subsegments.
+                    let (init_start, init_end) = Self::parse_range(&sb.initialization.range)?;
+                    segment_init = Some(Segment::new(
+                        &url_base, &file_url, init_start, init_end, None, None, None,
+                    )?);
+                    let (idx_start, idx_end) = Self::parse_range(&sb.index_range)?;
+                    let idx_seg = Segment::new(
+                        &url_base, &file_url, idx_start, idx_end, None, None, None,
+                    )?;
+                    segments = match idx_seg.download(http, RequestKind::InitSegment).await {
+                        Ok(dl) => {
+                            let mut slice = &dl.data[..];
+                            match parse_sidx(&mut slice) {
+                                Ok(sidx) => Self::generate_segments_from_sidx(
+                                    &url_base,
+                                    &file_url,
+                                    sidx,
+                                    idx_end + 1,
+                                )
+                                .unwrap_or_default(),
+                                Err(e) => {
+                                    log::warn!(
+                                        "[text] sidx parse failed for repr {}: {}",
+                                        representation.id, e
+                                    );
+                                    Vec::new()
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "[text] sidx download failed for repr {}: {}",
+                                representation.id, e
+                            );
+                            Vec::new()
+                        }
+                    };
+                    segment_range = Some(idx_seg);
+                }
+                None => {
+                    // Single-file delivery — the typical "external .vtt
+                    // per language" pattern. Compose the absolute URL
+                    // once; text_play will GET it whole at activation.
+                    if !file_url.is_empty() {
+                        single_file_url = Some(format!("{}{}", url_base, file_url));
+                    }
+                }
+            }
+
             text_representations.push(TextRepresenation {
                 id: representation.id,
                 codecs: representation.codecs.clone().unwrap_or_default(),
                 mime_type: representation.mime_type.clone(),
                 bandwidth: representation.bandwidth,
+                base_url: url_base,
+                file_url,
+                segment_init,
+                segment_range,
+                segments,
+                single_file_url,
             });
         }
 
@@ -578,7 +644,7 @@ impl Tracks {
                     audio_adaptations.push(value);
                 }
                 "text" => {
-                    let value = Self::parse_text_adaptation(&base_url, adaptation)?;
+                    let value = Self::parse_text_adaptation(&base_url, adaptation, http).await?;
                     text_adaptations.push(value);
                 }
                 other => log::warn!("AdaptationSet content_type {} ignored", other),

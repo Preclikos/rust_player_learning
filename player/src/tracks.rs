@@ -146,16 +146,12 @@ impl Tracks {
             }
         };
 
-        let sar = match &representation.sar {
-            Some(value) => value.to_string(),
-            None => {
-                return Err(format!(
-                    "Cannot get height from Representation Id: {}",
-                    representation.id
-                )
-                .into())
-            }
-        };
+        // @sar (Sample Aspect Ratio) is optional in DASH and defaults to
+        // 1:1 per the spec. Don't reject the stream over a missing one.
+        let sar = representation
+            .sar
+            .clone()
+            .unwrap_or_else(|| "1:1".to_string());
 
         let url_base = base_url.to_string();
         let file_url = representation.base_url.value.to_string();
@@ -380,38 +376,43 @@ impl Tracks {
     ) -> Result<VideoAdaptation, Box<dyn Error>> {
         let mut video_representations: Vec<VideoRepresenation> = vec![];
 
-        let frame_rate = match &adaptation.frame_rate {
-            Some(value) => value.to_string(),
-            None => {
-                return Err(format!(
-                    "Cannot get frameRate from AdaptationSet Id: {}",
-                    adaptation.id
-                )
-                .into())
-            }
-        };
+        // DASH lets @frameRate, @maxWidth, @maxHeight live either on the
+        // AdaptationSet or on each Representation. Real-world manifests
+        // (single-rep, certain encoders) routinely omit them at the
+        // adaptation level. Fall back gracefully so we don't reject the
+        // whole stream over missing metadata.
+        //
+        // For frame_rate, prefer the highest-bandwidth representation's
+        // value — adaptation sets with mixed framerates (e.g. low-rez
+        // 24fps + high-rez 60fps) should advertise the headline rate,
+        // not whichever happened to be listed first.
+        let frame_rate = adaptation.frame_rate.clone().or_else(|| {
+            adaptation
+                .representations
+                .iter()
+                .filter(|r| r.frame_rate.is_some())
+                .max_by_key(|r| r.bandwidth)
+                .and_then(|r| r.frame_rate.clone())
+        })
+        .unwrap_or_default();
 
-        let max_width = match &adaptation.max_width {
-            Some(value) => value,
-            None => {
-                return Err(format!(
-                    "Cannot get maxWidth from AdaptationSet Id: {}",
-                    adaptation.id
-                )
-                .into())
-            }
-        };
+        let max_width = adaptation.max_width.unwrap_or_else(|| {
+            adaptation
+                .representations
+                .iter()
+                .filter_map(|r| r.width)
+                .max()
+                .unwrap_or(0)
+        });
 
-        let max_height = match &adaptation.max_height {
-            Some(value) => value,
-            None => {
-                return Err(format!(
-                    "Cannot get maxHeight from AdaptationSet Id: {}",
-                    adaptation.id
-                )
-                .into())
-            }
-        };
+        let max_height = adaptation.max_height.unwrap_or_else(|| {
+            adaptation
+                .representations
+                .iter()
+                .filter_map(|r| r.height)
+                .max()
+                .unwrap_or(0)
+        });
         /*
                 let par = match &adaptation.par {
                     Some(value) => value.to_string(),
@@ -452,8 +453,8 @@ impl Tracks {
             id: adaptation.id,
             subsegment_alignment,
             frame_rate,
-            max_width: *max_width,
-            max_height: *max_height,
+            max_width,
+            max_height,
             //par,
             roles,
             representations: video_representations,
@@ -470,14 +471,11 @@ impl Tracks {
     ) -> Result<AudioAdaptation, Box<dyn Error>> {
         let mut audio_representations: Vec<AudioRepresentation> = vec![];
 
-        let lang = match &adaptation.lang {
-            Some(value) => value.to_string(),
-            None => {
-                return Err(
-                    format!("Cannot get lang from AdaptationSet Id: {}", adaptation.id).into(),
-                )
-            }
-        };
+        // @lang is optional in DASH (and often omitted on the single
+        // audio adaptation of a mono-lingual stream). Treat absence as
+        // unknown — AudioAdaptation::language() already returns None when
+        // the string is empty.
+        let lang = adaptation.lang.clone().unwrap_or_default();
 
         let subsegment_alignment = match &adaptation.subsegment_alignment {
             Some(value) => *value,

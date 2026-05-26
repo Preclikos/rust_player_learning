@@ -3,7 +3,10 @@ pub mod segment;
 pub mod text;
 pub mod video;
 
-use crate::manifest::{AdaptationSet, Representation, MPD};
+use crate::manifest::{
+    find_audio_channel_count, find_descriptor_values, slice_adaptation_set,
+    slice_representation, AdaptationSet, Representation, MPD,
+};
 use crate::net::{HttpClient, RequestKind};
 use crate::parsers::mp4::{parse_sidx, SidxBox};
 use crate::tracks::audio::{AudioAdaptation, AudioRepresentation};
@@ -34,10 +37,11 @@ impl Tracks {
     pub async fn new(
         base_url: String,
         mpd: &MPD,
+        raw_mpd: &str,
         http: &HttpClient,
     ) -> Result<Self, Box<dyn Error>> {
         let duration = Self::parse_duration(mpd)?;
-        let tracks = Self::parse_tracks(base_url, mpd, http).await?;
+        let tracks = Self::parse_tracks(base_url, mpd, raw_mpd, http).await?;
 
         Ok(Tracks {
             duration,
@@ -106,6 +110,7 @@ impl Tracks {
     async fn parse_video_representation(
         base_url: &String,
         representation: &Representation,
+        adaptation_block: Option<&str>,
         http: &HttpClient,
     ) -> Result<VideoRepresenation, Box<dyn Error>> {
         let codecs = match &representation.codecs {
@@ -204,6 +209,40 @@ impl Tracks {
             }
         }
 
+        // HDR / DV detection. Per spec §5: HDR10 = ColourPrimaries=9 OR
+        // TransferCharacteristics=16/18 in a SupplementalProperty. DV = an
+        // EssentialProperty with dolby_vision in the schemeIdUri (codec
+        // sniff via `dvh1.*` is a fallback for malformed manifests). We
+        // walk the raw XML of the AdaptationSet (which we can't parse via
+        // serde — see manifest.rs note) plus the Representation block.
+        let codecs_for_dv = codecs.as_str();
+        let dv_codec_sniff = codecs_for_dv.starts_with("dvh1")
+            || codecs_for_dv.starts_with("dvhe")
+            || codecs_for_dv.starts_with("dvav");
+
+        let mut hdr10 = false;
+        let mut dolby_vision = dv_codec_sniff;
+        if let Some(block) = adaptation_block {
+            let rep_block =
+                slice_representation(block, representation.id).unwrap_or(block);
+            let combined = format!("{}\n{}", block, rep_block);
+            // ColourPrimaries=9 (BT.2020) → HDR10.
+            let primaries = find_descriptor_values(&combined, "ColourPrimaries");
+            if primaries.iter().any(|v| v == "9") {
+                hdr10 = true;
+            }
+            // TransferCharacteristics=16 (PQ / SMPTE ST 2084) or 18 (HLG)
+            // → HDR10.
+            let xfer = find_descriptor_values(&combined, "TransferCharacteristics");
+            if xfer.iter().any(|v| v == "16" || v == "18") {
+                hdr10 = true;
+            }
+            // EssentialProperty dolby_vision_profile.
+            if !find_descriptor_values(&combined, "dolby_vision").is_empty() {
+                dolby_vision = true;
+            }
+        }
+
         let video_representation = VideoRepresenation {
             id: representation.id,
             base_url: url_base,
@@ -217,8 +256,8 @@ impl Tracks {
             segment_init: init_segment,
             segment_range: index_segment,
             segments,
-            supplemental_properties: representation.supplemental_properties.clone(),
-            essential_properties: representation.essential_properties.clone(),
+            hdr10,
+            dolby_vision,
         };
 
         Ok(video_representation)
@@ -227,6 +266,7 @@ impl Tracks {
     async fn parse_audio_representation(
         base_url: &String,
         representation: &Representation,
+        adaptation_block: Option<&str>,
         http: &HttpClient,
     ) -> Result<AudioRepresentation, Box<dyn Error>> {
         let codecs = match &representation.codecs {
@@ -303,17 +343,17 @@ impl Tracks {
             }
         }
 
-        // Parse channel count from <AudioChannelConfiguration value="..."/>.
-        // The element's `value` is typically a plain integer (e.g. "2",
-        // "6") for the urn:mpeg:dash:23003:3:audio_channel_configuration
-        // schema. Some encoders use bitmask hex for ChannelConfiguration —
-        // those would need a different parser; for now plain int handles
-        // everything we test against.
-        let channels = representation
-            .audio_channel_configurations
-            .first()
-            .and_then(|p| p.value.as_deref())
-            .and_then(|s| s.trim().parse::<u32>().ok());
+        // Pull <AudioChannelConfiguration value="N"/> from the raw XML
+        // for this Representation. (Serde can't read it for the same
+        // reason it can't read SupplementalProperty — interleaved with
+        // other children.)
+        let channels = adaptation_block
+            .and_then(|b| slice_representation(b, representation.id))
+            .and_then(|rb| find_audio_channel_count(rb))
+            .or_else(|| {
+                // Some manifests put it at AdaptationSet level instead.
+                adaptation_block.and_then(|b| find_audio_channel_count(b))
+            });
 
         let audio_representation = AudioRepresentation {
             id: representation.id,
@@ -335,6 +375,7 @@ impl Tracks {
     async fn parse_video_adaptation(
         base_url: &String,
         adaptation: &AdaptationSet,
+        raw_mpd: &str,
         http: &HttpClient,
     ) -> Result<VideoAdaptation, Box<dyn Error>> {
         let mut video_representations: Vec<VideoRepresenation> = vec![];
@@ -386,12 +427,26 @@ impl Tracks {
             None => false,
         };
 
+        let adaptation_block = slice_adaptation_set(raw_mpd, adaptation.id);
+
         let representations = &adaptation.representations;
         for representation in representations {
-            let video_representation =
-                Self::parse_video_representation(base_url, representation, http).await?;
+            let video_representation = Self::parse_video_representation(
+                base_url,
+                representation,
+                adaptation_block,
+                http,
+            )
+            .await?;
             video_representations.push(video_representation);
         }
+
+        // Flatten serde's `Vec<Property>` to plain role-value strings.
+        let roles = adaptation
+            .roles
+            .iter()
+            .filter_map(|p| p.value.clone())
+            .collect();
 
         let video_adaptation = VideoAdaptation {
             id: adaptation.id,
@@ -400,7 +455,7 @@ impl Tracks {
             max_width: *max_width,
             max_height: *max_height,
             //par,
-            roles: adaptation.roles.clone(),
+            roles,
             representations: video_representations,
         };
 
@@ -410,6 +465,7 @@ impl Tracks {
     async fn parse_audio_adaptation(
         base_url: &String,
         adaptation: &AdaptationSet,
+        raw_mpd: &str,
         http: &HttpClient,
     ) -> Result<AudioAdaptation, Box<dyn Error>> {
         let mut audio_representations: Vec<AudioRepresentation> = vec![];
@@ -428,18 +484,31 @@ impl Tracks {
             None => false,
         };
 
+        let adaptation_block = slice_adaptation_set(raw_mpd, adaptation.id);
+
         let representations = &adaptation.representations;
         for representation in representations {
-            let audio_representation =
-                Self::parse_audio_representation(base_url, representation, http).await?;
+            let audio_representation = Self::parse_audio_representation(
+                base_url,
+                representation,
+                adaptation_block,
+                http,
+            )
+            .await?;
             audio_representations.push(audio_representation);
         }
+
+        let roles = adaptation
+            .roles
+            .iter()
+            .filter_map(|p| p.value.clone())
+            .collect();
 
         Ok(AudioAdaptation {
             id: adaptation.id,
             lang,
             subsegment_alignment,
-            roles: adaptation.roles.clone(),
+            roles,
             representations: audio_representations,
         })
     }
@@ -463,6 +532,7 @@ impl Tracks {
     async fn parse_tracks(
         base_url: String,
         mpd: &MPD,
+        raw_mpd: &str,
         http: &HttpClient,
     ) -> Result<TracksResult, Box<dyn Error>> {
         let period = match mpd.periods.first() {
@@ -482,11 +552,17 @@ impl Tracks {
             let content_type = adaptation.content_type.as_str();
             match content_type {
                 "video" => {
-                    let value = Self::parse_video_adaptation(&base_url, adaptation, http).await?;
+                    let value = Self::parse_video_adaptation(
+                        &base_url, adaptation, raw_mpd, http,
+                    )
+                    .await?;
                     video_adaptations.push(value);
                 }
                 "audio" => {
-                    let value = Self::parse_audio_adaptation(&base_url, adaptation, http).await?;
+                    let value = Self::parse_audio_adaptation(
+                        &base_url, adaptation, raw_mpd, http,
+                    )
+                    .await?;
                     audio_adaptations.push(value);
                 }
                 "text" => {

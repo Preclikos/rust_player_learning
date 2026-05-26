@@ -895,7 +895,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             Some(u) => u.to_string(),
             None => return Err("BaseUrl not loaded!".into()),
         };
-        let tracks = match Tracks::new(base_url, &manifest.mpd, &self.http).await {
+        let tracks = match Tracks::new(base_url, &manifest.mpd, &manifest.content, &self.http).await {
             Ok(t) => t,
             Err(e) => {
                 self.emit_error(PlayerErrorKind::ManifestParse, format!("tracks: {}", e));

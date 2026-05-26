@@ -3,8 +3,12 @@
 # Local test recordings / extracted frames (kept out of repo)
 captures/
 frames*/
+phone_*/
 play*.mp4
 playback*.mp4
+phone*.mp4
+android.log
+durations.txt
 
 # Stale build output location (real output goes to app-android/android/app/src/main/jniLibs)
 app-android/src/main/jniLibs/

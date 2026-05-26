@@ -75,13 +75,14 @@ pub struct AdaptationSet {
     #[serde(rename = "Role", default)]
     pub roles: Vec<Property>,
 
-    /// Optional `SupplementalProperty` / `EssentialProperty` elements
-    /// (HDR colour primaries, Dolby Vision profile, etc.). Used by
-    /// `TrackInfo::hdr10` / `dolby_vision` heuristics.
-    #[serde(rename = "SupplementalProperty", default)]
-    pub supplemental_properties: Vec<Property>,
-    #[serde(rename = "EssentialProperty", default)]
-    pub essential_properties: Vec<Property>,
+    // NOTE: SupplementalProperty / EssentialProperty are deliberately NOT
+    // parsed here. quick-xml's serde adapter requires repeating elements
+    // (Vec<T>) to be CONTIGUOUS in the XML; real DASH manifests interleave
+    // SupplementalProperty with ContentProtection / Role / Representation
+    // and the parser blows up with "duplicate field SupplementalProperty".
+    // HDR/DV detection therefore relies on a post-hoc raw-XML scan
+    // (`manifest::extract_property_values`) at track-build time, not on
+    // serde fields. See VideoRepresenation::is_hdr10 / is_dolby_vision.
 
     #[serde(rename = "Representation")]
     pub representations: Vec<Representation>,
@@ -129,12 +130,10 @@ pub struct Representation {
     #[serde(rename = "SegmentBase")]
     pub segment_base: Option<SegmentBase>,
 
-    #[serde(rename = "SupplementalProperty", default)]
-    pub supplemental_properties: Vec<Property>,
-    #[serde(rename = "EssentialProperty", default)]
-    pub essential_properties: Vec<Property>,
-    #[serde(rename = "AudioChannelConfiguration", default)]
-    pub audio_channel_configurations: Vec<Property>,
+    // SupplementalProperty / EssentialProperty / AudioChannelConfiguration
+    // at Representation level have the same interleaving problem as on
+    // AdaptationSet. We pull them out of the raw XML in
+    // `manifest::extract_property_values`.
 }
 
 #[derive(Deserialize, Clone)]
@@ -156,4 +155,84 @@ pub struct SegmentBase {
 pub struct Initialization {
     #[serde(rename = "@range")]
     pub range: String,
+}
+
+// ---------------------------------------------------------------------------
+// Raw-XML helpers — work around quick-xml's "duplicate field" error on
+// interleaved repeating elements. We slice out the substring for a given
+// AdaptationSet / Representation block from `Manifest::content` and walk
+// it for the specific descriptors we care about. Light string search, no
+// re-parse — we already validated structure via serde.
+// ---------------------------------------------------------------------------
+
+/// Slice the substring `<AdaptationSet id="adaptation_id" ...>...</AdaptationSet>`
+/// out of the raw MPD content. Returns `None` if no AdaptationSet with
+/// that id is found (e.g. content_type mismatch in caller's mental model).
+pub fn slice_adaptation_set<'a>(content: &'a str, adaptation_id: u32) -> Option<&'a str> {
+    let needle = format!("<AdaptationSet id=\"{}\"", adaptation_id);
+    let start = content.find(&needle)?;
+    let rest = &content[start..];
+    let end = rest.find("</AdaptationSet>")?;
+    Some(&rest[..end])
+}
+
+/// Slice the substring `<Representation id="rep_id" ...>...</Representation>`
+/// out of the given block (typically the result of `slice_adaptation_set`).
+pub fn slice_representation<'a>(block: &'a str, rep_id: u32) -> Option<&'a str> {
+    let needle = format!("<Representation id=\"{}\"", rep_id);
+    let start = block.find(&needle)?;
+    let rest = &block[start..];
+    let end = rest.find("</Representation>")?;
+    Some(&rest[..end])
+}
+
+/// Find all `<SupplementalProperty|EssentialProperty>` elements in
+/// `block` whose `schemeIdUri` contains `scheme_substring`. Returns the
+/// `value` attribute of each match.
+pub fn find_descriptor_values(block: &str, scheme_substring: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cursor = block;
+    while let Some(open) = cursor.find('<') {
+        let after = &cursor[open + 1..];
+        let tag_end = match after.find('>') {
+            Some(i) => i,
+            None => break,
+        };
+        let tag = &after[..tag_end];
+        // We only care about *Property elements (Supplemental / Essential).
+        let is_prop = tag.starts_with("SupplementalProperty")
+            || tag.starts_with("EssentialProperty");
+        if is_prop && tag.contains(scheme_substring) {
+            // Pull out the value="..." attribute if present.
+            if let Some(val_start) = tag.find("value=\"") {
+                let rest = &tag[val_start + 7..];
+                if let Some(val_end) = rest.find('"') {
+                    out.push(rest[..val_end].to_string());
+                }
+            }
+        }
+        cursor = &after[tag_end + 1..];
+    }
+    out
+}
+
+/// Return the integer value of the FIRST `<AudioChannelConfiguration value="N"/>`
+/// in `block`, e.g. for parsing audio channel counts from a Representation.
+pub fn find_audio_channel_count(block: &str) -> Option<u32> {
+    let mut cursor = block;
+    while let Some(open) = cursor.find("<AudioChannelConfiguration") {
+        let after = &cursor[open..];
+        let tag_end = after.find('>')?;
+        let tag = &after[..tag_end];
+        if let Some(val_start) = tag.find("value=\"") {
+            let rest = &tag[val_start + 7..];
+            if let Some(val_end) = rest.find('"') {
+                if let Ok(n) = rest[..val_end].parse::<u32>() {
+                    return Some(n);
+                }
+            }
+        }
+        cursor = &after[tag_end + 1..];
+    }
+    None
 }

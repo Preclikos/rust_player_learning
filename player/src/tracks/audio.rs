@@ -1,5 +1,4 @@
 use super::segment::Segment;
-use crate::manifest::Property;
 
 #[derive(Clone)]
 pub struct AudioAdaptation {
@@ -9,7 +8,7 @@ pub struct AudioAdaptation {
 
     pub subsegment_alignment: bool,
 
-    pub roles: Vec<Property>,
+    pub roles: Vec<String>,
 
     pub representations: Vec<AudioRepresentation>,
 }
@@ -24,10 +23,9 @@ impl AudioAdaptation {
     }
 
     /// Returns the first DASH `Role` value (e.g. "main", "dub",
-    /// "commentary"). Most adaptation sets carry exactly one role; ones
-    /// that don't are unusual enough that returning the first is fine.
+    /// "commentary"). Most adaptation sets carry exactly one role.
     pub fn role(&self) -> Option<&str> {
-        self.roles.first().and_then(|r| r.value.as_deref())
+        self.roles.first().map(|s| s.as_str())
     }
 }
 
@@ -49,9 +47,8 @@ pub struct AudioRepresentation {
 
     pub audio_sampling_rate: u32,
 
-    /// Pre-parsed channel count from the MPD `AudioChannelConfiguration`
-    /// descriptor. `None` if the manifest didn't specify it (e.g.
-    /// stereo-only encoders that omit the element).
+    /// Channel count pulled from `<AudioChannelConfiguration value="N"/>`.
+    /// `None` when the manifest omits the descriptor.
     pub channels: Option<u32>,
 }
 

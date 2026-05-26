@@ -1,8 +1,6 @@
-use reqwest::{
-    header::{HeaderValue, RANGE},
-    Client,
-};
 use std::{error::Error, time::Duration};
+
+use crate::net::{HttpClient, RequestKind};
 
 #[derive(Clone)]
 pub struct Segment {
@@ -15,6 +13,14 @@ pub struct Segment {
     end_time: Duration,
     end_time_base: u32,
     timescale: u32,
+}
+
+/// Bandwidth-tracking result from a segment download: payload bytes plus
+/// wall-clock elapsed. Used by the EWMA in `video_play` to compute the
+/// `Position.bandwidth_bps` field on `PlayerEvent`.
+pub struct DownloadResult {
+    pub data: Vec<u8>,
+    pub elapsed: Duration,
 }
 
 impl Segment {
@@ -71,25 +77,24 @@ impl Segment {
         self.end_time
     }
 
-    pub async fn download(&self) -> Result<Vec<u8>, Box<dyn Error>> {
-        let client = Client::new();
-
-        let range_value = format!("bytes={}-{}", self.start, self.end);
-        let range_header = HeaderValue::from_str(&range_value).unwrap();
-
+    /// Fetch the segment's byte range through the centralised `HttpClient`,
+    /// returning both payload and elapsed time so callers can compute an
+    /// EWMA bandwidth estimate.
+    ///
+    /// `kind` lets the caller distinguish init segments (`InitSegment`)
+    /// from media segments (`Segment`) so an interceptor can route them
+    /// differently (e.g. different CDN, different auth).
+    pub async fn download(
+        &self,
+        http: &HttpClient,
+        kind: RequestKind,
+    ) -> Result<DownloadResult, Box<dyn Error + Send + Sync>> {
         let url = format!("{}{}", &self.base_url, &self.file_url);
-        let response = client.get(url).header(RANGE, range_header).send().await;
-
-        let response_bytes = match response {
-            Ok(success) => success.bytes().await,
-            Err(e) => return Err(format!("Segment response error: {}", e).into()),
-        };
-
-        let bytes = match response_bytes {
-            Ok(success) => success,
-            Err(e) => return Err(format!("Cannot read segment bytes: {}", e).into()),
-        };
-
-        Ok(bytes.to_vec())
+        let started = std::time::Instant::now();
+        let bytes = http.get_range(url, kind, self.start, self.end).await?;
+        Ok(DownloadResult {
+            data: bytes.to_vec(),
+            elapsed: started.elapsed(),
+        })
     }
 }

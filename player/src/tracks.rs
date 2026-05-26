@@ -4,6 +4,7 @@ pub mod text;
 pub mod video;
 
 use crate::manifest::{AdaptationSet, Representation, MPD};
+use crate::net::{HttpClient, RequestKind};
 use crate::parsers::mp4::{parse_sidx, SidxBox};
 use crate::tracks::audio::{AudioAdaptation, AudioRepresentation};
 use crate::tracks::text::{TextAdaptation, TextRepresenation};
@@ -30,9 +31,13 @@ pub struct Tracks {
 }
 
 impl Tracks {
-    pub async fn new(base_url: String, mpd: &MPD) -> Result<Self, Box<dyn Error>> {
+    pub async fn new(
+        base_url: String,
+        mpd: &MPD,
+        http: &HttpClient,
+    ) -> Result<Self, Box<dyn Error>> {
         let duration = Self::parse_duration(mpd)?;
-        let tracks = Self::parse_tracks(base_url, mpd).await?;
+        let tracks = Self::parse_tracks(base_url, mpd, http).await?;
 
         Ok(Tracks {
             duration,
@@ -101,6 +106,7 @@ impl Tracks {
     async fn parse_video_representation(
         base_url: &String,
         representation: &Representation,
+        http: &HttpClient,
     ) -> Result<VideoRepresenation, Box<dyn Error>> {
         let codecs = match &representation.codecs {
             Some(value) => value.to_string(),
@@ -178,8 +184,13 @@ impl Tracks {
 
         match representation.mime_type.as_str() {
             "video/mp4" => {
-                let index_vec = index_segment.download().await?;
-                let mut index_slice = &index_vec[..];
+                let index_dl = index_segment
+                    .download(http, RequestKind::InitSegment)
+                    .await
+                    .map_err(|e| -> Box<dyn Error> {
+                        format!("video sidx download: {}", e).into()
+                    })?;
+                let mut index_slice = &index_dl.data[..];
                 let sidx = parse_sidx(&mut index_slice)?;
                 segments =
                     Self::generate_segments_from_sidx(&url_base, &file_url, sidx, index_end + 1)?;
@@ -206,6 +217,8 @@ impl Tracks {
             segment_init: init_segment,
             segment_range: index_segment,
             segments,
+            supplemental_properties: representation.supplemental_properties.clone(),
+            essential_properties: representation.essential_properties.clone(),
         };
 
         Ok(video_representation)
@@ -214,6 +227,7 @@ impl Tracks {
     async fn parse_audio_representation(
         base_url: &String,
         representation: &Representation,
+        http: &HttpClient,
     ) -> Result<AudioRepresentation, Box<dyn Error>> {
         let codecs = match &representation.codecs {
             Some(value) => value.to_string(),
@@ -269,8 +283,13 @@ impl Tracks {
 
         match representation.mime_type.as_str() {
             "audio/mp4" => {
-                let index_vec = index_segment.download().await?;
-                let mut index_slice = &index_vec[..];
+                let index_dl = index_segment
+                    .download(http, RequestKind::InitSegment)
+                    .await
+                    .map_err(|e| -> Box<dyn Error> {
+                        format!("audio sidx download: {}", e).into()
+                    })?;
+                let mut index_slice = &index_dl.data[..];
                 let sidx = parse_sidx(&mut index_slice)?;
                 segments =
                     Self::generate_segments_from_sidx(&url_base, &file_url, sidx, index_end + 1)?;
@@ -284,6 +303,18 @@ impl Tracks {
             }
         }
 
+        // Parse channel count from <AudioChannelConfiguration value="..."/>.
+        // The element's `value` is typically a plain integer (e.g. "2",
+        // "6") for the urn:mpeg:dash:23003:3:audio_channel_configuration
+        // schema. Some encoders use bitmask hex for ChannelConfiguration —
+        // those would need a different parser; for now plain int handles
+        // everything we test against.
+        let channels = representation
+            .audio_channel_configurations
+            .first()
+            .and_then(|p| p.value.as_deref())
+            .and_then(|s| s.trim().parse::<u32>().ok());
+
         let audio_representation = AudioRepresentation {
             id: representation.id,
             base_url: url_base,
@@ -295,6 +326,7 @@ impl Tracks {
             segment_init: init_segment,
             segment_range: index_segment,
             segments,
+            channels,
         };
 
         Ok(audio_representation)
@@ -303,6 +335,7 @@ impl Tracks {
     async fn parse_video_adaptation(
         base_url: &String,
         adaptation: &AdaptationSet,
+        http: &HttpClient,
     ) -> Result<VideoAdaptation, Box<dyn Error>> {
         let mut video_representations: Vec<VideoRepresenation> = vec![];
 
@@ -356,7 +389,7 @@ impl Tracks {
         let representations = &adaptation.representations;
         for representation in representations {
             let video_representation =
-                Self::parse_video_representation(base_url, representation).await?;
+                Self::parse_video_representation(base_url, representation, http).await?;
             video_representations.push(video_representation);
         }
 
@@ -367,6 +400,7 @@ impl Tracks {
             max_width: *max_width,
             max_height: *max_height,
             //par,
+            roles: adaptation.roles.clone(),
             representations: video_representations,
         };
 
@@ -376,6 +410,7 @@ impl Tracks {
     async fn parse_audio_adaptation(
         base_url: &String,
         adaptation: &AdaptationSet,
+        http: &HttpClient,
     ) -> Result<AudioAdaptation, Box<dyn Error>> {
         let mut audio_representations: Vec<AudioRepresentation> = vec![];
 
@@ -396,7 +431,7 @@ impl Tracks {
         let representations = &adaptation.representations;
         for representation in representations {
             let audio_representation =
-                Self::parse_audio_representation(base_url, representation).await?;
+                Self::parse_audio_representation(base_url, representation, http).await?;
             audio_representations.push(audio_representation);
         }
 
@@ -404,6 +439,7 @@ impl Tracks {
             id: adaptation.id,
             lang,
             subsegment_alignment,
+            roles: adaptation.roles.clone(),
             representations: audio_representations,
         })
     }
@@ -424,7 +460,11 @@ impl Tracks {
         })
     }
 
-    async fn parse_tracks(base_url: String, mpd: &MPD) -> Result<TracksResult, Box<dyn Error>> {
+    async fn parse_tracks(
+        base_url: String,
+        mpd: &MPD,
+        http: &HttpClient,
+    ) -> Result<TracksResult, Box<dyn Error>> {
         let period = match mpd.periods.first() {
             Some(success) => success,
             None => {
@@ -442,11 +482,11 @@ impl Tracks {
             let content_type = adaptation.content_type.as_str();
             match content_type {
                 "video" => {
-                    let value = Self::parse_video_adaptation(&base_url, adaptation).await?;
+                    let value = Self::parse_video_adaptation(&base_url, adaptation, http).await?;
                     video_adaptations.push(value);
                 }
                 "audio" => {
-                    let value = Self::parse_audio_adaptation(&base_url, adaptation).await?;
+                    let value = Self::parse_audio_adaptation(&base_url, adaptation, http).await?;
                     audio_adaptations.push(value);
                 }
                 "text" => {

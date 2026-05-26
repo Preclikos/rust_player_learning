@@ -89,11 +89,18 @@ impl ApplicationHandler for App {
         let window = Arc::new(event_loop.create_window(attrs).unwrap());
         let mut player = Player::new(window.clone());
 
-        // Tell SurfaceFlinger this surface produces 24fps content so it locks
-        // the display to a compatible multiple of 24Hz (e.g. 120Hz on Galaxy S)
-        // and stops adaptive refresh rate switching mid-playback, which causes
-        // visible judder (each rate switch changes the vsync cadence abruptly).
-        set_frame_rate_24fps(&window);
+        // NOTE: ANativeWindow_setFrameRate(24, FIXED_SOURCE) DOES NOT help here.
+        // On Samsung devices (tested: Galaxy S21 120Hz panel, Samsung TV via
+        // Google TV Streamer) the compositor reacts to the 24fps hint by
+        // downgrading the display from 120Hz (a perfect 5x multiple of 24)
+        // to 60Hz — exactly the rate that produces 3:2 pulldown judder.
+        // Without the hint the panel stays at its native rate (120Hz on phones)
+        // and 24fps content plays with a clean 5-VSyncs-per-frame cadence.
+        // (TVs forced to 60Hz by their own logic still pulldown, but the hint
+        // doesn't help there either.)
+        // set_frame_rate_24fps(&window);
+
+        let _ = set_frame_rate_24fps; // suppress unused warning when not called
 
         self.window = Some(window);
         self.player = Some(player.clone());

@@ -1,12 +1,24 @@
 mod crypto;
 mod decoders;
+mod events;
 mod manifest;
-mod networking;
+mod net;
 mod parsers;
 mod renderers;
 mod tracks;
 mod utils;
 mod video;
+
+// Public re-exports so downstream consumers (BlackZone Console etc.) can
+// implement RequestInterceptor / LicenseResolver against the player's
+// canonical types — see PLAYER_INTEGRATION.md.
+pub use events::{
+    BufferingReason, Fps, PlayerErrorKind, PlayerEvent, TrackInfo, TrackKind,
+};
+pub use net::{
+    BoxError, HttpClient, LicenseResolver, NoopInterceptor, PreparedRequest,
+    RequestInterceptor, RequestKind, RetryPolicy,
+};
 
 use crypto::{
     parse_aac_config, parse_hvcc_nalus, parse_senc, parse_tenc, ClearKeyDecryptor,
@@ -32,7 +44,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use libc;
 use std::sync::Mutex as StdMutex;
 use std::time::Duration;
-use tokio::sync::{Notify, RwLock};
+use tokio::sync::{broadcast, Notify, RwLock};
 use tokio::time::Instant;
 use tokio::{join, sync::mpsc::Sender};
 use tracks::audio::{AudioAdaptation, AudioRepresentation};
@@ -56,6 +68,22 @@ pub struct Player<V: VideoSink = VideoRenderer, A: AudioSink = AudioRenderer> {
     manifest: Option<Manifest>,
     tracks: Arc<StdMutex<Option<Tracks>>>,
 
+    /// Shared HTTP transport used by every manifest / segment / license
+    /// fetch. Owns the single `reqwest::Client` connection pool and
+    /// applies the configured `RequestInterceptor` + `RetryPolicy`.
+    http: Arc<HttpClient>,
+
+    /// Broadcast(64) sender for `PlayerEvent`s. Cloning a `Player` shares
+    /// the same channel, so every subscriber sees every event regardless
+    /// of which Player handle emitted it.
+    events: Arc<broadcast::Sender<PlayerEvent>>,
+
+    /// Pause flag — checked in both video_sync_loop and audio_sync_loop
+    /// inner ticks. Toggled by `pause()` / `resume()`. While set, both
+    /// loops park on `pause_notify` and PTS does not advance.
+    paused: Arc<AtomicBool>,
+    pause_notify: Arc<Notify>,
+
     video_adaptation: Arc<StdMutex<Option<VideoAdaptation>>>,
     video_representation: Arc<StdMutex<Option<VideoRepresenation>>>,
 
@@ -71,7 +99,11 @@ pub struct Player<V: VideoSink = VideoRenderer, A: AudioSink = AudioRenderer> {
     seek_target: Arc<RwLock<Option<Duration>>>,
     position_ms: Arc<AtomicU64>,
 
-    decryptor: Arc<StdMutex<Option<Arc<dyn Decryptor>>>>,
+    /// ClearKey decryptor — single shared instance so cached keys and
+    /// the attached `LicenseResolver` survive across `play()` / `seek()`
+    /// cycles. Lazily created on first `set_clearkey` /
+    /// `set_license_resolver` call.
+    decryptor: Arc<StdMutex<Option<Arc<ClearKeyDecryptor>>>>,
 
     video_renderer: Arc<V>,
     audio_renderer: Arc<A>,
@@ -83,6 +115,10 @@ impl<V: VideoSink, A: AudioSink> Clone for Player<V, A> {
             base_url: self.base_url.clone(),
             manifest: self.manifest.clone(),
             tracks: Arc::clone(&self.tracks),
+            http: Arc::clone(&self.http),
+            events: Arc::clone(&self.events),
+            paused: Arc::clone(&self.paused),
+            pause_notify: Arc::clone(&self.pause_notify),
             video_adaptation: Arc::clone(&self.video_adaptation),
             video_representation: Arc::clone(&self.video_representation),
             audio_adaptation: Arc::clone(&self.audio_adaptation),
@@ -123,7 +159,17 @@ async fn video_sync_loop<V: VideoSink>(
     position_ms: Arc<AtomicU64>,
     stop: Arc<Notify>,
     stop_flag: Arc<AtomicBool>,
+    events: Arc<broadcast::Sender<PlayerEvent>>,
+    media_duration: Duration,
+    paused: Arc<AtomicBool>,
+    pause_notify: Arc<Notify>,
 ) {
+    // While paused, real time keeps advancing but media time must NOT.
+    // We accumulate the wall-clock duration spent paused and subtract
+    // it from `start_time.elapsed()` everywhere we compute "current
+    // playback time", so resuming after a 10s pause doesn't make every
+    // frame look "10s late" and trigger the drain-to-catch-up path.
+    let mut pause_skew = Duration::ZERO;
     // Start rendering this many ms before the target PTS so the GPU has time
     // to finish before the VSync deadline. The compositor (via
     // eglPresentationTimeANDROID) then holds the frame until the exact VSync.
@@ -132,6 +178,9 @@ async fn video_sync_loop<V: VideoSink>(
     let mut last_pts_ms = 0u64;
     let mut frame_idx: u64 = 0;
     let mut last_render_elapsed: u64 = 0;
+    // Position event rate-limit: ≤ 4 Hz per PLAYER_INTEGRATION.md §4.2.
+    let mut last_position_emit = Instant::now() - Duration::from_secs(1);
+    let mut emitted_playing = false;
     // BMDT (base media decode time) offset: DASH content timestamps are absolute
     // (e.g. ~7979ms for segment 0) while our wall clock starts at 0. Calibrated
     // on the first frame as (raw_pts - elapsed), making frame 0 render immediately
@@ -141,6 +190,19 @@ async fn video_sync_loop<V: VideoSink>(
         if stop_flag.load(Ordering::Relaxed) {
             break;
         }
+        // Park here if pause() was called. Note: when stop fires during
+        // a pause, we still want to exit cleanly.
+        if paused.load(Ordering::Relaxed) {
+            let pause_started = Instant::now();
+            tokio::select! {
+                _ = pause_notify.notified() => {}
+                _ = stop.notified() => break,
+            }
+            pause_skew += pause_started.elapsed();
+            if stop_flag.load(Ordering::Relaxed) {
+                break;
+            }
+        }
         let mut frame = tokio::select! {
             maybe = input_rx.recv() => match maybe {
                 Some(f) => f,
@@ -149,7 +211,10 @@ async fn video_sync_loop<V: VideoSink>(
             _ = stop.notified() => break,
         };
         let raw_pts_ms = (frame.pts_us / 1000) as u64;
-        let elapsed = start_time.elapsed().as_millis() as u64;
+        let elapsed = start_time
+            .elapsed()
+            .saturating_sub(pause_skew)
+            .as_millis() as u64;
 
         let base = *pts_base.get_or_insert(raw_pts_ms.saturating_sub(elapsed));
         let mut pts_ms = raw_pts_ms.saturating_sub(base);
@@ -209,11 +274,17 @@ async fn video_sync_loop<V: VideoSink>(
         let raw_pts_us = frame.pts_us;
         let base_us = base as i64 * 1_000;
         let pts_us_rel = (raw_pts_us - base_us).max(0);
-        let elapsed_us = start_time.elapsed().as_micros() as i64;
+        let elapsed_us = start_time
+            .elapsed()
+            .saturating_sub(pause_skew)
+            .as_micros() as i64;
         let pts_to_go_ns = (pts_us_rel - elapsed_us).max(0) * 1_000;
         frame.desired_present_ns = clock_monotonic_ns() + pts_to_go_ns;
 
-        let render_start = start_time.elapsed().as_millis() as u64;
+        let render_start = start_time
+            .elapsed()
+            .saturating_sub(pause_skew)
+            .as_millis() as u64;
         let interval_ms = if last_render_elapsed > 0 { render_start - last_render_elapsed } else { 0 };
         let delta_pts = if pts_ms >= last_pts_ms { pts_ms - last_pts_ms } else { 0 };
 
@@ -222,10 +293,34 @@ async fn video_sync_loop<V: VideoSink>(
         frame_idx += 1;
 
         position_ms.store(pts_ms, Ordering::Relaxed);
+
+        // Emit `Playing` once on the first rendered frame after a sync
+        // loop (re)starts. Buffering→Playing transition.
+        if !emitted_playing {
+            let _ = events.send(PlayerEvent::Playing);
+            emitted_playing = true;
+        }
+
         renderer.render_frame(frame).await;
 
-        let render_done = start_time.elapsed().as_millis() as u64;
+        let render_done = start_time
+            .elapsed()
+            .saturating_sub(pause_skew)
+            .as_millis() as u64;
         let render_ms = render_done - render_start;
+
+        // Rate-limited Position emission (≤ 4 Hz). Bandwidth + buffered
+        // ahead are 0 in this slice — populated in P2 when we instrument
+        // the download/decoder tasks.
+        if last_position_emit.elapsed() >= Duration::from_millis(250) {
+            let _ = events.send(PlayerEvent::Position {
+                position: Duration::from_millis(pts_ms),
+                duration: media_duration,
+                buffered_ahead_secs: 0.0,
+                bandwidth_bps: 0,
+            });
+            last_position_emit = Instant::now();
+        }
 
         log::info!("[vsync] #{} pts={}ms wall={}ms render={}ms interval={}ms Δpts={}ms",
             frame_idx - 1, pts_ms, render_start, render_ms, interval_ms, delta_pts);
@@ -269,7 +364,17 @@ async fn av_sync_handler<V: VideoSink, A: AudioSink>(
     audio_sink: Arc<A>,
     stop: Arc<Notify>,
     stop_flag: Arc<AtomicBool>,
+    events: Arc<broadcast::Sender<PlayerEvent>>,
+    media_duration: Duration,
+    paused: Arc<AtomicBool>,
+    pause_notify: Arc<Notify>,
 ) {
+    // Emit Buffering{Initial} immediately so the consumer can show "buffering"
+    // while the first segments download.
+    let _ = events.send(PlayerEvent::Buffering {
+        reason: BufferingReason::Initial,
+    });
+
     // Wait for both decoders to produce their first output before setting
     // start_time. This ensures A/V sync is established from a common wall-clock
     // origin. The audio channel is sized large enough (256 frames) that
@@ -291,6 +396,10 @@ async fn av_sync_handler<V: VideoSink, A: AudioSink>(
             position_ms,
             stop.clone(),
             stop_flag.clone(),
+            events.clone(),
+            media_duration,
+            paused,
+            pause_notify,
         )),
         tokio::spawn(audio_sync_loop(
             audio_rx,
@@ -299,6 +408,13 @@ async fn av_sync_handler<V: VideoSink, A: AudioSink>(
             stop_flag.clone(),
         )),
     );
+    // Both loops returning naturally (channels closed by decoder EOF) means
+    // we hit end-of-stream. If we were stopped explicitly, the consumer is
+    // tearing down and doesn't care about EndOfStream — but emitting it
+    // regardless is harmless and idempotent.
+    if !stop_flag.load(Ordering::Relaxed) {
+        let _ = events.send(PlayerEvent::EndOfStream);
+    }
     stop.notify_waiters();
 }
 
@@ -472,14 +588,16 @@ async fn video_play(
     stop_flag: Arc<AtomicBool>,
     decryptor: Option<Arc<dyn Decryptor>>,
     mut decoder: Box<dyn HwVideoDecoder>,
+    http: Arc<HttpClient>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let (download_tx, download_rx) = mpsc::channel::<DataSegment>(MAX_SEGMENTS);
 
-    let init_data = video_representation
+    let init_dl = video_representation
         .segment_init
-        .download()
+        .download(&http, RequestKind::InitSegment)
         .await
         .map_err(|e| -> Box<dyn Error + Send + Sync> { format!("init download: {}", e).into() })?;
+    let init_data = init_dl.data;
 
     let hvcc_nalus = parse_hvcc_nalus(&init_data)
         .ok_or_else(|| -> Box<dyn Error + Send + Sync> { "no hvcC in init segment".into() })?;
@@ -492,7 +610,15 @@ async fn video_play(
                 tenc.default_iv_size
             );
             let dec = decryptor.ok_or(
-                "Track is CENC-encrypted but no decryptor configured (call Player::set_clearkey)",
+                "Track is CENC-encrypted but no decryptor configured (call Player::set_clearkey or set_license_resolver)",
+            )?;
+            // Resolve the key NOW (async, possibly via LicenseResolver).
+            // decrypt_sample is on the hot path and stays sync — it just
+            // hits the cache populated here.
+            dec.ensure_key_for(tenc.default_kid).await.map_err(
+                |e| -> Box<dyn Error + Send + Sync> {
+                    format!("license resolve (video kid={}): {}", hex::encode(tenc.default_kid), e).into()
+                },
             )?;
             Some(TrackCrypto {
                 decryptor: dec,
@@ -515,7 +641,7 @@ async fn video_play(
 
     let segments = video_representation.segments.clone();
     let download_task =
-        task::spawn(download_task(segments, start_index, download_tx, stop, stop_flag));
+        task::spawn(download_task(segments, start_index, download_tx, stop, stop_flag, http));
     let decoder_task =
         task::spawn(video_decoder_task(download_rx, sender, decoder, init_data, video_ready, track_crypto));
 
@@ -535,14 +661,16 @@ async fn audio_play(
     stop_flag: Arc<AtomicBool>,
     decryptor: Option<Arc<dyn Decryptor>>,
     mut decoder: Box<dyn AudioDecoder>,
+    http: Arc<HttpClient>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let (download_tx, download_rx) = mpsc::channel::<DataSegment>(MAX_SEGMENTS);
 
-    let init_data = audio_representation
+    let init_dl = audio_representation
         .segment_init
-        .download()
+        .download(&http, RequestKind::InitSegment)
         .await
         .map_err(|e| -> Box<dyn Error + Send + Sync> { format!("audio init download: {}", e).into() })?;
+    let init_data = init_dl.data;
 
     let track_crypto = match parse_tenc(&init_data) {
         Some(tenc) => {
@@ -552,7 +680,12 @@ async fn audio_play(
                 tenc.default_iv_size
             );
             let dec = decryptor.ok_or(
-                "Audio track is CENC-encrypted but no decryptor configured (call Player::set_clearkey)",
+                "Audio track is CENC-encrypted but no decryptor configured (call Player::set_clearkey or set_license_resolver)",
+            )?;
+            dec.ensure_key_for(tenc.default_kid).await.map_err(
+                |e| -> Box<dyn Error + Send + Sync> {
+                    format!("license resolve (audio kid={}): {}", hex::encode(tenc.default_kid), e).into()
+                },
             )?;
             Some(TrackCrypto {
                 decryptor: dec,
@@ -591,7 +724,7 @@ async fn audio_play(
 
     let segments = audio_representation.segments.clone();
     let download_task =
-        task::spawn(download_task(segments, start_index, download_tx, stop, stop_flag));
+        task::spawn(download_task(segments, start_index, download_tx, stop, stop_flag, http));
     let decoder_task =
         task::spawn(audio_decoder_task(download_rx, sender, decoder, init_data, audio_ready, track_crypto));
 
@@ -616,10 +749,21 @@ impl Player<VideoRenderer, AudioRenderer> {
         let video_renderer = Arc::new(VideoRenderer::new(window).block_on());
         let audio_renderer = Arc::new(AudioRenderer::new());
 
+        let (events_tx, _) = broadcast::channel::<PlayerEvent>(64);
+        let events = Arc::new(events_tx);
+        // Emit the initial Idle state so freshly-constructed subscribers
+        // see something on their first recv() if they happen to subscribe
+        // before any state transition.
+        let _ = events.send(PlayerEvent::Idle);
+
         Player {
             base_url: None,
             manifest: None,
             tracks: Arc::new(StdMutex::new(None)),
+            http: Arc::new(HttpClient::new()),
+            events,
+            paused: Arc::new(AtomicBool::new(false)),
+            pause_notify: Arc::new(Notify::new()),
             video_adaptation: Arc::new(StdMutex::new(None)),
             video_representation: Arc::new(StdMutex::new(None)),
             audio_adaptation: Arc::new(StdMutex::new(None)),
@@ -649,10 +793,33 @@ impl Player<VideoRenderer, AudioRenderer> {
 // ---------------------------------------------------------------------------
 
 impl<V: VideoSink, A: AudioSink> Player<V, A> {
+    /// Pre-seed the ClearKey cache with `(kid_hex → key_hex)` pairs.
+    /// Backwards-compatible API: if a `LicenseResolver` is also installed,
+    /// these keys take precedence (cache hit wins).
     pub fn set_clearkey(&self, keys: HashMap<String, String>) -> Result<(), Box<dyn Error>> {
-        let decryptor = ClearKeyDecryptor::from_hex(keys)?;
-        *self.decryptor.lock().unwrap() = Some(Arc::new(decryptor));
+        let from_hex = ClearKeyDecryptor::from_hex(keys)?;
+        // ClearKeyDecryptor::from_hex returns a fresh instance with the
+        // parsed keys; merge them into our shared decryptor (creating it
+        // if this is the first crypto call).
+        let mut slot = self.decryptor.lock().unwrap();
+        let dec = slot.get_or_insert_with(|| {
+            Arc::new(ClearKeyDecryptor::new(HashMap::new()))
+        });
+        // Move keys out of the temporary decryptor into the shared one.
+        let parsed = from_hex.into_keys();
+        dec.add_keys(parsed);
         Ok(())
+    }
+
+    /// Install a `LicenseResolver` to fetch keys lazily on first encounter
+    /// of an unknown KID. May be combined with `set_clearkey` — pre-seeded
+    /// keys win on cache hit, the resolver is only asked on cache miss.
+    pub fn set_license_resolver(&self, resolver: Arc<dyn LicenseResolver>) {
+        let mut slot = self.decryptor.lock().unwrap();
+        let dec = slot.get_or_insert_with(|| {
+            Arc::new(ClearKeyDecryptor::new(HashMap::new()))
+        });
+        dec.set_resolver(resolver);
     }
 
     fn parse_base_url(full_url: &str) -> Result<String, Box<dyn Error>> {
@@ -667,7 +834,51 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         let base_url = Self::parse_base_url(url)?;
         self.base_url = Some(base_url);
         let url = url.to_string();
-        let manifest = Manifest::new(url).await?;
+        let manifest = match Manifest::new(url, &self.http).await {
+            Ok(m) => m,
+            Err(e) => {
+                self.emit_error(PlayerErrorKind::ManifestParse, format!("manifest: {}", e));
+                return Err(e);
+            }
+        };
+        // Multi-period MPDs are explicitly out of scope (see
+        // PLAYER_INTEGRATION.md §11). Reject upfront rather than silently
+        // playing only the first period.
+        if manifest.mpd.periods.len() > 1 {
+            let detail = format!(
+                "multi-period MPD not supported (got {} periods)",
+                manifest.mpd.periods.len()
+            );
+            self.emit_error(PlayerErrorKind::ManifestParse, detail.clone());
+            return Err(detail.into());
+        }
+
+        // Pre-count tracks for the ManifestLoaded event. The duration
+        // string is parsed inside `Tracks::new`, but we emit a coarse
+        // duration here from the MPD already.
+        let dur_str = &manifest.mpd.media_presentation_duration;
+        let duration = dur_str
+            .parse::<iso8601_duration::Duration>()
+            .ok()
+            .map(|d| crate::utils::time::iso_to_std_duration(&d))
+            .unwrap_or(Duration::ZERO);
+        let (mut video, mut audio, mut text) = (0usize, 0usize, 0usize);
+        if let Some(period) = manifest.mpd.periods.first() {
+            for a in &period.adaptation_sets {
+                match a.content_type.as_str() {
+                    "video" => video += 1,
+                    "audio" => audio += 1,
+                    "text" => text += 1,
+                    _ => {}
+                }
+            }
+        }
+        let _ = self.events.send(PlayerEvent::ManifestLoaded {
+            duration,
+            video_tracks: video,
+            audio_tracks: audio,
+            subtitle_tracks: text,
+        });
         self.manifest = Some(manifest);
         Ok(())
     }
@@ -684,9 +895,78 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             Some(u) => u.to_string(),
             None => return Err("BaseUrl not loaded!".into()),
         };
-        let tracks = Tracks::new(base_url, &manifest.mpd).await?;
+        let tracks = match Tracks::new(base_url, &manifest.mpd, &self.http).await {
+            Ok(t) => t,
+            Err(e) => {
+                self.emit_error(PlayerErrorKind::ManifestParse, format!("tracks: {}", e));
+                return Err(e);
+            }
+        };
         *self.tracks.lock().unwrap() = Some(tracks);
+        let _ = self.events.send(PlayerEvent::Prepared);
         Ok(())
+    }
+
+    /// Subscribe to the event stream. Each subscriber gets every event
+    /// from the moment of subscription forward (broadcast semantics).
+    /// The channel buffer holds 64 events; a slow subscriber that falls
+    /// behind by more receives `RecvError::Lagged(n)` and continues
+    /// from the newest event.
+    pub fn events(&self) -> broadcast::Receiver<PlayerEvent> {
+        self.events.subscribe()
+    }
+
+    /// Emit an `Error` event. Internal helper — surfaces both via
+    /// `events()` and as a `Result::Err` on the originating call.
+    fn emit_error(&self, kind: PlayerErrorKind, detail: impl Into<String>) {
+        let _ = self.events.send(PlayerEvent::Error {
+            kind,
+            detail: detail.into(),
+        });
+    }
+
+    /// Pause playback. The video sync loop parks on the next iteration;
+    /// audio output stops feeding the device. PTS does not advance.
+    /// `Paused` event is emitted; no-op if already paused.
+    pub fn pause(&self) {
+        if !self.paused.swap(true, Ordering::Relaxed) {
+            self.audio_renderer.set_paused(true);
+            let _ = self.events.send(PlayerEvent::Paused);
+        }
+    }
+
+    /// Resume playback after `pause()`. Wakes both sync loops and the
+    /// audio output. `Playing` is emitted by the first rendered frame
+    /// after resume. No-op if not paused.
+    pub fn resume(&self) {
+        if self.paused.swap(false, Ordering::Relaxed) {
+            self.audio_renderer.set_paused(false);
+            self.pause_notify.notify_waiters();
+        }
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Relaxed)
+    }
+
+    /// Install a `RequestInterceptor` (auth headers, URL rewrites). Replaces
+    /// the default `NoopInterceptor`. Subsequent requests use the new
+    /// interceptor; in-flight requests keep the previous one.
+    pub fn set_request_interceptor(&self, interceptor: Arc<dyn RequestInterceptor>) {
+        self.http.set_interceptor(interceptor);
+    }
+
+    /// Override the default `RetryPolicy` (3 attempts, 250ms × 2, cap 4s,
+    /// ±20% jitter). Affects every subsequent request.
+    pub fn set_retry_policy(&self, policy: RetryPolicy) {
+        self.http.set_retry_policy(policy);
+    }
+
+    /// How long the player waits on an interceptor or license-resolver call
+    /// before giving up (default 10s). On timeout the corresponding request
+    /// surfaces an Interceptor / LicenseResolver error.
+    pub fn set_callback_timeout(&self, timeout: Duration) {
+        self.http.set_callback_timeout(timeout);
     }
 
     pub fn get_tracks(&self) -> Result<Tracks, Box<dyn Error>> {
@@ -762,7 +1042,27 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         let audio_sink = self.audio_renderer.clone();
         let seek_target = self.seek_target.clone();
         let position_ms = self.position_ms.clone();
-        let decryptor_snapshot = self.decryptor.lock().unwrap().clone();
+        // Upcast Arc<ClearKeyDecryptor> → Arc<dyn Decryptor> for the
+        // generic pipeline. Cache + resolver are owned by the
+        // ClearKeyDecryptor and persist across play() cycles.
+        let decryptor_snapshot: Option<Arc<dyn Decryptor>> = self
+            .decryptor
+            .lock()
+            .unwrap()
+            .clone()
+            .map(|d| d as Arc<dyn Decryptor>);
+        let http_video = Arc::clone(&self.http);
+        let http_audio = Arc::clone(&self.http);
+        let events = Arc::clone(&self.events);
+        let paused = Arc::clone(&self.paused);
+        let pause_notify = Arc::clone(&self.pause_notify);
+        let media_duration = self
+            .tracks
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|t| t.duration)
+            .unwrap_or(Duration::ZERO);
 
         #[cfg(any(target_os = "windows", target_os = "linux"))]
         let video_decoder: Box<dyn HwVideoDecoder> =
@@ -809,6 +1109,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                 stop_flag.clone(),
                 decryptor_snapshot.clone(),
                 video_decoder,
+                http_video,
             ));
 
             let sample_rate = audio_sink.sample_rate();
@@ -822,6 +1123,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                 stop_flag.clone(),
                 decryptor_snapshot,
                 audio_decoder,
+                http_audio,
             ));
 
             av_sync_handler(
@@ -835,6 +1137,10 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                 audio_sink,
                 stop.clone(),
                 stop_flag.clone(),
+                events,
+                media_duration,
+                paused,
+                pause_notify,
             )
             .await;
 
@@ -909,6 +1215,7 @@ async fn download_task(
     segment_sender: Sender<DataSegment>,
     stop: Arc<Notify>,
     stop_flag: Arc<AtomicBool>,
+    http: Arc<HttpClient>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let segment_slice = &segments[..];
     for i in start_index..segment_slice.len() {
@@ -919,7 +1226,7 @@ async fn download_task(
         let seg = &segment_slice[i];
         let mut should_break = false;
         tokio::select! {
-            res = download_and_queue(i, seg, sender) => {
+            res = download_and_queue(i, seg, sender, &http) => {
                 match res {
                     Ok(()) => println!("Producing segment {}", i),
                     Err(e) => {
@@ -1010,12 +1317,18 @@ async fn download_and_queue(
     index: usize,
     segment: &Segment,
     sender: Sender<DataSegment>,
-) -> Result<(), Box<dyn Error>> {
-    let downloaded_data = segment.download().await?;
+    http: &HttpClient,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let dl = segment
+        .download(http, RequestKind::Segment)
+        .await
+        .map_err(|e| -> Box<dyn Error + Send + Sync> {
+            format!("segment download: {}", e).into()
+        })?;
     let data_segment = DataSegment {
         id: index,
-        size: downloaded_data.len(),
-        data: downloaded_data,
+        size: dl.data.len(),
+        data: dl.data,
     };
     if let Err(e) = sender.send(data_segment).await {
         return Err(format!("downstream receiver dropped: {:?}", e).into());

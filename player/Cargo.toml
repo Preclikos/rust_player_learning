@@ -19,6 +19,10 @@ re_mp4 = { version = "0.3.0" }
 hex = { version = "0.4" }
 aes = { version = "0.8" }
 ctr = { version = "0.9" }
+async-trait = "0.1"
+arc-swap = "1.7"
+bytes = "1"
+rand = "0.8"
 cpal ={ version =  "0.17" }
 bytemuck ={ version =  "1.13.1" }
 pollster = "0.4.0"

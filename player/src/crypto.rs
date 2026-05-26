@@ -1,10 +1,12 @@
 use std::collections::HashMap;
 use std::error::Error;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use aes::cipher::{KeyIvInit, StreamCipher};
 use aes::Aes128;
 use ctr::Ctr128BE;
+
+use crate::net::{BoxError, LicenseResolver};
 
 type Aes128Ctr = Ctr128BE<Aes128>;
 
@@ -13,7 +15,21 @@ type Aes128Ctr = Ctr128BE<Aes128>;
 /// Today implemented by [`ClearKeyDecryptor`] (software AES-CTR). Platform-backed
 /// decryptors (Android `MediaDrm`, iOS FairPlay, Widevine CDM) can be added by
 /// implementing this trait without touching the pipeline.
+///
+/// `decrypt_sample` is **synchronous** — the per-sample inner loop runs
+/// on the hot path and must not await. Async key resolution happens
+/// earlier via [`Decryptor::ensure_key_for`], with the result cached so
+/// that `decrypt_sample` only ever does a hashmap lookup.
+#[async_trait::async_trait]
 pub trait Decryptor: Send + Sync {
+    /// Ensure the key for `kid` is available locally (either pre‑seeded
+    /// or resolved via the attached `LicenseResolver`). Called once per
+    /// track when the decoder pipeline parses `tenc`; ClearKey-only
+    /// decryptors with a resolver will await an HTTP round trip here.
+    /// Implementations without an async resolver (pre-populated cache,
+    /// platform-managed key store) may make this a no-op.
+    async fn ensure_key_for(&self, kid: [u8; 16]) -> Result<(), BoxError>;
+
     fn decrypt_sample(
         &self,
         kid: &[u8; 16],
@@ -23,13 +39,26 @@ pub trait Decryptor: Send + Sync {
     ) -> Result<(), Box<dyn Error + Send + Sync>>;
 }
 
+/// Software AES-128-CTR ClearKey decryptor. Holds a `(kid → key)` cache
+/// that is populated either eagerly via [`ClearKeyDecryptor::from_hex`]
+/// (the legacy `set_clearkey(HashMap)` path) or lazily on first use via
+/// an attached [`LicenseResolver`].
+///
+/// Both the cache and the resolver use interior mutability so the
+/// decryptor can be shared through `Arc<ClearKeyDecryptor>` while the
+/// player still lets the consumer install / replace the resolver at any
+/// point before playback starts.
 pub struct ClearKeyDecryptor {
-    keys: HashMap<[u8; 16], [u8; 16]>,
+    keys: Mutex<HashMap<[u8; 16], [u8; 16]>>,
+    resolver: Mutex<Option<Arc<dyn LicenseResolver>>>,
 }
 
 impl ClearKeyDecryptor {
     pub fn new(keys: HashMap<[u8; 16], [u8; 16]>) -> Self {
-        Self { keys }
+        Self {
+            keys: Mutex::new(keys),
+            resolver: Mutex::new(None),
+        }
     }
 
     pub fn from_hex(map: HashMap<String, String>) -> Result<Self, Box<dyn Error>> {
@@ -48,9 +77,55 @@ impl ClearKeyDecryptor {
         }
         Ok(Self::new(keys))
     }
+
+    /// Attach a resolver consulted on cache misses. May be replaced
+    /// later; the cache is preserved across replacements.
+    pub fn set_resolver(&self, resolver: Arc<dyn LicenseResolver>) {
+        *self.resolver.lock().unwrap() = Some(resolver);
+    }
+
+    /// Merge additional pre-seeded keys into the cache (e.g. legacy
+    /// `set_clearkey(HashMap)` path).
+    pub fn add_keys(&self, more: HashMap<[u8; 16], [u8; 16]>) {
+        self.keys.lock().unwrap().extend(more);
+    }
+
+    /// Consume this decryptor and return its key cache. Used by
+    /// `Player::set_clearkey` to merge keys from a freshly-built decryptor
+    /// into the shared session-wide one.
+    pub fn into_keys(self) -> HashMap<[u8; 16], [u8; 16]> {
+        self.keys.into_inner().unwrap_or_default()
+    }
+
+    /// Look up a key for `kid`. Returns from cache if present; otherwise
+    /// calls the attached `LicenseResolver` (await-able) and caches the
+    /// result. If no key is cached AND no resolver is attached, returns
+    /// `Err` — surfaces as `PlayerErrorKind::LicenseResolver`.
+    pub async fn ensure_key(&self, kid: [u8; 16]) -> Result<[u8; 16], BoxError> {
+        if let Some(k) = self.keys.lock().unwrap().get(&kid).copied() {
+            return Ok(k);
+        }
+        let resolver = self.resolver.lock().unwrap().clone();
+        let resolver = resolver.ok_or_else(|| -> BoxError {
+            format!(
+                "no key cached for KID {} and no LicenseResolver attached \
+                 (call set_clearkey or set_license_resolver before play)",
+                hex::encode(kid)
+            )
+            .into()
+        })?;
+        let key = resolver.resolve(kid).await?;
+        self.keys.lock().unwrap().insert(kid, key);
+        Ok(key)
+    }
 }
 
+#[async_trait::async_trait]
 impl Decryptor for ClearKeyDecryptor {
+    async fn ensure_key_for(&self, kid: [u8; 16]) -> Result<(), BoxError> {
+        self.ensure_key(kid).await.map(|_| ())
+    }
+
     fn decrypt_sample(
         &self,
         kid: &[u8; 16],
@@ -58,11 +133,17 @@ impl Decryptor for ClearKeyDecryptor {
         data: &mut [u8],
         subsamples: &[(u16, u32)],
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        let key = self
-            .keys
-            .get(kid)
-            .ok_or_else(|| format!("ClearKey: no key for KID {}", hex::encode(kid)))?;
-        let mut cipher = Aes128Ctr::new(key.into(), iv.into());
+        // Synchronous fast path — caller MUST have ensured the key via
+        // ensure_key() upstream (e.g. once per segment when parsing tenc).
+        // We don't await here because this is called per-sample on the
+        // decoder hot path.
+        let key = {
+            let keys = self.keys.lock().unwrap();
+            *keys
+                .get(kid)
+                .ok_or_else(|| format!("ClearKey: no key for KID {} (ensure_key not called?)", hex::encode(kid)))?
+        };
+        let mut cipher = Aes128Ctr::new(&key.into(), iv.into());
 
         if subsamples.is_empty() {
             cipher.apply_keystream(data);

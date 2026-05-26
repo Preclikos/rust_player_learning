@@ -22,4 +22,9 @@ pub trait AudioSink: Send + Sync + 'static {
     fn flush(&self);
     fn stop(&self) -> impl Future<Output = ()> + Send + '_;
     fn volume(&self, diff: f32) -> impl Future<Output = ()> + Send + '_;
+    /// Pause/resume the underlying audio device. When `true`, the
+    /// implementation must stop pulling samples; when `false`, resume.
+    /// `Player::pause()` calls this so the cpal stream halts and we don't
+    /// burn through whatever was already queued.
+    fn set_paused(&self, paused: bool);
 }

@@ -23,6 +23,7 @@ pub struct AudioRenderer {
     sample_sender: Sender<f32>,
     sample_rate: u32,
     flush_flag: Arc<AtomicBool>,
+    paused_flag: Arc<AtomicBool>,
 }
 
 enum AudioRendererCommand {
@@ -34,16 +35,18 @@ impl AudioRenderer {
     pub fn new() -> Self {
         let stop = Arc::new(Notify::new());
         let flush_flag = Arc::new(AtomicBool::new(false));
+        let paused_flag = Arc::new(AtomicBool::new(false));
 
         let (command_sender, command_receiver) = mpsc::channel(4);
         let audio_thread =
-            AudioRenderer::start_thread(command_receiver, stop, flush_flag.clone());
+            AudioRenderer::start_thread(command_receiver, stop, flush_flag.clone(), paused_flag.clone());
 
         AudioRenderer {
             command_sender,
             sample_sender: audio_thread.0,
             sample_rate: audio_thread.1,
             flush_flag,
+            paused_flag,
         }
     }
 
@@ -54,6 +57,7 @@ impl AudioRenderer {
         volume: Arc<RwLock<f32>>,
         stop: Arc<Notify>,
         flush_flag: Arc<AtomicBool>,
+        paused_flag: Arc<AtomicBool>,
     ) {
         let stream_config = StreamConfig {
             channels: config.channels(),
@@ -64,6 +68,14 @@ impl AudioRenderer {
         let callback = move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
             if flush_flag.swap(false, Ordering::Relaxed) {
                 while sample_receiver.try_recv().is_ok() {}
+            }
+            // While paused, emit silence WITHOUT draining the receiver —
+            // resume picks up exactly where we left off.
+            if paused_flag.load(Ordering::Relaxed) {
+                for sample in data.iter_mut() {
+                    *sample = Sample::EQUILIBRIUM;
+                }
+                return;
             }
             let vol = volume.blocking_read();
             for sample in data.iter_mut() {
@@ -92,6 +104,7 @@ impl AudioRenderer {
         mut command_receiver: Receiver<AudioRendererCommand>,
         stop: Arc<Notify>,
         flush_flag: Arc<AtomicBool>,
+        paused_flag: Arc<AtomicBool>,
     ) -> (Sender<f32>, u32) {
         let (sample_sender, sample_receiver) = mpsc::channel::<f32>(192_000);
 
@@ -115,6 +128,7 @@ impl AudioRenderer {
             volume_cpal,
             stop_cpal,
             flush_flag,
+            paused_flag,
         ));
 
         let volume_handle = Arc::clone(&volume);
@@ -166,6 +180,10 @@ impl AudioRenderer {
         self.flush_flag.store(true, Ordering::Relaxed);
     }
 
+    pub fn set_paused(&self, paused: bool) {
+        self.paused_flag.store(paused, Ordering::Relaxed);
+    }
+
     pub async fn volume(&self, volume_diff: f32) {
         _ = self
             .command_sender
@@ -193,5 +211,9 @@ impl super::AudioSink for AudioRenderer {
 
     fn volume(&self, diff: f32) -> impl std::future::Future<Output = ()> + Send + '_ {
         AudioRenderer::volume(self, diff)
+    }
+
+    fn set_paused(&self, paused: bool) {
+        AudioRenderer::set_paused(self, paused)
     }
 }

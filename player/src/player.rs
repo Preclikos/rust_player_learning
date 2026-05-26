@@ -1001,6 +1001,30 @@ async fn text_play<V: VideoSink>(
             cues.len(),
             bytes.len()
         );
+        if cues.is_empty() {
+            // Dump a hex+ASCII preview of the first 256 bytes so future
+            // "0 cues" reports show what we actually got — line endings,
+            // BOM, or some upstream format we don't recognise yet.
+            let preview_len = bytes.len().min(256);
+            let mut hex_dump = String::new();
+            let mut ascii_dump = String::new();
+            for &b in &bytes[..preview_len] {
+                hex_dump.push_str(&format!("{:02x} ", b));
+                ascii_dump.push(if b.is_ascii_graphic() || b == b' ' {
+                    b as char
+                } else if b == b'\n' {
+                    '↵'
+                } else if b == b'\r' {
+                    '⏎'
+                } else {
+                    '.'
+                });
+            }
+            log::warn!(
+                "[subs] no cues parsed — preview ({} bytes):\n  hex: {}\n  txt: {}",
+                preview_len, hex_dump, ascii_dump
+            );
+        }
         video_sink.queue_subtitle_cues(cues);
         return Ok(());
     }

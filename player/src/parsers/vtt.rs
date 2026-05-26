@@ -60,19 +60,35 @@ pub fn parse_segment(data: &[u8], segment_pts_ms: i64) -> Vec<VttCue> {
 // ---------------------------------------------------------------------------
 
 fn parse_raw_webvtt(data: &[u8]) -> Vec<VttCue> {
-    let text = match std::str::from_utf8(data) {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
+    // UTF-8 lossy — keep going even if the source has a stray invalid
+    // byte (some web-scraped subs do). The cue text characters that
+    // matter for rendering are virtually always valid UTF-8.
+    let mut text = String::from_utf8_lossy(data).into_owned();
+
+    // Strip the optional UTF-8 BOM. WebVTT files served from real CDNs
+    // often have it.
+    if text.starts_with('\u{FEFF}') {
+        text.drain(..'\u{FEFF}'.len_utf8());
+    }
+
+    // Normalise line endings so block-splitting works regardless of
+    // whether the producer used LF, CRLF, or (legacy Mac) CR. With
+    // pure-CRLF files (common from Windows tooling) the original
+    // `split("\n\n")` matched nothing — block separators are
+    // `\r\n\r\n` and contain no consecutive `\n` chars.
+    let text = text.replace("\r\n", "\n").replace('\r', "\n");
+
     let mut out = Vec::new();
-    // Split into cue blocks separated by blank lines. Skip the WEBVTT
-    // header block and any STYLE/REGION blocks.
     for block in text.split("\n\n") {
-        let block = block.trim_matches(|c: char| c == '\r' || c == '\n' || c == ' ');
+        let block = block.trim_matches(|c: char| c == '\n' || c == ' ' || c == '\t');
         if block.is_empty() {
             continue;
         }
-        if block.starts_with("WEBVTT") || block.starts_with("STYLE") || block.starts_with("REGION") || block.starts_with("NOTE") {
+        if block.starts_with("WEBVTT")
+            || block.starts_with("STYLE")
+            || block.starts_with("REGION")
+            || block.starts_with("NOTE")
+        {
             continue;
         }
         if let Some(cue) = parse_cue_block(block) {
@@ -304,6 +320,16 @@ mod tests {
         assert_eq!(cues[0].end_ms, 4000);
         assert_eq!(cues[0].text, "Hello world");
         assert_eq!(cues[1].settings, "align:center");
+    }
+
+    #[test]
+    fn parses_crlf_webvtt_with_bom() {
+        // Real-world VTT served from Windows tooling: UTF-8 BOM + CRLF.
+        let data = b"\xEF\xBB\xBFWEBVTT\r\n\r\n00:00:01.500 --> 00:00:04.000\r\nHello world\r\n\r\n00:00:05.000 --> 00:00:06.250\r\nSecond";
+        let cues = parse_raw_webvtt(data);
+        assert_eq!(cues.len(), 2);
+        assert_eq!(cues[0].text, "Hello world");
+        assert_eq!(cues[1].start_ms, 5000);
     }
 
     #[test]

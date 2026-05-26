@@ -1878,6 +1878,21 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                 target.take().unwrap_or(Duration::ZERO)
             };
 
+            // Hard reset the audio sink before the new pipeline starts
+            // pumping samples. Without this, a play() that follows a
+            // natural EndOfStream inherits the previous pipeline's
+            // residual cpal-channel contents — the bounded mpsc holds
+            // up to ~2 s of f32 samples — and the next audio_sync_loop
+            // blocks on `send().await` until cpal drains the stale
+            // buffer at real-time rate. The downstream effect was that
+            // the second video in a loop appeared silent for the first
+            // few seconds and could deadlock if upstream backpressure
+            // stalled the decoder before any new sample landed in cpal.
+            // seek() already does this for user-initiated restarts;
+            // doing it here covers the EOS → next-play() case too.
+            audio_sink.flush();
+            audio_sink.set_paused(true);
+
             let video_start_index =
                 find_segment_index(&video_representation.segments, seek_offset);
             let audio_start_index =

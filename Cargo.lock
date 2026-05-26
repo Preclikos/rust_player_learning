@@ -201,6 +201,7 @@ dependencies = [
 name = "app"
 version = "0.1.0"
 dependencies = [
+ "app-shared",
  "bytemuck",
  "cpal",
  "env_logger",
@@ -221,6 +222,7 @@ version = "0.1.0"
 dependencies = [
  "android-activity",
  "android_logger",
+ "app-shared",
  "libc",
  "log",
  "player",
@@ -239,6 +241,15 @@ dependencies = [
  "pollster",
  "tokio",
  "winit",
+]
+
+[[package]]
+name = "app-shared"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "player",
+ "tokio",
 ]
 
 [[package]]

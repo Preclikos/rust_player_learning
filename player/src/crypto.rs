@@ -197,25 +197,6 @@ pub struct AacConfig {
     pub chan_conf: u8,
 }
 
-impl AacConfig {
-    /// Build a 7-byte ADTS header that wraps a raw AAC frame of `frame_len` bytes.
-    /// Used to make each MP4-muxed AAC sample self-describing for FFmpeg's AAC decoder.
-    pub fn adts_header(&self, frame_len: usize) -> [u8; 7] {
-        let total = frame_len + 7;
-        let mut h = [0u8; 7];
-        h[0] = 0xFF;
-        h[1] = 0xF1; // syncword + MPEG-4 + layer 0 + no CRC
-        h[2] = ((self.profile - 1) << 6)
-            | (self.freq_index << 2)
-            | ((self.chan_conf & 0x4) >> 2);
-        h[3] = ((self.chan_conf & 0x3) << 6) | ((total >> 11) as u8 & 0x03);
-        h[4] = ((total >> 3) & 0xFF) as u8;
-        h[5] = (((total & 0x07) as u8) << 5) | 0x1F;
-        h[6] = 0xFC;
-        h
-    }
-}
-
 /// Iterate top-level boxes in `data`, returning the body of the first box matching `target`.
 pub fn find_top_box<'a>(data: &'a [u8], target: &[u8; 4]) -> Option<&'a [u8]> {
     let mut i = 0;
@@ -278,18 +259,6 @@ pub fn parse_tenc(init_data: &[u8]) -> Option<TencInfo> {
         default_iv_size: iv_size,
         default_kid: kid,
     })
-}
-
-pub fn parse_frma(init_data: &[u8]) -> Option<[u8; 4]> {
-    let moov = find_top_box(init_data, b"moov")?;
-    let frma = find_descendant(moov, b"frma")?;
-    if frma.len() >= 4 {
-        let mut r = [0u8; 4];
-        r.copy_from_slice(&frma[..4]);
-        Some(r)
-    } else {
-        None
-    }
 }
 
 pub fn parse_senc(segment_data: &[u8], iv_size: usize) -> Option<Vec<SencEntry>> {

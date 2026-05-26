@@ -12,6 +12,7 @@ path = "src/lib.rs"
 # builds (cargo workspace still passes `cargo check` everywhere).
 [target.'cfg(target_os = "android")'.dependencies]
 player = { path = "../player" }
+app-shared = { path = "../app-shared" }
 winit = { version = "0.30.9", features = ["android-native-activity"] }
 android-activity = { version = "0.6", features = ["native-activity"] }
 android_logger = "0.14"

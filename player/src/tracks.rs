@@ -87,7 +87,7 @@ impl Tracks {
         for entry in entires.iter() {
             let end = start_byte + (entry.reference_size - 1);
 
-            let end_time_u32 = (start + entry.subsegment_duration);
+            let end_time_u32 = start + entry.subsegment_duration;
 
             let segment = Segment::new(
                 base_url,

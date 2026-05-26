@@ -5,7 +5,6 @@ use crate::net::{HttpClient, RequestKind};
 
 #[derive(Clone)]
 pub struct Manifest {
-    pub url: String,
     pub content: String,
     pub mpd: MPD,
 }
@@ -16,13 +15,13 @@ impl Manifest {
         http: &HttpClient,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let content = http
-            .get_text(url.clone(), RequestKind::Manifest)
+            .get_text(url, RequestKind::Manifest)
             .await
             .map_err(|e| -> Box<dyn std::error::Error> {
                 format!("manifest download: {}", e).into()
             })?;
         let mpd = Self::parse(&content)?;
-        Ok(Manifest { url, content, mpd })
+        Ok(Manifest { content, mpd })
     }
 
     fn parse(content: &str) -> Result<MPD, Box<dyn std::error::Error>> {

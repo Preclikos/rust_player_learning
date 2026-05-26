@@ -1,11 +1,9 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use player::Player;
 use pollster::FutureExt;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::join;
 use tokio::time::Instant;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, WindowEvent};
@@ -28,53 +26,16 @@ impl ApplicationHandler for App {
         //default_attrs.inner_size = Some(Size::Physical(PhysicalSize::new(1280, 800)));
         let window = Arc::new(event_loop.create_window(default_attrs).unwrap());
 
-        let mut player = Player::new(window.clone());
+        let player = Player::new(window.clone());
 
         self.player = Some(player.clone());
 
+        // Hand the player off to the shared test-playback fixture, then
+        // run the desktop-only stdin console against the same handle.
+        let console_player = player.clone();
         tokio::spawn(async move {
-            //tearsofsteel_
-            let _ = player
-                .open_url("https://preclikos.cz/examples/encrypted/manifest.mpd")
-                .await;
-
-            let mut keys = HashMap::new();
-            keys.insert(
-                "0fd37dac41c0e987e68d43b801b1210c".to_string(),
-                "fd8d9f408c2bd702970afcd3b219e791".to_string(),
-            );
-            keys.insert(
-                "519af81ab2d284f52aa8257d96b5e4bd".to_string(),
-                "627ef72b42d98770dec20ecab46cd1f4".to_string(),
-            );
-            if let Err(e) = player.set_clearkey(keys) {
-                log::error!("set_clearkey failed: {}", e);
-            }
-
-            let _ = player.prepare().await;
-
-            let tracks = player.get_tracks();
-
-            let tracks = tracks.unwrap();
-            let selected_video = tracks.video.first().unwrap();
-            let selected_video_representation = &selected_video.representations[5]; //.first().unwrap();
-
-            player.set_video_track(selected_video, selected_video_representation);
-
-            let selected_audio = tracks.audio.last().unwrap();
-            let selected_audio_representation = &selected_audio.representations.last().unwrap();
-
-            player.set_audio_track(selected_audio, selected_audio_representation);
-
-            let play_player = player.clone();
-            tokio::spawn(async move {
-                loop {
-                    let play = play_player.play();
-                    _ = join!(play.unwrap());
-                }
-            });
-
-            run_console(player).await;
+            app_shared::run_test_playback(player).await;
+            run_console(console_player).await;
         });
 
         self.window = Some(window.clone());

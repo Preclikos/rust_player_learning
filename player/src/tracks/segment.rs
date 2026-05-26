@@ -9,10 +9,7 @@ pub struct Segment {
     start: u64,
     end: u64,
     start_time: Duration,
-    start_time_base: u32,
     end_time: Duration,
-    end_time_base: u32,
-    timescale: u32,
 }
 
 /// Bandwidth-tracking result from a segment download: payload bytes plus
@@ -46,26 +43,16 @@ impl Segment {
             }
         };
 
-        let start_time = match start_time_base {
-            Some(time) => (to_duration(time), time),
-            None => (Duration::ZERO, 0),
-        };
-
-        let end_time = match end_time_base {
-            Some(time) => (to_duration(time), time),
-            None => (Duration::ZERO, 0),
-        };
+        let start_time = start_time_base.map(to_duration).unwrap_or(Duration::ZERO);
+        let end_time = end_time_base.map(to_duration).unwrap_or(Duration::ZERO);
 
         Ok(Segment {
             base_url: base_url.to_string(),
             file_url: file_url.to_string(),
             start,
             end,
-            start_time: start_time.0,
-            start_time_base: start_time.1,
-            end_time: end_time.0,
-            end_time_base: end_time.1,
-            timescale,
+            start_time,
+            end_time,
         })
     }
 

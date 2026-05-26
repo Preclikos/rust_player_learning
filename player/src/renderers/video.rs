@@ -106,10 +106,6 @@ pub struct VideoRenderer {
     window: Arc<Window>,
     device: wgpu::Device,
     backend: wgpu::Backend,
-    // True only when the adapter exposed TEXTURE_FORMAT_NV12 (required for AHB
-    // import on Android). PowerVR Rogue on Google TV does not; falls back to
-    // blue-screen clear so the renderer survives without crashing.
-    has_nv12_feature: bool,
     queue: wgpu::Queue,
     /// Optional WebVTT subtitle overlay. Built lazily on the first
     /// `set_subtitle_font` call so the wgpu pipeline (which needs the
@@ -465,7 +461,6 @@ impl VideoRenderer {
             window,
             device,
             backend,
-            has_nv12_feature,
             queue,
             frame_size: Arc::new(RwLock::new(size)),
             tex_y_max: Arc::new(RwLock::new(1.0_f32)),
@@ -605,6 +600,7 @@ impl VideoRenderer {
         // by the video sync loop using the BMDT-adjusted timeline.
         // The raw frame.pts_us here would be off by the segment-base
         // offset (commonly several seconds in real DASH streams).
+        #[cfg(target_os = "android")]
         let desired_present_ns = frame.desired_present_ns;
         match frame.native {
             #[cfg(any(target_os = "windows", target_os = "linux"))]

@@ -82,6 +82,9 @@ impl DirectX11SharedTexture {
     ) -> windows::core::Result<()> {
         self.synchronized_copy(context, tex, true, width, height, region)
     }
+    // Mirror of synchronized_copy_from; consumed by the DX12 interop branch
+    // that wgpu currently doesn't take for FFmpeg-imported D3D11 textures.
+    #[allow(dead_code)]
     pub fn synchronized_copy_to(
         &self,
         context: &ID3D11DeviceContext,
@@ -208,6 +211,7 @@ pub fn get_shared_texture_d3d11(
     }
 }
 
+#[allow(dead_code)]
 fn get_dx11_shared_texture_pitch(
     context: &ID3D11DeviceContext,
     texture: &ID3D11Texture2D,
@@ -384,7 +388,7 @@ pub fn create_dx12_resource_from_d3d11_texture(
     width: u32,
     height: u32,
     region: Option<u32>,
-) -> Result<(Direct3D12::ID3D12Resource), Box<dyn std::error::Error>> {
+) -> Result<Direct3D12::ID3D12Resource, Box<dyn std::error::Error>> {
     unsafe {
         let (handle, shared_texture) =
             get_shared_texture_d3d11(d3d11_device, texture, width, height)?;
@@ -492,6 +496,7 @@ pub fn create_texture_from_dx12_resource(
     }
 }*/
 
+#[allow(dead_code)]
 pub fn create_native_shared_buffer_dx12(
     device: &wgpu::Device,
     size: usize,
@@ -618,6 +623,7 @@ pub fn format_dxgi_to_wgpu(format: DXGI_FORMAT) -> TextureFormat {
     }
 }
 
+#[allow(dead_code)]
 pub fn format_wgpu_to_dxgi(format: TextureFormat) -> DXGI_FORMAT {
     match format {
         TextureFormat::NV12 => DXGI_FORMAT_NV12,

@@ -8,7 +8,6 @@ mod parsers;
 mod renderers;
 mod tracks;
 mod utils;
-mod video;
 
 // Public re-exports so downstream consumers (BlackZone Console etc.) can
 // implement RequestInterceptor / LicenseResolver against the player's
@@ -1161,8 +1160,7 @@ async fn video_supervisor(
         // keepalive frame_sender alive forever after the last segment
         // was decoded, the av_sync video_rx would never observe channel
         // close and `PlayerEvent::EndOfStream` would never fire.
-        let mut pending: Option<VideoRepresenation> = None;
-        loop {
+        let new_repr: VideoRepresenation = loop {
             tokio::select! {
                 _ = stop.notified() => {
                     local_stop_flag.store(true, Ordering::Relaxed);
@@ -1192,17 +1190,11 @@ async fn video_supervisor(
                         return Ok(());
                     }
                     if let Some(new) = switch_rx.borrow_and_update().clone() {
-                        pending = Some(new);
-                        break;
+                        break new;
                     }
                     // Spurious None — keep waiting.
                 }
             }
-        }
-
-        let new_repr = match pending.take() {
-            Some(r) => r,
-            None => continue,
         };
 
         // Avoid swapping to the same representation (the ABR engine guards
@@ -2103,7 +2095,6 @@ async fn download_task(
 #[derive(Debug, Clone)]
 struct DataSegment {
     id: usize,
-    size: usize,
     data: Vec<u8>,
 }
 
@@ -2230,7 +2221,6 @@ async fn download_and_queue(
     }
     let data_segment = DataSegment {
         id: index,
-        size: dl.data.len(),
         data: dl.data,
     };
     if let Err(e) = sender.send(data_segment).await {

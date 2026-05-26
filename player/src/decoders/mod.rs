@@ -27,12 +27,19 @@ pub mod videotoolbox;
 #[derive(Clone, Copy, Debug)]
 pub enum VideoCodec {
     Hevc,
+    // H.264 reserved for the planned ffmpeg/MediaCodec branch; currently only
+    // HEVC streams are exercised so the variant is never constructed.
+    #[allow(dead_code)]
     H264,
 }
 
 pub struct VideoDecoderParams {
     pub codec: VideoCodec,
+    // Width/height are consumed by MediaCodec on Android; the FFmpeg desktop
+    // path reads them from the bitstream/init segment so they're unused there.
+    #[allow(dead_code)]
     pub width: u32,
+    #[allow(dead_code)]
     pub height: u32,
     /// Raw NALU bytes (no length prefix, no start code) — VPS/SPS/PPS for HEVC,
     /// extracted from the hvcC box in the init segment.
@@ -153,6 +160,10 @@ pub trait HwVideoDecoder: Send {
     /// the returned `DecodedVideoFrame` is in microseconds.
     fn try_recv(&mut self) -> Result<Option<DecodedVideoFrame>, DecoderError>;
 
+    /// Reset internal decoder state. The play pipeline currently tears
+    /// decoders down on seek/track-switch instead of calling this — kept
+    /// as part of the trait API for future zero-restart paths.
+    #[allow(dead_code)]
     fn flush(&mut self) -> Result<(), DecoderError> {
         Ok(())
     }
@@ -171,6 +182,8 @@ pub trait AudioDecoder: Send {
     /// `samples` is interleaved stereo f32 PCM at `output_sample_rate`.
     fn try_recv(&mut self) -> Result<Option<DecodedAudioFrame>, DecoderError>;
 
+    /// See `HwVideoDecoder::flush`.
+    #[allow(dead_code)]
     fn flush(&mut self) -> Result<(), DecoderError> {
         Ok(())
     }

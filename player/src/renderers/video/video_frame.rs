@@ -23,7 +23,6 @@ pub struct VideoFrame {
     wgpu_device: wgpu::Device,
     wgpu_backend: wgpu::Backend,
     memory: Option<vk::DeviceMemory>,
-    image: Option<vk::Image>,
     texture: Texture,
 }
 
@@ -82,7 +81,6 @@ impl VideoFrame {
                 wgpu_device,
                 wgpu_backend,
                 memory: Some(image_with_memory.memory),
-                image: None,
                 texture,
             }
         }
@@ -154,7 +152,6 @@ impl VideoFrame {
                         wgpu_device,
                         wgpu_backend,
                         memory: None,
-                        image: None,
                         texture,
                     }
                 }
@@ -184,7 +181,6 @@ impl VideoFrame {
                         wgpu_device,
                         wgpu_backend,
                         memory: Some(image_with_memory.memory),
-                        image: Some(image_with_memory.raw_image),
                         texture,
                     }
                 }

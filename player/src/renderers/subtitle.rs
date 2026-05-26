@@ -91,6 +91,9 @@ struct CachedCue {
     target_w: u32,
     bitmap_w: u32,
     bitmap_h: u32,
+    /// Held to keep the underlying GPU resource alive for as long as `view`
+    /// is referenced. Never read directly — the `view` does all the work.
+    #[allow(dead_code)]
     texture: wgpu::Texture,
     view: wgpu::TextureView,
 }

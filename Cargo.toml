@@ -3,6 +3,7 @@ members = [
     "app",
     "app-android",
     "app-ios",
+    "app-shared",
     "player"
 ]
 resolver = "2"

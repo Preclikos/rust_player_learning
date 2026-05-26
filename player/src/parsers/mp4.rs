@@ -12,6 +12,13 @@ fn read_u16(data: &mut &[u8]) -> u16 {
     result
 }
 
+// SidxEntry / SidxBox carry every field defined by ISO/IEC 14496-12 §8.16.3
+// for completeness/diagnostics — the segment-index pipeline only reads
+// `reference_size`, `subsegment_duration`, `timescale`, `earliest_presentation_time`
+// and `first_offset`. The remaining fields are kept so the structs are
+// faithful representations of the box, which keeps the parser obvious and
+// makes ad-hoc `Debug` dumps useful.
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct SidxEntry {
     pub reference_type: u8,
@@ -22,6 +29,7 @@ pub struct SidxEntry {
     pub sap_delta: u32,
 }
 
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct SidxBox {
     pub size: u32,

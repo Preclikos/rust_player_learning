@@ -11,7 +11,6 @@
 
 #![cfg(target_os = "android")]
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Sets FLAG_KEEP_SCREEN_ON on the NativeActivity window so the screen stays
@@ -71,7 +70,6 @@ fn set_frame_rate_24fps(window: &winit::window::Window) {
 
 use android_activity::AndroidApp;
 use player::Player;
-use tokio::join;
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -87,7 +85,7 @@ impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let attrs = Window::default_attributes();
         let window = Arc::new(event_loop.create_window(attrs).unwrap());
-        let mut player = Player::new(window.clone());
+        let player = Player::new(window.clone());
 
         // NOTE: ANativeWindow_setFrameRate(24, FIXED_SOURCE) DOES NOT help here.
         // On Samsung devices (tested: Galaxy S21 120Hz panel, Samsung TV via
@@ -106,86 +104,9 @@ impl ApplicationHandler for App {
         self.player = Some(player.clone());
         log::info!("window + player created");
 
-        // Start playback in a background tokio task — mirror of the desktop
-        // app's setup loop. Uses the same encrypted stream + keys to verify
-        // the MediaCodec pipeline against known content.
-        tokio::spawn(async move {
-            if let Err(e) = player
-                .open_url("https://preclikos.cz/examples/encrypted/manifest.mpd")
-                .await
-            {
-                log::error!("open_url: {}", e);
-                return;
-            }
-
-            let mut keys = HashMap::new();
-            keys.insert(
-                "0fd37dac41c0e987e68d43b801b1210c".to_string(),
-                "fd8d9f408c2bd702970afcd3b219e791".to_string(),
-            );
-            keys.insert(
-                "519af81ab2d284f52aa8257d96b5e4bd".to_string(),
-                "627ef72b42d98770dec20ecab46cd1f4".to_string(),
-            );
-            if let Err(e) = player.set_clearkey(keys) {
-                log::error!("set_clearkey: {}", e);
-                return;
-            }
-
-            if let Err(e) = player.prepare().await {
-                log::error!("prepare: {}", e);
-                return;
-            }
-
-            let tracks = match player.get_tracks() {
-                Ok(t) => t,
-                Err(e) => {
-                    log::error!("get_tracks: {}", e);
-                    return;
-                }
-            };
-
-            // Pick 720p HEVC — index 5 matches the desktop default.
-            let selected_video = tracks.video.first().unwrap();
-            let selected_video_repr = &selected_video.representations[5];
-            player.set_video_track(selected_video, selected_video_repr);
-            log::info!(
-                "android: selected video {}x{} {}",
-                selected_video_repr.width,
-                selected_video_repr.height,
-                selected_video_repr.codecs
-            );
-
-            // Pick the first AAC (mp4a) audio representation — skip EC-3/other codecs
-            // that have no esds box and aren't supported by MediaCodec audio/mp4a-latm.
-            let selected_audio = tracks
-                .audio
-                .iter()
-                .find(|a| a.representations.iter().any(|r| r.codecs.starts_with("mp4a")))
-                .unwrap_or_else(|| tracks.audio.first().unwrap());
-            let selected_audio_repr = selected_audio
-                .representations
-                .iter()
-                .find(|r| r.codecs.starts_with("mp4a"))
-                .unwrap_or_else(|| selected_audio.representations.first().unwrap());
-            player.set_audio_track(selected_audio, selected_audio_repr);
-            log::info!(
-                "android: selected audio {} {}Hz",
-                selected_audio_repr.codecs,
-                selected_audio_repr.bandwidth,
-            );
-
-            loop {
-                let handle = match player.play() {
-                    Ok(h) => h,
-                    Err(e) => {
-                        log::error!("play(): {}", e);
-                        break;
-                    }
-                };
-                let _ = join!(handle);
-            }
-        });
+        // Same hardcoded encrypted stream + keys as the desktop shell —
+        // logic lives in app-shared so both shells stay in sync.
+        tokio::spawn(app_shared::run_test_playback(player));
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {

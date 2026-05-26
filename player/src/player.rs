@@ -1852,8 +1852,22 @@ fn decrypt_segment_in_place(
         None => return Ok(()),
     };
 
-    let senc_entries = parse_senc(data_vec, tc.iv_size)
-        .ok_or("Encrypted track but segment has no parseable senc box")?;
+    // No senc box = this segment is clear, even though the track's `tenc`
+    // box advertises encryption. Common Encryption explicitly supports
+    // mixed-protection tracks — some samples / segments in the clear,
+    // others encrypted with the cached KID. Skipping decryption is the
+    // correct behaviour here; treating it as fatal stalled playback the
+    // first time a clear segment landed.
+    let senc_entries = match parse_senc(data_vec, tc.iv_size) {
+        Some(e) => e,
+        None => {
+            log::debug!(
+                "[crypto] no senc in segment — treating as clear (track kid={})",
+                hex::encode(tc.kid)
+            );
+            return Ok(());
+        }
+    };
 
     let sample_ranges: Vec<(usize, usize)> = {
         let mp4 = Mp4::read_bytes(&data_vec[..])
@@ -1872,6 +1886,18 @@ fn decrypt_segment_in_place(
     for ((offset, size), entry) in sample_ranges.iter().zip(senc_entries.iter()) {
         let end = offset + size;
         if end > data_vec.len() {
+            continue;
+        }
+        // Per-sample "clear" entries also exist within an encrypted senc:
+        //   - IV all-zeros AND no subsamples → sample is clear
+        //   - subsamples list present but every entry has encrypted=0
+        // In both cases applying the keystream is a no-op anyway (CTR with
+        // IV=0 still XORs against a real keystream, breaking the data), so
+        // we must detect and skip.
+        let iv_is_zero = entry.iv.iter().all(|&b| b == 0);
+        let no_encrypted_bytes = !entry.subsamples.is_empty()
+            && entry.subsamples.iter().all(|&(_, enc)| enc == 0);
+        if iv_is_zero || no_encrypted_bytes {
             continue;
         }
         tc.decryptor

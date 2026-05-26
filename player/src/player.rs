@@ -23,7 +23,7 @@ pub use net::{
 };
 
 use crypto::{
-    parse_aac_config, parse_hvcc_nalus, parse_senc, parse_tenc, ClearKeyDecryptor,
+    kid_short, parse_aac_config, parse_hvcc_nalus, parse_senc, parse_tenc, ClearKeyDecryptor,
     Decryptor, TrackCrypto,
 };
 use decoders::{
@@ -745,7 +745,7 @@ async fn video_play(
         Some(tenc) => {
             log::info!(
                 "video: CENC encrypted, KID={} iv_size={}",
-                hex::encode(tenc.default_kid),
+                kid_short(&tenc.default_kid),
                 tenc.default_iv_size
             );
             let dec = decryptor.ok_or(
@@ -756,7 +756,7 @@ async fn video_play(
             // hits the cache populated here.
             dec.ensure_key_for(tenc.default_kid).await.map_err(
                 |e| -> Box<dyn Error + Send + Sync> {
-                    format!("license resolve (video kid={}): {}", hex::encode(tenc.default_kid), e).into()
+                    format!("license resolve (video kid={}): {}", kid_short(&tenc.default_kid), e).into()
                 },
             )?;
             Some(TrackCrypto {
@@ -831,7 +831,7 @@ async fn audio_play(
         Some(tenc) => {
             log::info!(
                 "audio: CENC encrypted, KID={} iv_size={}",
-                hex::encode(tenc.default_kid),
+                kid_short(&tenc.default_kid),
                 tenc.default_iv_size
             );
             let dec = decryptor.ok_or(
@@ -839,7 +839,7 @@ async fn audio_play(
             )?;
             dec.ensure_key_for(tenc.default_kid).await.map_err(
                 |e| -> Box<dyn Error + Send + Sync> {
-                    format!("license resolve (audio kid={}): {}", hex::encode(tenc.default_kid), e).into()
+                    format!("license resolve (audio kid={}): {}", kid_short(&tenc.default_kid), e).into()
                 },
             )?;
             Some(TrackCrypto {
@@ -945,13 +945,29 @@ async fn audio_play(
 ///
 /// Both paths skip silently if the representation isn't decodable
 /// (TTML for now).
+/// `active` is the live cell holding the currently-selected subtitle
+/// representation. If the consumer flips it (via clear_subtitle_track
+/// or set_subtitle_track to a different track) the task notices between
+/// operations and exits so stale downloads stop wasting bandwidth.
 async fn text_play<V: VideoSink>(
     text_representation: tracks::text::TextRepresenation,
     stop: Arc<Notify>,
     stop_flag: Arc<AtomicBool>,
     http: Arc<HttpClient>,
     video_sink: Arc<V>,
+    active: Arc<StdMutex<Option<tracks::text::TextRepresenation>>>,
+    target_id: u32,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    // Helper: did the consumer change subtitle selection out from under us?
+    let still_selected = |active: &Arc<StdMutex<Option<tracks::text::TextRepresenation>>>| -> bool {
+        active
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|r| r.id == target_id)
+            .unwrap_or(false)
+    };
+
     if !text_representation.is_webvtt() {
         log::info!(
             "[subs] representation {} is not WebVTT ({}/{}) — skipping",
@@ -976,8 +992,15 @@ async fn text_play<V: VideoSink>(
             },
             _ = stop.notified() => return Ok(()),
         };
+        if !still_selected(&active) {
+            return Ok(());
+        }
         let cues = crate::parsers::vtt::parse_segment(&bytes, 0);
-        log::info!("[subs] parsed {} cues from single VTT file", cues.len());
+        log::info!(
+            "[subs] parsed {} cues from {} bytes (single VTT file)",
+            cues.len(),
+            bytes.len()
+        );
         video_sink.queue_subtitle_cues(cues);
         return Ok(());
     }
@@ -986,17 +1009,17 @@ async fn text_play<V: VideoSink>(
     let init = match &text_representation.segment_init {
         Some(s) => s,
         None => {
-            log::info!("[subs] representation {} has no segments and no single-file URL", text_representation.id);
+            log::info!(
+                "[subs] representation {} has no segments and no single-file URL",
+                text_representation.id
+            );
             return Ok(());
         }
     };
-    // Init segment is fetched but currently unused by the cue parser
-    // (each sample carries its own VTT box). Still download it so any
-    // server-side cache priming behaves like the audio/video tracks.
     let _ = init.download(&http, RequestKind::InitSegment).await;
 
     for (i, seg) in text_representation.segments.iter().enumerate() {
-        if stop_flag.load(Ordering::Relaxed) {
+        if stop_flag.load(Ordering::Relaxed) || !still_selected(&active) {
             break;
         }
         let dl_fut = seg.download(&http, RequestKind::Segment);
@@ -1564,10 +1587,11 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         Ok(())
     }
 
-    /// Select a subtitle track. If `play()` is already running, the new
-    /// representation's cue pipeline spawns immediately and starts
-    /// pushing into the overlay. Otherwise the selection is stored and
-    /// the next `play()` picks it up.
+    /// Select a subtitle track. Spawns the text_play pipeline
+    /// immediately — works regardless of whether `play()` is currently
+    /// running, has finished, or hasn't been called yet. Single-file
+    /// VTT downloads once then exits; CMAF streaming runs until the
+    /// segment list is exhausted or `clear_subtitle_track` fires.
     pub fn set_subtitle_track(&self, representation: &tracks::text::TextRepresenation) {
         *self.subtitle_representation.lock().unwrap() = Some(representation.clone());
         // Wipe any cues from the previous track so they don't bleed
@@ -1577,12 +1601,28 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             "[subs] selected representation id={} codecs={} mime={}",
             representation.id, representation.codecs, representation.mime_type
         );
+
+        // Spawn text_play right now. We don't track the handle — when
+        // clear_subtitle_track flips subtitle_representation to None
+        // the running task checks the flag between segments and exits.
+        let repr = representation.clone();
+        let stop = self.stop.clone();
+        let stop_flag = self.stop_flag.clone();
+        let http = Arc::clone(&self.http);
+        let sink = self.video_renderer.clone();
+        let active = Arc::clone(&self.subtitle_representation);
+        let target_id = representation.id;
+        tokio::spawn(async move {
+            let res = text_play(repr, stop, stop_flag, http, sink, active, target_id).await;
+            if let Err(e) = res {
+                log::warn!("[subs] text_play exited: {}", e);
+            }
+        });
     }
 
-    /// Disable subtitles. Wipes the overlay's queued cues and prevents
-    /// the next `play()` from spawning a text_play task. Currently
-    /// running text_play tasks finish their in-flight segment then
-    /// drain on the play-level stop.
+    /// Disable subtitles. Wipes the overlay's queued cues; any running
+    /// `text_play` notices the cleared selection on its next segment
+    /// boundary and exits cleanly.
     pub fn clear_subtitle_track(&self) {
         *self.subtitle_representation.lock().unwrap() = None;
         self.video_renderer.clear_subtitles();
@@ -1850,23 +1890,12 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                 seg_in_flight,
             ));
 
-            // Optional subtitle pipeline. Single-shot for single-file
-            // VTT, streaming for ISO BMFF. The task self-terminates when
-            // its work is done, so we don't keep it in the join set.
-            if let Some(repr) = subtitle_repr_snapshot.clone() {
-                let stop_subs = stop.clone();
-                let stop_flag_subs = stop_flag.clone();
-                tokio::spawn(async move {
-                    let _ = text_play(
-                        repr,
-                        stop_subs,
-                        stop_flag_subs,
-                        http_subs,
-                        video_sink_for_subs,
-                    )
-                    .await;
-                });
-            }
+            // Subtitles: text_play is spawned from set_subtitle_track,
+            // not here. It runs independently of play() so seeks or
+            // track switches don't tear it down — the loaded cues live
+            // in the overlay until clear_subtitle_track or a new
+            // set_subtitle_track replaces them.
+            let _ = (&http_subs, &video_sink_for_subs, &subtitle_repr_snapshot);
 
             av_sync_handler(
                 snapped_seek_offset,
@@ -2041,7 +2070,7 @@ fn decrypt_segment_in_place(
         None => {
             log::debug!(
                 "[crypto] no senc in segment — treating as clear (track kid={})",
-                hex::encode(tc.kid)
+                kid_short(&tc.kid)
             );
             return Ok(());
         }

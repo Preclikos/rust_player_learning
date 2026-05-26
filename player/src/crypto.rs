@@ -8,6 +8,14 @@ use ctr::Ctr128BE;
 
 use crate::net::{BoxError, LicenseResolver};
 
+/// Render a key ID as a short identifier for logs. Returns the first 8
+/// hex chars + ellipsis so engineers can correlate without leaking the
+/// full KID. Use everywhere we'd otherwise hex::encode the full thing.
+pub fn kid_short(kid: &[u8; 16]) -> String {
+    let full = hex::encode(kid);
+    format!("{}…", &full[..8])
+}
+
 type Aes128Ctr = Ctr128BE<Aes128>;
 
 /// Abstraction over CENC sample decryption.
@@ -110,7 +118,7 @@ impl ClearKeyDecryptor {
             format!(
                 "no key cached for KID {} and no LicenseResolver attached \
                  (call set_clearkey or set_license_resolver before play)",
-                hex::encode(kid)
+                kid_short(&kid)
             )
             .into()
         })?;
@@ -141,7 +149,7 @@ impl Decryptor for ClearKeyDecryptor {
             let keys = self.keys.lock().unwrap();
             *keys
                 .get(kid)
-                .ok_or_else(|| format!("ClearKey: no key for KID {} (ensure_key not called?)", hex::encode(kid)))?
+                .ok_or_else(|| format!("ClearKey: no key for KID {} (ensure_key not called?)", kid_short(kid)))?
         };
         let mut cipher = Aes128Ctr::new(&key.into(), iv.into());
 

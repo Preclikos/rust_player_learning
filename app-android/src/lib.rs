@@ -218,8 +218,12 @@ impl ApplicationHandler for App {
 
 #[no_mangle]
 fn android_main(app: AndroidApp) {
+    // Default to Info so per-frame [vsync]/[mc] traces (24 lines/sec at
+    // 24fps) stay out of logcat. Bump to Debug / Trace when diagnosing
+    // playback issues — every player log site now uses the standard
+    // log:: levels (no rogue println!s).
     android_logger::init_once(
-        android_logger::Config::default().with_max_level(log::LevelFilter::Debug),
+        android_logger::Config::default().with_max_level(log::LevelFilter::Info),
     );
     log::info!("android_main: starting");
 

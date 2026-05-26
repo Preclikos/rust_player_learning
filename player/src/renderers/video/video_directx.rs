@@ -296,7 +296,7 @@ pub fn create_vk_image_from_d3d11_texture(
                 d3d11_device_context.CopyResource(&ss, texture);
 
                 let dx_pitch = get_dx11_shared_texture_pitch(d3d11_device_context, &ss).unwrap();
-                println!("DX pitch: {}", dx_pitch);
+                log::trace!("DX pitch: {}", dx_pitch);
         */
         let raw_image = {
             let raw_dev = device
@@ -361,7 +361,7 @@ pub fn create_vk_image_from_d3d11_texture(
             let allocated_memory = raw_device.allocate_memory(&allocate_info, None)?;
 
             let pitch = get_vulkan_shared_texture_pitch(raw_device, raw_image);
-            println!("Vulkan pitch: {}", pitch);
+            log::trace!("Vulkan pitch: {}", pitch);
             raw_device.bind_image_memory(raw_image, allocated_memory, 0)?;
 
             VkImageMemory {

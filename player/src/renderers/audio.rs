@@ -84,7 +84,7 @@ impl AudioRenderer {
             }
         };
 
-        let err_fn = |err| eprintln!("An error occurred on stream: {}", err);
+        let err_fn = |err| log::error!("audio stream error: {}", err);
 
         let stream = device
             .build_output_stream(
@@ -142,7 +142,7 @@ impl AudioRenderer {
                     AudioRendererCommand::Volume(new_volume) => {
                         let mut vol = volume_handle.write().await;
                         *vol += new_volume;
-                        println!("Volume changed to: {}", *vol);
+                        log::debug!("volume: {}", *vol);
                     }
                 }
             }

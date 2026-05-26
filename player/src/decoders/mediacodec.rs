@@ -219,7 +219,7 @@ impl HwVideoDecoder for MediaCodecDecoder {
                     log::warn!("[mc] BACKWARD #{} pts={}ms last={}ms Δ={}ms",
                         idx, pts / 1000, self.last_decoded_pts_us / 1000, delta / 1000);
                 } else {
-                    log::info!("[mc] decoded #{} pts={}ms Δ={}ms",
+                    log::trace!("[mc] decoded #{} pts={}ms Δ={}ms",
                         idx, pts / 1000, delta / 1000);
                 }
                 self.last_decoded_pts_us = pts;

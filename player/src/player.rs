@@ -322,7 +322,7 @@ async fn video_sync_loop<V: VideoSink>(
             last_position_emit = Instant::now();
         }
 
-        log::info!("[vsync] #{} pts={}ms wall={}ms render={}ms interval={}ms Δpts={}ms",
+        log::trace!("[vsync] #{} pts={}ms wall={}ms render={}ms interval={}ms Δpts={}ms",
             frame_idx - 1, pts_ms, render_start, render_ms, interval_ms, delta_pts);
     }
 }
@@ -445,7 +445,7 @@ async fn video_decoder_task(
     let mut reorder_buf: Vec<DecodedVideoFrame> = Vec::with_capacity(REORDER_DEPTH + 1);
 
     while let Some(segment) = receiver.recv().await {
-        println!("Consuming video segment: {}", segment.id);
+        log::debug!("[dec] consuming video segment: {}", segment.id);
 
         let mut data_vec = init_data.clone();
         data_vec.extend_from_slice(&segment.data[..]);
@@ -530,7 +530,7 @@ async fn audio_decoder_task(
     track_crypto: Option<TrackCrypto>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     while let Some(segment) = receiver.recv().await {
-        println!("Consuming audio segment: {}", segment.id);
+        log::debug!("[dec] consuming audio segment: {}", segment.id);
 
         let mut data_vec = init_data.clone();
         data_vec.extend_from_slice(&segment.data[..]);
@@ -604,7 +604,7 @@ async fn video_play(
 
     let track_crypto = match parse_tenc(&init_data) {
         Some(tenc) => {
-            println!(
+            log::info!(
                 "video: CENC encrypted, KID={} iv_size={}",
                 hex::encode(tenc.default_kid),
                 tenc.default_iv_size
@@ -627,7 +627,7 @@ async fn video_play(
             })
         }
         None => {
-            println!("video: clear (no tenc box)");
+            log::info!("video: clear (no tenc box)");
             None
         }
     };
@@ -674,7 +674,7 @@ async fn audio_play(
 
     let track_crypto = match parse_tenc(&init_data) {
         Some(tenc) => {
-            println!(
+            log::info!(
                 "audio: CENC encrypted, KID={} iv_size={}",
                 hex::encode(tenc.default_kid),
                 tenc.default_iv_size
@@ -694,7 +694,7 @@ async fn audio_play(
             })
         }
         None => {
-            println!("audio: clear (no tenc)");
+            log::info!("audio: clear (no tenc)");
             None
         }
     };
@@ -709,7 +709,7 @@ async fn audio_play(
         ((aac_config.freq_index & 0x01) << 7) | (aac_config.chan_conf << 3),
     ];
 
-    println!(
+    log::info!(
         "audio: AAC profile={} freq_index={} (={}Hz) chan_conf={}",
         aac_config.profile, aac_config.freq_index, input_sample_rate, aac_config.chan_conf
     );
@@ -1228,9 +1228,9 @@ async fn download_task(
         tokio::select! {
             res = download_and_queue(i, seg, sender, &http) => {
                 match res {
-                    Ok(()) => println!("Producing segment {}", i),
+                    Ok(()) => log::debug!("[dl] produced segment {}", i),
                     Err(e) => {
-                        eprintln!("download_task: segment {} failed: {}", i, e);
+                        log::error!("[dl] segment {} failed: {}", i, e);
                         should_break = true;
                     }
                 }
@@ -1259,8 +1259,8 @@ fn log_task_result<T, E: std::fmt::Display>(
 ) {
     match result {
         Ok(Ok(_)) => {}
-        Ok(Err(e)) => eprintln!("{}: {}", name, e),
-        Err(e) => eprintln!("{}: join error: {}", name, e),
+        Ok(Err(e)) => log::error!("{}: {}", name, e),
+        Err(e) => log::error!("{}: join error: {}", name, e),
     }
 }
 

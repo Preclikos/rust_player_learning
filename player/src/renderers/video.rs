@@ -274,7 +274,7 @@ impl VideoRenderer {
             Some(format) => format,
             None => cap.formats[0],
         };
-        println!("{:?}", cap.formats);
+        log::debug!("surface formats: {:?}", cap.formats);
 
         //let surface_format = cap.formats[4]; //.last().unwrap();
 

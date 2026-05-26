@@ -63,7 +63,7 @@ impl Tracks {
         match mpd.media_presentation_duration.parse::<IsoDuration>() {
             Ok(iso_duration) => Ok(iso_to_std_duration(&iso_duration)),
             Err(e) => {
-                eprintln!(
+                log::error!(
                     "Failed to parse media presentation duration: {}",
                     e.position
                 );
@@ -538,7 +538,7 @@ impl Tracks {
         let period = match mpd.periods.first() {
             Some(success) => success,
             None => {
-                eprintln!("Failed to parse Period");
+                log::error!("Failed to parse Period");
                 return Err("Failed to parse Period".into());
             }
         };
@@ -569,7 +569,7 @@ impl Tracks {
                     let value = Self::parse_text_adaptation(&base_url, adaptation)?;
                     text_adaptations.push(value);
                 }
-                _ => println!("Not supported"),
+                other => log::warn!("AdaptationSet content_type {} ignored", other),
             }
         }
 

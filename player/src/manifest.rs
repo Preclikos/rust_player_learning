@@ -27,7 +27,7 @@ impl Manifest {
 
     fn parse(content: &str) -> Result<MPD, Box<dyn std::error::Error>> {
         from_str::<MPD>(content).map_err(|e| -> Box<dyn std::error::Error> {
-            eprintln!("Failed to parse MPD: {}", e);
+            log::error!("Failed to parse MPD: {}", e);
             "Failed to parse MPD".into()
         })
     }

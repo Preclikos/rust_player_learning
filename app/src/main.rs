@@ -48,7 +48,7 @@ impl ApplicationHandler for App {
                 "627ef72b42d98770dec20ecab46cd1f4".to_string(),
             );
             if let Err(e) = player.set_clearkey(keys) {
-                eprintln!("set_clearkey failed: {}", e);
+                log::error!("set_clearkey failed: {}", e);
             }
 
             let _ = player.prepare().await;
@@ -91,7 +91,7 @@ impl ApplicationHandler for App {
                 if let Some(player) = &self.player {
                     player.stop().block_on();
                 }
-                println!("The close button was pressed; stopping");
+                log::info!("close button pressed; stopping");
                 event_loop.exit();
             }
             WindowEvent::RedrawRequested => {
@@ -116,7 +116,7 @@ impl ApplicationHandler for App {
                 is_synthetic: _,
             } => match (event.physical_key, event.state) {
                 (PhysicalKey::Code(KeyCode::Escape), ElementState::Pressed) => {
-                    println!("Escape key pressed; exiting");
+                    log::info!("Escape pressed; exiting");
                     if let Some(player) = &self.player {
                         player.stop().block_on();
                     }
@@ -204,10 +204,10 @@ mod platform {
             match xdg_session_type.as_str() {
                 "x11" => prevent_screensaver_x11(),
                 "wayland" => prevent_screensaver_wayland(),
-                _ => eprintln!("Unsupported display server: {}", xdg_session_type),
+                _ => log::warn!("Unsupported display server: {}", xdg_session_type),
             }
         } else {
-            eprintln!("Failed to detect XDG_SESSION_TYPE");
+            log::warn!("Failed to detect XDG_SESSION_TYPE");
         }
     }
 
@@ -217,16 +217,16 @@ mod platform {
             if !display.is_null() {
                 XResetScreenSaver(display);
             } else {
-                eprintln!("Failed to open X display");
+                log::warn!("Failed to open X display");
             }
         }
     }
 
     fn prevent_screensaver_wayland() {
-        if let Ok(display) = Connection::connect_to_env() {
-            eprintln!("Wayland support requires compositor-specific methods.");
+        if let Ok(_display) = Connection::connect_to_env() {
+            log::warn!("Wayland support requires compositor-specific methods.");
         } else {
-            eprintln!("Failed to connect to Wayland display");
+            log::warn!("Failed to connect to Wayland display");
         }
     }
 }
@@ -235,7 +235,7 @@ mod platform {
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
 mod platform {
     pub fn prevent_screensaver() {
-        eprintln!("Screensaver prevention is not supported on this platform.");
+        log::warn!("Screensaver prevention is not supported on this platform.");
     }
 }
 

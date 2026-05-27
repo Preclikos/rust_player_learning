@@ -192,8 +192,43 @@ mod platform {
     }
 }
 
+// macOS: IOPMAssertionCreateWithName drží display zapnutý.
+// Assertion existuje dokud žije proces; OS ji uvolní při exitu.
+#[cfg(target_os = "macos")]
+mod platform {
+    use core_foundation::base::TCFType;
+    use core_foundation::string::CFString;
+
+    #[link(name = "IOKit", kind = "framework")]
+    extern "C" {
+        fn IOPMAssertionCreateWithName(
+            assertion_type: core_foundation_sys::string::CFStringRef,
+            level: u32,
+            reason: core_foundation_sys::string::CFStringRef,
+            assertion_id: *mut u32,
+        ) -> i32;
+    }
+
+    pub fn prevent_screensaver() {
+        let assertion_type = CFString::new("NoDisplaySleepAssertion");
+        let reason = CFString::new("Video playback");
+        let mut id: u32 = 0;
+        let rc = unsafe {
+            IOPMAssertionCreateWithName(
+                assertion_type.as_concrete_TypeRef(),
+                255, // kIOPMAssertionLevelOn
+                reason.as_concrete_TypeRef(),
+                &mut id,
+            )
+        };
+        if rc != 0 {
+            log::warn!("IOPMAssertionCreateWithName failed: {}", rc);
+        }
+    }
+}
+
 // Default implementation for other platforms
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
 mod platform {
     pub fn prevent_screensaver() {
         log::warn!("Screensaver prevention is not supported on this platform.");

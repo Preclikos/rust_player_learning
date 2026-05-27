@@ -1,8 +1,11 @@
+#![cfg(any(target_os = "windows", target_os = "linux"))]
+
 use ash::vk;
 use ffmpeg_next::frame::Video;
 use ffmpeg_sys_next::AVHWFramesContext;
 use std::sync::Arc;
-use wgpu::{wgc::api::Vulkan, Backend, Extent3d, Texture};
+use wgpu::wgc::api::Vulkan;
+use wgpu::{Backend, Extent3d, Texture};
 
 use super::video_vulkan::create_texture_from_vk_image;
 
@@ -207,3 +210,4 @@ impl Drop for VideoFrame {
         }
     }
 }
+

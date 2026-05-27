@@ -7,9 +7,9 @@
 
 use std::error::Error;
 
-#[cfg(any(target_os = "windows", target_os = "linux"))]
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
 pub mod ffmpeg_audio;
-#[cfg(any(target_os = "windows", target_os = "linux"))]
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
 pub mod ffmpeg_hw;
 #[cfg(target_os = "android")]
 pub mod mediacodec;
@@ -59,10 +59,10 @@ pub struct DecodedVideoFrame {
 /// Platform-native handle wrapping a decoded frame's GPU surface.
 #[non_exhaustive]
 pub enum PlatformFrame {
-    /// Desktop (Windows + Linux): the raw decoded frame from FFmpeg, which
-    /// carries its own D3D11/VAAPI hw_frames_ctx pointer. The video renderer
-    /// imports the native surface via VideoFrame::new.
-    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    /// Desktop (Windows + Linux + macOS): the raw decoded frame from FFmpeg, which
+    /// carries its own D3D11/VAAPI/VideoToolbox hw_frames_ctx pointer. The video
+    /// renderer imports the native surface via VideoFrame::new.
+    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
     FfmpegVideo(std::sync::Arc<ffmpeg_next::frame::Video>),
     /// Owned AHardwareBuffer produced by MediaCodec's output Surface.
     #[cfg(target_os = "android")]

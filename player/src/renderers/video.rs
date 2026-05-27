@@ -1,4 +1,4 @@
-#[cfg(any(target_os = "windows", target_os = "linux"))]
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
 use ffmpeg_next::frame::Video;
 use tokio::sync::{
     mpsc::{self, Receiver, Sender},
@@ -6,6 +6,8 @@ use tokio::sync::{
 };
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 use video_frame::VideoFrame;
+#[cfg(target_os = "macos")]
+use video_macos::{MetalNV12Frame, MetalTextureCache};
 use wgpu::{Backends, Buffer};
 use wgpu::{Device, SurfaceConfiguration};
 use winit::dpi::PhysicalSize;
@@ -16,10 +18,13 @@ mod video_directx;
 mod video_frame;
 #[cfg(target_os = "linux")]
 mod video_vaapi;
+// Vulkan import helper is only compiled on Windows/Linux — macOS uses Metal directly.
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 mod video_vulkan;
 #[cfg(target_os = "android")]
 mod video_gles_egl;
+#[cfg(target_os = "macos")]
+mod video_macos;
 
 use std::sync::Arc;
 
@@ -105,6 +110,9 @@ fn select_preferred_format(
 pub struct VideoRenderer {
     window: Arc<Window>,
     device: wgpu::Device,
+    // Used by the FFmpeg HW import path on Win/Linux to dispatch between
+    // DX12 and Vulkan; the macOS Metal path doesn't need it.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     backend: wgpu::Backend,
     queue: wgpu::Queue,
     /// Optional WebVTT subtitle overlay. Built lazily on the first
@@ -147,6 +155,10 @@ pub struct VideoRenderer {
     // alive guarantees the GPU is done with each by the time it's dropped.
     #[cfg(target_os = "android")]
     ahb_keepalive: Arc<std::sync::Mutex<std::collections::VecDeque<Arc<crate::decoders::SendableAhb>>>>,
+    /// Zero-copy CVPixelBuffer → MTLTexture cache. None when the wgpu backend
+    /// isn't Metal (shouldn't happen on macOS but the constructor is fallible).
+    #[cfg(target_os = "macos")]
+    metal_cache: Option<Arc<MetalTextureCache>>,
 }
 
 pub enum VideoRendererCommand {
@@ -166,7 +178,7 @@ impl VideoRenderer {
         // emulator vkCreateInstance failures) and follows the recommended path.
         #[cfg(target_os = "android")]
         let backend = Backends::GL;
-        #[cfg(target_os = "ios")]
+        #[cfg(any(target_os = "ios", target_os = "macos"))]
         let backend = Backends::METAL;
 
         let instance = Instance::new(InstanceDescriptor {
@@ -207,8 +219,17 @@ impl VideoRenderer {
         // Some Vulkan GPUs (e.g. PowerVR Rogue on Google TV) also don't expose
         // NV12, so intersect with what the adapter actually supports rather than
         // requesting blindly and unwrapping into a panic.
-        let is_hw_backend = backend == wgpu::Backend::Vulkan || backend == wgpu::Backend::Dx12;
-        let required_features = if is_hw_backend {
+        // Windows/Linux use a single multi-planar NV12 wgpu texture (plane views
+        // via aspect Plane0/Plane1). macOS Metal can't expose TEXTURE_FORMAT_NV12,
+        // but the renderer still imports two separate Y+UV MTLTextures from
+        // CVPixelBuffer planes, so it needs the pipeline created exactly like
+        // the desktop NV12 path. `is_hw_backend` controls limits; the
+        // pipeline-creation gate `has_nv12_feature` is widened to include Metal
+        // below so the macOS path gets a working RenderPipeline.
+        let is_hw_backend = backend == wgpu::Backend::Vulkan
+            || backend == wgpu::Backend::Dx12
+            || backend == wgpu::Backend::Metal;
+        let required_features = if is_hw_backend && backend != wgpu::Backend::Metal {
             let desired = wgpu::Features::TEXTURE_FORMAT_NV12
                 | wgpu::Features::TEXTURE_FORMAT_16BIT_NORM;
             adapter.features() & desired
@@ -242,7 +263,14 @@ impl VideoRenderer {
             }
         };
 
-        let has_nv12_feature = required_features.contains(wgpu::Features::TEXTURE_FORMAT_NV12);
+        // On Windows/Linux the pipeline only works when the adapter exposes
+        // TEXTURE_FORMAT_NV12 (multi-planar texture). On macOS Metal the
+        // pipeline binds two separate Y+UV textures (R8/RG8) imported from
+        // CVPixelBuffer planes, so no NV12 feature is needed — but the
+        // pipeline + vertex buffer still need to be created.
+        let needs_pipeline = required_features.contains(wgpu::Features::TEXTURE_FORMAT_NV12)
+            || backend == wgpu::Backend::Metal;
+        let has_nv12_feature = needs_pipeline;
         log::info!(
             "[renderer] backend={:?} nv12={} adapter={}",
             backend,
@@ -457,6 +485,19 @@ impl VideoRenderer {
             }
         }
 
+        // Build the CVMetalTextureCache once per renderer so every frame's
+        // import lookup hits the same cache (Apple caches the IOSurface →
+        // MTLTexture binding internally, so per-frame creation would be
+        // wasteful).
+        #[cfg(target_os = "macos")]
+        let metal_cache = MetalTextureCache::new(&device);
+        #[cfg(target_os = "macos")]
+        if metal_cache.is_none() {
+            log::error!(
+                "[renderer] CVMetalTextureCache init failed — zero-copy NV12 import will not work"
+            );
+        }
+
         let renderer = VideoRenderer {
             window,
             device,
@@ -479,6 +520,8 @@ impl VideoRenderer {
             gles_oes_pending,
             #[cfg(target_os = "android")]
             ahb_keepalive,
+            #[cfg(target_os = "macos")]
+            metal_cache,
         };
 
         renderer.spawn_command_thread(command_receiver);
@@ -603,7 +646,7 @@ impl VideoRenderer {
         #[cfg(target_os = "android")]
         let desired_present_ns = frame.desired_present_ns;
         match frame.native {
-            #[cfg(any(target_os = "windows", target_os = "linux"))]
+            #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
             PlatformFrame::FfmpegVideo(ffmpeg_frame) => {
                 self.render(ffmpeg_frame).await;
             }
@@ -620,46 +663,74 @@ impl VideoRenderer {
         }
     }
 
-    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
     pub async fn render(&self, frame: Arc<Video>) {
-        let video_frame = VideoFrame::new(self.device.clone(), self.backend, frame.clone());
-
-        let texture = video_frame.get_texture();
-
-        let y_plane_view = match texture.format() {
-            TextureFormat::P010 => {
-                texture.create_view(&wgpu::TextureViewDescriptor {
-                    format: Some(wgpu::TextureFormat::R16Unorm), // Y plane (16-bit to match 10-bit data)
-                    aspect: wgpu::TextureAspect::Plane0,
-                    ..Default::default()
-                })
+        // macOS: zero-copy import. The CVPixelBuffer in frame.data[3] becomes
+        // two MTLTextures via CVMetalTextureCache; both wgpu::Textures are
+        // backed by the same IOSurface the GPU decode wrote into. The
+        // MetalNV12Frame holds the CVMetalTextureRefs alive until the render
+        // pass is submitted, so the GPU doesn't sample a recycled buffer.
+        #[cfg(target_os = "macos")]
+        let _macos_frame = {
+            let cache = match &self.metal_cache {
+                Some(c) => c,
+                None => {
+                    log::warn!("[renderer] metal_cache missing, dropping frame");
+                    return;
+                }
+            };
+            match MetalNV12Frame::new(cache, &self.device, &frame) {
+                Ok(f) => f,
+                Err(e) => {
+                    log::warn!("[renderer] MetalNV12Frame::new failed: {}", e);
+                    return;
+                }
             }
-            TextureFormat::NV12 => {
-                texture.create_view(&wgpu::TextureViewDescriptor {
-                    format: Some(wgpu::TextureFormat::R8Unorm), // Y plane (8-bit to match 8-bit data)
-                    aspect: wgpu::TextureAspect::Plane0,
-                    ..Default::default()
-                })
-            }
-            _ => panic!("Not supported"),
         };
 
-        let uv_plane_view = match texture.format() {
-            TextureFormat::P010 => {
-                texture.create_view(&wgpu::TextureViewDescriptor {
-                    format: Some(wgpu::TextureFormat::Rg16Unorm), // Y plane (16-bit to match 10-bit data)
+        // macOS exposes Y/UV as two separate single-plane Metal textures imported from
+        // CVPixelBuffer. Windows/Linux expose a single multi-planar NV12 / P010
+        // texture and view its planes via aspect Plane0/Plane1.
+        #[cfg(target_os = "macos")]
+        let (y_plane_view, uv_plane_view) = {
+            let y = _macos_frame.y_texture.create_view(&Default::default());
+            let uv = _macos_frame.uv_texture.create_view(&Default::default());
+            (y, uv)
+        };
+
+        #[cfg(not(target_os = "macos"))]
+        let video_frame = VideoFrame::new(self.device.clone(), self.backend, frame.clone());
+
+        #[cfg(not(target_os = "macos"))]
+        let (y_plane_view, uv_plane_view) = {
+            let texture = video_frame.get_texture();
+            let y = match texture.format() {
+                TextureFormat::P010 => texture.create_view(&wgpu::TextureViewDescriptor {
+                    format: Some(wgpu::TextureFormat::R16Unorm),
+                    aspect: wgpu::TextureAspect::Plane0,
+                    ..Default::default()
+                }),
+                TextureFormat::NV12 => texture.create_view(&wgpu::TextureViewDescriptor {
+                    format: Some(wgpu::TextureFormat::R8Unorm),
+                    aspect: wgpu::TextureAspect::Plane0,
+                    ..Default::default()
+                }),
+                _ => panic!("Not supported"),
+            };
+            let uv = match texture.format() {
+                TextureFormat::P010 => texture.create_view(&wgpu::TextureViewDescriptor {
+                    format: Some(wgpu::TextureFormat::Rg16Unorm),
                     aspect: wgpu::TextureAspect::Plane1,
                     ..Default::default()
-                })
-            }
-            TextureFormat::NV12 => {
-                texture.create_view(&wgpu::TextureViewDescriptor {
-                    format: Some(wgpu::TextureFormat::Rg8Unorm), // Y plane (8-bit to match 8-bit data)
+                }),
+                TextureFormat::NV12 => texture.create_view(&wgpu::TextureViewDescriptor {
+                    format: Some(wgpu::TextureFormat::Rg8Unorm),
                     aspect: wgpu::TextureAspect::Plane1,
                     ..Default::default()
-                })
-            }
-            _ => panic!("Not supported"),
+                }),
+                _ => panic!("Not supported"),
+            };
+            (y, uv)
         };
 
         // Desktop path always has NV12 feature, so pipeline/buffer are always Some.

@@ -1,4 +1,4 @@
-#![cfg(any(target_os = "windows", target_os = "linux"))]
+#![cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
 
 use std::sync::Arc;
 
@@ -29,6 +29,8 @@ impl FfmpegHwDecoder {
         let device_type = AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA;
         #[cfg(target_os = "linux")]
         let device_type = AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI;
+        #[cfg(target_os = "macos")]
+        let device_type = AVHWDeviceType::AV_HWDEVICE_TYPE_VIDEOTOOLBOX;
 
         let mut ctx: *mut AVBufferRef = std::ptr::null_mut();
         let ret = unsafe {
@@ -58,6 +60,10 @@ impl HwVideoDecoder for FfmpegHwDecoder {
         #[cfg(target_os = "linux")]
         {
             "VAAPI (FFmpeg)"
+        }
+        #[cfg(target_os = "macos")]
+        {
+            "VideoToolbox (FFmpeg)"
         }
     }
 
@@ -138,6 +144,11 @@ impl HwVideoDecoder for FfmpegHwDecoder {
                 let pts_us = frame.pts().unwrap_or(0) * 1000;
                 let width = frame.width();
                 let height = frame.height();
+
+                // macOS: keep the AVFrame as AV_PIX_FMT_VIDEOTOOLBOX — the CVPixelBufferRef
+                // lives in frame.data[3] and the video renderer wraps it as two MTLTextures
+                // (Y + UV planes) via CVMetalTextureCache. Zero-copy GPU import.
+
                 Ok(Some(DecodedVideoFrame {
                     pts_us,
                     width,

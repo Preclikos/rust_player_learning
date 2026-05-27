@@ -1,4 +1,4 @@
-#![cfg(any(target_os = "windows", target_os = "linux"))]
+#![cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
 
 use ffmpeg_next::format::sample::Type;
 use ffmpeg_next::software::resampling::Context as ResampleCtx;

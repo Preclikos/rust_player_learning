@@ -1,4 +1,4 @@
-//! iOS AAC / AC-3 / EAC-3 decoder backed by AudioConverter.
+//! Apple (macOS + iOS) AAC / AC-3 / EAC-3 decoder backed by AudioConverter.
 //!
 //! Input  ASBD: compressed source (`'aac '` / `'ac-3'` / `'ec-3'`) at the
 //!              codec's native sample rate, with the AudioSpecificConfig
@@ -12,7 +12,7 @@
 //! `submit`; `try_recv` pops from a small FIFO. AudioConverter is
 //! stateful but cheap to drive packet-by-packet.
 
-#![cfg(target_os = "ios")]
+#![cfg(any(target_os = "ios", target_os = "macos"))]
 
 use std::collections::VecDeque;
 use std::ffi::c_void;

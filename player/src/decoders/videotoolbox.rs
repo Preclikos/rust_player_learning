@@ -1,4 +1,4 @@
-//! iOS HEVC decoder backed by VTDecompressionSession.
+//! Apple (macOS + iOS) HEVC decoder backed by VTDecompressionSession.
 //!
 //! Pipeline:
 //!   `configure(params)` builds a CMVideoFormatDescription from the hvcC
@@ -16,7 +16,7 @@
 //!   `PlatformFrame::CvPixelBuffer(CvPixelBufferOwned)` so the renderer
 //!   can zero-copy import it via CVMetalTextureCache (shared with macOS).
 
-#![cfg(target_os = "ios")]
+#![cfg(any(target_os = "ios", target_os = "macos"))]
 
 use std::collections::VecDeque;
 use std::ffi::c_void;

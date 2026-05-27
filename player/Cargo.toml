@@ -35,15 +35,19 @@ log = "0.4"
 # get uploaded as textures and drawn over the video surface.
 fontdue = "0.9"
 
-# FFmpeg is desktop-only; mobile uses MediaCodec (Android) / VideoToolbox (iOS).
+# FFmpeg is Windows/Linux only — macOS and iOS use native VideoToolbox +
+# AudioToolbox, Android uses MediaCodec. ffmpeg-next 8.x ships with a
+# newer bindgen that works with LLVM 22+.
 # Desktop uses native-tls (system OpenSSL/Schannel) for reqwest.
-# ffmpeg-next 8.x ships with a newer bindgen that works with LLVM 22+.
-# macOS uses the same FFmpeg crate but configures AV_HWDEVICE_TYPE_VIDEOTOOLBOX,
-# so HW frames come back as CVPixelBufferRef instead of D3D11/VAAPI surfaces.
-[target.'cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))'.dependencies]
+[target.'cfg(any(target_os = "windows", target_os = "linux"))'.dependencies]
 ffmpeg-next = { version = "8.1.0"}
 ffmpeg-sys-next = { version = "8.1.0"}
 reqwest = { version = "0.12.12", default-features = false, features = ["default-tls"] }
+
+# macOS desktop also uses rustls — no system OpenSSL dependency, and the
+# native VideoToolbox path means we don't need Homebrew FFmpeg either.
+[target.'cfg(target_os = "macos")'.dependencies]
+reqwest = { version = "0.12.12", default-features = false, features = ["rustls-tls"] }
 
 # Apple zero-copy interop, shared by macOS (FFmpeg VideoToolbox) and iOS
 # (native VTDecompressionSession). Both pull a CVPixelBuffer through

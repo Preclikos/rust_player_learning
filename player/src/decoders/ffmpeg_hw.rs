@@ -1,4 +1,4 @@
-#![cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+#![cfg(any(target_os = "windows", target_os = "linux"))]
 
 use std::sync::Arc;
 
@@ -29,8 +29,6 @@ impl FfmpegHwDecoder {
         let device_type = AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA;
         #[cfg(target_os = "linux")]
         let device_type = AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI;
-        #[cfg(target_os = "macos")]
-        let device_type = AVHWDeviceType::AV_HWDEVICE_TYPE_VIDEOTOOLBOX;
 
         let mut ctx: *mut AVBufferRef = std::ptr::null_mut();
         let ret = unsafe {
@@ -60,10 +58,6 @@ impl HwVideoDecoder for FfmpegHwDecoder {
         #[cfg(target_os = "linux")]
         {
             "VAAPI (FFmpeg)"
-        }
-        #[cfg(target_os = "macos")]
-        {
-            "VideoToolbox (FFmpeg)"
         }
     }
 

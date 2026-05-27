@@ -1683,7 +1683,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
     }
 
     pub async fn prepare(&mut self) -> Result<(), Box<dyn Error>> {
-        #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
         ffmpeg_next::init()?;
 
         let manifest = match &self.manifest {
@@ -2084,7 +2084,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         // Video decoder factory — the supervisor calls this once per spawned
         // video_play (one for the initial repr, again for every ABR swap).
         let video_decoder_factory: VideoDecoderFactory = {
-            #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+            #[cfg(any(target_os = "windows", target_os = "linux"))]
             {
                 Arc::new(|| Box::new(decoders::ffmpeg_hw::FfmpegHwDecoder::new()))
             }
@@ -2092,7 +2092,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             {
                 Arc::new(|| Box::new(decoders::mediacodec::MediaCodecDecoder::new()))
             }
-            #[cfg(target_os = "ios")]
+            #[cfg(any(target_os = "ios", target_os = "macos"))]
             {
                 Arc::new(|| {
                     let d = decoders::videotoolbox::VideoToolboxDecoder::new()
@@ -2110,13 +2110,13 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             *self.stats.decoder_name.lock().unwrap() = probe.name().to_string();
         }
 
-        #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
         let audio_decoder: Box<dyn AudioDecoder> =
             Box::new(decoders::ffmpeg_audio::FfmpegAudioDecoder::new());
         #[cfg(target_os = "android")]
         let audio_decoder: Box<dyn AudioDecoder> =
             Box::new(decoders::mediacodec_audio::MediaCodecAudioDecoder::new());
-        #[cfg(target_os = "ios")]
+        #[cfg(any(target_os = "ios", target_os = "macos"))]
         let audio_decoder: Box<dyn AudioDecoder> =
             Box::new(decoders::audiotoolbox::AudioToolboxDecoder::new());
 

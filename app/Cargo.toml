@@ -9,11 +9,14 @@ app-shared = { path = "../app-shared" }
 tokio = { version = "1.43.0", features = ["full"] }
 winit = "0.30.9"
 pollster = "0.4.0"
-ffmpeg-next = {version = "8.1.0"}
-bytemuck ={ version =  "1.13.1" }
-cpal ={ version =  "0.17" }
 env_logger = "0.11.6"
 log = "0.4"
+
+# FFmpeg is only pulled in on Windows / Linux (the desktop player
+# backend); macOS uses native VideoToolbox via the player crate and
+# doesn't need ffmpeg-next at all.
+[target.'cfg(any(target_os = "windows", target_os = "linux"))'.dependencies]
+ffmpeg-next = {version = "8.1.0"}
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = ["Win32_System_Power"] }

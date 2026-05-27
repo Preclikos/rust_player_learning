@@ -7,17 +7,17 @@
 
 use std::error::Error;
 
-#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 pub mod ffmpeg_audio;
-#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 pub mod ffmpeg_hw;
 #[cfg(target_os = "android")]
 pub mod mediacodec;
 #[cfg(target_os = "android")]
 pub mod mediacodec_audio;
-#[cfg(target_os = "ios")]
+#[cfg(any(target_os = "ios", target_os = "macos"))]
 pub mod audiotoolbox;
-#[cfg(target_os = "ios")]
+#[cfg(any(target_os = "ios", target_os = "macos"))]
 pub mod videotoolbox;
 
 // ---------------------------------------------------------------------------
@@ -59,18 +59,18 @@ pub struct DecodedVideoFrame {
 /// Platform-native handle wrapping a decoded frame's GPU surface.
 #[non_exhaustive]
 pub enum PlatformFrame {
-    /// Desktop (Windows + Linux + macOS): the raw decoded frame from FFmpeg, which
-    /// carries its own D3D11/VAAPI/VideoToolbox hw_frames_ctx pointer. The video
-    /// renderer imports the native surface via VideoFrame::new.
-    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+    /// Desktop (Windows + Linux): the raw decoded frame from FFmpeg, which
+    /// carries its own D3D11/VAAPI hw_frames_ctx pointer. The video renderer
+    /// imports the native surface via VideoFrame::new.
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     FfmpegVideo(std::sync::Arc<ffmpeg_next::frame::Video>),
     /// Owned AHardwareBuffer produced by MediaCodec's output Surface.
     #[cfg(target_os = "android")]
     HardwareBuffer(AndroidHardwareBufferFrame),
-    /// iOS / tvOS: native VTDecompressionSession output. The retained
-    /// CVPixelBufferRef points to GPU memory (IOSurface-backed) the
-    /// video renderer imports via CVMetalTextureCache zero-copy.
-    #[cfg(target_os = "ios")]
+    /// macOS / iOS / tvOS: native VTDecompressionSession output. The
+    /// retained CVPixelBufferRef points to GPU memory (IOSurface-backed)
+    /// the video renderer imports via CVMetalTextureCache zero-copy.
+    #[cfg(any(target_os = "ios", target_os = "macos"))]
     CvPixelBuffer(CvPixelBufferOwned),
 }
 
@@ -78,12 +78,12 @@ pub enum PlatformFrame {
 /// construction, CFRelease on Drop — so an owned `CvPixelBufferOwned`
 /// keeps the underlying IOSurface alive across thread boundaries until
 /// the renderer is done with it.
-#[cfg(target_os = "ios")]
+#[cfg(any(target_os = "ios", target_os = "macos"))]
 pub struct CvPixelBufferOwned {
     raw: *mut std::ffi::c_void,
 }
 
-#[cfg(target_os = "ios")]
+#[cfg(any(target_os = "ios", target_os = "macos"))]
 impl CvPixelBufferOwned {
     /// SAFETY: `raw` must be a valid CVPixelBufferRef. Retains the buffer
     /// so the caller can drop their reference after this call.
@@ -100,7 +100,7 @@ impl CvPixelBufferOwned {
     }
 }
 
-#[cfg(target_os = "ios")]
+#[cfg(any(target_os = "ios", target_os = "macos"))]
 impl Drop for CvPixelBufferOwned {
     fn drop(&mut self) {
         extern "C" {
@@ -115,7 +115,7 @@ impl Drop for CvPixelBufferOwned {
 // CVPixelBuffer is documented as thread-safe for retain/release; the
 // IOSurface backing is also safe to share. The frame travels from the
 // decode worker to the renderer task across thread boundaries.
-#[cfg(target_os = "ios")]
+#[cfg(any(target_os = "ios", target_os = "macos"))]
 unsafe impl Send for CvPixelBufferOwned {}
 
 #[cfg(target_os = "android")]

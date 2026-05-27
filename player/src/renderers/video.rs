@@ -1,4 +1,4 @@
-#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 use ffmpeg_next::frame::Video;
 use tokio::sync::{
     mpsc::{self, Receiver, Sender},
@@ -658,7 +658,7 @@ impl VideoRenderer {
         #[cfg(target_os = "android")]
         let desired_present_ns = frame.desired_present_ns;
         match frame.native {
-            #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+            #[cfg(any(target_os = "windows", target_os = "linux"))]
             PlatformFrame::FfmpegVideo(ffmpeg_frame) => {
                 self.render(ffmpeg_frame).await;
             }
@@ -666,7 +666,7 @@ impl VideoRenderer {
             PlatformFrame::HardwareBuffer(ahb) => {
                 self.render_android(ahb, desired_present_ns).await;
             }
-            #[cfg(target_os = "ios")]
+            #[cfg(any(target_os = "ios", target_os = "macos"))]
             PlatformFrame::CvPixelBuffer(cv_buf) => {
                 self.render_cv_pixel_buffer(cv_buf).await;
             }
@@ -675,45 +675,11 @@ impl VideoRenderer {
         }
     }
 
-    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
-    pub async fn render(&self, frame: Arc<Video>) {
-        // macOS: zero-copy import — CVPixelBuffer from frame.data[3] becomes
-        // two MTLTextures via CVMetalTextureCache; shared helper renders.
-        // iOS shares the same helper but its CVPixelBuffer comes from
-        // VTDecompressionSession (see render_cv_pixel_buffer).
-        #[cfg(target_os = "macos")]
-        {
-            let cache = match &self.metal_cache {
-                Some(c) => c.clone(),
-                None => {
-                    log::warn!("[renderer] metal_cache missing, dropping frame");
-                    return;
-                }
-            };
-            let cv: *const std::ffi::c_void = unsafe { (*frame.as_ptr()).data[3] as *const _ };
-            let mf = match unsafe { MetalNV12Frame::new(&cache, &self.device, cv) } {
-                Ok(f) => f,
-                Err(e) => {
-                    log::warn!("[renderer] MetalNV12Frame::new failed: {}", e);
-                    return;
-                }
-            };
-            self.render_metal_nv12(mf).await;
-            return;
-        }
-
-        // From here on: Windows / Linux only. The whole body is gated so
-        // names like `y_plane_view` aren't even type-checked when
-        // building for macOS (where this function returns above).
-        #[cfg(not(target_os = "macos"))]
-        self.render_ffmpeg_native(frame).await;
-    }
-
-    /// Windows / Linux FFmpeg → wgpu native-import draw path. Pulled into
-    /// its own method so the cfg-gating around the macOS branch doesn't
-    /// leak into shared variable scoping.
+    /// Windows / Linux FFmpeg → wgpu native-import draw path. macOS / iOS
+    /// route through `render_cv_pixel_buffer` instead (zero-copy
+    /// CVPixelBuffer → MTLTexture).
     #[cfg(any(target_os = "windows", target_os = "linux"))]
-    async fn render_ffmpeg_native(&self, frame: Arc<Video>) {
+    pub async fn render(&self, frame: Arc<Video>) {
         let video_frame = VideoFrame::new(self.device.clone(), self.backend, frame.clone());
 
         let (y_plane_view, uv_plane_view) = {
@@ -947,10 +913,10 @@ impl VideoRenderer {
         self.queue.present(surface_texture);
     }
 
-    /// iOS: render a `CVPixelBufferOwned` from VTDecompressionSession.
+    /// macOS / iOS: render a `CVPixelBufferOwned` from VTDecompressionSession.
     /// Wraps the buffer into a `MetalNV12Frame` (two zero-copy MTLTextures)
     /// and dispatches to the shared Metal NV12 helper.
-    #[cfg(target_os = "ios")]
+    #[cfg(any(target_os = "ios", target_os = "macos"))]
     pub async fn render_cv_pixel_buffer(&self, buf: crate::decoders::CvPixelBufferOwned) {
         let cache = match &self.metal_cache {
             Some(c) => c.clone(),

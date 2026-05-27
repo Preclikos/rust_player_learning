@@ -237,6 +237,7 @@ dependencies = [
 name = "app-ios"
 version = "0.1.0"
 dependencies = [
+ "app-shared",
  "log",
  "oslog",
  "player",

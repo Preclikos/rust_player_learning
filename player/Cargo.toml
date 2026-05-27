@@ -45,15 +45,15 @@ ffmpeg-next = { version = "8.1.0"}
 ffmpeg-sys-next = { version = "8.1.0"}
 reqwest = { version = "0.12.12", default-features = false, features = ["default-tls"] }
 
-# macOS zero-copy interop. VideoToolbox vrací CVPixelBuffer (přes ffmpeg-next
-# v hwframe → frame.data[3]). Skrz CVMetalTextureCache získáme dva MTLTextury
-# (Y plane R8Unorm + UV plane RG8Unorm), které pak obalíme jako wgpu::Texture
-# přes wgpu_hal::metal::Device::texture_from_raw.
+# Apple zero-copy interop, shared by macOS (FFmpeg VideoToolbox) and iOS
+# (native VTDecompressionSession). Both pull a CVPixelBuffer through
+# CVMetalTextureCache → MTLTextures → wgpu::Texture via
+# wgpu_hal::metal::Device::texture_from_raw.
 #
 # Verze objc2 jsou pinnuté tak, aby přesně odpovídaly těm, které používá wgpu
 # fork — jinak `Retained<ProtocolObject<dyn MTLTexture>>` co vyrobíme nesedne
 # do signature `texture_from_raw`.
-[target.'cfg(target_os = "macos")'.dependencies]
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
 objc2 = "0.6.3"
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std"] }
 objc2-metal = { version = "0.3.2", default-features = false, features = [

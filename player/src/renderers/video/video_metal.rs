@@ -1,25 +1,26 @@
-//! macOS zero-copy NV12 import: AVFrame (VideoToolbox) → CVPixelBuffer →
-//! CVMetalTextureCache → MTLTexture → wgpu::Texture.
+//! Apple zero-copy NV12 import: CVPixelBuffer → CVMetalTextureCache →
+//! MTLTexture → wgpu::Texture. Shared by macOS (FFmpeg VideoToolbox HW
+//! frames; AVFrame.data[3] = CVPixelBufferRef) and iOS (native
+//! VTDecompressionSession output, CVPixelBufferRef stored directly in
+//! PlatformFrame::CvPixelBuffer).
 //!
 //! Flow:
 //!   1. `MetalTextureCache::new(device)` extracts the underlying MTLDevice
 //!      from the wgpu device via the Metal HAL and creates a
 //!      CVMetalTextureCache against it. One per VideoRenderer.
-//!   2. `MetalNV12Frame::new(cache, device, frame)` for each decoded frame:
-//!      pulls the CVPixelBufferRef out of the FFmpeg HW frame's `data[3]`,
-//!      asks the cache for two CVMetalTextureRefs (planes 0 and 1), wraps
-//!      each MTLTexture as a `wgpu::Texture` via
+//!   2. `MetalNV12Frame::new(cache, device, cv_pixel_buffer)` for each
+//!      decoded frame: asks the cache for two CVMetalTextureRefs (planes
+//!      0 and 1), wraps each MTLTexture as a `wgpu::Texture` via
 //!      `wgpu_hal::metal::Device::texture_from_raw`, and holds the
 //!      CVMetalTextureRefs alive until the frame is dropped (so the GPU
 //!      doesn't sample a recycled buffer).
 
-#![cfg(target_os = "macos")]
+#![cfg(any(target_os = "macos", target_os = "ios"))]
 
 use std::ffi::c_void;
 use std::ptr;
 use std::sync::Arc;
 
-use ffmpeg_next::frame::Video;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLDevice, MTLTexture, MTLTextureType};
@@ -163,24 +164,24 @@ pub struct MetalNV12Frame {
 unsafe impl Send for MetalNV12Frame {}
 
 impl MetalNV12Frame {
-    /// Import the FFmpeg VideoToolbox HW frame as two wgpu textures.
-    /// `frame` must be an `AV_PIX_FMT_VIDEOTOOLBOX` frame — the
-    /// CVPixelBufferRef is in `frame.data[3]`.
-    pub fn new(
+    /// Import a CVPixelBuffer (NV12) as two wgpu textures.
+    /// `cv_pixel_buffer` is a `CVPixelBufferRef` cast to a raw pointer.
+    /// Caller is responsible for keeping the pixel buffer retained for the
+    /// duration of this call; the cache may also retain it internally.
+    ///
+    /// # Safety
+    /// `cv_pixel_buffer` must be a valid, non-null CVPixelBufferRef
+    /// containing NV12 (kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange /
+    /// FullRange) data.
+    pub unsafe fn new(
         cache: &MetalTextureCache,
         device: &wgpu::Device,
-        frame: &Video,
+        cv_pixel_buffer: *const c_void,
     ) -> Result<Self, String> {
-        // SAFETY: ffmpeg-sys's Video::as_ptr returns a valid AVFrame for the
-        // duration of the borrow. data[3] is set by FFmpeg's VideoToolbox
-        // decoder to the underlying CVPixelBufferRef.
-        let pixel_buffer: CFTypeRef = unsafe {
-            let ptr = (*frame.as_ptr()).data[3];
-            if ptr.is_null() {
-                return Err("VideoToolbox frame has no CVPixelBuffer in data[3]".into());
-            }
-            ptr as CFTypeRef
-        };
+        if cv_pixel_buffer.is_null() {
+            return Err("CVPixelBuffer is null".into());
+        }
+        let pixel_buffer: CFTypeRef = cv_pixel_buffer;
 
         // Plane dims come from the CVPixelBuffer (NV12: UV plane is half size
         // in both dimensions). AVFrame.width/height isn't used here — we trust

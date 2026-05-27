@@ -6,8 +6,8 @@ use tokio::sync::{
 };
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 use video_frame::VideoFrame;
-#[cfg(target_os = "macos")]
-use video_macos::{MetalNV12Frame, MetalTextureCache};
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+use video_metal::{MetalNV12Frame, MetalTextureCache};
 use wgpu::{Backends, Buffer};
 use wgpu::{Device, SurfaceConfiguration};
 use winit::dpi::PhysicalSize;
@@ -23,8 +23,8 @@ mod video_vaapi;
 mod video_vulkan;
 #[cfg(target_os = "android")]
 mod video_gles_egl;
-#[cfg(target_os = "macos")]
-mod video_macos;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+mod video_metal;
 
 use std::sync::Arc;
 
@@ -111,8 +111,8 @@ pub struct VideoRenderer {
     window: Arc<Window>,
     device: wgpu::Device,
     // Used by the FFmpeg HW import path on Win/Linux to dispatch between
-    // DX12 and Vulkan; the macOS Metal path doesn't need it.
-    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    // DX12 and Vulkan; the Apple Metal path doesn't need it.
+    #[cfg_attr(any(target_os = "macos", target_os = "ios"), allow(dead_code))]
     backend: wgpu::Backend,
     queue: wgpu::Queue,
     /// Optional WebVTT subtitle overlay. Built lazily on the first
@@ -156,8 +156,9 @@ pub struct VideoRenderer {
     #[cfg(target_os = "android")]
     ahb_keepalive: Arc<std::sync::Mutex<std::collections::VecDeque<Arc<crate::decoders::SendableAhb>>>>,
     /// Zero-copy CVPixelBuffer → MTLTexture cache. None when the wgpu backend
-    /// isn't Metal (shouldn't happen on macOS but the constructor is fallible).
-    #[cfg(target_os = "macos")]
+    /// isn't Metal (shouldn't happen on Apple platforms but the constructor
+    /// is fallible).
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     metal_cache: Option<Arc<MetalTextureCache>>,
 }
 
@@ -489,9 +490,9 @@ impl VideoRenderer {
         // import lookup hits the same cache (Apple caches the IOSurface →
         // MTLTexture binding internally, so per-frame creation would be
         // wasteful).
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         let metal_cache = MetalTextureCache::new(&device);
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         if metal_cache.is_none() {
             log::error!(
                 "[renderer] CVMetalTextureCache init failed — zero-copy NV12 import will not work"
@@ -520,7 +521,7 @@ impl VideoRenderer {
             gles_oes_pending,
             #[cfg(target_os = "android")]
             ahb_keepalive,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             metal_cache,
         };
 
@@ -655,8 +656,8 @@ impl VideoRenderer {
                 self.render_android(ahb, desired_present_ns).await;
             }
             #[cfg(target_os = "ios")]
-            PlatformFrame::CvPixelBuffer { .. } => {
-                log::warn!("render_frame: iOS CvPixelBuffer not implemented");
+            PlatformFrame::CvPixelBuffer(cv_buf) => {
+                self.render_cv_pixel_buffer(cv_buf).await;
             }
             #[allow(unreachable_patterns)]
             _ => {}
@@ -665,43 +666,45 @@ impl VideoRenderer {
 
     #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
     pub async fn render(&self, frame: Arc<Video>) {
-        // macOS: zero-copy import. The CVPixelBuffer in frame.data[3] becomes
-        // two MTLTextures via CVMetalTextureCache; both wgpu::Textures are
-        // backed by the same IOSurface the GPU decode wrote into. The
-        // MetalNV12Frame holds the CVMetalTextureRefs alive until the render
-        // pass is submitted, so the GPU doesn't sample a recycled buffer.
+        // macOS: zero-copy import — CVPixelBuffer from frame.data[3] becomes
+        // two MTLTextures via CVMetalTextureCache; shared helper renders.
+        // iOS shares the same helper but its CVPixelBuffer comes from
+        // VTDecompressionSession (see render_cv_pixel_buffer).
         #[cfg(target_os = "macos")]
-        let _macos_frame = {
+        {
             let cache = match &self.metal_cache {
-                Some(c) => c,
+                Some(c) => c.clone(),
                 None => {
                     log::warn!("[renderer] metal_cache missing, dropping frame");
                     return;
                 }
             };
-            match MetalNV12Frame::new(cache, &self.device, &frame) {
+            let cv: *const std::ffi::c_void = unsafe { (*frame.as_ptr()).data[3] as *const _ };
+            let mf = match unsafe { MetalNV12Frame::new(&cache, &self.device, cv) } {
                 Ok(f) => f,
                 Err(e) => {
                     log::warn!("[renderer] MetalNV12Frame::new failed: {}", e);
                     return;
                 }
-            }
-        };
+            };
+            self.render_metal_nv12(mf).await;
+            return;
+        }
 
-        // macOS exposes Y/UV as two separate single-plane Metal textures imported from
-        // CVPixelBuffer. Windows/Linux expose a single multi-planar NV12 / P010
-        // texture and view its planes via aspect Plane0/Plane1.
-        #[cfg(target_os = "macos")]
-        let (y_plane_view, uv_plane_view) = {
-            let y = _macos_frame.y_texture.create_view(&Default::default());
-            let uv = _macos_frame.uv_texture.create_view(&Default::default());
-            (y, uv)
-        };
-
+        // From here on: Windows / Linux only. The whole body is gated so
+        // names like `y_plane_view` aren't even type-checked when
+        // building for macOS (where this function returns above).
         #[cfg(not(target_os = "macos"))]
+        self.render_ffmpeg_native(frame).await;
+    }
+
+    /// Windows / Linux FFmpeg → wgpu native-import draw path. Pulled into
+    /// its own method so the cfg-gating around the macOS branch doesn't
+    /// leak into shared variable scoping.
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    async fn render_ffmpeg_native(&self, frame: Arc<Video>) {
         let video_frame = VideoFrame::new(self.device.clone(), self.backend, frame.clone());
 
-        #[cfg(not(target_os = "macos"))]
         let (y_plane_view, uv_plane_view) = {
             let texture = video_frame.get_texture();
             let y = match texture.format() {
@@ -832,6 +835,132 @@ impl VideoRenderer {
             self.window.pre_present_notify();
             self.queue.present(surface_texture);
         }
+    }
+
+    /// Shared Apple Metal render path: draws an NV12 frame from two
+    /// single-plane textures (Y = R8Unorm, UV = Rg8Unorm). Takes ownership
+    /// of `metal_frame` and drops it after queue.submit — that's when the
+    /// wgpu::Textures' MTLTexture retains are the only thing keeping the
+    /// IOSurface alive through the in-flight GPU pass.
+    ///
+    /// MetalNV12Frame is `Send` but not `Sync` (raw CFTypeRef), so we
+    /// take it by value instead of `&` to keep `render_frame`'s
+    /// returned future `Send` across the await.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    async fn render_metal_nv12(&self, metal_frame: MetalNV12Frame) {
+        let y_plane_view = metal_frame.y_texture.create_view(&Default::default());
+        let uv_plane_view = metal_frame.uv_texture.create_view(&Default::default());
+
+        let layout = self.texture_bind_group_layout.as_ref().expect("no bind group layout");
+        let texture_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&y_plane_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&uv_plane_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+            ],
+            label: Some("metal_nv12_bind_group"),
+        });
+
+        let surface = self.surface.lock().await;
+        let vb_arc = self.vertex_buffer.as_ref().expect("no vertex buffer");
+        let vertex_buffer = vb_arc.read().await;
+        let render_pipeline = self.render_pipeline.as_ref().expect("no render pipeline");
+
+        let surface_texture = match surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(t) => t,
+            wgpu::CurrentSurfaceTexture::Suboptimal(t) => {
+                log::warn!("[renderer] suboptimal surface — queuing resize, rendering anyway");
+                let _ = self
+                    .command_sender
+                    .try_send(VideoRendererCommand::Resize(self.window.inner_size()));
+                t
+            }
+            other => {
+                log::warn!("surface texture not available: {:?}", other);
+                return;
+            }
+        };
+
+        let texture_view = surface_texture.texture.create_view(&wgpu::TextureViewDescriptor {
+            format: Some(self.surface_format),
+            ..Default::default()
+        });
+
+        let overlay_snapshot = self.subtitle_overlay.lock().unwrap().clone();
+        let (surface_w, surface_h) = {
+            let cfg = self.surface_config.read().await;
+            (cfg.width, cfg.height)
+        };
+
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        {
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &texture_view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+
+            render_pass.set_pipeline(render_pipeline);
+            render_pass.set_bind_group(0, &texture_bind_group, &[]);
+            render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+            render_pass.draw(0..6, 0..1);
+
+            if let Some(overlay) = overlay_snapshot {
+                overlay.draw_into(&mut render_pass, surface_w, surface_h);
+            }
+        }
+
+        self.queue.submit([encoder.finish()]);
+        self.window.pre_present_notify();
+        self.queue.present(surface_texture);
+    }
+
+    /// iOS: render a `CVPixelBufferOwned` from VTDecompressionSession.
+    /// Wraps the buffer into a `MetalNV12Frame` (two zero-copy MTLTextures)
+    /// and dispatches to the shared Metal NV12 helper.
+    #[cfg(target_os = "ios")]
+    pub async fn render_cv_pixel_buffer(&self, buf: crate::decoders::CvPixelBufferOwned) {
+        let cache = match &self.metal_cache {
+            Some(c) => c.clone(),
+            None => {
+                log::warn!("[renderer] metal_cache missing, dropping frame");
+                return;
+            }
+        };
+        let mf = match unsafe { MetalNV12Frame::new(&cache, &self.device, buf.as_ptr()) } {
+            Ok(f) => f,
+            Err(e) => {
+                log::warn!("[renderer] MetalNV12Frame::new (iOS) failed: {}", e);
+                return;
+            }
+        };
+        // The wgpu::Textures inside `mf` hold a +1 retain on the MTLTexture,
+        // so dropping `buf` early (the +1 from VTDecompressionSession) is
+        // fine — Metal still has a live reference until queue.submit's
+        // command buffer completes.
+        drop(buf);
+        self.render_metal_nv12(mf).await;
     }
 
     /// GLES zero-copy path: stores per-frame AHB data then calls queue.present().

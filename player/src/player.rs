@@ -2116,6 +2116,9 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         #[cfg(target_os = "android")]
         let audio_decoder: Box<dyn AudioDecoder> =
             Box::new(decoders::mediacodec_audio::MediaCodecAudioDecoder::new());
+        #[cfg(target_os = "ios")]
+        let audio_decoder: Box<dyn AudioDecoder> =
+            Box::new(decoders::audiotoolbox::AudioToolboxDecoder::new());
 
         // Install a fresh per-play switch channel so apply_video_representation
         // can route ABR swaps into the supervisor. Dropped at end of play().

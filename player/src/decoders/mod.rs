@@ -67,9 +67,56 @@ pub enum PlatformFrame {
     /// Owned AHardwareBuffer produced by MediaCodec's output Surface.
     #[cfg(target_os = "android")]
     HardwareBuffer(AndroidHardwareBufferFrame),
+    /// iOS / tvOS: native VTDecompressionSession output. The retained
+    /// CVPixelBufferRef points to GPU memory (IOSurface-backed) the
+    /// video renderer imports via CVMetalTextureCache zero-copy.
     #[cfg(target_os = "ios")]
-    CvPixelBuffer { buffer: *mut std::ffi::c_void },
+    CvPixelBuffer(CvPixelBufferOwned),
 }
+
+/// Reference-counted wrapper around a CVPixelBufferRef. CFRetain on
+/// construction, CFRelease on Drop — so an owned `CvPixelBufferOwned`
+/// keeps the underlying IOSurface alive across thread boundaries until
+/// the renderer is done with it.
+#[cfg(target_os = "ios")]
+pub struct CvPixelBufferOwned {
+    raw: *mut std::ffi::c_void,
+}
+
+#[cfg(target_os = "ios")]
+impl CvPixelBufferOwned {
+    /// SAFETY: `raw` must be a valid CVPixelBufferRef. Retains the buffer
+    /// so the caller can drop their reference after this call.
+    pub unsafe fn from_retained(raw: *mut std::ffi::c_void) -> Self {
+        extern "C" {
+            fn CFRetain(cf: *const std::ffi::c_void) -> *const std::ffi::c_void;
+        }
+        unsafe { CFRetain(raw as *const _) };
+        Self { raw }
+    }
+
+    pub fn as_ptr(&self) -> *const std::ffi::c_void {
+        self.raw as *const _
+    }
+}
+
+#[cfg(target_os = "ios")]
+impl Drop for CvPixelBufferOwned {
+    fn drop(&mut self) {
+        extern "C" {
+            fn CFRelease(cf: *const std::ffi::c_void);
+        }
+        if !self.raw.is_null() {
+            unsafe { CFRelease(self.raw as *const _) };
+        }
+    }
+}
+
+// CVPixelBuffer is documented as thread-safe for retain/release; the
+// IOSurface backing is also safe to share. The frame travels from the
+// decode worker to the renderer task across thread boundaries.
+#[cfg(target_os = "ios")]
+unsafe impl Send for CvPixelBufferOwned {}
 
 #[cfg(target_os = "android")]
 pub struct SendableAhb(pub ndk::hardware_buffer::HardwareBufferRef);

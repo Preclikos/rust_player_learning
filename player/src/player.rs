@@ -446,9 +446,25 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
 async fn audio_sync_loop<A: AudioSink>(
     mut input_rx: mpsc::Receiver<DecodedAudioFrame>,
     sink: Arc<A>,
+    target_pts_ms: i64,
     stop: Arc<Notify>,
     stop_flag: Arc<AtomicBool>,
 ) {
+    // Align the FIRST audible sample with `target_pts_ms` (= video's
+    // snapped seek offset). DASH audio and video segments rarely share
+    // boundaries: a seek that lands cleanly on a video segment boundary
+    // will pick the audio segment that CONTAINS that PTS — and that
+    // segment typically starts up to ~1 s before. Without correction,
+    // audio_sync_loop would push those pre-target samples to cpal first,
+    // delaying every subsequent sample by that gap and producing
+    // perceptible audio-lag-behind-video for the rest of playback.
+    //
+    // We trim the leading samples here (or pad with silence if the
+    // audio segment instead starts AFTER the target) so cpal's first
+    // emitted sample corresponds to media-time `target_pts_ms`, the
+    // same anchor video_sync_loop uses for its first rendered frame.
+    let sample_rate = sink.sample_rate() as i64;
+    let mut aligned = false;
     loop {
         if stop_flag.load(Ordering::Relaxed) {
             break;
@@ -460,11 +476,56 @@ async fn audio_sync_loop<A: AudioSink>(
             },
             _ = stop.notified() => break,
         };
-        if !frame.samples.is_empty() {
-            tokio::select! {
-                _ = sink.put_samples(&frame.samples) => {}
-                _ = stop.notified() => break,
+        if frame.samples.is_empty() {
+            continue;
+        }
+        // Build the slice/owned buffer to actually hand off to cpal.
+        // Stereo interleaved: samples.len() / 2 = per-channel frames.
+        let trimmed: std::borrow::Cow<'_, [f32]> = if aligned {
+            std::borrow::Cow::Borrowed(&frame.samples)
+        } else {
+            let frames_per_chan = (frame.samples.len() / 2) as i64;
+            let dur_ms = if sample_rate > 0 {
+                frames_per_chan * 1000 / sample_rate
+            } else {
+                0
+            };
+            let frame_end_ms = frame.pts_ms + dur_ms;
+            if frame_end_ms <= target_pts_ms {
+                // Whole frame lies before the target — drop it.
+                continue;
+            } else if frame.pts_ms < target_pts_ms {
+                // Frame straddles the target — trim leading samples.
+                let drop_ms = target_pts_ms - frame.pts_ms;
+                let drop_chan = (drop_ms * sample_rate / 1000) as usize;
+                let drop_idx = (drop_chan * 2).min(frame.samples.len());
+                aligned = true;
+                if drop_idx >= frame.samples.len() {
+                    continue;
+                }
+                std::borrow::Cow::Borrowed(&frame.samples[drop_idx..])
+            } else {
+                // Frame starts at/after target — pad silence so the
+                // first audible sample lands on target.
+                let pad_ms = frame.pts_ms - target_pts_ms;
+                let pad_chan = (pad_ms * sample_rate / 1000) as usize;
+                aligned = true;
+                if pad_chan == 0 {
+                    std::borrow::Cow::Borrowed(&frame.samples)
+                } else {
+                    let mut buf = Vec::with_capacity(pad_chan * 2 + frame.samples.len());
+                    buf.resize(pad_chan * 2, 0.0_f32);
+                    buf.extend_from_slice(&frame.samples);
+                    std::borrow::Cow::Owned(buf)
+                }
             }
+        };
+        if trimmed.is_empty() {
+            continue;
+        }
+        tokio::select! {
+            _ = sink.put_samples(&trimmed) => {}
+            _ = stop.notified() => break,
         }
     }
 }
@@ -532,6 +593,7 @@ async fn av_sync_handler<V: VideoSink, A: AudioSink>(
         tokio::spawn(audio_sync_loop(
             audio_rx,
             audio_sink,
+            seek_offset.as_millis() as i64,
             stop.clone(),
             stop_flag.clone(),
         )),

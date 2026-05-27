@@ -12,10 +12,10 @@ pollster = "0.4.0"
 env_logger = "0.11.6"
 log = "0.4"
 
-# FFmpeg is only pulled in on Windows / Linux (the desktop player
-# backend); macOS uses native VideoToolbox via the player crate and
-# doesn't need ffmpeg-next at all.
-[target.'cfg(any(target_os = "windows", target_os = "linux"))'.dependencies]
+# FFmpeg ships everywhere except iOS — the desktop player backend
+# pulls in audio (and on Win/Linux also video) through ffmpeg-next.
+# On macOS only the audio path uses it; video stays native VideoToolbox.
+[target.'cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))'.dependencies]
 ffmpeg-next = {version = "8.1.0"}
 
 [target.'cfg(windows)'.dependencies]

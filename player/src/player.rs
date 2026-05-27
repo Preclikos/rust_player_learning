@@ -1683,7 +1683,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
     }
 
     pub async fn prepare(&mut self) -> Result<(), Box<dyn Error>> {
-        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
         ffmpeg_next::init()?;
 
         let manifest = match &self.manifest {
@@ -2110,13 +2110,13 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             *self.stats.decoder_name.lock().unwrap() = probe.name().to_string();
         }
 
-        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
         let audio_decoder: Box<dyn AudioDecoder> =
             Box::new(decoders::ffmpeg_audio::FfmpegAudioDecoder::new());
         #[cfg(target_os = "android")]
         let audio_decoder: Box<dyn AudioDecoder> =
             Box::new(decoders::mediacodec_audio::MediaCodecAudioDecoder::new());
-        #[cfg(any(target_os = "ios", target_os = "macos"))]
+        #[cfg(target_os = "ios")]
         let audio_decoder: Box<dyn AudioDecoder> =
             Box::new(decoders::audiotoolbox::AudioToolboxDecoder::new());
 

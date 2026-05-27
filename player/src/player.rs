@@ -88,18 +88,26 @@ struct StatsState {
     /// EWMA of segment download throughput in bits-per-second, surfaced via
     /// `Position.bandwidth_bps` and consumed by the ABR engine.
     bandwidth_bps_ewma: AtomicU64,
-    /// Highest PTS (in ms) we've pulled from the **video** decoder —
-    /// whether it's already been rendered or is still parked in the
-    /// av_sync mpsc channel. Read together with `audio_last_decoded_pts_ms`
-    /// to compute `Position.buffered_ahead_secs = min(video, audio)`,
-    /// which is the actually-safe-to-play horizon (whichever runs out
-    /// first stalls playback).
+    /// Highest media-time PTS (in ms) currently available locally for
+    /// **video** — bumped both when `download_task` finishes a segment
+    /// (segment.end_time) and when `video_decoder_task` produces a
+    /// frame. Including the downloaded-but-not-yet-decoded segments
+    /// matches the documented semantics of `buffered_ahead_secs`:
+    /// "amount of media that's safe to play through if the network
+    /// drops *right now*". Decode is local CPU work that completes
+    /// without network, so a downloaded segment is just as safe as a
+    /// decoded one. Without the download-side update the gauge
+    /// effectively topped out at `frame_sender` capacity (~2.7 s at
+    /// 24 fps), regardless of how large the consumer set
+    /// `buffer_target_secs`.
     last_decoded_pts_ms: std::sync::atomic::AtomicI64,
-    /// Highest PTS (in ms) we've pulled from the **audio** decoder.
-    /// Same semantics as `last_decoded_pts_ms`. Audio segments often run
-    /// slightly ahead of video on the same wallclock (smaller frames,
-    /// faster decode), so video tends to be the bottleneck — but a small
-    /// initial buffer or a slow audio decoder can flip that.
+    /// Same as `last_decoded_pts_ms` but for the audio pipeline.
+    /// Read together with the video field to compute
+    /// `Position.buffered_ahead_secs = min(video, audio)` — whichever
+    /// runs out first stalls playback. Audio segments are smaller and
+    /// decode faster than video, so audio is normally well ahead, but
+    /// a slow audio download or a very small initial buffer can flip
+    /// that on startup.
     audio_last_decoded_pts_ms: std::sync::atomic::AtomicI64,
     /// Name of the currently-active video decoder backend
     /// (`"D3D11VA (FFmpeg)"`, `"MediaCodec"`, …). Plumbed in at play().
@@ -864,6 +872,13 @@ async fn video_play(
     })?;
 
     let segments = video_representation.segments.clone();
+    let dl_stats = Arc::clone(&stats);
+    let on_video_dl: SegmentDoneCallback = Arc::new(move |pts_ms| {
+        let prev = dl_stats.last_decoded_pts_ms.load(Ordering::Relaxed);
+        if pts_ms > prev {
+            dl_stats.last_decoded_pts_ms.store(pts_ms, Ordering::Relaxed);
+        }
+    });
     let download_task = task::spawn(download_task(
         segments,
         start_index,
@@ -872,6 +887,7 @@ async fn video_play(
         stop_flag,
         http,
         Some(Arc::clone(&stats)),
+        Some(on_video_dl),
     ));
     let decoder_task = task::spawn(video_decoder_task(
         download_rx,
@@ -988,6 +1004,15 @@ async fn audio_play(
     })?;
 
     let segments = audio_representation.segments.clone();
+    let dl_stats = Arc::clone(&stats);
+    let on_audio_dl: SegmentDoneCallback = Arc::new(move |pts_ms| {
+        let prev = dl_stats.audio_last_decoded_pts_ms.load(Ordering::Relaxed);
+        if pts_ms > prev {
+            dl_stats
+                .audio_last_decoded_pts_ms
+                .store(pts_ms, Ordering::Relaxed);
+        }
+    });
     let download_task = task::spawn(download_task(
         segments,
         start_index,
@@ -996,6 +1021,7 @@ async fn audio_play(
         stop_flag,
         http,
         Some(Arc::clone(&stats)),
+        Some(on_audio_dl),
     ));
     let decoder_task = task::spawn(audio_decoder_task(
         download_rx,
@@ -2126,6 +2152,14 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Callback fired by `download_task` after each successful segment
+/// download, passed the segment's end-PTS in milliseconds. Both
+/// `video_play` and `audio_play` plug this in to push the
+/// `Position.buffered_ahead_secs` gauge forward as media lands in the
+/// local download buffer — rather than only when the decoder finally
+/// gets around to producing a frame.
+type SegmentDoneCallback = Arc<dyn Fn(i64) + Send + Sync>;
+
 async fn download_task(
     segments: Vec<Segment>,
     start_index: usize,
@@ -2134,6 +2168,7 @@ async fn download_task(
     stop_flag: Arc<AtomicBool>,
     http: Arc<HttpClient>,
     stats: Option<Arc<StatsState>>,
+    on_segment_done: Option<SegmentDoneCallback>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let segment_slice = &segments[..];
     for i in start_index..segment_slice.len() {
@@ -2147,7 +2182,12 @@ async fn download_task(
         tokio::select! {
             res = download_and_queue(i, seg, sender, &http, stats.as_ref()) => {
                 match res {
-                    Ok(()) => log::debug!("[dl] produced segment {}", i),
+                    Ok(()) => {
+                        log::debug!("[dl] produced segment {}", i);
+                        if let Some(cb) = &on_segment_done {
+                            cb(seg.end_time().as_millis() as i64);
+                        }
+                    }
                     Err(e) => {
                         log::error!("[dl] segment {} failed: {}", i, e);
                         should_break = true;

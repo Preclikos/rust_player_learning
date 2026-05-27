@@ -12,3 +12,6 @@ durations.txt
 
 # Stale build output location (real output goes to app-android/android/app/src/main/jniLibs)
 app-android/src/main/jniLibs/
+
+# iOS Simulator build output (RustPlayer.app bundle assembled by build_sim.sh)
+app-ios/ios/build/

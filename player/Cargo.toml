@@ -76,6 +76,14 @@ libc = "0.2"
 reqwest = { version = "0.12.12", default-features = false, features = ["rustls-tls"] }
 glow = "0.17"
 
+# iOS: rustls-tls so reqwest doesn't try to use native-tls (which has no
+# default feature gate on iOS and silently links to nothing — every HTTPS
+# call then fails with "error sending request" at the TLS layer). The
+# audio/video decoder path is fully native (VideoToolbox + AudioToolbox),
+# so we don't pull in ffmpeg-next here.
+[target.'cfg(target_os = "ios")'.dependencies]
+reqwest = { version = "0.12.12", default-features = false, features = ["rustls-tls"] }
+
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [ "Win32_System_Com", "Win32_System_Console", "Win32_System_SystemServices", "Win32_UI_Shell", "Win32_Foundation", "Wdk_Foundation", "Win32_System_LibraryLoader",
              "Win32_Graphics_Dwm", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D11", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Dxgi", "Win32_Graphics_Direct3D12",

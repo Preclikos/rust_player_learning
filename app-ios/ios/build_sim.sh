@@ -118,16 +118,35 @@ DEVICE_ID="$(xcrun simctl list devices booted 2>/dev/null | awk -F'[()]' '/Boote
 
 if [ -z "$DEVICE_ID" ]; then
     echo "==> No booted simulator; creating $SIM_DEVICE"
-    # Pick latest iOS runtime (or SIM_RUNTIME override).
+    # Pick latest iOS runtime (or SIM_RUNTIME override). simctl prints rows like
+    #   iOS 18.1 (18.1 - 22B81) - com.apple.CoreSimulator.SimRuntime.iOS-18-1
+    # The identifier we want is the last whitespace-separated token on lines
+    # whose runtime is actually usable ("(...) - <id>"). Filter out
+    # "unavailable" runtimes the way `xcodebuild -downloadPlatform` leaves
+    # half-downloaded ones.
     if [ -z "$SIM_RUNTIME" ]; then
-        SIM_RUNTIME="$(xcrun simctl list runtimes available | awk '/iOS/ {print $NF}' | tail -1)"
+        SIM_RUNTIME="$(xcrun simctl list runtimes \
+            | grep -i '^iOS ' \
+            | grep -v -i 'unavailable' \
+            | awk '{print $NF}' \
+            | tail -1)"
+    fi
+    if [ -z "$SIM_RUNTIME" ]; then
+        echo "error: no iOS Simulator runtime installed." >&2
+        echo "Install one with: xcodebuild -downloadPlatform iOS" >&2
+        echo "Then re-run this script." >&2
+        exit 1
     fi
     DEVICE_TYPE_ID="$(xcrun simctl list devicetypes | awk -F'[()]' -v d="$SIM_DEVICE" 'index($0, d) {print $(NF-1); exit}')"
     [ -n "$DEVICE_TYPE_ID" ] || { echo "device type not found: $SIM_DEVICE" >&2; exit 1; }
+    echo "==> simctl create RustPlayerTest $DEVICE_TYPE_ID $SIM_RUNTIME"
     DEVICE_ID="$(xcrun simctl create "RustPlayerTest" "$DEVICE_TYPE_ID" "$SIM_RUNTIME")"
-    xcrun simctl boot "$DEVICE_ID"
-    # Open Simulator.app so the window is visible.
-    open -a Simulator
+    xcrun simctl boot "$DEVICE_ID" || true
+    # Open Simulator.app so the window is visible. Xcode 16 doesn't
+    # register Simulator.app under its short name with LaunchServices yet,
+    # so prefer the absolute path bundled inside Xcode.app.
+    SIM_APP="$(xcode-select -p)/Applications/Simulator.app"
+    [ -d "$SIM_APP" ] && open "$SIM_APP" || open -a Simulator || true
 fi
 
 echo "==> Simulator device: $DEVICE_ID"

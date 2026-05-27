@@ -249,11 +249,22 @@ impl VideoRenderer {
             // wgpu::Limits::default() asks for max_texture_dimension_2d = 8192,
             // but some embedded Vulkan GPUs (e.g. PowerVR Rogue on Google TV)
             // only support 4096 and cause request_device to fail outright.
+            //
+            // The iOS Simulator's MoltenVK-backed GPU also caps
+            // max_inter_stage_shader_variables at 15 (wgpu's default is 16),
+            // so clamp every per-adapter scalar limit to the adapter's value
+            // rather than asking blindly. We start from wgpu::Limits::default()
+            // and floor each field to min(default, adapter), so request_device
+            // never asks for more than the hardware promises.
             let adapter_limits = adapter.limits();
+            let d = wgpu::Limits::default();
             wgpu::Limits {
                 max_texture_dimension_2d: adapter_limits.max_texture_dimension_2d,
                 max_texture_dimension_1d: adapter_limits.max_texture_dimension_1d,
-                ..wgpu::Limits::default()
+                max_inter_stage_shader_variables: d
+                    .max_inter_stage_shader_variables
+                    .min(adapter_limits.max_inter_stage_shader_variables),
+                ..d
             }
         } else {
             let adapter_limits = adapter.limits();

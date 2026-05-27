@@ -25,19 +25,26 @@ struct App {
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        // winit on iOS attaches a CAMetalLayer-backed UIView to the
-        // UIScene's UIWindow. wgpu picks up that surface via raw-window-handle.
+        log::info!("resumed: creating window");
         let attrs = Window::default_attributes();
-        let window = Arc::new(event_loop.create_window(attrs).unwrap());
+        let window = match event_loop.create_window(attrs) {
+            Ok(w) => Arc::new(w),
+            Err(e) => {
+                log::error!("create_window failed: {}", e);
+                return;
+            }
+        };
+        log::info!("resumed: window created, constructing Player");
+
         let player = Player::new(window.clone());
+        log::info!("resumed: Player::new returned");
 
         self.window = Some(window);
         self.player = Some(player.clone());
-        log::info!("iOS window + player created");
 
-        // Same encrypted DASH fixture the desktop + Android shells use —
-        // logic lives in app-shared so the platform shells stay in sync.
+        log::info!("resumed: spawning run_test_playback");
         tokio::spawn(app_shared::run_test_playback(player));
+        log::info!("resumed: done");
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -69,6 +76,26 @@ pub extern "C" fn rust_main() {
     let _ = oslog::OsLogger::new("com.rust.player")
         .level_filter(log::LevelFilter::Info)
         .init();
+
+    // Route any panics into oslog so they show up in Console.app /
+    // `simctl spawn log show`. Without this hook `panic_cannot_unwind`
+    // aborts the process while the panic message is still on stderr —
+    // which is /dev/null inside the simulator app sandbox.
+    std::panic::set_hook(Box::new(|info| {
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "<non-string panic payload>".to_string()
+        };
+        log::error!("RUST PANIC at {}: {}", location, payload);
+    }));
+
     log::info!("rust_main: starting iOS playback shell");
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -77,12 +104,15 @@ pub extern "C" fn rust_main() {
         .expect("tokio runtime");
     let _guard = rt.enter();
 
+    log::info!("rust_main: building EventLoop");
     let event_loop = EventLoop::new().expect("event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
+    log::info!("rust_main: EventLoop built, entering run_app");
 
     let mut app = App {
         window: None,
         player: None,
     };
-    let _ = event_loop.run_app(&mut app);
+    let result = event_loop.run_app(&mut app);
+    log::info!("rust_main: run_app returned: {:?}", result.is_ok());
 }

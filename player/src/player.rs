@@ -449,41 +449,22 @@ async fn audio_sync_loop<A: AudioSink>(
     stop: Arc<Notify>,
     stop_flag: Arc<AtomicBool>,
 ) {
-    log::info!("[audio_sync] entering loop");
-    let mut frame_count: u64 = 0;
     loop {
         if stop_flag.load(Ordering::Relaxed) {
-            log::info!("[audio_sync] stop_flag observed → exit (frames={})", frame_count);
             break;
         }
         let frame = tokio::select! {
             maybe = input_rx.recv() => match maybe {
                 Some(f) => f,
-                None => {
-                    log::info!("[audio_sync] input_rx closed → exit (frames={})", frame_count);
-                    break;
-                }
+                None => break,
             },
-            _ = stop.notified() => {
-                log::info!("[audio_sync] stop notified during recv → exit (frames={})", frame_count);
-                break;
-            }
+            _ = stop.notified() => break,
         };
         if !frame.samples.is_empty() {
-            if frame_count < 3 || frame_count % 50 == 0 {
-                log::info!(
-                    "[audio_sync] frame #{} pts={}ms samples={}",
-                    frame_count, frame.pts_ms, frame.samples.len()
-                );
-            }
             tokio::select! {
                 _ = sink.put_samples(&frame.samples) => {}
-                _ = stop.notified() => {
-                    log::info!("[audio_sync] stop notified during put_samples → exit (frames={})", frame_count);
-                    break;
-                }
+                _ = stop.notified() => break,
             }
-            frame_count += 1;
         }
     }
 }
@@ -515,13 +496,9 @@ async fn av_sync_handler<V: VideoSink, A: AudioSink>(
     // start_time. This ensures A/V sync is established from a common wall-clock
     // origin. The audio channel is sized large enough (256 frames) that
     // the audio decoder task won't block even if video download is slow.
-    log::info!("[av_sync] waiting for video_ready + audio_ready");
     tokio::select! {
-        _ = async { tokio::join!(video_ready.notified(), audio_ready.notified()); } => {
-            log::info!("[av_sync] both ready signals fired");
-        }
+        _ = async { tokio::join!(video_ready.notified(), audio_ready.notified()); } => {}
         _ = stop.notified() => {
-            log::info!("[av_sync] stop fired before ready signals → returning");
             stop.notify_waiters();
             return;
         }
@@ -534,14 +511,8 @@ async fn av_sync_handler<V: VideoSink, A: AudioSink>(
     // warmed up, then "catch up" once real samples arrived — perceived
     // as audio leading or lagging by an unpredictable amount). seek()
     // re-pauses + flushes; this restores playback for the new pipeline.
-    let player_paused = paused.load(Ordering::Relaxed);
-    log::info!(
-        "[av_sync] start_time set; player_paused={} → set_paused({})",
-        player_paused, !player_paused && false
-    );
-    if !player_paused {
+    if !paused.load(Ordering::Relaxed) {
         audio_sink.set_paused(false);
-        log::info!("[av_sync] called audio_sink.set_paused(false)");
     }
     let (_, _) = tokio::join!(
         tokio::spawn(video_sync_loop(
@@ -706,7 +677,6 @@ async fn audio_decoder_task(
     // started hearing real samples 20-200 ms after video began
     // rendering — perceived as constant audio lag.
     let mut first_audio_signaled = false;
-    log::info!("[audio_dec] task starting");
     while let Some(segment) = receiver.recv().await {
         log::debug!("[dec] consuming audio segment: {}", segment.id);
 
@@ -750,11 +720,9 @@ async fn audio_decoder_task(
                                 .store(pts_ms, Ordering::Relaxed);
                         }
                         if sender.send(frame).await.is_err() {
-                            log::info!("[audio_dec] downstream receiver dropped; exiting");
                             return Ok(());
                         }
                         if !first_audio_signaled {
-                            log::info!("[audio_dec] firing audio_ready (first frame queued)");
                             audio_ready.notify_one();
                             first_audio_signaled = true;
                         }
@@ -1914,10 +1882,8 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             // stalled the decoder before any new sample landed in cpal.
             // seek() already does this for user-initiated restarts;
             // doing it here covers the EOS → next-play() case too.
-            log::info!("[play] entering audio reset (flush + pause)");
             audio_sink.flush();
             audio_sink.set_paused(true);
-            log::info!("[play] audio reset done; seek_offset={:?}", seek_offset);
 
             let video_start_index =
                 find_segment_index(&video_representation.segments, seek_offset);
@@ -2047,10 +2013,29 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         Duration::from_millis(self.position_ms.load(Ordering::Relaxed))
     }
 
+    /// Stop the current `play()` pipeline. Re-callable: the Player can
+    /// be driven through another `open_url` / `play()` cycle afterwards
+    /// without rebuilding the audio device.
+    ///
+    /// Previously this also called `audio_renderer.stop()`, which sent
+    /// the AudioRenderer's `Stop` command and tore down the underlying
+    /// cpal output stream. That made the renderer single-use: any
+    /// subsequent `play()` would push samples into a closed channel,
+    /// the cpal callback was no longer firing, and audio stayed silent
+    /// forever. Consumers that drive multiple movies through a single
+    /// Player (BlackZone Console picks a movie, leaves the player
+    /// screen via stop(), then picks another) hit this on movie #2.
+    /// The cpal stream now stays alive across `stop()` and is only
+    /// torn down when the AudioRenderer itself is dropped — i.e. when
+    /// the last Player handle is dropped.
     pub async fn stop(&self) {
         self.stop_flag.store(true, Ordering::Relaxed);
         self.stop.notify_waiters();
-        self.audio_renderer.stop().await;
+        // Drain any samples still queued for cpal and park the device
+        // until the next play() unpauses it. Mirrors what seek() and
+        // play()-startup do for the same "switching pipelines" reason.
+        self.audio_renderer.flush();
+        self.audio_renderer.set_paused(true);
     }
 
     pub fn volume(&self, volume_diff: f32) {

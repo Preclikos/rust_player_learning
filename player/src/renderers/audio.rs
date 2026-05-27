@@ -106,24 +106,10 @@ impl AudioRenderer {
             buffer_size: cpal::BufferSize::Default,
         };
 
-        // Diagnostic counters for the cpal callback. Aggregated per
-        // 1-second window so we can see whether the audio thread is
-        // (a) still firing, (b) finding samples in the channel, or
-        // (c) underrunning. Help diagnose the "silent 2nd play" path.
-        use std::sync::atomic::AtomicU64 as DiagU64;
-        let diag_calls = Arc::new(DiagU64::new(0));
-        let diag_real = Arc::new(DiagU64::new(0));
-        let diag_silent = Arc::new(DiagU64::new(0));
-        let diag_calls_cb = Arc::clone(&diag_calls);
-        let diag_real_cb = Arc::clone(&diag_real);
-        let diag_silent_cb = Arc::clone(&diag_silent);
-        let paused_flag_rep = Arc::clone(&paused_flag);
-
         let callback = move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
             if flush_flag.swap(false, Ordering::Relaxed) {
                 while sample_receiver.try_recv().is_ok() {}
             }
-            diag_calls_cb.fetch_add(1, Ordering::Relaxed);
             // While paused, emit silence WITHOUT draining the receiver —
             // resume picks up exactly where we left off.
             if paused_flag.load(Ordering::Relaxed) {
@@ -133,43 +119,11 @@ impl AudioRenderer {
                 return;
             }
             let vol = volume.blocking_read();
-            let mut real = 0u64;
-            let mut silent = 0u64;
             for sample in data.iter_mut() {
-                match sample_receiver.try_recv() {
-                    Ok(asample) => {
-                        *sample = asample * *vol;
-                        real += 1;
-                    }
-                    Err(_) => {
-                        *sample = Sample::EQUILIBRIUM;
-                        silent += 1;
-                    }
-                }
+                let asample = sample_receiver.try_recv().unwrap_or(Sample::EQUILIBRIUM);
+                *sample = asample * *vol;
             }
-            diag_real_cb.fetch_add(real, Ordering::Relaxed);
-            diag_silent_cb.fetch_add(silent, Ordering::Relaxed);
         };
-
-        // Periodic diagnostic reporter — runs on the tokio runtime, dumps
-        // the callback counters every second.
-        let diag_calls_rep = Arc::clone(&diag_calls);
-        let diag_real_rep = Arc::clone(&diag_real);
-        let diag_silent_rep = Arc::clone(&diag_silent);
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(1));
-            loop {
-                interval.tick().await;
-                let calls = diag_calls_rep.swap(0, Ordering::Relaxed);
-                let real = diag_real_rep.swap(0, Ordering::Relaxed);
-                let silent = diag_silent_rep.swap(0, Ordering::Relaxed);
-                let paused = paused_flag_rep.load(Ordering::Relaxed);
-                log::info!(
-                    "[cpal] last 1s: calls={} real_samples={} silent_samples={} paused={}",
-                    calls, real, silent, paused
-                );
-            }
-        });
 
         let err_fn = |err| log::error!("audio stream error: {}", err);
 

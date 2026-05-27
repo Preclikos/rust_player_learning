@@ -86,13 +86,18 @@ pub async fn run_test_playback(mut player: Player) {
     // Audio: prefer an AAC (mp4a*) representation since the Android
     // MediaCodec backend can't configure EC-3 / AC-3 without an esds box.
     // Desktop accepts either, so this is a safe lowest-common-denominator.
+    // Override via `RUST_PLAYER_AUDIO=ec-3` (or `ac-3`, `mp4a`) for runtime
+    // testing of the AudioToolbox / FFmpeg / MediaCodec AC-3 paths.
+    let codec_prefix: String =
+        std::env::var("RUST_PLAYER_AUDIO").unwrap_or_else(|_| "mp4a".to_string());
+    log::info!("audio preference: codec prefix = {}", codec_prefix);
     let (audio_adapt, audio_repr) = match tracks
         .audio
         .iter()
         .find_map(|a| {
             a.representations
                 .iter()
-                .find(|r| r.codecs.starts_with("mp4a"))
+                .find(|r| r.codecs.starts_with(codec_prefix.as_str()))
                 .map(|r| (a, r))
         })
         .or_else(|| {

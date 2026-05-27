@@ -49,6 +49,25 @@ const K_AUDIO_FORMAT_FLAG_IS_PACKED: u32 = 1 << 3;
 const K_MPEG4_OBJECT_ID_AAC_LC: u32 = 2;
 
 const K_AUDIO_CONVERTER_DECOMPRESSION_MAGIC_COOKIE: AudioConverterPropertyID = fourcc(b"dmgc");
+const K_AUDIO_CONVERTER_INPUT_CHANNEL_LAYOUT: AudioConverterPropertyID = fourcc(b"icl ");
+const K_AUDIO_CONVERTER_OUTPUT_CHANNEL_LAYOUT: AudioConverterPropertyID = fourcc(b"ocl ");
+
+// AudioChannelLayoutTag = (Apple-defined-major << 16) | channel_count.
+// MPEG_5_1_C = L R C LFE Ls Rs — what the EAC-3 / AC-3 bitstreams use.
+// Stereo = L R.
+const K_AUDIO_CHANNEL_LAYOUT_TAG_MPEG_5_1_C: u32 = (130 << 16) | 6;
+const K_AUDIO_CHANNEL_LAYOUT_TAG_STEREO: u32 = (101 << 16) | 2;
+const K_AUDIO_CHANNEL_LAYOUT_TAG_MONO: u32 = (100 << 16) | 1;
+
+#[repr(C)]
+struct AudioChannelLayout {
+    channel_layout_tag: u32,
+    channel_bitmap: u32,
+    number_channel_descriptions: u32,
+    // Zero-length array stub — for tagged layouts the array is empty,
+    // and the struct's effective size is the first three fields.
+    _channel_descriptions: [u8; 0],
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -275,6 +294,67 @@ impl AudioDecoder for AudioToolboxDecoder {
                 log::warn!(
                     "AudioConverterSetProperty(MagicCookie) status {} — proceeding anyway",
                     st
+                );
+            }
+        }
+
+        // Channel layout: when input is multichannel (5.1 typical for EAC-3 /
+        // AC-3) AudioConverter needs explicit Input/Output ChannelLayout
+        // properties to drive its downmix matrix — without them
+        // FillComplexBuffer silently returns 0 produced frames when input
+        // and output channel counts differ AND a sample-rate conversion is
+        // also requested. With layouts set, the converter does ITU-R BS.775
+        // downmix to stereo.
+        let in_layout_tag = match params.input_channels {
+            1 => K_AUDIO_CHANNEL_LAYOUT_TAG_MONO,
+            2 => K_AUDIO_CHANNEL_LAYOUT_TAG_STEREO,
+            // 6-channel AC-3 / EAC-3 streams are 5.1 (L R C LFE Ls Rs).
+            6 => K_AUDIO_CHANNEL_LAYOUT_TAG_MPEG_5_1_C,
+            n => {
+                log::warn!(
+                    "AudioToolboxDecoder: no known ChannelLayoutTag for {} channels, skipping",
+                    n
+                );
+                0
+            }
+        };
+        if in_layout_tag != 0 {
+            let in_layout = AudioChannelLayout {
+                channel_layout_tag: in_layout_tag,
+                channel_bitmap: 0,
+                number_channel_descriptions: 0,
+                _channel_descriptions: [],
+            };
+            let out_layout = AudioChannelLayout {
+                channel_layout_tag: K_AUDIO_CHANNEL_LAYOUT_TAG_STEREO,
+                channel_bitmap: 0,
+                number_channel_descriptions: 0,
+                _channel_descriptions: [],
+            };
+            // Effective struct size = three u32 fields (Apple's API only
+            // reads beyond when number_channel_descriptions > 0).
+            let sz = (std::mem::size_of::<u32>() * 3) as u32;
+            let st_in = unsafe {
+                AudioConverterSetProperty(
+                    converter,
+                    K_AUDIO_CONVERTER_INPUT_CHANNEL_LAYOUT,
+                    sz,
+                    &in_layout as *const _ as *const c_void,
+                )
+            };
+            let st_out = unsafe {
+                AudioConverterSetProperty(
+                    converter,
+                    K_AUDIO_CONVERTER_OUTPUT_CHANNEL_LAYOUT,
+                    sz,
+                    &out_layout as *const _ as *const c_void,
+                )
+            };
+            if st_in != 0 || st_out != 0 {
+                log::warn!(
+                    "AudioConverterSetProperty(ChannelLayout) status in={} out={}",
+                    st_in,
+                    st_out
                 );
             }
         }

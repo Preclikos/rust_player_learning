@@ -22,8 +22,14 @@ pub struct AudioRenderer {
     command_sender: Sender<AudioRendererCommand>,
     sample_sender: Sender<f32>,
     sample_rate: u32,
+    channels: u16,
     flush_flag: Arc<AtomicBool>,
     paused_flag: Arc<AtomicBool>,
+    /// Number of interleaved samples (f32 slots) cpal should silently
+    /// drop from the front of the device queue on its next invocation.
+    /// Used by `drop_ms` to fast-forward audio when video_sync_loop
+    /// catches up by dropping frames.
+    drop_pending: Arc<std::sync::atomic::AtomicU64>,
     /// Last-frame peak dB per channel (f32 bits stored in AtomicU32).
     /// `peak_seen` flips on first push so we can return `None` until data
     /// is actually flowing — avoids reporting `-inf` at startup.
@@ -41,6 +47,7 @@ impl AudioRenderer {
     pub fn new() -> Self {
         let stop = Arc::new(Notify::new());
         let flush_flag = Arc::new(AtomicBool::new(false));
+        let drop_pending = Arc::new(std::sync::atomic::AtomicU64::new(0));
         // Start paused so cpal emits silence (without draining the
         // mpsc) until av_sync_handler is ready to start playback. Once
         // the av_sync handler observes both decoders' first frame, it
@@ -53,15 +60,22 @@ impl AudioRenderer {
         let paused_flag = Arc::new(AtomicBool::new(true));
 
         let (command_sender, command_receiver) = mpsc::channel(4);
-        let audio_thread =
-            AudioRenderer::start_thread(command_receiver, stop, flush_flag.clone(), paused_flag.clone());
+        let audio_thread = AudioRenderer::start_thread(
+            command_receiver,
+            stop,
+            flush_flag.clone(),
+            paused_flag.clone(),
+            drop_pending.clone(),
+        );
 
         AudioRenderer {
             command_sender,
             sample_sender: audio_thread.0,
             sample_rate: audio_thread.1,
+            channels: audio_thread.2,
             flush_flag,
             paused_flag,
+            drop_pending,
             peak_l_db: Arc::new(AtomicU32::new(0)),
             peak_r_db: Arc::new(AtomicU32::new(0)),
             peak_seen: Arc::new(AtomicBool::new(false)),
@@ -99,6 +113,7 @@ impl AudioRenderer {
         stop: Arc<Notify>,
         flush_flag: Arc<AtomicBool>,
         paused_flag: Arc<AtomicBool>,
+        drop_pending: Arc<std::sync::atomic::AtomicU64>,
     ) {
         let stream_config = StreamConfig {
             channels: config.channels(),
@@ -109,6 +124,16 @@ impl AudioRenderer {
         let callback = move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
             if flush_flag.swap(false, Ordering::Relaxed) {
                 while sample_receiver.try_recv().is_ok() {}
+            }
+            // `drop_pending` is set by `drop_ms` whenever video_sync_loop
+            // catches up by skipping frames — we drain that many samples
+            // from the front of the queue so the audio jumps forward by
+            // the same wall-clock amount.
+            let pending_drop = drop_pending.swap(0, Ordering::Relaxed);
+            for _ in 0..pending_drop {
+                if sample_receiver.try_recv().is_err() {
+                    break;
+                }
             }
             // While paused, emit silence WITHOUT draining the receiver —
             // resume picks up exactly where we left off.
@@ -146,7 +171,8 @@ impl AudioRenderer {
         stop: Arc<Notify>,
         flush_flag: Arc<AtomicBool>,
         paused_flag: Arc<AtomicBool>,
-    ) -> (Sender<f32>, u32) {
+        drop_pending: Arc<std::sync::atomic::AtomicU64>,
+    ) -> (Sender<f32>, u32, u16) {
         let (sample_sender, sample_receiver) = mpsc::channel::<f32>(192_000);
 
         let device = cpal::default_host()
@@ -170,6 +196,7 @@ impl AudioRenderer {
             stop_cpal,
             flush_flag,
             paused_flag,
+            drop_pending,
         ));
 
         let volume_handle = Arc::clone(&volume);
@@ -189,7 +216,7 @@ impl AudioRenderer {
             }
         });
 
-        (sample_sender, config.sample_rate())
+        (sample_sender, config.sample_rate(), config.channels())
     }
 
     #[cfg(any(target_os = "windows", target_os = "linux"))]
@@ -237,6 +264,22 @@ impl AudioRenderer {
         self.paused_flag.store(paused, Ordering::Relaxed);
     }
 
+    /// Schedule the next cpal callback to discard ~`ms` of buffered
+    /// audio from the front of the device queue. Convert ms → device
+    /// frames → interleaved sample count (one slot per channel per
+    /// frame). The atomic is `fetch_add`-ed so repeated drops during a
+    /// run of late video frames accumulate correctly.
+    pub fn drop_ms(&self, ms: u64) {
+        let drop_samples = ms
+            .saturating_mul(self.sample_rate as u64)
+            .saturating_mul(self.channels as u64)
+            / 1000;
+        if drop_samples > 0 {
+            self.drop_pending
+                .fetch_add(drop_samples, Ordering::Relaxed);
+        }
+    }
+
     pub async fn volume(&self, volume_diff: f32) {
         _ = self
             .command_sender
@@ -268,6 +311,10 @@ impl super::AudioSink for AudioRenderer {
 
     fn set_paused(&self, paused: bool) {
         AudioRenderer::set_paused(self, paused)
+    }
+
+    fn drop_ms(&self, ms: u64) {
+        AudioRenderer::drop_ms(self, ms)
     }
 
     fn last_peak_db(&self) -> Option<[f32; 2]> {

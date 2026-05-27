@@ -54,6 +54,14 @@ pub trait AudioSink: Send + Sync + 'static {
     /// burn through whatever was already queued.
     fn set_paused(&self, paused: bool);
 
+    /// Drop approximately `ms` of audio from the head of the device
+    /// queue without touching the device itself. The video sync loop
+    /// calls this whenever it has to drop frames to catch up to wall
+    /// clock — keeping audio aligned with the new video time instead
+    /// of trailing behind by the drop amount. Default no-op so
+    /// alternate sinks (e.g. mocks in tests) keep compiling.
+    fn drop_ms(&self, _ms: u64) {}
+
     /// Latest L/R peak in dB (range roughly -120..=0). `None` before the
     /// first audio frame has been pushed. Surfaced via `PlayerEvent::Stats`
     /// so the TUI can draw a tiny VU meter.

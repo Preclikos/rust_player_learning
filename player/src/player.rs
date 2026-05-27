@@ -74,6 +74,29 @@ const DEFAULT_BUFFER_TARGET_SECS: u32 = 8;
 /// 2 is a conservative floor that biases the cap upward.
 const ASSUMED_SEGMENT_SECS: u32 = 2;
 
+/// Result of a starvation-state update — exposed by the helper so the
+/// caller can react to combined-state transitions (the moment EITHER
+/// side starts stalling, or the moment BOTH have recovered).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StarvationTransition {
+    /// Combined state didn't change — either still healthy or still
+    /// buffering. No action required.
+    Unchanged,
+    /// Healthy → buffering. Pause audio sink, emit
+    /// `PlayerEvent::Buffering { Stall }`.
+    EnteredBuffering,
+    /// Buffering → healthy. Unpause audio sink (unless user-paused),
+    /// emit `PlayerEvent::Playing`.
+    ExitedBuffering,
+}
+
+/// Which sync-loop is reporting the starvation transition.
+#[derive(Clone, Copy, Debug)]
+enum StallSide {
+    Video,
+    Audio,
+}
+
 /// Shared counters surfaced via `PlayerEvent::Stats`. Created once in
 /// `Player::new` and cloned into every play() pipeline so the stats keep
 /// accumulating across seek / track-switch boundaries.
@@ -112,6 +135,17 @@ struct StatsState {
     /// Name of the currently-active video decoder backend
     /// (`"D3D11VA (FFmpeg)"`, `"MediaCodec"`, …). Plumbed in at play().
     decoder_name: StdMutex<String>,
+
+    /// Set by `video_sync_loop` when its decoder pipeline hasn't
+    /// produced a frame for >300 ms (download stall, decode hang, …).
+    /// Read by `audio_sync_loop` so an audio-only-healthy side parks
+    /// instead of draining its cpal queue and showing the user video
+    /// frozen with audio still playing.
+    video_starving: AtomicBool,
+    /// Symmetric to `video_starving` — set by `audio_sync_loop` when
+    /// IT hasn't received a frame for >300 ms. Video parks on its
+    /// current frame instead of marching forward over silence.
+    audio_starving: AtomicBool,
 }
 
 pub struct Player<V: VideoSink = VideoRenderer, A: AudioSink = AudioRenderer> {
@@ -225,6 +259,37 @@ impl<V: VideoSink, A: AudioSink> Clone for Player<V, A> {
 // A/V sync loop — identical on all platforms, generic over sink traits
 // ---------------------------------------------------------------------------
 
+/// Toggle the per-side starvation flag and report what changed about
+/// the COMBINED `video_starving || audio_starving` state. Callers use
+/// the returned transition to decide whether to pause / unpause the
+/// audio sink and emit a `PlayerEvent::Buffering` or `Playing` to the
+/// consumer. The transition is computed read-modify-read-style (no
+/// CAS) because each side only writes its own flag, so there's a
+/// single writer per atomic.
+fn report_starvation(
+    stats: &StatsState,
+    side: StallSide,
+    starving: bool,
+) -> StarvationTransition {
+    let other_starving = match side {
+        StallSide::Video => stats.audio_starving.load(Ordering::Relaxed),
+        StallSide::Audio => stats.video_starving.load(Ordering::Relaxed),
+    };
+    let was_buffering = other_starving
+        || match side {
+            StallSide::Video => stats.video_starving.swap(starving, Ordering::Relaxed),
+            StallSide::Audio => stats.audio_starving.swap(starving, Ordering::Relaxed),
+        };
+    let is_buffering = other_starving || starving;
+    if !was_buffering && is_buffering {
+        StarvationTransition::EnteredBuffering
+    } else if was_buffering && !is_buffering {
+        StarvationTransition::ExitedBuffering
+    } else {
+        StarvationTransition::Unchanged
+    }
+}
+
 // Returns current CLOCK_MONOTONIC time in nanoseconds.
 // Used to compute absolute presentation timestamps for eglPresentationTimeANDROID.
 #[cfg(target_os = "android")]
@@ -269,6 +334,17 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
     // Stats event rate-limit: ≤ 1 Hz per PLAYER_INTEGRATION.md §4.1.
     let mut last_stats_emit = Instant::now() - Duration::from_secs(1);
     let mut emitted_playing = false;
+    // Starvation tracking — flips when the decoder hasn't produced a
+    // frame for >300 ms (typically a network outage hitting the
+    // download side and propagating through the empty decoder queue).
+    // While set, audio_sink is paused and the consumer sees a
+    // Buffering{Stall} event; resetting on the next frame emits
+    // Playing again. Without this, video would freeze (recv blocked)
+    // while audio kept emptying its ~2 s cpal queue — exactly the
+    // "audio kept going, no buffering UI" symptom from the network-
+    // disconnect repro.
+    let mut starving = false;
+    let mut starvation_started: Option<Instant> = None;
     // BMDT (base media decode time) offset: DASH content timestamps are absolute
     // (e.g. ~7979ms for segment 0) while our wall clock starts at 0. Calibrated
     // on the first frame as (raw_pts - elapsed), making frame 0 render immediately
@@ -291,12 +367,80 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
                 break;
             }
         }
-        let mut frame = tokio::select! {
-            maybe = input_rx.recv() => match maybe {
-                Some(f) => f,
-                None => break,
-            },
-            _ = stop.notified() => break,
+        // Race recv against a 300 ms timeout so we can detect that
+        // the decoder pipeline has stopped producing frames (network
+        // outage, slow segment download, decoder hang, …) and pause
+        // the audio sink + surface `Buffering{Stall}` to the consumer.
+        // ALSO park here while the AUDIO side is starving: if audio
+        // has gone silent we don't want video to keep ploughing ahead
+        // through frames, the user is supposed to see "buffering"
+        // not "video playing without sound". `pause_skew` accumulates
+        // the wait so once both sides recover the next frame still
+        // renders at its proper PTS instead of being declared LATE
+        // by the wall-clock-based catch-up logic.
+        let mut frame = loop {
+            // If the AUDIO side is currently stalled, park video here
+            // until it recovers. Recv on input_rx with no timeout so
+            // we observe stop / forward channel closure normally.
+            if stats.audio_starving.load(Ordering::Relaxed) {
+                let park_started = Instant::now();
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                    _ = stop.notified() => return,
+                }
+                pause_skew += park_started.elapsed();
+                continue;
+            }
+            let starvation_wait = tokio::time::sleep(Duration::from_millis(300));
+            tokio::pin!(starvation_wait);
+            tokio::select! {
+                maybe = input_rx.recv() => {
+                    let f = match maybe {
+                        Some(f) => f,
+                        None => return,
+                    };
+                    if starving {
+                        let waited = starvation_started
+                            .map(|t| t.elapsed().as_millis() as u64)
+                            .unwrap_or(0);
+                        log::info!("[vsync] starvation recovered after {}ms", waited);
+                        // Treat the time we were starving as paused
+                        // time so the recovered frame's pts_ms isn't
+                        // declared LATE by however many ms we sat
+                        // waiting for the network.
+                        if let Some(t) = starvation_started.take() {
+                            pause_skew += t.elapsed();
+                        }
+                        starving = false;
+                        if let StarvationTransition::ExitedBuffering =
+                            report_starvation(&stats, StallSide::Video, false)
+                        {
+                            let _ = events.send(PlayerEvent::Playing);
+                            if !paused.load(Ordering::Relaxed) {
+                                audio_sink.set_paused(false);
+                            }
+                        }
+                    }
+                    break f;
+                }
+                _ = &mut starvation_wait => {
+                    if !starving {
+                        starving = true;
+                        starvation_started = Some(Instant::now());
+                        log::warn!("[vsync] no frame for 300ms — entering buffering");
+                        if let StarvationTransition::EnteredBuffering =
+                            report_starvation(&stats, StallSide::Video, true)
+                        {
+                            let _ = events.send(PlayerEvent::Buffering {
+                                reason: BufferingReason::Stall,
+                            });
+                            audio_sink.set_paused(true);
+                        }
+                    }
+                    continue;
+                }
+                _ = stop.notified() => return,
+            }
         };
         let raw_pts_ms = (frame.pts_us / 1000) as u64;
         let elapsed = start_time
@@ -322,6 +466,7 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
                 // (the channel can hold 64 frames = 2.7 s) causing a jarring
                 // jump. Draining exactly late_ms/frame_interval frames brings
                 // pts ≈ elapsed with no overshoot and no content skip.
+                let pts_before_drain = pts_ms;
                 let max_drain = (late_ms / 42).saturating_sub(1) as usize;
                 let mut drained = 0usize;
                 loop {
@@ -339,6 +484,17 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
                     stats
                         .video_frames_dropped
                         .fetch_add(drained as u64, Ordering::Relaxed);
+                    // Drop the matching amount of audio so the speaker
+                    // jumps forward in lock-step with video. Without
+                    // this, audio kept playing the pre-drop samples
+                    // queued in cpal — so every dropped batch shifted
+                    // A/V sync by ~drained × frame_interval ms in the
+                    // audio-leads direction, and the shift accumulated
+                    // visibly across multiple late events.
+                    let audio_skip_ms = pts_ms.saturating_sub(pts_before_drain);
+                    if audio_skip_ms > 0 {
+                        audio_sink.drop_ms(audio_skip_ms);
+                    }
                 }
             }
         } else {
@@ -457,6 +613,9 @@ async fn audio_sync_loop<A: AudioSink>(
     target_pts_ms: i64,
     stop: Arc<Notify>,
     stop_flag: Arc<AtomicBool>,
+    stats: Arc<StatsState>,
+    events: Arc<broadcast::Sender<PlayerEvent>>,
+    paused: Arc<AtomicBool>,
 ) {
     // Align the FIRST audible sample with `target_pts_ms` (= video's
     // snapped seek offset). DASH audio and video segments rarely share
@@ -473,16 +632,59 @@ async fn audio_sync_loop<A: AudioSink>(
     // same anchor video_sync_loop uses for its first rendered frame.
     let sample_rate = sink.sample_rate() as i64;
     let mut aligned = false;
+    let mut starving = false;
     loop {
         if stop_flag.load(Ordering::Relaxed) {
             break;
         }
-        let frame = tokio::select! {
-            maybe = input_rx.recv() => match maybe {
-                Some(f) => f,
-                None => break,
-            },
-            _ = stop.notified() => break,
+        // Mirror video_sync_loop's recv-with-timeout: if the audio
+        // pipeline stops producing frames (decoder hang, network
+        // outage on the audio adaptation set, …), flip into
+        // Buffering state so the consumer sees "stalled" and the
+        // audio sink stops emitting whatever's left in its cpal
+        // queue. Combined with `stats.audio_starving` being checked
+        // in video_sync_loop, this also stalls video on this frame
+        // — preventing the asymmetric "audio silent but video keeps
+        // playing" state.
+        let frame = loop {
+            let starvation_wait = tokio::time::sleep(Duration::from_millis(300));
+            tokio::pin!(starvation_wait);
+            tokio::select! {
+                maybe = input_rx.recv() => {
+                    let f = match maybe {
+                        Some(f) => f,
+                        None => return,
+                    };
+                    if starving {
+                        starving = false;
+                        if let StarvationTransition::ExitedBuffering =
+                            report_starvation(&stats, StallSide::Audio, false)
+                        {
+                            let _ = events.send(PlayerEvent::Playing);
+                            if !paused.load(Ordering::Relaxed) {
+                                sink.set_paused(false);
+                            }
+                        }
+                    }
+                    break f;
+                }
+                _ = &mut starvation_wait => {
+                    if !starving {
+                        starving = true;
+                        log::warn!("[async] no audio frame for 300ms — entering buffering");
+                        if let StarvationTransition::EnteredBuffering =
+                            report_starvation(&stats, StallSide::Audio, true)
+                        {
+                            let _ = events.send(PlayerEvent::Buffering {
+                                reason: BufferingReason::Stall,
+                            });
+                            sink.set_paused(true);
+                        }
+                    }
+                    continue;
+                }
+                _ = stop.notified() => return,
+            }
         };
         if frame.samples.is_empty() {
             continue;
@@ -533,7 +735,7 @@ async fn audio_sync_loop<A: AudioSink>(
         }
         tokio::select! {
             _ = sink.put_samples(&trimmed) => {}
-            _ = stop.notified() => break,
+            _ = stop.notified() => return,
         }
     }
 }
@@ -583,6 +785,9 @@ async fn av_sync_handler<V: VideoSink, A: AudioSink>(
     if !paused.load(Ordering::Relaxed) {
         audio_sink.set_paused(false);
     }
+    let stats_audio = Arc::clone(&stats);
+    let events_audio = Arc::clone(&events);
+    let paused_audio = Arc::clone(&paused);
     let (_, _) = tokio::join!(
         tokio::spawn(video_sync_loop(
             start_time.clone(),
@@ -604,6 +809,9 @@ async fn av_sync_handler<V: VideoSink, A: AudioSink>(
             seek_offset.as_millis() as i64,
             stop.clone(),
             stop_flag.clone(),
+            stats_audio,
+            events_audio,
+            paused_audio,
         )),
     );
     // Both loops returning naturally (channels closed by decoder EOF) means
@@ -1995,6 +2203,13 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             stats
                 .audio_last_decoded_pts_ms
                 .store(snapped_seek_offset.as_millis() as i64, Ordering::Relaxed);
+            // Clear any stale starvation state from a previous play()
+            // — a play that ended in Buffering would otherwise leave
+            // the flags set, and the next pipeline would never emit
+            // the initial Playing event because is_buffering would
+            // already read true.
+            stats.video_starving.store(false, Ordering::Relaxed);
+            stats.audio_starving.store(false, Ordering::Relaxed);
 
             let (frame_sender, frame_receiver) = mpsc::channel::<DecodedVideoFrame>(64);
             let (sample_sender, sample_receiver) = mpsc::channel::<DecodedAudioFrame>(256);
@@ -2170,32 +2385,83 @@ async fn download_task(
     stats: Option<Arc<StatsState>>,
     on_segment_done: Option<SegmentDoneCallback>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    /// How long `download_task` keeps retrying a single failing
+    /// segment before giving up and ending the pipeline. The inner
+    /// `HttpClient::get` already does ~3 short retries (~2 s); this
+    /// outer cap covers extended outages, e.g. a Wi-Fi drop while a
+    /// movie is playing. Long enough for a typical reconnect, short
+    /// enough that the player doesn't sit silently forever when the
+    /// network is genuinely gone.
+    const SEGMENT_RETRY_TOTAL: Duration = Duration::from_secs(30);
+
     let segment_slice = &segments[..];
     for i in start_index..segment_slice.len() {
         if stop_flag.load(Ordering::Relaxed) {
             break;
         }
-        let sender = segment_sender.clone();
         let seg = &segment_slice[i];
+        let mut backoff = Duration::from_millis(500);
+        // Outer retry loop: keep trying the same segment until it
+        // succeeds, the user stops playback, the seek target changes,
+        // or `SEGMENT_RETRY_TOTAL` elapses. Previously download_task
+        // broke out on the first error — so a brief network blip tore
+        // the whole pipeline down. Now a Wi-Fi blip rides through
+        // transparently, and only a genuine extended outage ends the
+        // pipeline.
+        let retry_started = Instant::now();
+        let started = retry_started;
         let mut should_break = false;
-        let started = Instant::now();
-        tokio::select! {
-            res = download_and_queue(i, seg, sender, &http, stats.as_ref()) => {
-                match res {
-                    Ok(()) => {
-                        log::debug!("[dl] produced segment {}", i);
-                        if let Some(cb) = &on_segment_done {
-                            cb(seg.end_time().as_millis() as i64);
+        let mut last_err: Option<Box<dyn Error + Send + Sync>> = None;
+        loop {
+            if stop_flag.load(Ordering::Relaxed) {
+                should_break = true;
+                break;
+            }
+            if retry_started.elapsed() > SEGMENT_RETRY_TOTAL {
+                log::error!(
+                    "[dl] segment {} gave up after {:?} of retries: {}",
+                    i,
+                    SEGMENT_RETRY_TOTAL,
+                    last_err
+                        .as_ref()
+                        .map(|e| e.to_string())
+                        .unwrap_or_else(|| "(no error captured)".to_string())
+                );
+                should_break = true;
+                break;
+            }
+            let sender = segment_sender.clone();
+            let outcome = tokio::select! {
+                res = download_and_queue(i, seg, sender, &http, stats.as_ref()) => Some(res),
+                _ = stop.notified() => None,
+            };
+            match outcome {
+                Some(Ok(())) => {
+                    log::debug!("[dl] produced segment {}", i);
+                    if let Some(cb) = &on_segment_done {
+                        cb(seg.end_time().as_millis() as i64);
+                    }
+                    break;
+                }
+                Some(Err(e)) => {
+                    log::warn!(
+                        "[dl] segment {} failed, retrying in {:?}: {}",
+                        i, backoff, e
+                    );
+                    last_err = Some(e);
+                    tokio::select! {
+                        _ = tokio::time::sleep(backoff) => {}
+                        _ = stop.notified() => {
+                            should_break = true;
+                            break;
                         }
                     }
-                    Err(e) => {
-                        log::error!("[dl] segment {} failed: {}", i, e);
-                        should_break = true;
-                    }
+                    backoff = (backoff * 2).min(Duration::from_secs(8));
                 }
-            }
-            _ = stop.notified() => {
-                should_break = true;
+                None => {
+                    should_break = true;
+                    break;
+                }
             }
         }
         if let Some(s) = stats.as_ref() {

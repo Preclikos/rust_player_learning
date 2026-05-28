@@ -426,7 +426,11 @@ impl VideoRenderer {
             (None, None, None)
         };
 
-        let (command_sender, command_receiver) = mpsc::channel(4);
+        // Capacity sized for drag-resize bursts: Win32 generates many WM_SIZE
+        // events per second while the user drags a window edge. The consumer
+        // coalesces backlogged commands (see spawn_command_thread) so a deep
+        // queue is fine — we just need send().await to never block.
+        let (command_sender, command_receiver) = mpsc::channel(32);
 
         // On Android GLES path (no working Vulkan), build the OES renderer now while
         // the EGL context is available. We do this by accessing the hal device and
@@ -577,55 +581,82 @@ impl VideoRenderer {
         let device = self.device.clone();
         let window = self.window.clone();
         tokio::spawn(async move {
-            while let Some(command) = command_receiver.recv().await {
-                match command {
-                    VideoRendererCommand::ChangeFrameSize(new_frame_size) => {
-                        {
-                            let mut size = frame_size.write().await;
-                            *size = new_frame_size;
-                        }
-                        let window_size = window.inner_size();
-                        if window_size.width > 0 && window_size.height > 0 {
+            while let Some(initial) = command_receiver.recv().await {
+                // Drain the channel and keep only the latest of each command
+                // kind. During a drag-resize the producer floods us with
+                // Resize events; every surface.configure() rebuilds the
+                // DX12/Vulkan swapchain (10–20 ms on Windows), so processing
+                // every intermediate size makes the window lag by hundreds of
+                // ms. Only the final size is observable to the user.
+                let mut latest_resize = None;
+                let mut latest_frame_size = None;
+                match initial {
+                    VideoRendererCommand::Resize(s) => latest_resize = Some(s),
+                    VideoRendererCommand::ChangeFrameSize(s) => latest_frame_size = Some(s),
+                }
+                while let Ok(next) = command_receiver.try_recv() {
+                    match next {
+                        VideoRendererCommand::Resize(s) => latest_resize = Some(s),
+                        VideoRendererCommand::ChangeFrameSize(s) => latest_frame_size = Some(s),
+                    }
+                }
+
+                // ChangeFrameSize first so frame_size reflects the new
+                // content aspect before the Resize branch rebuilds the
+                // vertex buffer for the latest window size.
+                if let Some(new_frame_size) = latest_frame_size {
+                    {
+                        let mut size = frame_size.write().await;
+                        *size = new_frame_size;
+                    }
+                    let window_size = window.inner_size();
+                    if window_size.width > 0 && window_size.height > 0 {
+                        // Release the config write lock before taking surface.lock() —
+                        // the render path takes surface first, then config(read), so
+                        // holding config(write) across surface.lock() would AB-BA
+                        // deadlock with an in-flight render.
+                        let new_config = {
                             let mut config_guard = config.write().await;
                             config_guard.width = window_size.width;
                             config_guard.height = window_size.height;
-                            {
-                                surface.lock().await.configure(&device, &config_guard);
-                            }
-                            if let Some(vb) = &vertex_buffer {
-                                let ty_max = *tex_y_max.read().await;
-                                Self::change_vertex_buffer(
-                                    &device,
-                                    window_size,
-                                    new_frame_size,
-                                    ty_max,
-                                    vb.clone(),
-                                )
-                                .await;
-                            }
+                            config_guard.clone()
+                        };
+                        surface.lock().await.configure(&device, &new_config);
+                        if let Some(vb) = &vertex_buffer {
+                            let ty_max = *tex_y_max.read().await;
+                            Self::change_vertex_buffer(
+                                &device,
+                                window_size,
+                                new_frame_size,
+                                ty_max,
+                                vb.clone(),
+                            )
+                            .await;
                         }
                     }
-                    VideoRendererCommand::Resize(new_size) => {
-                        if new_size.width > 0 && new_size.height > 0 {
-                            log::info!("[renderer] resize {}x{}", new_size.width, new_size.height);
+                }
+
+                if let Some(new_size) = latest_resize {
+                    if new_size.width > 0 && new_size.height > 0 {
+                        log::info!("[renderer] resize {}x{}", new_size.width, new_size.height);
+                        let new_config = {
                             let mut config_guard = config.write().await;
                             config_guard.width = new_size.width;
                             config_guard.height = new_size.height;
-                            {
-                                surface.lock().await.configure(&device, &config_guard);
-                            }
-                            if let Some(vb) = &vertex_buffer {
-                                let frame_size = frame_size.read().await;
-                                let ty_max = *tex_y_max.read().await;
-                                Self::change_vertex_buffer(
-                                    &device,
-                                    new_size,
-                                    *frame_size,
-                                    ty_max,
-                                    vb.clone(),
-                                )
-                                .await;
-                            }
+                            config_guard.clone()
+                        };
+                        surface.lock().await.configure(&device, &new_config);
+                        if let Some(vb) = &vertex_buffer {
+                            let frame_size = frame_size.read().await;
+                            let ty_max = *tex_y_max.read().await;
+                            Self::change_vertex_buffer(
+                                &device,
+                                new_size,
+                                *frame_size,
+                                ty_max,
+                                vb.clone(),
+                            )
+                            .await;
                         }
                     }
                 }

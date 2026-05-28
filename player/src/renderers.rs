@@ -47,7 +47,17 @@ pub trait AudioSink: Send + Sync + 'static {
     fn sample_rate(&self) -> u32;
     fn flush(&self);
     fn stop(&self) -> impl Future<Output = ()> + Send + '_;
-    fn volume(&self, diff: f32) -> impl Future<Output = ()> + Send + '_;
+    /// Absolute volume in 0.0..=1.0. Implementations must clamp.
+    fn set_volume(&self, volume: f32);
+    /// Last value passed to `set_volume`, or the implementation's
+    /// chosen default before the first set.
+    fn get_volume(&self) -> f32;
+    /// Relative adjustment. Default impl is `set_volume(get_volume() + diff)`
+    /// clamped to 0.0..=1.0; suitable for hotkey-driven nudges.
+    fn volume(&self, diff: f32) {
+        let new = (self.get_volume() + diff).clamp(0.0, 1.0);
+        self.set_volume(new);
+    }
     /// Pause/resume the underlying audio device. When `true`, the
     /// implementation must stop pulling samples; when `false`, resume.
     /// `Player::pause()` calls this so the cpal stream halts and we don't

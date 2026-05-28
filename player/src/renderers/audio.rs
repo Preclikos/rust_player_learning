@@ -15,7 +15,7 @@ use ffmpeg_next::frame::Audio;
 use pollster::FutureExt;
 use tokio::sync::{
     mpsc::{self, Receiver, Sender},
-    Notify, RwLock,
+    Notify,
 };
 
 pub struct AudioRenderer {
@@ -30,6 +30,11 @@ pub struct AudioRenderer {
     /// Used by `drop_ms` to fast-forward audio when video_sync_loop
     /// catches up by dropping frames.
     drop_pending: Arc<std::sync::atomic::AtomicU64>,
+    /// Volume gain in 0.0..=1.0, stored as `f32::to_bits` so the cpal
+    /// output callback (which runs on a non-tokio audio thread) can read
+    /// it without blocking. Writes go through `set_volume`; the integration
+    /// layer is expected to restore any persisted user value on startup.
+    volume: Arc<AtomicU32>,
     /// Last-frame peak dB per channel (f32 bits stored in AtomicU32).
     /// `peak_seen` flips on first push so we can return `None` until data
     /// is actually flowing — avoids reporting `-inf` at startup.
@@ -40,7 +45,6 @@ pub struct AudioRenderer {
 
 enum AudioRendererCommand {
     Stop,
-    Volume(f32),
 }
 
 impl AudioRenderer {
@@ -59,6 +63,12 @@ impl AudioRenderer {
         // unpredictable amount.
         let paused_flag = Arc::new(AtomicBool::new(true));
 
+        // Unity gain default. The integration layer (UI) overrides this
+        // by calling set_volume() after construction once it has loaded
+        // the persisted user value — defaulting low silently masked
+        // decode/sync issues.
+        let volume = Arc::new(AtomicU32::new(1.0_f32.to_bits()));
+
         let (command_sender, command_receiver) = mpsc::channel(4);
         let audio_thread = AudioRenderer::start_thread(
             command_receiver,
@@ -66,6 +76,7 @@ impl AudioRenderer {
             flush_flag.clone(),
             paused_flag.clone(),
             drop_pending.clone(),
+            volume.clone(),
         );
 
         AudioRenderer {
@@ -76,6 +87,7 @@ impl AudioRenderer {
             flush_flag,
             paused_flag,
             drop_pending,
+            volume,
             peak_l_db: Arc::new(AtomicU32::new(0)),
             peak_r_db: Arc::new(AtomicU32::new(0)),
             peak_seen: Arc::new(AtomicBool::new(false)),
@@ -109,7 +121,7 @@ impl AudioRenderer {
         mut sample_receiver: Receiver<f32>,
         device: Device,
         config: SupportedStreamConfig,
-        volume: Arc<RwLock<f32>>,
+        volume: Arc<AtomicU32>,
         stop: Arc<Notify>,
         flush_flag: Arc<AtomicBool>,
         paused_flag: Arc<AtomicBool>,
@@ -143,10 +155,10 @@ impl AudioRenderer {
                 }
                 return;
             }
-            let vol = volume.blocking_read();
+            let vol = f32::from_bits(volume.load(Ordering::Relaxed));
             for sample in data.iter_mut() {
                 let asample = sample_receiver.try_recv().unwrap_or(Sample::EQUILIBRIUM);
-                *sample = asample * *vol;
+                *sample = asample * vol;
             }
         };
 
@@ -172,6 +184,7 @@ impl AudioRenderer {
         flush_flag: Arc<AtomicBool>,
         paused_flag: Arc<AtomicBool>,
         drop_pending: Arc<std::sync::atomic::AtomicU64>,
+        volume: Arc<AtomicU32>,
     ) -> (Sender<f32>, u32, u16) {
         let (sample_sender, sample_receiver) = mpsc::channel::<f32>(192_000);
 
@@ -183,34 +196,25 @@ impl AudioRenderer {
             .default_output_config()
             .expect("Failed to get default config");
 
-        let volume = Arc::new(RwLock::new(0.15_f32));
-
         let stop_cpal = stop.clone();
         let config_cpal = config.clone();
-        let volume_cpal = Arc::clone(&volume);
         tokio::spawn(AudioRenderer::start_audio(
             sample_receiver,
             device,
             config_cpal,
-            volume_cpal,
+            volume,
             stop_cpal,
             flush_flag,
             paused_flag,
             drop_pending,
         ));
 
-        let volume_handle = Arc::clone(&volume);
         tokio::spawn(async move {
             while let Some(command) = command_receiver.recv().await {
                 match command {
                     AudioRendererCommand::Stop => {
                         stop.notify_waiters();
                         break;
-                    }
-                    AudioRendererCommand::Volume(new_volume) => {
-                        let mut vol = volume_handle.write().await;
-                        *vol += new_volume;
-                        log::debug!("volume: {}", *vol);
                     }
                 }
             }
@@ -280,11 +284,19 @@ impl AudioRenderer {
         }
     }
 
-    pub async fn volume(&self, volume_diff: f32) {
-        _ = self
-            .command_sender
-            .send(AudioRendererCommand::Volume(volume_diff))
-            .await;
+    pub fn get_volume(&self) -> f32 {
+        f32::from_bits(self.volume.load(Ordering::Relaxed))
+    }
+
+    pub fn set_volume(&self, volume: f32) {
+        let v = volume.clamp(0.0, 1.0);
+        self.volume.store(v.to_bits(), Ordering::Relaxed);
+        log::debug!("volume: {}", v);
+    }
+
+    pub fn volume(&self, diff: f32) {
+        let new = (self.get_volume() + diff).clamp(0.0, 1.0);
+        self.set_volume(new);
     }
 }
 
@@ -305,7 +317,15 @@ impl super::AudioSink for AudioRenderer {
         AudioRenderer::stop(self)
     }
 
-    fn volume(&self, diff: f32) -> impl std::future::Future<Output = ()> + Send + '_ {
+    fn set_volume(&self, volume: f32) {
+        AudioRenderer::set_volume(self, volume)
+    }
+
+    fn get_volume(&self) -> f32 {
+        AudioRenderer::get_volume(self)
+    }
+
+    fn volume(&self, diff: f32) {
         AudioRenderer::volume(self, diff)
     }
 

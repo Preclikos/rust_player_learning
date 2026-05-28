@@ -2349,11 +2349,22 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         self.audio_renderer.set_paused(true);
     }
 
+    /// Relative volume nudge — adds `volume_diff` to the current value and
+    /// clamps to 0.0..=1.0. Convenience for hotkey-driven adjustments.
     pub fn volume(&self, volume_diff: f32) {
-        let audio_sink = self.audio_renderer.clone();
-        tokio::spawn(async move {
-            audio_sink.volume(volume_diff).await;
-        });
+        self.audio_renderer.volume(volume_diff);
+    }
+
+    /// Absolute volume in 0.0..=1.0. The UI layer should call this on
+    /// startup with any persisted user value, and whenever the user
+    /// drags a volume slider.
+    pub fn set_volume(&self, volume: f32) {
+        self.audio_renderer.set_volume(volume);
+    }
+
+    /// Current volume in 0.0..=1.0.
+    pub fn get_volume(&self) -> f32 {
+        self.audio_renderer.get_volume()
     }
 
     pub fn resize(&self, size: PhysicalSize<u32>) {

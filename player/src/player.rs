@@ -366,6 +366,11 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
             if stop_flag.load(Ordering::Relaxed) {
                 break;
             }
+            // Re-arm Playing emission: pause() emits Paused, and resume()
+            // relies on the first post-resume frame to emit Playing — but
+            // emitted_playing was sticky-true from startup, so the gate
+            // below would swallow the Paused→Playing transition.
+            emitted_playing = false;
         }
         // Race recv against a 300 ms timeout so we can detect that
         // the decoder pipeline has stopped producing frames (network

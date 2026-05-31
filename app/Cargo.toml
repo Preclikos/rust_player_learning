@@ -16,7 +16,7 @@ log = "0.4"
 # pulls in audio (and on Win/Linux also video) through ffmpeg-next.
 # On macOS only the audio path uses it; video stays native VideoToolbox.
 [target.'cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))'.dependencies]
-ffmpeg-next = {version = "8.1.0"}
+ffmpeg-next = { version = "7.1" }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = ["Win32_System_Power"] }

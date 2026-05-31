@@ -40,14 +40,16 @@ fontdue = "0.9"
 # native for video). AudioToolbox's AAC decoder mis-behaves when fed
 # access units packet-by-packet on macOS, so we let the proven
 # ffmpeg AAC / AC-3 / EAC-3 decoders handle that side.
-# ffmpeg-next 8.x ships with a newer bindgen that works with LLVM 22+.
-# ffmpeg-next is pulled from vendor/ffmpeg-next/ (3 wildcard match arms patched).
-# Path dep — not `version = ...` — so the patch travels when player is consumed
-# as a git dependency. `[patch.crates-io]` only applies to the root workspace
-# building right now; downstream consumers wouldn't see it.
+#
+# Pinned to 7.1 series across the workspace because all target platforms
+# ship FFmpeg 7.x system libs (avutil-59 / avcodec-61 / swresample-5).
+# Staying on the matching Rust crate series keeps its match arms aligned
+# with the bindgen-generated enum surface.
+# NOTE: ffmpeg-sys-next 7.1.x predates LLVM 22 — if your toolchain's
+# libclang is 22+, bindgen may fail and you'll need to bump back to 8.x.
 [target.'cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))'.dependencies]
-ffmpeg-next = { path = "../vendor/ffmpeg-next", version = "8.1.0" }
-ffmpeg-sys-next = { version = "8.1.0"}
+ffmpeg-next = { version = "7.1" }
+ffmpeg-sys-next = { version = "7.1" }
 
 # Win/Linux: native-tls (system OpenSSL/Schannel). macOS prefers rustls
 # so we don't drag native-tls + OpenSSL into the build.

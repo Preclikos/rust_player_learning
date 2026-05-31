@@ -6,7 +6,16 @@ members = [
     "app-shared",
     "player"
 ]
+exclude = ["vendor"]
 resolver = "2"
+
+# Temporary patch: ffmpeg-next 8.1.0 has match statements over rustified enums
+# (AVCodecID, AVFrameSideDataType, AVPacketSideDataType) without wildcard arms.
+# FFmpeg 8.1.1 backports added new variants (IAMF_*, DYNAMIC_HDR_SMPTE_2094_APP5,
+# WEBP_ANIM, HEVC_CONF) which break compilation against system FFmpeg 8.1.1+.
+# Remove this and the vendor/ffmpeg-next directory once ffmpeg-next > 8.1.0 ships.
+[patch.crates-io]
+ffmpeg-next = { path = "vendor/ffmpeg-next" }
 
 # Optimize crypto crates even in dev builds. Without this, AES-CTR decryption
 # of a 2 MB DASH segment takes ~4s in debug mode (~0.5 MB/s) — even with

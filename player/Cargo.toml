@@ -41,8 +41,12 @@ fontdue = "0.9"
 # access units packet-by-packet on macOS, so we let the proven
 # ffmpeg AAC / AC-3 / EAC-3 decoders handle that side.
 # ffmpeg-next 8.x ships with a newer bindgen that works with LLVM 22+.
+# ffmpeg-next is pulled from vendor/ffmpeg-next/ (3 wildcard match arms patched).
+# Path dep — not `version = ...` — so the patch travels when player is consumed
+# as a git dependency. `[patch.crates-io]` only applies to the root workspace
+# building right now; downstream consumers wouldn't see it.
 [target.'cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))'.dependencies]
-ffmpeg-next = { version = "8.1.0"}
+ffmpeg-next = { path = "../vendor/ffmpeg-next", version = "8.1.0" }
 ffmpeg-sys-next = { version = "8.1.0"}
 
 # Win/Linux: native-tls (system OpenSSL/Schannel). macOS prefers rustls

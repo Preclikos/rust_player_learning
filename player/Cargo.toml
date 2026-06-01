@@ -27,7 +27,10 @@ cpal ={ version =  "0.17" }
 bytemuck ={ version =  "1.13.1" }
 pollster = "0.4.0"
 wgpu = { git = "https://github.com/Preclikos/wgpu.git" }
-winit = "0.30.9"
+# Raw window/display handle types for building wgpu surfaces from a
+# host-provided window/layer. The player is winit-free — hosts pass handles in.
+# Pinned to the same major as the wgpu fork so the handle types unify.
+raw-window-handle = "0.6"
 ash = "0.38.0"
 log = "0.4"
 # Subtitle font rasterization. Pure-Rust, no system deps. Used by the
@@ -85,11 +88,10 @@ objc2-metal = { version = "0.3.2", default-features = false, features = [
     "MTLPixelFormat",
 ] }
 
-# Android-only: enable winit's NativeActivity backend, MediaCodec via the
-# ndk crate, JNI binding for future Java interop, and rustls so reqwest
-# doesn't need a cross-compiled OpenSSL.
+# Android-only: MediaCodec via the ndk crate, JNI binding for Java interop,
+# and rustls so reqwest doesn't need a cross-compiled OpenSSL. (No winit — the
+# host Activity owns the Surface; see app-android.)
 [target.'cfg(target_os = "android")'.dependencies]
-winit = { version = "0.30.9", features = ["android-native-activity"] }
 ndk = { version = "0.9", features = ["media", "api-level-29"] }
 ndk-sys = "0.6"
 jni = "0.21"

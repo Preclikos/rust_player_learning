@@ -1,170 +1,146 @@
-// Android entry point.
+// Android smoke test — EMBEDDED into a host Activity's Surface (no winit).
 //
-// Build with cargo-ndk, e.g.:
+// This is the Android counterpart of the desktop/iOS smoke shells, following
+// the *embed* model real apps use: a normal `Activity` owns a `SurfaceView`
+// (`android/.../MainActivity.java`) and hands its `Surface` to `nativeStart`
+// over JNI. We turn it into an `ANativeWindow` and render straight into it —
+// no winit `NativeActivity`, no `android_main`.
+//
+// It is intentionally self-contained: it plays the bundled encrypted test
+// stream from `app_shared` (clearkeys baked in). Provider auth / licence
+// callbacks are NOT wired here — that belongs to the product bridge that
+// consumes the same `Player::new_from_android_surface` API from outside this
+// repo.
+//
+// Build with cargo-ndk (Gradle's buildRust task does this automatically):
 //   cargo ndk -t arm64-v8a build -p app-android
-// Then bundle the resulting libapp_android.so into an Android Studio project
-// that loads it via System.loadLibrary("app_android"). The NativeActivity
-// dispatches to `android_main` below.
 //
-// This crate is intentionally a no-op when not targeting Android, so the
-// workspace can still `cargo build` on desktop without an NDK toolchain.
+// This crate is a no-op when not targeting Android, so the workspace still
+// builds on desktop without an NDK toolchain.
 
 #![cfg(target_os = "android")]
 
-use std::sync::Arc;
+use std::ffi::c_void;
+use std::sync::OnceLock;
 
-/// Sets FLAG_KEEP_SCREEN_ON on the NativeActivity window so the screen stays
-/// on during video playback without needing a WakeLock.
-fn keep_screen_on(app: &android_activity::AndroidApp) {
-    use android_activity::WindowManagerFlags;
-    app.set_window_flags(WindowManagerFlags::KEEP_SCREEN_ON, WindowManagerFlags::empty());
-    log::info!("keep-screen-on: FLAG_KEEP_SCREEN_ON set");
+use jni::objects::{JClass, JObject};
+use jni::sys::{jint, jlong};
+use jni::JNIEnv;
+use player::{PhysicalSize, Player};
+
+/// Player + the `ANativeWindow` ref it renders into. The window ref is acquired
+/// by `ANativeWindow_fromSurface` and must outlive the player's wgpu surface,
+/// so we keep it here and release it in `nativeDestroy` *after* the player is
+/// dropped.
+struct Handle {
+    player: Player,
+    native_window: *mut ndk_sys::ANativeWindow,
 }
 
-/// Hints to SurfaceFlinger that this window produces 24fps content.
-/// SurfaceFlinger then selects a display refresh rate that is an integer
-/// multiple of 24Hz (e.g. 48Hz, 120Hz) for perfect cadence.
+/// Dedicated multi-thread Tokio runtime. The host owns the UI thread / looper,
+/// so the player needs its own runtime for decode/render/download tasks.
+fn runtime() -> &'static tokio::runtime::Runtime {
+    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime")
+    })
+}
+
+fn init_logging() {
+    static ONCE: OnceLock<()> = OnceLock::new();
+    ONCE.get_or_init(|| {
+        // Info by default so per-frame vsync/mediacodec traces stay out of
+        // logcat. Bump to Debug/Trace when diagnosing playback.
+        android_logger::init_once(
+            android_logger::Config::default().with_max_level(log::LevelFilter::Info),
+        );
+        log::info!("app-android: embedded player loaded");
+    });
+}
+
+/// `MainActivity.nativeStart(Surface, int, int) -> long`.
 ///
-/// On modern Android the linker uses per-library namespaces, so
-/// dlsym(RTLD_DEFAULT) doesn't find symbols in libandroid.so even on
-/// API 34. We must dlopen the library explicitly.
-fn set_frame_rate_24fps(window: &winit::window::Window) {
-    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-    let Ok(handle) = window.window_handle() else { return };
-    let native_ptr = match handle.as_raw() {
-        RawWindowHandle::AndroidNdk(h) => h.a_native_window.as_ptr(),
-        _ => return,
-    };
-
-    // ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE = 1
-    // ANATIVEWINDOW_CHANGE_FRAME_RATE_ALWAYS = 0
-    const FIXED_SOURCE: i8 = 1;
-    const ALWAYS: i8 = 0;
-
-    unsafe {
-        // libandroid.so is loaded by the system but in a private namespace;
-        // RTLD_DEFAULT can't see it. dlopen with RTLD_NOLOAD grabs the already-
-        // loaded handle without a second load; fall back to a fresh dlopen.
-        let lib = {
-            let name = b"libandroid.so\0".as_ptr() as *const libc::c_char;
-            let h = libc::dlopen(name, libc::RTLD_NOW | libc::RTLD_NOLOAD);
-            if h.is_null() { libc::dlopen(name, libc::RTLD_NOW) } else { h }
-        };
-        if lib.is_null() {
-            log::warn!("set_frame_rate_24fps: dlopen(libandroid.so) failed");
-            return;
-        }
-        let sym = libc::dlsym(lib, b"ANativeWindow_setFrameRate\0".as_ptr() as *const libc::c_char);
-        if sym.is_null() {
-            log::info!("ANativeWindow_setFrameRate unavailable (API < 30)");
-            libc::dlclose(lib);
-            return;
-        }
-        type Fn = unsafe extern "C" fn(*mut libc::c_void, f32, i8, i8) -> libc::c_int;
-        let f: Fn = std::mem::transmute(sym);
-        let ret = f(native_ptr.cast(), 24.0, FIXED_SOURCE, ALWAYS);
-        log::info!("ANativeWindow_setFrameRate(24.0, FIXED_SOURCE, ALWAYS) = {}", ret);
-        libc::dlclose(lib);
-    }
-}
-
-use android_activity::AndroidApp;
-use player::Player;
-use winit::application::ApplicationHandler;
-use winit::event::WindowEvent;
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::platform::android::EventLoopBuilderExtAndroid;
-use winit::window::{Window, WindowId};
-
-struct App {
-    window: Option<Arc<Window>>,
-    player: Option<Player>,
-}
-
-impl ApplicationHandler for App {
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        let attrs = Window::default_attributes();
-        let window = Arc::new(event_loop.create_window(attrs).unwrap());
-        let player = Player::new(window.clone());
-
-        // NOTE: ANativeWindow_setFrameRate(24, FIXED_SOURCE) DOES NOT help here.
-        // On Samsung devices (tested: Galaxy S21 120Hz panel, Samsung TV via
-        // Google TV Streamer) the compositor reacts to the 24fps hint by
-        // downgrading the display from 120Hz (a perfect 5x multiple of 24)
-        // to 60Hz — exactly the rate that produces 3:2 pulldown judder.
-        // Without the hint the panel stays at its native rate (120Hz on phones)
-        // and 24fps content plays with a clean 5-VSyncs-per-frame cadence.
-        // (TVs forced to 60Hz by their own logic still pulldown, but the hint
-        // doesn't help there either.)
-        // set_frame_rate_24fps(&window);
-
-        let _ = set_frame_rate_24fps; // suppress unused warning when not called
-
-        self.window = Some(window);
-        self.player = Some(player.clone());
-        log::info!("window + player created");
-
-        // Same hardcoded encrypted stream + keys as the desktop shell —
-        // logic lives in app-shared so both shells stay in sync.
-        tokio::spawn(app_shared::run_test_playback(player));
-    }
-
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::KeyboardInput { event, .. } => {
-                use winit::keyboard::{Key, NamedKey};
-                if let Key::Named(NamedKey::GoBack) = &event.logical_key {
-                    if event.state == winit::event::ElementState::Released {
-                        log::info!("back button: exiting");
-                        event_loop.exit();
-                    }
-                }
-            }
-            WindowEvent::Resized(new_size) => {
-                log::info!("window resized: {}x{}", new_size.width, new_size.height);
-                if let Some(player) = &self.player {
-                    player.resize(new_size);
-                }
-            }
-            WindowEvent::RedrawRequested => {
-                if let Some(w) = self.window.as_ref() {
-                    w.request_redraw();
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
+/// Builds a player rendering into the given `Surface` and starts the bundled
+/// encrypted test stream. Returns an opaque handle (as a `jlong`) the host
+/// keeps for `nativeSetSize` / `nativeDestroy`. Returns 0 on failure.
 #[no_mangle]
-fn android_main(app: AndroidApp) {
-    // Default to Info so per-frame [vsync]/[mc] traces (24 lines/sec at
-    // 24fps) stay out of logcat. Bump to Debug / Trace when diagnosing
-    // playback issues — every player log site now uses the standard
-    // log:: levels (no rogue println!s).
-    android_logger::init_once(
-        android_logger::Config::default().with_max_level(log::LevelFilter::Info),
-    );
-    log::info!("android_main: starting");
+pub extern "system" fn Java_cz_preclikos_rustplayer_MainActivity_nativeStart(
+    env: JNIEnv,
+    _class: JClass,
+    surface: JObject,
+    width: jint,
+    height: jint,
+) -> jlong {
+    init_logging();
 
-    keep_screen_on(&app);
-
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime");
-    let _guard = rt.enter();
-
-    let event_loop = EventLoop::builder()
-        .with_android_app(app)
-        .build()
-        .expect("event loop");
-    event_loop.set_control_flow(ControlFlow::Poll);
-
-    let mut app = App {
-        window: None,
-        player: None,
+    // ANativeWindow_fromSurface returns an *acquired* reference (release with
+    // ANativeWindow_release). Raw-pointer `as` casts bridge the jni vs ndk-sys
+    // JNIEnv/jobject type aliases without depending on them matching exactly.
+    let native_window = unsafe {
+        ndk_sys::ANativeWindow_fromSurface(env.get_raw() as *mut _, surface.as_raw() as *mut _)
     };
-    let _ = event_loop.run_app(&mut app);
+    if native_window.is_null() {
+        log::error!("nativeStart: ANativeWindow_fromSurface returned null");
+        return 0;
+    }
+
+    let w = width.max(1) as u32;
+    let h = height.max(1) as u32;
+    log::info!("nativeStart: {}x{}", w, h);
+
+    // Building the renderer block_on's and spawns Tokio tasks internally, so it
+    // must run inside the runtime.
+    let _guard = runtime().enter();
+    let player = Player::new_from_android_surface(native_window as *mut c_void, w, h);
+
+    // Drive the shared smoke-test fixture: open_url → clearkey → prepare →
+    // pick tracks → play(). Same stream/keys as the desktop + iOS shells.
+    runtime().spawn(app_shared::run_test_playback(player.clone()));
+
+    let handle = Box::new(Handle {
+        player,
+        native_window,
+    });
+    Box::into_raw(handle) as jlong
+}
+
+/// `MainActivity.nativeSetSize(long, int, int)` — reconfigure on layout change.
+#[no_mangle]
+pub extern "system" fn Java_cz_preclikos_rustplayer_MainActivity_nativeSetSize(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    width: jint,
+    height: jint,
+) {
+    if handle == 0 {
+        return;
+    }
+    let h = unsafe { &*(handle as *mut Handle) };
+    h.player
+        .resize(PhysicalSize::new(width.max(1) as u32, height.max(1) as u32));
+}
+
+/// `MainActivity.nativeDestroy(long)` — tear down and release the window ref.
+#[no_mangle]
+pub extern "system" fn Java_cz_preclikos_rustplayer_MainActivity_nativeDestroy(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) {
+    if handle == 0 {
+        return;
+    }
+    let h = unsafe { Box::from_raw(handle as *mut Handle) };
+    let Handle {
+        player,
+        native_window,
+    } = *h;
+    // Drop the player (and its wgpu surface) first, then release the window ref
+    // we acquired in nativeStart.
+    drop(player);
+    unsafe { ndk_sys::ANativeWindow_release(native_window) };
 }

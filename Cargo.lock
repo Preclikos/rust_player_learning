@@ -209,15 +209,13 @@ dependencies = [
 name = "app-android"
 version = "0.1.0"
 dependencies = [
- "android-activity",
  "android_logger",
  "app-shared",
- "libc",
+ "jni 0.21.1",
  "log",
+ "ndk-sys",
  "player",
- "pollster",
  "tokio",
- "winit",
 ]
 
 [[package]]
@@ -228,9 +226,7 @@ dependencies = [
  "log",
  "oslog",
  "player",
- "pollster",
  "tokio",
- "winit",
 ]
 
 [[package]]
@@ -2386,6 +2382,7 @@ dependencies = [
  "pollster",
  "quick-xml 0.37.5",
  "rand 0.8.6",
+ "raw-window-handle",
  "re_mp4",
  "reqwest",
  "serde",
@@ -2394,7 +2391,6 @@ dependencies = [
  "url",
  "wgpu",
  "windows",
- "winit",
 ]
 
 [[package]]

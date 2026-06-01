@@ -116,11 +116,11 @@ impl HwVideoDecoder for FfmpegHwDecoder {
         }
         unsafe {
             (*ctx.as_mut_ptr()).hw_device_ctx = self.hw_device_ctx;
-            // D3D11/VAAPI pools default to ~20 surfaces. The video channel
-            // holds up to 64 decoded frames, so we need a pool large enough
-            // to cover them all. extra_hw_frames enlarges the fixed pool by
-            // this amount on top of FFmpeg's inferred minimum.
-            (*ctx.as_mut_ptr()).extra_hw_frames = 64;
+            // Pool size: HEVC's internal needs (~24) plus a small buffer for the
+            // renderer's in-flight queue. The channel hard-caps at 64 frames but
+            // rarely holds more than ~5 in practice. Intel Arc D3D11VA refuses
+            // pools >~48 surfaces in a Texture2DArray, so we keep this conservative.
+            (*ctx.as_mut_ptr()).extra_hw_frames = 16;
             // Steer libavcodec to the HW pixel format instead of the
             // software fallback — see select_hw_format above.
             (*ctx.as_mut_ptr()).get_format = Some(select_hw_format);

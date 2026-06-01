@@ -9,6 +9,7 @@ use winit::application::ApplicationHandler;
 use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::window::{Fullscreen, Window, WindowId};
 
 struct App {
@@ -26,7 +27,26 @@ impl ApplicationHandler for App {
         //default_attrs.inner_size = Some(Size::Physical(PhysicalSize::new(1280, 800)));
         let window = Arc::new(event_loop.create_window(default_attrs).unwrap());
 
-        let player = Player::new(window.clone());
+        // The player is winit-free: hand it raw window+display handles instead
+        // of the Window. We keep `self.window` alive for the player's lifetime.
+        let size = window.inner_size();
+        let window_handle = window
+            .window_handle()
+            .expect("window handle")
+            .as_raw();
+        let display_handle = window
+            .display_handle()
+            .expect("display handle")
+            .as_raw();
+        let player =
+            Player::new_from_raw_handle(window_handle, display_handle, size.width, size.height);
+
+        // Keep winit's frame-pacing hint: call pre_present_notify right before
+        // each present from inside the player's render loop.
+        {
+            let w = window.clone();
+            player.set_pre_present_hook(Box::new(move || w.pre_present_notify()));
+        }
 
         self.player = Some(player.clone());
 
@@ -69,7 +89,7 @@ impl ApplicationHandler for App {
                 window.request_redraw();
             }
             WindowEvent::Resized(size) => {
-                player.resize(size);
+                player.resize(player::PhysicalSize::new(size.width, size.height));
             }
             WindowEvent::KeyboardInput {
                 device_id: _,

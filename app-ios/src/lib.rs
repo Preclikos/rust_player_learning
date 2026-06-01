@@ -1,118 +1,121 @@
-// iOS entry point — mirrors the Android shell:
-//   * Build with cargo-lipo / cargo-xcode / `cargo build --target …-ios-sim`.
-//   * The resulting libapp_ios.a (.staticlib) is linked into an Xcode app
-//     bundle that provides UIApplicationMain + the storyboard.
-//   * That bundle's AppDelegate calls `rust_main()` after UIApplication
-//     boots — winit takes the UIScene / UIWindow lifecycle from there.
+// iOS smoke test — EMBEDDED into a host-owned UIView (no winit).
 //
-// On non-iOS targets this crate is a no-op so `cargo check` across the
-// workspace stays green without a cross-compile toolchain.
+// This crate is the iOS counterpart of the desktop/Android smoke shells, but
+// it follows the *embed* model that real apps use: the Objective-C host
+// (`ios/RustPlayer/main.m`) owns `UIApplicationMain` and a `CAMetalLayer`-backed
+// view, then hands that layer to `rust_player_start`. The player renders
+// straight into it — no winit, no `UIApplicationDelegate` takeover.
+//
+// It is intentionally self-contained: it plays the bundled encrypted test
+// stream from `app_shared` (clearkeys baked in). Provider auth / licence
+// callbacks are NOT wired here — that belongs to the product bridge that
+// consumes the same `Player::new_from_metal_layer` API from outside this repo.
+//
+//   * Build with `cargo build -p app-ios --target aarch64-apple-ios-sim`
+//     (see `ios/build_sim.sh`); the resulting `libapp_ios.a` links into the
+//     Obj-C app bundle.
+//
+// On non-iOS targets this crate is a no-op so the workspace still builds
+// without a cross-compile toolchain.
 
 #![cfg(target_os = "ios")]
 
-use std::sync::Arc;
+use std::ffi::c_void;
+use std::sync::OnceLock;
 
-use player::Player;
-use winit::application::ApplicationHandler;
-use winit::event::WindowEvent;
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::window::{Window, WindowId};
+use player::{PhysicalSize, Player};
 
-struct App {
-    window: Option<Arc<Window>>,
-    player: Option<Player>,
+/// Dedicated multi-thread Tokio runtime that drives the player. The host owns
+/// the CFRunLoop (via `UIApplicationMain`), so the player needs its own runtime
+/// for the decode/render/download tasks — there is no winit event loop here.
+fn runtime() -> &'static tokio::runtime::Runtime {
+    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime")
+    })
 }
 
-impl ApplicationHandler for App {
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        log::info!("resumed: creating window");
-        let attrs = Window::default_attributes();
-        let window = match event_loop.create_window(attrs) {
-            Ok(w) => Arc::new(w),
-            Err(e) => {
-                log::error!("create_window failed: {}", e);
-                return;
-            }
-        };
-        log::info!("resumed: window created, constructing Player");
+/// One-time logging + panic routing into oslog. Without the panic hook a
+/// `panic_cannot_unwind` aborts the process while the message is still on
+/// stderr — which is `/dev/null` inside the simulator app sandbox.
+fn init_once() {
+    static ONCE: OnceLock<()> = OnceLock::new();
+    ONCE.get_or_init(|| {
+        let _ = oslog::OsLogger::new("com.rust.player")
+            .level_filter(log::LevelFilter::Info)
+            .init();
 
-        let player = Player::new(window.clone());
-        log::info!("resumed: Player::new returned");
-
-        self.window = Some(window);
-        self.player = Some(player.clone());
-
-        log::info!("resumed: spawning run_test_playback");
-        tokio::spawn(app_shared::run_test_playback(player));
-        log::info!("resumed: done");
-    }
-
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::Resized(new_size) => {
-                log::info!("window resized: {}x{}", new_size.width, new_size.height);
-                if let Some(player) = &self.player {
-                    player.resize(new_size);
-                }
-            }
-            WindowEvent::RedrawRequested => {
-                if let Some(w) = self.window.as_ref() {
-                    w.request_redraw();
-                }
-            }
-            _ => {}
-        }
-    }
+        std::panic::set_hook(Box::new(|info| {
+            let location = info
+                .location()
+                .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+                .unwrap_or_else(|| "<unknown>".to_string());
+            let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
+                (*s).to_string()
+            } else if let Some(s) = info.payload().downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "<non-string panic payload>".to_string()
+            };
+            log::error!("RUST PANIC at {}: {}", location, payload);
+        }));
+    });
 }
 
-/// Entry point invoked from the Objective-C / Swift app shell after
-/// UIApplicationMain finishes booting the runtime. Symbol is `_rust_main`
-/// in the .a — declare in the host code as:
+/// Create a player rendering into `metal_layer` (a `CAMetalLayer*`) and start
+/// the bundled encrypted test stream. Returns an opaque handle the host keeps
+/// for `rust_player_set_size` / `rust_player_destroy`. The host guarantees the
+/// layer outlives the player.
 ///
-///   extern void rust_main(void);
+/// Declare in the Obj-C host as:
+///   extern void *rust_player_start(void *metal_layer, uint32_t w, uint32_t h);
 #[no_mangle]
-pub extern "C" fn rust_main() {
-    let _ = oslog::OsLogger::new("com.rust.player")
-        .level_filter(log::LevelFilter::Info)
-        .init();
+pub extern "C" fn rust_player_start(
+    metal_layer: *mut c_void,
+    width: u32,
+    height: u32,
+) -> *mut c_void {
+    init_once();
 
-    // Route any panics into oslog so they show up in Console.app /
-    // `simctl spawn log show`. Without this hook `panic_cannot_unwind`
-    // aborts the process while the panic message is still on stderr —
-    // which is /dev/null inside the simulator app sandbox.
-    std::panic::set_hook(Box::new(|info| {
-        let location = info
-            .location()
-            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
-            .unwrap_or_else(|| "<unknown>".to_string());
-        let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
-            (*s).to_string()
-        } else if let Some(s) = info.payload().downcast_ref::<String>() {
-            s.clone()
-        } else {
-            "<non-string panic payload>".to_string()
-        };
-        log::error!("RUST PANIC at {}: {}", location, payload);
-    }));
+    if metal_layer.is_null() {
+        log::error!("rust_player_start: null metal_layer");
+        return std::ptr::null_mut();
+    }
 
-    log::info!("rust_main: starting iOS playback shell");
+    log::info!("rust_player_start: {}x{}", width, height);
 
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime");
-    let _guard = rt.enter();
+    // `Player::new_from_metal_layer` blocks on building the renderer, which
+    // spawns Tokio tasks internally — so it must run inside the runtime.
+    let _guard = runtime().enter();
+    let player = Player::new_from_metal_layer(metal_layer, width.max(1), height.max(1));
 
-    log::info!("rust_main: building EventLoop");
-    let event_loop = EventLoop::new().expect("event loop");
-    event_loop.set_control_flow(ControlFlow::Poll);
-    log::info!("rust_main: EventLoop built, entering run_app");
+    // Drive the shared smoke-test fixture: open_url → clearkey → prepare →
+    // pick tracks → play(). Identical stream/keys as the desktop + Android shells.
+    runtime().spawn(app_shared::run_test_playback(player.clone()));
 
-    let mut app = App {
-        window: None,
-        player: None,
-    };
-    let result = event_loop.run_app(&mut app);
-    log::info!("rust_main: run_app returned: {:?}", result.is_ok());
+    Box::into_raw(Box::new(player)) as *mut c_void
+}
+
+/// Reconfigure the surface after a layout/orientation change. `width`/`height`
+/// are in physical pixels (the host multiplies points by the layer's
+/// `contentsScale`).
+#[no_mangle]
+pub extern "C" fn rust_player_set_size(handle: *mut c_void, width: u32, height: u32) {
+    if handle.is_null() {
+        return;
+    }
+    let player = unsafe { &*(handle as *mut Player) };
+    player.resize(PhysicalSize::new(width.max(1), height.max(1)));
+}
+
+/// Tear down the player and free the handle. Safe to call with NULL.
+#[no_mangle]
+pub extern "C" fn rust_player_destroy(handle: *mut c_void) {
+    if handle.is_null() {
+        return;
+    }
+    let _ = unsafe { Box::from_raw(handle as *mut Player) };
 }

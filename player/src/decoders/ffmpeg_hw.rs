@@ -3,7 +3,12 @@
 use std::sync::Arc;
 
 use ffmpeg_next::Packet;
-use ffmpeg_sys_next::{av_hwdevice_ctx_create, AVBufferRef, AVCodecContext, AVHWDeviceType, AVPixelFormat};
+use ffmpeg_sys_next::{
+    av_buffer_ref, av_buffer_unref, av_hwdevice_ctx_create, AVBufferRef, AVCodecContext,
+    AVHWDeviceType, AVPixelFormat,
+};
+#[cfg(target_os = "windows")]
+use ffmpeg_sys_next::{av_hwframe_ctx_alloc, av_hwframe_ctx_init, AVHWFramesContext};
 
 use crate::parsers::mp4::{apped_hevc_header, parse_hevc_nalu};
 
@@ -44,8 +49,12 @@ impl FfmpegHwDecoder {
 
 impl Drop for FfmpegHwDecoder {
     fn drop(&mut self) {
-        // ffmpeg-next's decoder Drop releases the codec context, which unref's
-        // hw_device_ctx. We don't free it here to avoid a double-free.
+        // configure() now hands the codec context its OWN refcounted reference
+        // (via av_buffer_ref) so the decoder's drop unrefs that one without
+        // invalidating ours. Release ours here.
+        if !self.hw_device_ctx.is_null() {
+            unsafe { av_buffer_unref(&mut self.hw_device_ctx) };
+        }
     }
 }
 
@@ -115,16 +124,48 @@ impl HwVideoDecoder for FfmpegHwDecoder {
             self.create_hw_device()?;
         }
         unsafe {
-            (*ctx.as_mut_ptr()).hw_device_ctx = self.hw_device_ctx;
-            // Leave `extra_hw_frames` at libavcodec's default (0). With 0,
-            // D3D11VA's frame allocator stays on a *dynamic* pool that hands
-            // out individual ID3D11Texture2D resources on demand; setting it
-            // >0 flips the same allocator to a *static* Texture2DArray sized
-            // to base_dpb + extra_hw_frames. Intel Arc D3D11VA returns ENOMEM
-            // from the very first packet on that static-array path (observed
-            // on A750, even at "safe" pool sizes), so the dynamic pool is the
-            // universally-compatible default — matches FFmpeg's hw_decode.c.
+            (*ctx.as_mut_ptr()).hw_device_ctx = av_buffer_ref(self.hw_device_ctx);
             (*ctx.as_mut_ptr()).get_format = Some(select_hw_format);
+        }
+
+        // Windows D3D11VA: pre-allocate `hw_frames_ctx` ourselves *before* the
+        // first send_packet. libavcodec's auto-allocation
+        // (avcodec_get_hw_frames_parameters → av_hwframe_ctx_init) returns
+        // ENOMEM on Intel Arc A750 the moment the first real slice arrives —
+        // observed regardless of `extra_hw_frames` value (64, 16, 0 all
+        // failed). Pre-allocating with explicit width/height/sw_format from
+        // the manifest sidesteps the auto-allocation path entirely.
+        //
+        // Sticking to AV_PIX_FMT_NV12 as sw_format: every Bento4/MPEG-DASH
+        // test stream we ship is 8-bit HEVC Main. Real 10-bit content
+        // (Main 10 HDR) would need P010 here, which we don't probe yet.
+        #[cfg(target_os = "windows")]
+        unsafe {
+            let frames_ref = av_hwframe_ctx_alloc(self.hw_device_ctx);
+            if frames_ref.is_null() {
+                return Err("av_hwframe_ctx_alloc returned null".into());
+            }
+            let frames_ctx = (*frames_ref).data as *mut AVHWFramesContext;
+            (*frames_ctx).format = AVPixelFormat::AV_PIX_FMT_D3D11;
+            (*frames_ctx).sw_format = AVPixelFormat::AV_PIX_FMT_NV12;
+            (*frames_ctx).width = params.width as i32;
+            (*frames_ctx).height = params.height as i32;
+            // 20 surfaces = HEVC max DPB (16) + a couple in flight to the
+            // renderer's pending queue. Static pool is fine here; the
+            // ENOMEM we were seeing was inside FFmpeg's *path*, not at the
+            // D3D11 driver level when an explicit pool size is set.
+            (*frames_ctx).initial_pool_size = 20;
+
+            let ret = av_hwframe_ctx_init(frames_ref);
+            if ret < 0 {
+                let mut owned = frames_ref;
+                av_buffer_unref(&mut owned);
+                return Err(format!("av_hwframe_ctx_init failed: {}", ret).into());
+            }
+
+            (*ctx.as_mut_ptr()).hw_frames_ctx = av_buffer_ref(frames_ref);
+            let mut owned = frames_ref;
+            av_buffer_unref(&mut owned);
         }
 
         let mut decoder = ctx

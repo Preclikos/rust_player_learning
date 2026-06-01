@@ -1502,6 +1502,15 @@ impl VideoRenderer {
                 keep.pop_front();
             }
         }
+
+        // Drain wgpu's deferred-destruction queue once per frame. Without
+        // this the per-frame VkImageViews / VkDescriptorSets / VkImages
+        // sit in `Device::lock_life` until something else polls — observed
+        // as a ~14 MB/min Graphics-PSS climb on Mali-G78 even with the AHB
+        // and VkDeviceMemory already freed. `Maintain::Poll` is non-
+        // blocking; it just walks the active submissions, releases the
+        // resources of any that have completed since last call.
+        let _ = self.device.poll(wgpu::PollType::Poll);
     }
 }
 

@@ -6,7 +6,7 @@ use std::future::Future;
 
 use crate::decoders::DecodedVideoFrame;
 use crate::parsers::vtt::VttCue;
-use winit::dpi::PhysicalSize;
+use crate::PhysicalSize;
 
 /// Receives decoded video frames and presents them to the display.
 /// Implementations swap per platform (wgpu NV12 on desktop, GLES OES on Android).

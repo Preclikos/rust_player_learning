@@ -10,7 +10,6 @@ use video_frame::VideoFrame;
 use video_metal::{MetalNV12Frame, MetalTextureCache};
 use wgpu::{Backends, Buffer};
 use wgpu::{Device, SurfaceConfiguration};
-use winit::dpi::PhysicalSize;
 
 #[cfg(target_os = "windows")]
 mod video_directx;
@@ -34,7 +33,32 @@ use wgpu::{Instance, InstanceDescriptor};
 
 use wgpu::TextureFormat;
 use wgpu::{util::DeviceExt, BindGroupLayout, Sampler};
-use winit::window::Window;
+
+use crate::PhysicalSize;
+use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
+// Raw-handle builders for the embedded Android path (host-provided ANativeWindow).
+#[cfg(target_os = "android")]
+use raw_window_handle::{AndroidDisplayHandle, AndroidNdkWindowHandle};
+
+/// Hook invoked right before each present (desktop wires this to
+/// `winit::window::Window::pre_present_notify`). The player crate stays
+/// winit-free; embedded hosts leave it unset.
+type PrePresentHook = Box<dyn Fn() + Send + Sync>;
+
+/// Where the wgpu `Surface` is built from. Consumed synchronously at the top of
+/// `new_with_surface` (before any await), so the raw pointer / handles never
+/// cross an await point.
+enum SurfaceSource {
+    /// Desktop / any host with raw window+display handles (e.g. winit). Also
+    /// the embedded Android path (an `ANativeWindow`-derived handle).
+    RawHandle {
+        window: RawWindowHandle,
+        display: Option<RawDisplayHandle>,
+    },
+    /// Embedded Apple: a host-provided `CAMetalLayer*`.
+    #[cfg(any(target_os = "ios", target_os = "macos"))]
+    MetalLayer(*mut std::ffi::c_void),
+}
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -108,7 +132,15 @@ fn select_preferred_format(
 }
 
 pub struct VideoRenderer {
-    window: Arc<Window>,
+    /// Last known drawable size (device pixels). There is no winit `Window` to
+    /// query, so the host keeps this current via `Player::resize`.
+    /// `std::sync::RwLock` (not tokio) so `inner_size()` stays a cheap
+    /// synchronous read inside the async render path.
+    surface_size: Arc<std::sync::RwLock<PhysicalSize<u32>>>,
+    /// Optional pre-present hook (desktop wires it to winit's
+    /// `pre_present_notify`). `std::sync::Mutex` because it's read inside the
+    /// synchronous tail of the render path, just before `queue.present()`.
+    pre_present: std::sync::Mutex<Option<PrePresentHook>>,
     device: wgpu::Device,
     // Used by the FFmpeg HW import path on Win/Linux to dispatch between
     // DX12 and Vulkan; the Apple Metal path doesn't need it.
@@ -122,7 +154,7 @@ pub struct VideoRenderer {
     /// the main video quad. Android's GLES OES path doesn't call it
     /// yet — subtitle rendering there is a separate follow-up.
     subtitle_overlay: Arc<std::sync::Mutex<Option<Arc<super::subtitle::SubtitleOverlay>>>>,
-    frame_size: Arc<RwLock<winit::dpi::PhysicalSize<u32>>>,
+    frame_size: Arc<RwLock<PhysicalSize<u32>>>,
     // Crop factor for the texture V-axis: content_height / buffer_height.
     // Always 1.0 on desktop; set to <1.0 on Android when the hardware codec
     // pads the output buffer taller than the visible frame (e.g. 736 for 720p).
@@ -168,7 +200,68 @@ pub enum VideoRendererCommand {
 }
 
 impl VideoRenderer {
-    pub async fn new(window: Arc<Window>) -> Self {
+    /// Desktop / any host that can hand over raw window + display handles
+    /// (e.g. winit). The player never touches winit; the host keeps the
+    /// underlying window alive for the renderer's lifetime.
+    pub async fn new_from_raw_handle(
+        window_handle: RawWindowHandle,
+        display_handle: RawDisplayHandle,
+        width: u32,
+        height: u32,
+    ) -> Self {
+        let size = PhysicalSize::new(width.max(1), height.max(1));
+        Self::new_with_surface(
+            size,
+            SurfaceSource::RawHandle {
+                window: window_handle,
+                display: Some(display_handle),
+            },
+        )
+        .await
+    }
+
+    /// Embedded Apple path: build the wgpu surface from a host-provided
+    /// `CAMetalLayer*` (no winit, no `UIApplicationMain`). The host guarantees
+    /// the layer outlives the renderer.
+    #[cfg(any(target_os = "ios", target_os = "macos"))]
+    pub async fn new_from_metal_layer(
+        layer: *mut std::ffi::c_void,
+        width: u32,
+        height: u32,
+    ) -> Self {
+        let size = PhysicalSize::new(width.max(1), height.max(1));
+        Self::new_with_surface(size, SurfaceSource::MetalLayer(layer)).await
+    }
+
+    /// Embedded Android path: build the wgpu surface from a host-provided
+    /// `ANativeWindow*` (no winit `NativeActivity`). The host (JNI shim)
+    /// acquires the window before this call and releases it after the renderer
+    /// is dropped.
+    #[cfg(target_os = "android")]
+    pub async fn new_from_android_surface(
+        native_window: *mut std::ffi::c_void,
+        width: u32,
+        height: u32,
+    ) -> Self {
+        let size = PhysicalSize::new(width.max(1), height.max(1));
+        let window = RawWindowHandle::AndroidNdk(AndroidNdkWindowHandle::new(
+            std::ptr::NonNull::new(native_window).expect("null ANativeWindow"),
+        ));
+        let display = RawDisplayHandle::Android(AndroidDisplayHandle::new());
+        Self::new_with_surface(
+            size,
+            SurfaceSource::RawHandle {
+                window,
+                display: Some(display),
+            },
+        )
+        .await
+    }
+
+    /// Shared constructor body. Differs from the old `new` only in how the
+    /// wgpu surface is created and where the initial size comes from — both are
+    /// parameters now.
+    async fn new_with_surface(size: PhysicalSize<u32>, surface_source: SurfaceSource) -> Self {
         #[cfg(target_os = "windows")]
         let backend = Backends::DX12;
         #[cfg(target_os = "linux")]
@@ -190,7 +283,22 @@ impl VideoRenderer {
             display: None,
         });
 
-        let surface = instance.create_surface(window.clone()).unwrap();
+        let surface = match surface_source {
+            SurfaceSource::RawHandle { window, display } => unsafe {
+                instance
+                    .create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
+                        raw_display_handle: display,
+                        raw_window_handle: window,
+                    })
+                    .unwrap()
+            },
+            #[cfg(any(target_os = "ios", target_os = "macos"))]
+            SurfaceSource::MetalLayer(layer) => unsafe {
+                instance
+                    .create_surface_unsafe(wgpu::SurfaceTargetUnsafe::CoreAnimationLayer(layer))
+                    .unwrap()
+            },
+        };
 
         #[cfg(target_os = "android")]
         let adapter = instance
@@ -301,8 +409,6 @@ impl VideoRenderer {
             })
             .await
             .unwrap();
-
-        let size: PhysicalSize<u32> = window.inner_size();
 
         let preferred_formats = vec![
             TextureFormat::Rgb10a2Unorm,
@@ -515,7 +621,8 @@ impl VideoRenderer {
         }
 
         let renderer = VideoRenderer {
-            window,
+            surface_size: Arc::new(std::sync::RwLock::new(size)),
+            pre_present: std::sync::Mutex::new(None),
             device,
             backend,
             queue,
@@ -543,6 +650,26 @@ impl VideoRenderer {
         renderer.spawn_command_thread(command_receiver);
 
         renderer
+    }
+
+    /// Last known drawable size (device pixels), kept current by the host via
+    /// `resize`. Replaces the old `window.inner_size()`.
+    #[inline]
+    fn inner_size(&self) -> PhysicalSize<u32> {
+        *self.surface_size.read().unwrap()
+    }
+
+    /// Invoke the host's pre-present hook if one is installed. No-op otherwise.
+    #[inline]
+    fn pre_present_notify(&self) {
+        if let Some(f) = self.pre_present.lock().unwrap().as_ref() {
+            f();
+        }
+    }
+
+    /// Install the pre-present hook (see `Player::set_pre_present_hook`).
+    pub fn set_pre_present_hook(&self, hook: PrePresentHook) {
+        *self.pre_present.lock().unwrap() = Some(hook);
     }
 
     async fn change_vertex_buffer(
@@ -579,7 +706,7 @@ impl VideoRenderer {
         let tex_y_max = Arc::clone(&self.tex_y_max);
         let vertex_buffer = self.vertex_buffer.clone(); // Option<Arc<...>>
         let device = self.device.clone();
-        let window = self.window.clone();
+        let surface_size = Arc::clone(&self.surface_size);
         tokio::spawn(async move {
             while let Some(initial) = command_receiver.recv().await {
                 // Drain the channel and keep only the latest of each command
@@ -609,7 +736,7 @@ impl VideoRenderer {
                         let mut size = frame_size.write().await;
                         *size = new_frame_size;
                     }
-                    let window_size = window.inner_size();
+                    let window_size = *surface_size.read().unwrap();
                     if window_size.width > 0 && window_size.height > 0 {
                         // Release the config write lock before taking surface.lock() —
                         // the render path takes surface first, then config(read), so
@@ -639,6 +766,9 @@ impl VideoRenderer {
                 if let Some(new_size) = latest_resize {
                     if new_size.width > 0 && new_size.height > 0 {
                         log::info!("[renderer] resize {}x{}", new_size.width, new_size.height);
+                        // Keep the size cell current so later inner_size() reads
+                        // (render path, ChangeFrameSize) see the new layout.
+                        *surface_size.write().unwrap() = new_size;
                         let new_config = {
                             let mut config_guard = config.write().await;
                             config_guard.width = new_size.width;
@@ -780,7 +910,7 @@ impl VideoRenderer {
                     // the config is corrected before the next frame.
                     log::warn!("[renderer] suboptimal surface — queuing resize, rendering anyway");
                     let _ = self.command_sender.try_send(
-                        VideoRendererCommand::Resize(self.window.inner_size()),
+                        VideoRendererCommand::Resize(self.inner_size()),
                     );
                     t
                 }
@@ -840,7 +970,7 @@ impl VideoRenderer {
 
             // Submit the command in the queue to execute
             self.queue.submit([encoder.finish()]);
-            self.window.pre_present_notify();
+            self.pre_present_notify();
             self.queue.present(surface_texture);
         }
     }
@@ -890,7 +1020,7 @@ impl VideoRenderer {
                 log::warn!("[renderer] suboptimal surface — queuing resize, rendering anyway");
                 let _ = self
                     .command_sender
-                    .try_send(VideoRendererCommand::Resize(self.window.inner_size()));
+                    .try_send(VideoRendererCommand::Resize(self.inner_size()));
                 t
             }
             other => {
@@ -940,7 +1070,7 @@ impl VideoRenderer {
         }
 
         self.queue.submit([encoder.finish()]);
-        self.window.pre_present_notify();
+        self.pre_present_notify();
         self.queue.present(surface_texture);
     }
 
@@ -1050,13 +1180,13 @@ impl VideoRenderer {
                 });
             }
             self.queue.submit([encoder.finish()]);
-            self.window.pre_present_notify();
+            self.pre_present_notify();
             self.queue.present(surface_texture);
             return;
         };
 
         // Compute aspect-ratio-preserving scale factors.
-        let window_size = self.window.inner_size();
+        let window_size = self.inner_size();
         let frame_size = *self.frame_size.read().await;
         let tex_y_max = *self.tex_y_max.read().await;
         let (scale_x, scale_y) = if frame_size.width > 0 && frame_size.height > 0 {
@@ -1086,7 +1216,7 @@ impl VideoRenderer {
         // Submit empty wgpu work to keep the frame-tracking state machine consistent,
         // then present — the hook fires inside present() and draws the OES quad.
         self.queue.submit([]);
-        self.window.pre_present_notify();
+        self.pre_present_notify();
         self.queue.present(surface_texture);
 
         // Keep this AHB alive for one extra frame. The GPU may still be sampling
@@ -1134,11 +1264,11 @@ impl super::VideoSink for VideoRenderer {
         VideoRenderer::render_frame(self, frame)
     }
 
-    fn resize(&self, size: winit::dpi::PhysicalSize<u32>) -> impl std::future::Future<Output = ()> + Send + '_ {
+    fn resize(&self, size: PhysicalSize<u32>) -> impl std::future::Future<Output = ()> + Send + '_ {
         VideoRenderer::resize(self, size)
     }
 
-    fn change_frame_size(&self, size: winit::dpi::PhysicalSize<u32>) -> impl std::future::Future<Output = ()> + Send + '_ {
+    fn change_frame_size(&self, size: PhysicalSize<u32>) -> impl std::future::Future<Output = ()> + Send + '_ {
         VideoRenderer::change_frame_size(self, size)
     }
 

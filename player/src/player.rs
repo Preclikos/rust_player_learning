@@ -20,6 +20,24 @@ pub use net::{
     BoxError, HttpClient, LicenseResolver, NoopInterceptor, PreparedRequest,
     RequestInterceptor, RequestKind, RetryPolicy,
 };
+/// Physical (device-pixel) size of the render target. A tiny owned type so the
+/// player crate doesn't depend on winit; mirrors the subset of
+/// `winit::dpi::PhysicalSize` the player uses (`new`, `.width`, `.height`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct PhysicalSize<P = u32> {
+    pub width: P,
+    pub height: P,
+}
+
+impl<P> PhysicalSize<P> {
+    pub const fn new(width: P, height: P) -> Self {
+        Self { width, height }
+    }
+}
+
+// Re-exported so hosts can name the handle types they pass to
+// `Player::new_from_raw_handle` without pinning their own raw-window-handle.
+pub use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 
 use crypto::{
     kid_short, parse_aac_config, parse_hvcc_nalus, parse_senc, parse_tenc, ClearKeyDecryptor,
@@ -35,8 +53,6 @@ use re_mp4::Mp4;
 use renderers::audio::AudioRenderer;
 use renderers::video::VideoRenderer;
 use renderers::{AudioSink, VideoSink};
-use winit::dpi::PhysicalSize;
-use winit::window::Window;
 
 use arc_swap::ArcSwap;
 use std::collections::HashMap;
@@ -1537,15 +1553,72 @@ async fn video_supervisor(
 // ---------------------------------------------------------------------------
 
 impl Player<VideoRenderer, AudioRenderer> {
-    pub fn new(window: Arc<Window>) -> Self {
+    /// Host-owned-surface path for desktop (or any host that can hand over raw
+    /// window + display handles, e.g. winit). The player never touches winit
+    /// itself — the host keeps the underlying window alive for the player's
+    /// lifetime and forwards layout changes via `resize`.
+    pub fn new_from_raw_handle(
+        window_handle: RawWindowHandle,
+        display_handle: RawDisplayHandle,
+        width: u32,
+        height: u32,
+    ) -> Self {
+        let video_renderer = Arc::new(
+            VideoRenderer::new_from_raw_handle(window_handle, display_handle, width, height)
+                .block_on(),
+        );
+        let audio_renderer = Arc::new(AudioRenderer::new());
+        Self::from_renderers(video_renderer, audio_renderer)
+    }
+
+    /// Install a hook invoked right before each frame is presented. Desktop
+    /// hosts wire this to `winit::window::Window::pre_present_notify` so the
+    /// compositor still gets its frame-pacing hint; embedded hosts (iOS/Android)
+    /// leave it unset (`CAMetalLayer` / `ANativeWindow` need no pre-notify).
+    pub fn set_pre_present_hook(&self, hook: Box<dyn Fn() + Send + Sync>) {
+        self.video_renderer.set_pre_present_hook(hook);
+    }
+
+    /// Embedded Apple path: render into a host-provided `CAMetalLayer*`.
+    /// Mirror of `new` for an app that owns `UIApplicationMain` itself (no
+    /// winit). The host keeps the layer alive for the player's lifetime and
+    /// drives layout changes through `Player::resize`.
+    #[cfg(any(target_os = "ios", target_os = "macos"))]
+    pub fn new_from_metal_layer(layer: *mut std::ffi::c_void, width: u32, height: u32) -> Self {
+        let video_renderer =
+            Arc::new(VideoRenderer::new_from_metal_layer(layer, width, height).block_on());
+        let audio_renderer = Arc::new(AudioRenderer::new());
+        Self::from_renderers(video_renderer, audio_renderer)
+    }
+
+    /// Embedded Android path: render into a host-provided `ANativeWindow*`
+    /// (obtained from a Java `Surface`). Mirror of `new` for a host Activity
+    /// that owns the `SurfaceView` (no winit `NativeActivity`).
+    #[cfg(target_os = "android")]
+    pub fn new_from_android_surface(
+        native_window: *mut std::ffi::c_void,
+        width: u32,
+        height: u32,
+    ) -> Self {
+        let video_renderer = Arc::new(
+            VideoRenderer::new_from_android_surface(native_window, width, height).block_on(),
+        );
+        let audio_renderer = Arc::new(AudioRenderer::new());
+        Self::from_renderers(video_renderer, audio_renderer)
+    }
+
+    /// Assemble a `Player` from already-built renderers. Shared tail of every
+    /// constructor above — the only difference between the winit and embedded
+    /// paths is how the `VideoRenderer` obtained its surface.
+    fn from_renderers(
+        video_renderer: Arc<VideoRenderer>,
+        audio_renderer: Arc<AudioRenderer>,
+    ) -> Self {
         let start_time = Arc::new(Instant::now());
 
         let video_ready = Arc::new(Notify::new());
         let audio_ready = Arc::new(Notify::new());
         let stop = Arc::new(Notify::new());
-
-        let video_renderer = Arc::new(VideoRenderer::new(window).block_on());
-        let audio_renderer = Arc::new(AudioRenderer::new());
 
         let (events_tx, _) = broadcast::channel::<PlayerEvent>(64);
         let events = Arc::new(events_tx);

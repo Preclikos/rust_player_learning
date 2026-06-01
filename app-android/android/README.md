@@ -1,8 +1,10 @@
 # Android build
 
-Gradle wrapper around the `app-android` Rust cdylib. Produces an APK that
-loads `libapp_android.so` via `NativeActivity` and dispatches to
-`android_main()`.
+Gradle wrapper around the `app-android` Rust cdylib. Produces an APK whose
+`MainActivity` owns a `SurfaceView` and hands its `Surface` to the embedded
+Rust player over JNI (`nativeStart` / `nativeSetSize` / `nativeDestroy`). This
+is the **embed** model real apps use — the player renders straight into a
+host-owned Surface, not a winit `NativeActivity`.
 
 ## Verified status
 
@@ -76,9 +78,9 @@ cd app-android/android
 adb logcat -s RustStdoutStderr   # follow Rust log output
 ```
 
-Expected behaviour: blank window, `RustStdoutStderr` shows
-`android_main: starting` and `window created`. Nothing else — the
-player library isn't wired in yet.
+Expected behaviour: the `SurfaceView` shows the decrypted test stream
+(MediaCodec HEVC → GLES). `logcat` shows `app-android: embedded player
+loaded`, `nativeStart: WxH`, then the playback pipeline logs.
 
 ## Adding more ABIs
 
@@ -91,10 +93,11 @@ rustup target add armv7-linux-androideabi
 rustup target add x86_64-linux-android
 ```
 
-## What's NOT working yet
+## Architecture note
 
-The APK launches and `android_main()` runs winit's event loop, but
-`Player` is not constructed — the player library still depends on
-FFmpeg + D3D11VA/VAAPI which are not available on Android. The decoder
-refactor (`HwVideoDecoder` trait + `MediaCodec` impl) is the next step
-to make actual playback work.
+`MainActivity` (Java) is a thin host: it creates a `SurfaceView`, and on
+`surfaceChanged` calls `nativeStart(surface, w, h)` (or `nativeSetSize`
+on later layout changes), then `nativeDestroy` on `surfaceDestroyed`.
+The Rust side (`app-android/src/lib.rs`) turns the `Surface` into an
+`ANativeWindow`, builds `Player::new_from_android_surface`, and plays the
+bundled encrypted test stream. There is no winit on this path.

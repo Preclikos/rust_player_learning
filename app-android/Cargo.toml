@@ -13,10 +13,9 @@ path = "src/lib.rs"
 [target.'cfg(target_os = "android")'.dependencies]
 player = { path = "../player" }
 app-shared = { path = "../app-shared" }
-winit = { version = "0.30.9", features = ["android-native-activity"] }
-android-activity = { version = "0.6", features = ["native-activity"] }
 android_logger = "0.14"
 log = "0.4"
 tokio = { version = "1.43.0", features = ["full"] }
-pollster = "0.4.0"
-libc = "0.2"
+# JNI entry points + ANativeWindow_fromSurface for the host-Surface embed path.
+jni = "0.21"
+ndk-sys = "0.6"

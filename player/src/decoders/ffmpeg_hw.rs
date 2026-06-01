@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use ffmpeg_next::Packet;
-use ffmpeg_sys_next::{av_hwdevice_ctx_create, AVBufferRef, AVHWDeviceType};
+use ffmpeg_sys_next::{av_hwdevice_ctx_create, AVBufferRef, AVCodecContext, AVHWDeviceType, AVPixelFormat};
 
 use crate::parsers::mp4::{apped_hevc_header, parse_hevc_nalu};
 
@@ -49,6 +49,45 @@ impl Drop for FfmpegHwDecoder {
     }
 }
 
+// libavcodec calls `get_format` during stream-header parsing with a
+// null-terminated array of pixel formats the decoder can produce for
+// the negotiated stream. The default impl picks the first software
+// format, which leaves `frame.hw_frames_ctx == NULL` and breaks
+// renderers/video/video_frame.rs:101's hw_frames_ctx expectation.
+//
+// We pick the platform's HW format if it's on offer and otherwise
+// return AV_PIX_FMT_NONE so libavcodec aborts decoder open — louder
+// than silently sliding into software and panicking downstream.
+#[cfg(target_os = "windows")]
+unsafe extern "C" fn select_hw_format(
+    _ctx: *mut AVCodecContext,
+    fmts: *const AVPixelFormat,
+) -> AVPixelFormat {
+    let mut p = fmts;
+    while unsafe { *p } != AVPixelFormat::AV_PIX_FMT_NONE {
+        if unsafe { *p } == AVPixelFormat::AV_PIX_FMT_D3D11 {
+            return AVPixelFormat::AV_PIX_FMT_D3D11;
+        }
+        p = unsafe { p.add(1) };
+    }
+    AVPixelFormat::AV_PIX_FMT_NONE
+}
+
+#[cfg(target_os = "linux")]
+unsafe extern "C" fn select_hw_format(
+    _ctx: *mut AVCodecContext,
+    fmts: *const AVPixelFormat,
+) -> AVPixelFormat {
+    let mut p = fmts;
+    while unsafe { *p } != AVPixelFormat::AV_PIX_FMT_NONE {
+        if unsafe { *p } == AVPixelFormat::AV_PIX_FMT_VAAPI {
+            return AVPixelFormat::AV_PIX_FMT_VAAPI;
+        }
+        p = unsafe { p.add(1) };
+    }
+    AVPixelFormat::AV_PIX_FMT_NONE
+}
+
 impl HwVideoDecoder for FfmpegHwDecoder {
     fn name(&self) -> &'static str {
         #[cfg(target_os = "windows")]
@@ -81,6 +120,9 @@ impl HwVideoDecoder for FfmpegHwDecoder {
             // to cover them all. extra_hw_frames enlarges the fixed pool by
             // this amount on top of FFmpeg's inferred minimum.
             (*ctx.as_mut_ptr()).extra_hw_frames = 64;
+            // Steer libavcodec to the HW pixel format instead of the
+            // software fallback — see select_hw_format above.
+            (*ctx.as_mut_ptr()).get_format = Some(select_hw_format);
         }
 
         let mut decoder = ctx

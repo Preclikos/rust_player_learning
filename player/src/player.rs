@@ -1488,6 +1488,9 @@ async fn video_supervisor(
     position_ms: Arc<AtomicU64>,
     events: Arc<broadcast::Sender<PlayerEvent>>,
     segments_in_flight: usize,
+    // Content origin (first segment's absolute presentation time). position_ms
+    // is 0-based, so we add this back to locate segments on a soft swap.
+    origin: Duration,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut current_repr = initial_repr;
     let mut current_start = initial_start_index;
@@ -1586,7 +1589,8 @@ async fn video_supervisor(
         // the current playback position. This guarantees the first frame
         // emitted by the NEW pipeline has PTS > the last frame from the
         // OLD pipeline, so the av_sync receiver doesn't see backward PTS.
-        let pos = Duration::from_millis(position_ms.load(Ordering::Relaxed));
+        // position_ms is 0-based; segment start_times are absolute → add origin.
+        let pos = Duration::from_millis(position_ms.load(Ordering::Relaxed)) + origin;
         let mut new_start = find_segment_index(&new_repr.segments, pos);
         if new_start + 1 < new_repr.segments.len() {
             new_start = new_start.saturating_add(1);
@@ -2222,17 +2226,13 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         let audio_sink = self.audio_renderer.clone();
         let seek_target = self.seek_target.clone();
         let position_ms = self.position_ms.clone();
-        // Upcast Arc<ClearKeyDecryptor> → Arc<dyn Decryptor> for the
-        // generic pipeline. Cache + resolver are owned by the
-        // ClearKeyDecryptor and persist across play() cycles.
-        let decryptor_snapshot: Option<Arc<dyn Decryptor>> = self
-            .decryptor
-            .lock()
-            .unwrap()
-            .clone()
-            .map(|d| d as Arc<dyn Decryptor>);
-        let http_video = Arc::clone(&self.http);
-        let http_audio = Arc::clone(&self.http);
+        // Cells re-read on every (re)start of the pipeline so a seek /
+        // track-switch picks up the latest selection + decryptor without the
+        // consumer re-calling play().
+        let http = Arc::clone(&self.http);
+        let video_repr_cell = Arc::clone(&self.video_representation);
+        let audio_repr_cell = Arc::clone(&self.audio_representation);
+        let decryptor_cell = Arc::clone(&self.decryptor);
         let events = Arc::clone(&self.events);
         let paused = Arc::clone(&self.paused);
         let pause_notify = Arc::clone(&self.pause_notify);
@@ -2273,25 +2273,8 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             *self.stats.decoder_name.lock().unwrap() = probe.name().to_string();
         }
 
-        // macOS + iOS both use FFmpeg for audio (AudioToolbox AAC is broken when
-        // fed access units packet-by-packet); video stays native VideoToolbox.
-        #[cfg(any(
-            target_os = "windows",
-            target_os = "linux",
-            target_os = "macos",
-            target_os = "ios"
-        ))]
-        let audio_decoder: Box<dyn AudioDecoder> =
-            Box::new(decoders::ffmpeg_audio::FfmpegAudioDecoder::new());
-        #[cfg(target_os = "android")]
-        let audio_decoder: Box<dyn AudioDecoder> =
-            Box::new(decoders::mediacodec_audio::MediaCodecAudioDecoder::new());
-
-        // Install a fresh per-play switch channel so apply_video_representation
-        // can route ABR swaps into the supervisor. Dropped at end of play().
-        let (switch_tx, switch_rx) =
-            tokio::sync::watch::channel::<Option<VideoRepresenation>>(None);
-        *self.video_switch_tx.lock().unwrap() = Some(switch_tx);
+        // The per-play switch channel (ABR soft-swap) is (re)installed inside
+        // the pipeline loop below; keep a handle to the slot for cleanup.
         let video_switch_slot = Arc::clone(&self.video_switch_tx);
 
         let stats = Arc::clone(&self.stats);
@@ -2304,18 +2287,10 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             "play(): buffer target {}s -> {} segments in flight",
             self.buffer_target_secs.load(Ordering::Relaxed), seg_in_flight
         );
-        // Snapshot the subtitle representation at play() time. Mid-play
-        // track switches go through set_subtitle_track which already
-        // calls clear_subtitles + stores the new repr; the next play()
-        // cycle picks it up.
-        let subtitle_repr_snapshot = self.subtitle_representation.lock().unwrap().clone();
-        let http_subs = Arc::clone(&self.http);
-        let video_sink_for_subs = self.video_renderer.clone();
-
         let play = tokio::spawn(async move {
-            // ABR tick: runs alongside the playback pipeline. Each second,
-            // if the strategy is BandwidthEwma, re-evaluate which video
-            // representation fits the measured throughput. Quiet on Manual.
+            // ABR tick runs once for the whole play() lifetime (survives the
+            // seek/track-switch restarts below), stopping with the play-level
+            // stop_flag. On Manual it's a no-op each tick.
             let abr_stop_flag = abr_player.stop_flag.clone();
             tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(Duration::from_secs(1));
@@ -2330,127 +2305,183 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                     abr_player.abr_tick();
                 }
             });
-            let seek_offset = {
-                let mut target = seek_target.write().await;
-                stop_flag.store(false, Ordering::Relaxed);
-                target.take().unwrap_or(Duration::ZERO)
-            };
 
-            // Hard reset the audio sink before the new pipeline starts
-            // pumping samples. Without this, a play() that follows a
-            // natural EndOfStream inherits the previous pipeline's
-            // residual cpal-channel contents — the bounded mpsc holds
-            // up to ~2 s of f32 samples — and the next audio_sync_loop
-            // blocks on `send().await` until cpal drains the stale
-            // buffer at real-time rate. The downstream effect was that
-            // the second video in a loop appeared silent for the first
-            // few seconds and could deadlock if upstream backpressure
-            // stalled the decoder before any new sample landed in cpal.
-            // seek() already does this for user-initiated restarts;
-            // doing it here covers the EOS → next-play() case too.
-            audio_sink.flush();
-            audio_sink.set_paused(true);
+            // Self-restarting pipeline. seek() / change_video_track() /
+            // change_audio_track() tear the current pipeline down (set
+            // stop_flag + seek_target) — we rebuild here instead of relying on
+            // the consumer to call play() again in a loop. A real stop() (no
+            // seek_target) or a natural EndOfStream (stop_flag stays false)
+            // leaves seek_target None after the pipeline ends → we exit.
+            loop {
+                let seek_offset = {
+                    let mut target = seek_target.write().await;
+                    stop_flag.store(false, Ordering::Relaxed);
+                    target.take().unwrap_or(Duration::ZERO)
+                };
 
-            let video_start_index =
-                find_segment_index(&video_representation.segments, seek_offset);
-            let audio_start_index =
-                find_segment_index(&audio_representation.segments, seek_offset);
+                // Hard reset the audio sink before the (re)started pipeline
+                // pumps samples — drops the previous pipeline's residual
+                // cpal-channel contents (see seek()/EOS rationale).
+                audio_sink.flush();
+                audio_sink.set_paused(true);
 
-            let snapped_seek_offset = video_representation
-                .segments
-                .get(video_start_index)
-                .map(|s| s.start_time())
-                .unwrap_or(seek_offset);
-            position_ms.store(snapped_seek_offset.as_millis() as u64, Ordering::Relaxed);
-            // Snap the decode high-water-mark to the new position so the
-            // buffer gauge reads 0 until the fresh pipeline produces its
-            // first frames. Otherwise a stale value from the previous
-            // pipeline would inflate (or after a backward seek, mislead)
-            // the gauge for the first second.
-            stats
-                .last_decoded_pts_ms
-                .store(snapped_seek_offset.as_millis() as i64, Ordering::Relaxed);
-            stats
-                .audio_last_decoded_pts_ms
-                .store(snapped_seek_offset.as_millis() as i64, Ordering::Relaxed);
-            // Clear any stale starvation state from a previous play()
-            // — a play that ended in Buffering would otherwise leave
-            // the flags set, and the next pipeline would never emit
-            // the initial Playing event because is_buffering would
-            // already read true.
-            stats.video_starving.store(false, Ordering::Relaxed);
-            stats.audio_starving.store(false, Ordering::Relaxed);
+                // Re-read the current selection so a track switch that arrived
+                // alongside the seek takes effect on restart.
+                let video_representation = match video_repr_cell.lock().unwrap().clone() {
+                    Some(v) => v,
+                    None => break,
+                };
+                let audio_representation = match audio_repr_cell.lock().unwrap().clone() {
+                    Some(a) => a,
+                    None => break,
+                };
+                // A zero-segment representation would buffer forever — fail loud
+                // instead of wedging (also guards a restart onto a broken rep).
+                if video_representation.segments.is_empty()
+                    || audio_representation.segments.is_empty()
+                {
+                    let _ = events.send(PlayerEvent::Error {
+                        kind: PlayerErrorKind::ManifestParse,
+                        detail: "selected representation has no media segments".to_string(),
+                    });
+                    break;
+                }
 
-            let (frame_sender, frame_receiver) = mpsc::channel::<DecodedVideoFrame>(64);
-            let (sample_sender, sample_receiver) = mpsc::channel::<DecodedAudioFrame>(256);
+                // Content origin = the first segment's presentation time. The
+                // media PTS / sidx EPT are absolute (non-zero
+                // baseMediaDecodeTime), so subtracting this exposes a 0-based
+                // position/seek to consumers (matches the 0-based duration).
+                let origin = video_representation
+                    .segments
+                    .first()
+                    .map(|s| s.start_time())
+                    .unwrap_or(Duration::ZERO);
 
-            let events_for_supervisor = Arc::clone(&events);
-            let video = tokio::spawn(video_supervisor(
-                video_representation,
-                video_start_index,
-                frame_sender,
-                video_ready.clone(),
-                stop.clone(),
-                stop_flag.clone(),
-                decryptor_snapshot.clone(),
-                video_decoder_factory,
-                http_video,
-                Arc::clone(&stats),
-                switch_rx,
-                position_ms.clone(),
-                events_for_supervisor,
-                seg_in_flight,
-            ));
+                // seek_offset is 0-based; map to the absolute media timeline to
+                // locate the segment.
+                let abs_offset = seek_offset + origin;
+                let video_start_index =
+                    find_segment_index(&video_representation.segments, abs_offset);
+                let audio_start_index =
+                    find_segment_index(&audio_representation.segments, abs_offset);
 
-            let sample_rate = audio_sink.sample_rate();
-            let audio = tokio::spawn(audio_play(
-                audio_representation,
-                audio_start_index,
-                audio_ready.clone(),
-                sample_sender,
-                sample_rate,
-                stop.clone(),
-                stop_flag.clone(),
-                decryptor_snapshot,
-                audio_decoder,
-                http_audio,
-                Arc::clone(&stats),
-                seg_in_flight,
-            ));
+                // 0-based snapped position (absolute segment start - origin).
+                // Feeding this to av_sync (start_time = now - snapped) keeps the
+                // video_sync_loop's `base` anchored to the origin, so position
+                // and pts_ms come out 0-based.
+                let snapped_abs = video_representation
+                    .segments
+                    .get(video_start_index)
+                    .map(|s| s.start_time())
+                    .unwrap_or(abs_offset);
+                let snapped_seek_offset = snapped_abs.saturating_sub(origin);
+                position_ms.store(snapped_seek_offset.as_millis() as u64, Ordering::Relaxed);
+                stats
+                    .last_decoded_pts_ms
+                    .store(snapped_seek_offset.as_millis() as i64, Ordering::Relaxed);
+                stats
+                    .audio_last_decoded_pts_ms
+                    .store(snapped_seek_offset.as_millis() as i64, Ordering::Relaxed);
+                // Clear stale starvation state so the fresh pipeline can emit
+                // its initial Playing event.
+                stats.video_starving.store(false, Ordering::Relaxed);
+                stats.audio_starving.store(false, Ordering::Relaxed);
 
-            // Subtitles: text_play is spawned from set_subtitle_track,
-            // not here. It runs independently of play() so seeks or
-            // track switches don't tear it down — the loaded cues live
-            // in the overlay until clear_subtitle_track or a new
-            // set_subtitle_track replaces them.
-            let _ = (&http_subs, &video_sink_for_subs, &subtitle_repr_snapshot);
+                // Per-iteration decryptor snapshot (shared ClearKey state).
+                let decryptor_snapshot: Option<Arc<dyn Decryptor>> = decryptor_cell
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .map(|d| d as Arc<dyn Decryptor>);
 
-            av_sync_handler(
-                snapped_seek_offset,
-                video_ready.clone(),
-                frame_receiver,
-                video_sink,
-                position_ms,
-                audio_ready.clone(),
-                sample_receiver,
-                audio_sink,
-                stop.clone(),
-                stop_flag.clone(),
-                events,
-                media_duration,
-                paused,
-                pause_notify,
-                stats,
-            )
-            .await;
+                // Per-iteration audio decoder (consumed by audio_play).
+                #[cfg(any(
+                    target_os = "windows",
+                    target_os = "linux",
+                    target_os = "macos",
+                    target_os = "ios"
+                ))]
+                let audio_decoder: Box<dyn AudioDecoder> =
+                    Box::new(decoders::ffmpeg_audio::FfmpegAudioDecoder::new());
+                #[cfg(target_os = "android")]
+                let audio_decoder: Box<dyn AudioDecoder> =
+                    Box::new(decoders::mediacodec_audio::MediaCodecAudioDecoder::new());
 
-            let (play_res, audio_res) = join!(video, audio);
-            log_task_result("video_supervisor", play_res);
-            log_task_result("audio_play", audio_res);
+                // Fresh per-iteration switch channel for ABR soft-swaps.
+                let (switch_tx, switch_rx) =
+                    tokio::sync::watch::channel::<Option<VideoRepresenation>>(None);
+                *video_switch_slot.lock().unwrap() = Some(switch_tx);
 
-            // Drop the watch sender so a stale apply_video_representation
-            // between play() calls becomes a no-op until the next play().
-            *video_switch_slot.lock().unwrap() = None;
+                let (frame_sender, frame_receiver) = mpsc::channel::<DecodedVideoFrame>(64);
+                let (sample_sender, sample_receiver) = mpsc::channel::<DecodedAudioFrame>(256);
+
+                let video = tokio::spawn(video_supervisor(
+                    video_representation,
+                    video_start_index,
+                    frame_sender,
+                    video_ready.clone(),
+                    stop.clone(),
+                    stop_flag.clone(),
+                    decryptor_snapshot.clone(),
+                    video_decoder_factory.clone(),
+                    Arc::clone(&http),
+                    Arc::clone(&stats),
+                    switch_rx,
+                    position_ms.clone(),
+                    Arc::clone(&events),
+                    seg_in_flight,
+                    origin,
+                ));
+
+                let sample_rate = audio_sink.sample_rate();
+                let audio = tokio::spawn(audio_play(
+                    audio_representation,
+                    audio_start_index,
+                    audio_ready.clone(),
+                    sample_sender,
+                    sample_rate,
+                    stop.clone(),
+                    stop_flag.clone(),
+                    decryptor_snapshot,
+                    audio_decoder,
+                    Arc::clone(&http),
+                    Arc::clone(&stats),
+                    seg_in_flight,
+                ));
+
+                av_sync_handler(
+                    snapped_seek_offset,
+                    video_ready.clone(),
+                    frame_receiver,
+                    video_sink.clone(),
+                    position_ms.clone(),
+                    audio_ready.clone(),
+                    sample_receiver,
+                    audio_sink.clone(),
+                    stop.clone(),
+                    stop_flag.clone(),
+                    Arc::clone(&events),
+                    media_duration,
+                    paused.clone(),
+                    pause_notify.clone(),
+                    Arc::clone(&stats),
+                )
+                .await;
+
+                let (play_res, audio_res) = join!(video, audio);
+                log_task_result("video_supervisor", play_res);
+                log_task_result("audio_play", audio_res);
+
+                // Drop the watch sender so a stale apply_video_representation
+                // between pipelines becomes a no-op.
+                *video_switch_slot.lock().unwrap() = None;
+
+                // Restart in-process iff a seek arrived (seek_target set again
+                // by seek()/change_*_track). A real stop()/EOS leaves it None.
+                if seek_target.read().await.is_none() {
+                    break;
+                }
+            }
         });
         Ok(play)
     }

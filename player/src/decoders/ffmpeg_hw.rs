@@ -35,6 +35,23 @@ impl FfmpegHwDecoder {
         #[cfg(target_os = "linux")]
         let device_type = AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI;
 
+        // One-time: bump FFmpeg's libavcodec/libavutil log level to VERBOSE so
+        // the underlying HRESULT from D3D11VA's CreateTexture2D (e.g.
+        // "CreateTexture2D failed: 0x80070057") prints to stderr alongside
+        // our AVERROR_UNKNOWN wrapping. Without this we only see the
+        // catch-all FFmpeg error and have no way to tell what the driver
+        // actually rejected. On Linux these lines flow through Rust's `log`
+        // crate via `ffmpeg_log::install_once`; on Windows there's no
+        // forwarder, so they hit stderr directly. Either way they show up
+        // in the same log capture.
+        unsafe {
+            use std::sync::Once;
+            static LOG_INIT: Once = Once::new();
+            LOG_INIT.call_once(|| {
+                ffmpeg_sys_next::av_log_set_level(ffmpeg_sys_next::AV_LOG_VERBOSE);
+            });
+        }
+
         let mut ctx: *mut AVBufferRef = std::ptr::null_mut();
         let ret = unsafe {
             av_hwdevice_ctx_create(&mut ctx, device_type, std::ptr::null(), std::ptr::null_mut(), 0)

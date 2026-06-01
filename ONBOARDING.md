@@ -72,9 +72,11 @@ player.volume(diff: f32)
 
 ## Decoder pipeline
 
-### Desktop (Windows / Linux)
-- **Video**: FFmpeg `ffmpeg-next 8.1` → D3D11VA (Windows) or VAAPI (Linux) → `VideoFrame` → wgpu NV12 texture → `shader.wgsl`
-- **Audio**: FFmpeg → PCM → cpal
+### Desktop (Windows / Linux / macOS)
+- **Video**: FFmpeg `ffmpeg-next 7.1` → D3D11VA (Windows) / VAAPI (Linux) → `VideoFrame` → wgpu NV12 texture → `shader.wgsl`. macOS skips FFmpeg for video and runs VTDecompressionSession directly.
+- **Audio**: FFmpeg → PCM → cpal. macOS also takes the FFmpeg path because AudioToolbox's AAC decoder mis-handles packetized AUs.
+
+See [`README.md`](README.md) for how to build a known-good FFmpeg locally and run the smoke tests.
 
 ### Android
 - **Video**: NDK `MediaCodec` → `AHardwareBuffer` → one of two render paths (see below)

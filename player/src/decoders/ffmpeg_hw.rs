@@ -144,8 +144,13 @@ impl HwVideoDecoder for FfmpegHwDecoder {
         // call.
         #[cfg(target_os = "windows")]
         unsafe {
+            // FFmpeg exposes P010 only as endian-tagged variants
+            // (`AV_PIX_FMT_P010LE` / `AV_PIX_FMT_P010BE`); the bare
+            // `AV_PIX_FMT_P010` is a C macro that bindgen doesn't surface.
+            // Every target we ship on (Windows / Linux / Android / Apple) is
+            // little-endian, so hard-code the LE form.
             let sw_format = if params.bit_depth >= 10 {
-                AVPixelFormat::AV_PIX_FMT_P010
+                AVPixelFormat::AV_PIX_FMT_P010LE
             } else {
                 AVPixelFormat::AV_PIX_FMT_NV12
             };

@@ -1,5 +1,10 @@
 /target
 
+# Vendored FFmpeg system libs produced by player/scripts/build-ffmpeg.sh.
+# Local artefacts only — every dev/runner builds their own per platform.
+# See player/FFMPEG_BUILD.md for what goes here.
+player/vendor/
+
 # Local test recordings / extracted frames (kept out of repo)
 captures/
 frames*/

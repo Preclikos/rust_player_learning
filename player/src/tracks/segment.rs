@@ -26,8 +26,8 @@ impl Segment {
         file_url: &String,
         start: u64,
         end: u64,
-        start_time_base: Option<u32>,
-        end_time_base: Option<u32>,
+        start_time_base: Option<u64>,
+        end_time_base: Option<u64>,
         timescale: Option<u32>,
     ) -> Result<Self, Box<dyn Error>> {
         let timescale = match timescale {
@@ -35,11 +35,11 @@ impl Segment {
             None => 0,
         };
 
-        let to_duration = |time: u32| -> Duration {
+        let to_duration = |time: u64| -> Duration {
             if timescale == 0 {
                 Duration::ZERO
             } else {
-                Duration::from_micros((time as u64) * 1_000_000 / (timescale as u64))
+                Duration::from_micros(time * 1_000_000 / (timescale as u64))
             }
         };
 

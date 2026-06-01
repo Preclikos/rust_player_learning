@@ -12,6 +12,14 @@ fn read_u16(data: &mut &[u8]) -> u16 {
     result
 }
 
+fn read_u64(data: &mut &[u8]) -> u64 {
+    let result = u64::from_be_bytes([
+        data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
+    ]);
+    *data = &data[8..]; // Move the slice forward
+    result
+}
+
 // SidxEntry / SidxBox carry every field defined by ISO/IEC 14496-12 §8.16.3
 // for completeness/diagnostics — the segment-index pipeline only reads
 // `reference_size`, `subsegment_duration`, `timescale`, `earliest_presentation_time`
@@ -37,8 +45,12 @@ pub struct SidxBox {
     pub flags: u32,
     pub reference_id: u32,
     pub timescale: u32,
-    pub earliest_presentation_time: u32,
-    pub first_offset: u32,
+    // 64-bit in a version-1 sidx, 32-bit in version 0 (ISO/IEC 14496-12
+    // §8.16.3). Stored as u64 either way so a version-1 box parses with the
+    // correct field widths — reading these as u32 unconditionally would shift
+    // every subsequent field by 8 bytes and mis-read `entry_count`.
+    pub earliest_presentation_time: u64,
+    pub first_offset: u64,
     pub entry_count: u16,
     pub entries: Vec<SidxEntry>,
 }
@@ -56,6 +68,11 @@ pub fn parse_sidx(data: &mut &[u8]) -> Result<SidxBox, Box<dyn Error>> {
         return Err("Not a valid sidx box!".into());
     }
 
+    // 64-bit box: `size == 1` means an 8-byte largesize follows the type.
+    if size == 1 {
+        let _largesize = read_u64(data);
+    }
+
     // Read version and flags
     let version_flags = read_u32(data);
     let version = (version_flags >> 24) as u8;
@@ -63,8 +80,16 @@ pub fn parse_sidx(data: &mut &[u8]) -> Result<SidxBox, Box<dyn Error>> {
 
     let reference_id = read_u32(data);
     let timescale = read_u32(data);
-    let earliest_presentation_time = read_u32(data);
-    let first_offset = read_u32(data); // Offset where the first segment starts
+    // version 1 widens earliest_presentation_time + first_offset to 64-bit
+    // (ISO/IEC 14496-12 §8.16.3). Reading them as u32 on a version-1 box was
+    // the bug: every later field shifted by 8 bytes, so `entry_count` came out
+    // garbage (often 0) → empty segment list → the player scheduled no media
+    // segments and buffered forever, with no parse error.
+    let (earliest_presentation_time, first_offset) = if version >= 1 {
+        (read_u64(data), read_u64(data))
+    } else {
+        (read_u32(data) as u64, read_u32(data) as u64)
+    };
 
     *data = &data[2..]; // Move the slice forward reserved 16bits
 
@@ -91,6 +116,18 @@ pub fn parse_sidx(data: &mut &[u8]) -> Result<SidxBox, Box<dyn Error>> {
             sap_delta,
         });
     }
+
+    // Diagnostic: a version-1 box that previously mis-parsed produced 0
+    // entries (→ no media segments). Logging version + entry count makes that
+    // failure mode obvious in a single line.
+    log::info!(
+        "[sidx] version={} timescale={} entries={} ept={} first_offset={}",
+        version,
+        timescale,
+        entries.len(),
+        earliest_presentation_time,
+        first_offset
+    );
 
     Ok(SidxBox {
         size,

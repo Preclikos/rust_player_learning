@@ -81,13 +81,15 @@ impl Tracks {
         let entires = sidx.entries;
         let mut segments: Vec<Segment> = vec![];
 
-        let mut start = sidx.earliest_presentation_time.clone();
+        // earliest_presentation_time + first_offset are u64 (version-1 sidx may
+        // exceed 32 bits); subsegment_duration is always 32-bit per spec.
+        let mut start = sidx.earliest_presentation_time;
 
-        let mut start_byte = offset + u64::from(sidx.first_offset);
+        let mut start_byte = offset + sidx.first_offset;
         for entry in entires.iter() {
             let end = start_byte + (entry.reference_size - 1);
 
-            let end_time_u32 = start + entry.subsegment_duration;
+            let end_time = start + u64::from(entry.subsegment_duration);
 
             let segment = Segment::new(
                 base_url,
@@ -95,13 +97,13 @@ impl Tracks {
                 start_byte,
                 end,
                 Some(start),
-                Some(end_time_u32),
+                Some(end_time),
                 Some(sidx.timescale),
             )?;
             segments.push(segment);
 
             start_byte += entry.reference_size;
-            start = end_time_u32;
+            start = end_time;
         }
 
         Ok(segments)

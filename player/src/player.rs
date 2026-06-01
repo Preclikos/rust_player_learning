@@ -2183,6 +2183,28 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             None => return Err("Audio Track not set".into()),
         };
 
+        // Robustness: a representation with zero media segments would leave the
+        // pipeline waiting forever for frames that never arrive — a silent hang
+        // (kind=2 = 0 requests, eternal buffering, no error). This happens when
+        // a SegmentBase/sidx yields no subsegments (e.g. a mis-parsed sidx).
+        // Fail loud instead of wedging so the cause is visible.
+        if video_representation.segments.is_empty() {
+            let msg = format!(
+                "video representation {} has no media segments (SegmentBase/sidx yielded none)",
+                video_representation.id
+            );
+            self.emit_error(PlayerErrorKind::ManifestParse, msg.clone());
+            return Err(msg.into());
+        }
+        if audio_representation.segments.is_empty() {
+            let msg = format!(
+                "audio representation {} has no media segments (SegmentBase/sidx yielded none)",
+                audio_representation.id
+            );
+            self.emit_error(PlayerErrorKind::ManifestParse, msg.clone());
+            return Err(msg.into());
+        }
+
         let video_ready = self.video_ready.clone();
         let audio_ready = self.audio_ready.clone();
         let stop = self.stop.clone();

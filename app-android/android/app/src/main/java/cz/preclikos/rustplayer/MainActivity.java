@@ -1,6 +1,7 @@
 package cz.preclikos.rustplayer;
 
 import android.app.Activity;
+import android.content.Context;
 import android.os.Bundle;
 import android.view.Surface;
 import android.view.SurfaceHolder;
@@ -24,7 +25,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     // Opaque pointer to the Rust-side Handle (0 = not started).
     private long handle = 0;
 
-    private static native long nativeStart(Surface surface, int width, int height);
+    // The Context is forwarded so the Rust side can seed ndk_context with
+    // (JavaVM, Activity) — cpal and other transitive deps look it up there.
+    private static native long nativeStart(Context context, Surface surface, int width, int height);
     private static native void nativeSetSize(long handle, int width, int height);
     private static native void nativeDestroy(long handle);
 
@@ -47,7 +50,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     @Override
     public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
         if (handle == 0) {
-            handle = nativeStart(holder.getSurface(), width, height);
+            handle = nativeStart(getApplicationContext(), holder.getSurface(), width, height);
         } else {
             nativeSetSize(handle, width, height);
         }

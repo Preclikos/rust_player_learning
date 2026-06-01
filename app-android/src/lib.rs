@@ -49,6 +49,28 @@ fn runtime() -> &'static tokio::runtime::Runtime {
     })
 }
 
+/// Seed `ndk_context` with (JavaVM, Activity) so cpal et al. can resolve the
+/// Android runtime without us having to thread a `NativeActivity` through.
+/// Idempotent — the global state is set on the first call and left alone
+/// thereafter; the global ref is intentionally leaked because the process
+/// keeps the Activity around for its whole lifetime.
+fn init_ndk_context(env: &mut JNIEnv, context: &JObject) {
+    static ONCE: OnceLock<()> = OnceLock::new();
+    ONCE.get_or_init(|| {
+        let vm = env.get_java_vm().expect("get_java_vm");
+        let ctx_global = env
+            .new_global_ref(context)
+            .expect("new_global_ref(context)");
+        // ndk_context just stores the raw pointers; both must outlive the
+        // process. Leak the GlobalRef so the JVM doesn't reclaim it.
+        let ctx_raw = ctx_global.as_raw() as *mut c_void;
+        std::mem::forget(ctx_global);
+        unsafe {
+            ndk_context::initialize_android_context(vm.get_java_vm_pointer() as *mut c_void, ctx_raw);
+        }
+    });
+}
+
 fn init_logging() {
     static ONCE: OnceLock<()> = OnceLock::new();
     ONCE.get_or_init(|| {
@@ -57,6 +79,13 @@ fn init_logging() {
         android_logger::init_once(
             android_logger::Config::default().with_max_level(log::LevelFilter::Info),
         );
+        // Route Rust panics through android_logger so they land in logcat
+        // under the `app_android` tag. Without this hook a panic in a
+        // background tokio task (or in the JNI thread itself) just delivers
+        // SIGABRT with no message, leaving only an unsymbolicated tombstone.
+        std::panic::set_hook(Box::new(|info| {
+            log::error!("rust panic: {}", info);
+        }));
         log::info!("app-android: embedded player loaded");
     });
 }
@@ -68,13 +97,15 @@ fn init_logging() {
 /// keeps for `nativeSetSize` / `nativeDestroy`. Returns 0 on failure.
 #[no_mangle]
 pub extern "system" fn Java_cz_preclikos_rustplayer_MainActivity_nativeStart(
-    env: JNIEnv,
+    mut env: JNIEnv,
     _class: JClass,
+    context: JObject,
     surface: JObject,
     width: jint,
     height: jint,
 ) -> jlong {
     init_logging();
+    init_ndk_context(&mut env, &context);
 
     // ANativeWindow_fromSurface returns an *acquired* reference (release with
     // ANativeWindow_release). Raw-pointer `as` casts bridge the jni vs ndk-sys

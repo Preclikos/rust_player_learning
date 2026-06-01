@@ -19,3 +19,7 @@ tokio = { version = "1.43.0", features = ["full"] }
 # JNI entry points + ANativeWindow_fromSurface for the host-Surface embed path.
 jni = "0.21"
 ndk-sys = "0.6"
+# In the embed model nothing initialises the global ndk_context for us (no
+# NativeActivity, no android-activity crate); we have to seed JavaVM +
+# Activity ourselves so transitive deps like cpal can resolve them.
+ndk-context = "0.1"

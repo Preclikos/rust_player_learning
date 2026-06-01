@@ -1,15 +1,34 @@
-//! Routes FFmpeg's libav* diagnostics through Rust's `log` crate so
-//! downstream binaries (Blackzone Console etc.) can consume them via the
-//! usual env_logger / tracing-log subscriber without depending on
+//! Sets FFmpeg's libav* verbosity threshold and — on Linux — routes
+//! the messages through Rust's `log` crate so downstream binaries
+//! (Blackzone Console etc.) can subscribe without depending on
 //! ffmpeg-sys-next directly.
 //!
-//! Public surface: `LogLevel` + `set_log_level(...)`. Re-exported at the
-//! `player` crate root. The forwarder is idempotent — calling
-//! `set_log_level` again only changes the verbosity threshold; the
-//! av_log_set_callback registration happens once via `std::sync::Once`.
+//! Public surface: `LogLevel` + `set_log_level(...)`. Re-exported at
+//! the `player` crate root. The forwarding callback is idempotent —
+//! re-calling `set_log_level` only changes the verbosity threshold;
+//! `av_log_set_callback` is wired up once via `std::sync::Once`.
 //!
-//! Messages are emitted with `target: "ffmpeg"`, so consumers can route
-//! them independently of the player's own logs.
+//! Messages are emitted with `target: "ffmpeg"`, so consumers can
+//! route them independently of the player's own logs.
+//!
+//! ## Platform support
+//!
+//! `av_log_set_level` is cross-platform — it takes a plain `c_int` and
+//! works on every target where ffmpeg-sys-next links.
+//!
+//! `av_log_set_callback`, however, exposes a `va_list` parameter whose
+//! bindgen-generated Rust type varies per platform:
+//!
+//!   - Linux: `*mut sys::__va_list_tag` (struct emitted by bindgen)
+//!   - Windows MSVC/MinGW: `va_list` ≈ `*mut c_char`, no struct exists
+//!   - macOS bindgen output: no `__va_list_tag` symbol at all
+//!
+//! Bridging that portably requires either a small C shim (build.rs +
+//! cc crate) or `core::ffi::VaList`, which is still nightly-only.
+//! Until one of those lands, we install the forwarding callback **on
+//! Linux only**. Windows + macOS still get level control and silent
+//! categories — their FFmpeg output goes to the libav* default
+//! callback (stderr), not through Rust's `log` facade.
 
 #[derive(Copy, Clone, Debug)]
 pub enum LogLevel {
@@ -27,8 +46,7 @@ pub enum LogLevel {
 mod imp {
     use super::LogLevel;
     use ffmpeg_sys_next as sys;
-    use std::ffi::{c_char, c_int, c_void};
-    use std::sync::Once;
+    use std::ffi::c_int;
 
     impl LogLevel {
         fn to_av(self) -> c_int {
@@ -45,18 +63,27 @@ mod imp {
         }
     }
 
-    static INIT: Once = Once::new();
-
     pub fn set_log_level(level: LogLevel) {
-        INIT.call_once(|| unsafe {
-            sys::av_log_set_callback(Some(forward));
-        });
         unsafe { sys::av_log_set_level(level.to_av()) };
+        #[cfg(target_os = "linux")]
+        super::linux_forwarder::install_once();
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod linux_forwarder {
+    use ffmpeg_sys_next as sys;
+    use std::ffi::{c_char, c_int, c_void};
+    use std::sync::Once;
+
+    pub fn install_once() {
+        static INIT: Once = Once::new();
+        INIT.call_once(|| unsafe { sys::av_log_set_callback(Some(forward)) });
     }
 
     // FFmpeg invokes this from arbitrary threads (decoder workers, I/O
-    // callbacks, internal helpers). Everything inside must be Send-safe.
-    // `log::log!` and `Once` are; we don't touch any shared mutable state.
+    // callbacks, internal helpers). Everything inside must be Send-safe;
+    // `log::log!` and `Once` are, and we touch no shared mutable state.
     unsafe extern "C" fn forward(
         avcl: *mut c_void,
         level: c_int,

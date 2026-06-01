@@ -7,12 +7,17 @@
 
 use std::error::Error;
 
-// macOS uses ffmpeg for AUDIO (AudioToolbox's AAC decoder mis-behaves
-// when fed access units packet-by-packet — first packet decodes, then
-// it returns 0 frames forever) but the native VideoToolbox path for
-// VIDEO (= zero-copy CVPixelBuffer → wgpu Metal). iOS keeps both
-// native; Windows / Linux keep both FFmpeg.
-#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+// macOS AND iOS use ffmpeg for AUDIO (AudioToolbox's AAC decoder mis-behaves
+// when fed access units packet-by-packet — first packet decodes, then it
+// returns 0 frames forever) but the native VideoToolbox path for VIDEO
+// (= zero-copy CVPixelBuffer → wgpu Metal). Windows / Linux keep both FFmpeg;
+// Android uses MediaCodec for both.
+#[cfg(any(
+    target_os = "windows",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "ios"
+))]
 pub mod ffmpeg_audio;
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 pub mod ffmpeg_hw;
@@ -20,8 +25,6 @@ pub mod ffmpeg_hw;
 pub mod mediacodec;
 #[cfg(target_os = "android")]
 pub mod mediacodec_audio;
-#[cfg(target_os = "ios")]
-pub mod audiotoolbox;
 #[cfg(any(target_os = "ios", target_os = "macos"))]
 pub mod videotoolbox;
 

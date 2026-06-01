@@ -45,11 +45,14 @@ fontdue = "0.9"
 # into the precomposed code points fonts actually carry glyphs for.
 unicode-normalization = "0.1"
 
-# FFmpeg ships everywhere except iOS / Android — Win/Linux use it for
-# both video + audio, macOS uses it for AUDIO only (VideoToolbox stays
-# native for video). AudioToolbox's AAC decoder mis-behaves when fed
-# access units packet-by-packet on macOS, so we let the proven
-# ffmpeg AAC / AC-3 / EAC-3 decoders handle that side.
+# FFmpeg is used on every target except Android (MediaCodec). Win/Linux use it
+# for both video + audio; macOS AND iOS use it for AUDIO only (native
+# VideoToolbox stays for video). AudioToolbox's AAC decoder mis-behaves when fed
+# access units packet-by-packet (confirmed on macOS sim AND iOS device), so we
+# let the proven ffmpeg AAC / AC-3 / EAC-3 decoders handle that side.
+#
+# iOS links a STATIC, audio-only FFmpeg built by player/scripts/build-ffmpeg.sh
+# (ios-arm64 / ios-sim-*); see app-ios/ios/build_sim.sh for the cross link wiring.
 #
 # Pinned to 7.1 series across the workspace because all target platforms
 # ship FFmpeg 7.x system libs (avutil-59 / avcodec-61 / swresample-5).
@@ -57,7 +60,7 @@ unicode-normalization = "0.1"
 # with the bindgen-generated enum surface.
 # NOTE: ffmpeg-sys-next 7.1.x predates LLVM 22 — if your toolchain's
 # libclang is 22+, bindgen may fail and you'll need to bump back to 8.x.
-[target.'cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))'.dependencies]
+[target.'cfg(any(target_os = "windows", target_os = "linux", target_os = "macos", target_os = "ios"))'.dependencies]
 ffmpeg-next = { version = "7.1" }
 ffmpeg-sys-next = { version = "7.1" }
 
@@ -101,9 +104,9 @@ glow = "0.17"
 
 # iOS: rustls-tls so reqwest doesn't try to use native-tls (which has no
 # default feature gate on iOS and silently links to nothing — every HTTPS
-# call then fails with "error sending request" at the TLS layer). The
-# audio/video decoder path is fully native (VideoToolbox + AudioToolbox),
-# so we don't pull in ffmpeg-next here.
+# call then fails with "error sending request" at the TLS layer). Video is
+# native VideoToolbox; audio is FFmpeg (see the ffmpeg-next target block above
+# — iOS is included there).
 [target.'cfg(target_os = "ios")'.dependencies]
 reqwest = { version = "0.12.12", default-features = false, features = ["rustls-tls"] }
 

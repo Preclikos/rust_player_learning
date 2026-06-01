@@ -18,23 +18,34 @@
 # external codec libs (x264/x265/vpx/aom/dav1d/…). No transitive deps,
 # bundle stays ~5–10 MB of shared objects per platform.
 #
-# Usage: build-ffmpeg.sh <linux | windows | macos-x64 | macos-arm64>
+# Usage: build-ffmpeg.sh <linux | windows | macos-x64 | macos-arm64
+#                         | ios-arm64 | ios-sim-arm64 | ios-sim-x64>
 #
 # Idempotent: if vendor/<platform>/lib/pkgconfig/libavcodec.pc exists,
 # bails fast. To force rebuild: `rm -rf player/vendor/<platform>/`.
+#
+# iOS builds are STATIC + audio-only (the player decodes video with native
+# VideoToolbox; FFmpeg on iOS is only the AAC/AC-3/E-AC-3 audio path). Desktop
+# builds stay shared + full (video software fallback + hwaccel).
 #
 # Runner pre-reqs:
 #   linux:       gcc, make, nasm, pkg-config, curl, xz-utils, libva-dev
 #   windows:     msys64 mingw-w64-x86_64-toolchain + mingw-w64-x86_64-nasm
 #                + pkg-config + make; run through msys64 bash:
 #                `C:\msys64\usr\bin\bash.exe -lc './scripts/build-ffmpeg.sh windows'`
-#   macos:       Xcode CLI tools (clang, make), brew install nasm pkg-config
+#   macos / ios: Xcode (full, for the iOS SDKs), brew install nasm pkg-config
 set -euo pipefail
 
-PLATFORM="${1:?usage: $0 <linux|windows|macos-x64|macos-arm64>}"
+PLATFORM="${1:?usage: $0 <linux|windows|macos-x64|macos-arm64|ios-arm64|ios-sim-arm64|ios-sim-x64>}"
 FFMPEG_VERSION="7.1.1"
 # Script lives at player/scripts/build-ffmpeg.sh — go up to player/.
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+# Defaults (desktop): shared libs, full decoder/parser set. iOS overrides these
+# to static + audio-only below.
+LINK_KIND=(--enable-shared --disable-static)
+DECODERS="h264,hevc,aac,ac3,eac3"
+PARSERS="h264,hevc,aac,ac3"
 
 case "$PLATFORM" in
   linux)
@@ -111,8 +122,38 @@ case "$PLATFORM" in
       --enable-hwaccel=h264_videotoolbox,hevc_videotoolbox
     )
     ;;
+  ios-arm64|ios-sim-arm64|ios-sim-x64)
+    PREFIX="$ROOT/vendor/$PLATFORM"
+    JOBS="$(sysctl -n hw.ncpu 2>/dev/null || echo 4)"
+    # iOS: STATIC libs (an app can't load arbitrary dylibs without embedding +
+    # signing a framework) and AUDIO-ONLY (video = native VideoToolbox).
+    LINK_KIND=(--enable-static --disable-shared)
+    DECODERS="aac,ac3,eac3"
+    PARSERS="aac,ac3"
+    case "$PLATFORM" in
+      ios-arm64)     SDK=iphoneos;        ARCH=arm64;  MINVER="-miphoneos-version-min=15.0" ;;
+      ios-sim-arm64) SDK=iphonesimulator; ARCH=arm64;  MINVER="-mios-simulator-version-min=15.0" ;;
+      ios-sim-x64)   SDK=iphonesimulator; ARCH=x86_64; MINVER="-mios-simulator-version-min=15.0" ;;
+    esac
+    SYSROOT="$(xcrun --sdk "$SDK" --show-sdk-path)"
+    # `--cc=$(xcrun -f clang)` is a single absolute-path token (avoids the
+    # multi-token CC stripping noted in the macos-arm64 case); `-arch` +
+    # `-isysroot` in the flags do the actual cross-targeting. inline-asm off:
+    # arm64 hits the same libavcodec/aarch64/cabac.h clang incompat as macOS
+    # arm64, and audio-only decode doesn't need the asm hot paths anyway.
+    EXTRA=(
+      --enable-cross-compile
+      --target-os=darwin
+      --arch="$ARCH"
+      --cc="$(xcrun -f clang)"
+      --sysroot="$SYSROOT"
+      "--extra-cflags=-arch $ARCH -isysroot $SYSROOT $MINVER"
+      "--extra-ldflags=-arch $ARCH -isysroot $SYSROOT $MINVER"
+      --disable-inline-asm
+    )
+    ;;
   *)
-    echo "error: unknown platform '$PLATFORM' (expected linux|windows|macos-x64|macos-arm64)" >&2
+    echo "error: unknown platform '$PLATFORM' (expected linux|windows|macos-x64|macos-arm64|ios-arm64|ios-sim-arm64|ios-sim-x64)" >&2
     exit 1
     ;;
 esac
@@ -141,14 +182,14 @@ cd "$BUILD"
 mkdir -p "$PREFIX"
 "$SRC/configure" \
   --prefix="$PREFIX" \
-  --enable-shared --disable-static \
+  "${LINK_KIND[@]}" \
   --disable-programs --disable-doc \
   --disable-htmlpages --disable-manpages --disable-podpages --disable-txtpages \
   --disable-postproc \
   --disable-autodetect \
   --disable-everything \
-  --enable-decoder=h264,hevc,aac,ac3,eac3 \
-  --enable-parser=h264,hevc,aac,ac3 \
+  --enable-decoder="$DECODERS" \
+  --enable-parser="$PARSERS" \
   "${EXTRA[@]}" 2>&1 | tee "$PREFIX/configure.log"
 
 echo ""
@@ -167,6 +208,6 @@ rm -rf "$BUILD" "$SRC_PARENT"
 echo ""
 echo "FFmpeg $FFMPEG_VERSION installed to $PREFIX"
 echo "Libraries:"
-ls "$PREFIX/lib/" | grep -E '\.(so\.|dylib|dll\.a)' | head
+ls "$PREFIX/lib/" | grep -E '\.(so\.|dylib|dll\.a|a)$' | head
 echo "pkg-config files:"
 ls "$PREFIX/lib/pkgconfig/" | head

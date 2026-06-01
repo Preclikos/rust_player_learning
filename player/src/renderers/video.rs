@@ -789,19 +789,17 @@ impl VideoRenderer {
                         let mut size = frame_size.write().await;
                         *size = new_frame_size;
                     }
+                    // A content frame-size change (new representation / quality
+                    // switch) only affects the letterbox aspect — handled by
+                    // rebuilding the vertex quad below. The surface/swapchain is
+                    // sized to the window, which has NOT changed, so we must NOT
+                    // reconfigure it here: doing so rebuilds the swapchain
+                    // needlessly and on the iOS simulator flashes a fresh
+                    // (uninitialized, red) CAMetalLayer drawable for one frame
+                    // before the next video frame clears it. Surface reconfigure
+                    // belongs only to the Resize branch.
                     let window_size = *surface_size.read().unwrap();
                     if window_size.width > 0 && window_size.height > 0 {
-                        // Release the config write lock before taking surface.lock() —
-                        // the render path takes surface first, then config(read), so
-                        // holding config(write) across surface.lock() would AB-BA
-                        // deadlock with an in-flight render.
-                        let new_config = {
-                            let mut config_guard = config.write().await;
-                            config_guard.width = window_size.width;
-                            config_guard.height = window_size.height;
-                            config_guard.clone()
-                        };
-                        surface.lock().await.configure(&device, &new_config);
                         if let Some(vb) = &vertex_buffer {
                             let ty_max = *tex_y_max.read().await;
                             Self::change_vertex_buffer(

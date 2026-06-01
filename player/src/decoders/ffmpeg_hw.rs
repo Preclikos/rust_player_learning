@@ -59,33 +59,34 @@ impl Drop for FfmpegHwDecoder {
 // return AV_PIX_FMT_NONE so libavcodec aborts decoder open — louder
 // than silently sliding into software and panicking downstream.
 #[cfg(target_os = "windows")]
-unsafe extern "C" fn select_hw_format(
-    _ctx: *mut AVCodecContext,
-    fmts: *const AVPixelFormat,
-) -> AVPixelFormat {
-    let mut p = fmts;
-    while unsafe { *p } != AVPixelFormat::AV_PIX_FMT_NONE {
-        if unsafe { *p } == AVPixelFormat::AV_PIX_FMT_D3D11 {
-            return AVPixelFormat::AV_PIX_FMT_D3D11;
-        }
-        p = unsafe { p.add(1) };
-    }
-    AVPixelFormat::AV_PIX_FMT_NONE
-}
-
+const WANTED_HW: AVPixelFormat = AVPixelFormat::AV_PIX_FMT_D3D11;
 #[cfg(target_os = "linux")]
+const WANTED_HW: AVPixelFormat = AVPixelFormat::AV_PIX_FMT_VAAPI;
+
 unsafe extern "C" fn select_hw_format(
     _ctx: *mut AVCodecContext,
     fmts: *const AVPixelFormat,
 ) -> AVPixelFormat {
+    // Snapshot the offered list so we can log it once. Critical for
+    // diagnosing "decoder fails on this driver but works on another"
+    // reports — different FFmpeg builds / GPU drivers offer different
+    // sets, and a mismatch with WANTED_HW silently kills decoding.
+    let mut offered = Vec::with_capacity(8);
     let mut p = fmts;
     while unsafe { *p } != AVPixelFormat::AV_PIX_FMT_NONE {
-        if unsafe { *p } == AVPixelFormat::AV_PIX_FMT_VAAPI {
-            return AVPixelFormat::AV_PIX_FMT_VAAPI;
-        }
+        offered.push(unsafe { *p });
         p = unsafe { p.add(1) };
     }
-    AVPixelFormat::AV_PIX_FMT_NONE
+    log::info!(
+        "[ffmpeg_hw] get_format offered: {:?}; want {:?}",
+        offered,
+        WANTED_HW
+    );
+    if offered.contains(&WANTED_HW) {
+        WANTED_HW
+    } else {
+        AVPixelFormat::AV_PIX_FMT_NONE
+    }
 }
 
 impl HwVideoDecoder for FfmpegHwDecoder {
@@ -160,9 +161,24 @@ impl HwVideoDecoder for FfmpegHwDecoder {
             // Store pts in milliseconds — FFmpeg's time base for this decoder is 1ms.
             packet.set_pts(Some(pts_us / 1000));
             packet.data_mut().unwrap().clone_from_slice(&nalu);
-            decoder
-                .send_packet(&packet)
-                .map_err(|e| -> DecoderError { format!("send_packet: {}", e).into() })?;
+            decoder.send_packet(&packet).map_err(|e| -> DecoderError {
+                // Include errno + Debug repr so opaque strerror strings like
+                // "Not enough space" (Windows-localised ENOSPC?
+                // AVERROR_BUFFER_TOO_SMALL?) can be cross-referenced against
+                // FFmpeg's error codes during triage.
+                let errno = match &e {
+                    ffmpeg_next::Error::Other { errno } => Some(*errno),
+                    _ => None,
+                };
+                format!(
+                    "send_packet: {} (errno={:?}, nalu_len={}, pts_ms={})",
+                    e,
+                    errno,
+                    nalu.len(),
+                    pts_us / 1000
+                )
+                .into()
+            })?;
         }
         Ok(())
     }

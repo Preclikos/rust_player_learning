@@ -1518,13 +1518,28 @@ async fn video_supervisor(
                     let _ = vp_handle.await;
                     return Ok(());
                 }
-                _ = &mut vp_handle => {
+                res = &mut vp_handle => {
                     // video_play returned without us asking. Either it
                     // ran out of segments (EOF) or it errored. Either
                     // way, exit the supervisor so the keepalive
                     // frame_sender drops, the video channel closes, and
-                    // av_sync can fire EndOfStream.
-                    log::info!("[video] supervisor: video_play exited naturally; closing pipeline");
+                    // av_sync can fire EndOfStream. Surface the inner
+                    // result so a `configure()` / `init download` /
+                    // decoder failure doesn't masquerade as a clean EOF
+                    // — without this, decoder.configure errors are
+                    // silently swallowed and the only symptom is
+                    // "supervisor exited naturally" right after start.
+                    match res {
+                        Ok(Ok(())) => {
+                            log::info!("[video] supervisor: video_play exited naturally; closing pipeline");
+                        }
+                        Ok(Err(e)) => {
+                            log::error!("[video] supervisor: video_play failed: {}", e);
+                        }
+                        Err(e) => {
+                            log::error!("[video] supervisor: video_play task panicked: {}", e);
+                        }
+                    }
                     return Ok(());
                 }
                 _ = async {

@@ -151,6 +151,11 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_MainActivity_nativeSetSize(
         return;
     }
     let h = unsafe { &*(handle as *mut Handle) };
+    // `Player::resize` calls `tokio::spawn` internally to drive the renderer
+    // resize on a worker; without a runtime context the spawn aborts the
+    // process. nativeSetSize fires from the JNI/UI thread, which has no
+    // implicit runtime — enter ours explicitly, same pattern as nativeStart.
+    let _guard = runtime().enter();
     h.player
         .resize(PhysicalSize::new(width.max(1) as u32, height.max(1) as u32));
 }

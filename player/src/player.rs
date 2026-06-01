@@ -2,6 +2,7 @@ mod abr;
 mod crypto;
 mod decoders;
 mod events;
+mod ffmpeg_log;
 mod manifest;
 mod net;
 mod parsers;
@@ -16,6 +17,7 @@ pub use abr::AbrStrategy;
 pub use events::{
     BufferingReason, Fps, PlayerErrorKind, PlayerEvent, TrackInfo, TrackKind,
 };
+pub use ffmpeg_log::{set_log_level, LogLevel};
 pub use net::{
     BoxError, HttpClient, LicenseResolver, NoopInterceptor, PreparedRequest,
     RequestInterceptor, RequestKind, RetryPolicy,

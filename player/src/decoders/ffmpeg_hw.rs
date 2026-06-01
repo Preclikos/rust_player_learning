@@ -116,13 +116,14 @@ impl HwVideoDecoder for FfmpegHwDecoder {
         }
         unsafe {
             (*ctx.as_mut_ptr()).hw_device_ctx = self.hw_device_ctx;
-            // Pool size: HEVC's internal needs (~24) plus a small buffer for the
-            // renderer's in-flight queue. The channel hard-caps at 64 frames but
-            // rarely holds more than ~5 in practice. Intel Arc D3D11VA refuses
-            // pools >~48 surfaces in a Texture2DArray, so we keep this conservative.
-            (*ctx.as_mut_ptr()).extra_hw_frames = 16;
-            // Steer libavcodec to the HW pixel format instead of the
-            // software fallback — see select_hw_format above.
+            // Leave `extra_hw_frames` at libavcodec's default (0). With 0,
+            // D3D11VA's frame allocator stays on a *dynamic* pool that hands
+            // out individual ID3D11Texture2D resources on demand; setting it
+            // >0 flips the same allocator to a *static* Texture2DArray sized
+            // to base_dpb + extra_hw_frames. Intel Arc D3D11VA returns ENOMEM
+            // from the very first packet on that static-array path (observed
+            // on A750, even at "safe" pool sizes), so the dynamic pool is the
+            // universally-compatible default — matches FFmpeg's hw_decode.c.
             (*ctx.as_mut_ptr()).get_format = Some(select_hw_format);
         }
 

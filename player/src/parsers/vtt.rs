@@ -11,6 +11,7 @@
 //! future use but currently ignored by the overlay.
 
 use std::time::Duration;
+use unicode_normalization::UnicodeNormalization;
 
 #[derive(Clone, Debug)]
 pub struct VttCue {
@@ -150,6 +151,10 @@ fn parse_cue_block(block: &str) -> Option<VttCue> {
     if text.is_empty() {
         return None;
     }
+    // fontdue has no shaping engine — collapse decomposed sequences
+    // (NFD) to precomposed code points (NFC) so diacritics render as a
+    // single glyph the font actually carries.
+    let text: String = text.nfc().collect();
     Some(VttCue {
         start_ms,
         end_ms,
@@ -306,6 +311,8 @@ fn parse_vttc(body: &[u8], start_ms: i64, end_ms: i64) -> Option<VttCue> {
     if payload.is_empty() {
         return None;
     }
+    // Same NFC fold-down as the raw-WebVTT path — see parse_cue_block.
+    let payload: String = payload.nfc().collect();
     Some(VttCue {
         start_ms,
         end_ms,

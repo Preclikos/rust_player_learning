@@ -34,6 +34,13 @@ log = "0.4"
 # wgpu-based subtitle overlay to bake cue text into RGBA bitmaps that
 # get uploaded as textures and drawn over the video surface.
 fontdue = "0.9"
+# Normalize WebVTT cue text to NFC before rasterization. fontdue has no
+# shaping engine, so a decomposed sequence (e.g. "e" + U+030C combining
+# caron) is rendered as two separate glyphs at the same pen position
+# instead of the single precomposed "ě" U+011B. Czech / Slovak / Polish
+# subs in NFD form looked garbled until this collapsed combining marks
+# into the precomposed code points fonts actually carry glyphs for.
+unicode-normalization = "0.1"
 
 # FFmpeg ships everywhere except iOS / Android — Win/Linux use it for
 # both video + audio, macOS uses it for AUDIO only (VideoToolbox stays

@@ -163,9 +163,14 @@ impl HwVideoDecoder for FfmpegHwDecoder {
             (*frames_ctx).sw_format = sw_format;
             (*frames_ctx).width = params.width as i32;
             (*frames_ctx).height = params.height as i32;
-            // 20 surfaces = HEVC max DPB (16) + a couple in flight to the
-            // renderer's pending queue.
-            (*frames_ctx).initial_pool_size = 20;
+            // `initial_pool_size = 0` skips d3d11va_alloc_pool entirely —
+            // av_hwframe_ctx_init returns 0, and individual textures are
+            // CreateTexture2D'd lazily by av_hwframe_get_buffer. Static
+            // pool with size 20 returned AVERROR_UNKNOWN on Intel Arc
+            // A750 (the driver refused the 20-element NV12 Texture2DArray
+            // with BIND_DECODER | BIND_SHADER_RESOURCE flags). Dynamic
+            // pool sidesteps the array constraint.
+            (*frames_ctx).initial_pool_size = 0;
 
             let ret = av_hwframe_ctx_init(frames_ref);
             if ret < 0 {

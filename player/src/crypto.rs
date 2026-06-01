@@ -309,6 +309,18 @@ pub fn parse_senc(segment_data: &[u8], iv_size: usize) -> Option<Vec<SencEntry>>
     Some(entries)
 }
 
+/// Extract the luma bit depth from the `hvcC` box's `bitDepthLumaMinus8`
+/// field (byte 17, low 3 bits). 8 for SDR HEVC Main, 10 for HDR Main 10.
+/// Returns None if the box is missing or too short.
+pub fn parse_hvcc_bit_depth(init_data: &[u8]) -> Option<u8> {
+    let moov = find_top_box(init_data, b"moov")?;
+    let hvcc = find_descendant(moov, b"hvcC")?;
+    if hvcc.len() < 18 {
+        return None;
+    }
+    Some(8 + (hvcc[17] & 0x07))
+}
+
 /// Extract VPS/SPS/PPS NALUs from the `hvcC` box (HEVC decoder configuration record).
 pub fn parse_hvcc_nalus(init_data: &[u8]) -> Option<Vec<Vec<u8>>> {
     let moov = find_top_box(init_data, b"moov")?;

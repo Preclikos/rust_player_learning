@@ -42,7 +42,8 @@ impl<P> PhysicalSize<P> {
 pub use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 
 use crypto::{
-    kid_short, parse_aac_config, parse_hvcc_nalus, parse_senc, parse_tenc, ClearKeyDecryptor,
+    kid_short, parse_aac_config, parse_hvcc_bit_depth, parse_hvcc_nalus, parse_senc, parse_tenc,
+    ClearKeyDecryptor,
     Decryptor, TrackCrypto,
 };
 use decoders::{
@@ -1073,6 +1074,13 @@ async fn video_play(
 
     let hvcc_nalus = parse_hvcc_nalus(&init_data)
         .ok_or_else(|| -> Box<dyn Error + Send + Sync> { "no hvcC in init segment".into() })?;
+    // hvcC's bitDepthLumaMinus8 → luma bit depth. Drives sw_format on the
+    // Windows D3D11VA frames context (NV12 vs P010). Default 8-bit if the
+    // hvcC box is unreadable.
+    let bit_depth = parse_hvcc_bit_depth(&init_data).unwrap_or(8);
+    if bit_depth != 8 {
+        log::info!("video: HEVC bit depth = {}", bit_depth);
+    }
 
     let track_crypto = match parse_tenc(&init_data) {
         Some(tenc) => {
@@ -1109,6 +1117,7 @@ async fn video_play(
         width: video_representation.width,
         height: video_representation.height,
         hvcc_nalus,
+        bit_depth,
     })?;
 
     let segments = video_representation.segments.clone();

@@ -136,31 +136,41 @@ impl HwVideoDecoder for FfmpegHwDecoder {
         // failed). Pre-allocating with explicit width/height/sw_format from
         // the manifest sidesteps the auto-allocation path entirely.
         //
-        // Sticking to AV_PIX_FMT_NV12 as sw_format: every Bento4/MPEG-DASH
-        // test stream we ship is 8-bit HEVC Main. Real 10-bit content
-        // (Main 10 HDR) would need P010 here, which we don't probe yet.
+        // sw_format MUST match the stream's bit depth: NV12 for 8-bit HEVC
+        // Main, P010 for 10-bit Main 10 (HDR). Mismatch → CreateTexture2D
+        // refuses to allocate the pool and av_hwframe_ctx_init returns
+        // AVERROR_UNKNOWN (-1313558101). bit_depth comes from the hvcC
+        // box's bitDepthLumaMinus8 field, parsed in player.rs before this
+        // call.
         #[cfg(target_os = "windows")]
         unsafe {
+            let sw_format = if params.bit_depth >= 10 {
+                AVPixelFormat::AV_PIX_FMT_P010
+            } else {
+                AVPixelFormat::AV_PIX_FMT_NV12
+            };
             let frames_ref = av_hwframe_ctx_alloc(self.hw_device_ctx);
             if frames_ref.is_null() {
                 return Err("av_hwframe_ctx_alloc returned null".into());
             }
             let frames_ctx = (*frames_ref).data as *mut AVHWFramesContext;
             (*frames_ctx).format = AVPixelFormat::AV_PIX_FMT_D3D11;
-            (*frames_ctx).sw_format = AVPixelFormat::AV_PIX_FMT_NV12;
+            (*frames_ctx).sw_format = sw_format;
             (*frames_ctx).width = params.width as i32;
             (*frames_ctx).height = params.height as i32;
             // 20 surfaces = HEVC max DPB (16) + a couple in flight to the
-            // renderer's pending queue. Static pool is fine here; the
-            // ENOMEM we were seeing was inside FFmpeg's *path*, not at the
-            // D3D11 driver level when an explicit pool size is set.
+            // renderer's pending queue.
             (*frames_ctx).initial_pool_size = 20;
 
             let ret = av_hwframe_ctx_init(frames_ref);
             if ret < 0 {
                 let mut owned = frames_ref;
                 av_buffer_unref(&mut owned);
-                return Err(format!("av_hwframe_ctx_init failed: {}", ret).into());
+                return Err(format!(
+                    "av_hwframe_ctx_init failed: {} (bit_depth={}, sw_format={:?}, {}x{})",
+                    ret, params.bit_depth, sw_format, params.width, params.height
+                )
+                .into());
             }
 
             (*ctx.as_mut_ptr()).hw_frames_ctx = av_buffer_ref(frames_ref);

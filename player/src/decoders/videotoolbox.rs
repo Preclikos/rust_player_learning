@@ -116,6 +116,12 @@ extern "C" {
     static kCVPixelBufferMetalCompatibilityKey: CFStringRef;
     static kCVPixelBufferIOSurfacePropertiesKey: CFStringRef;
 
+    // -- CoreVideo buffer geometry (used by try_recv to report real dimensions
+    //    in the DecodedVideoFrame so downstream Stats can render the resolution
+    //    instead of "0×0"). --
+    fn CVPixelBufferGetWidth(buf: CVImageBufferRef) -> usize;
+    fn CVPixelBufferGetHeight(buf: CVImageBufferRef) -> usize;
+
     // -- CoreMedia --
     fn CMVideoFormatDescriptionCreateFromHEVCParameterSets(
         allocator: CFAllocatorRef,
@@ -483,15 +489,17 @@ impl HwVideoDecoder for VideoToolboxDecoder {
         };
         drop(q);
 
-        // Width/height come from the CVPixelBuffer the renderer queries on
-        // its own; here we report 0 to match the FFmpeg path (which also
-        // reads from the AVFrame at render time). The play loop uses these
-        // fields only for `change_frame_size` notifications, which the
-        // renderer recomputes from the actual texture anyway.
+        // Pull real dimensions off the CVPixelBuffer so downstream consumers
+        // (Stats event, renderer change_frame_size notifications) get correct
+        // values instead of 0 — the renderer recomputes its own texture size
+        // either way, but the player's Stats path surfaces this directly.
+        let raw = buf.as_ptr() as CVImageBufferRef;
+        let width = unsafe { CVPixelBufferGetWidth(raw) } as u32;
+        let height = unsafe { CVPixelBufferGetHeight(raw) } as u32;
         Ok(Some(DecodedVideoFrame {
             pts_us,
-            width: 0,
-            height: 0,
+            width,
+            height,
             native: PlatformFrame::CvPixelBuffer(buf),
             desired_present_ns: 0,
         }))

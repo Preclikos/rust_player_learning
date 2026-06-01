@@ -95,9 +95,34 @@ rustup target add x86_64-linux-android
 
 ## Architecture note
 
-`MainActivity` (Java) is a thin host: it creates a `SurfaceView`, and on
-`surfaceChanged` calls `nativeStart(surface, w, h)` (or `nativeSetSize`
-on later layout changes), then `nativeDestroy` on `surfaceDestroyed`.
-The Rust side (`app-android/src/lib.rs`) turns the `Surface` into an
-`ANativeWindow`, builds `Player::new_from_android_surface`, and plays the
-bundled encrypted test stream. There is no winit on this path.
+`MainActivity` (Kotlin) is a thin host: it creates a `SurfaceView`, and on
+`surfaceChanged` calls `nativeStart(context, surface, w, h)` (or
+`nativeSetSize` on later layout changes), then `nativeDestroy` on
+`surfaceDestroyed`. The JNI externs live in a companion object with
+`@JvmStatic` so the symbol names land on the outer class — matching what
+the Rust `extern "system" fn Java_..._nativeStart` declarations expect.
+The Rust side (`app-android/src/lib.rs`) seeds `ndk_context` with
+(JavaVM, Context), turns the `Surface` into an `ANativeWindow`, builds
+`Player::new_from_android_surface`, and plays the bundled encrypted test
+stream. There is no winit on this path.
+
+## Project layout
+
+Modern Android project — Kotlin DSL Gradle files, version catalog under
+`gradle/libs.versions.toml`, Kotlin sources under `app/src/main/kotlin/`:
+
+```
+android/
+├── settings.gradle.kts
+├── build.gradle.kts                (root)
+├── gradle.properties
+├── gradle/
+│   └── libs.versions.toml          (AGP / Kotlin / SDK versions)
+└── app/
+    ├── build.gradle.kts            (app module + cargo-ndk tasks)
+    └── src/main/
+        ├── AndroidManifest.xml
+        ├── kotlin/cz/preclikos/rustplayer/MainActivity.kt
+        ├── res/values/strings.xml
+        └── jniLibs/<abi>/libapp_android.so   (produced by cargo-ndk)
+```

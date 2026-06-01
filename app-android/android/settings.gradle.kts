@@ -15,4 +15,4 @@ dependencyResolutionManagement {
 }
 
 rootProject.name = "rust_player_android"
-include ':app'
+include(":app")

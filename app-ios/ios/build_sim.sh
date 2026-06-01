@@ -58,6 +58,30 @@ echo "==> Simulator target: $TARGET (arch: $CLANG_ARCH)"
 rustup target add "$TARGET" >/dev/null
 
 # ---------------------------------------------------------------------
+# 2b. Build the vendored static FFmpeg (audio-only) for this simulator arch
+#     and prime ffmpeg-sys-next's cross build (bindgen + pkg-config).
+# ---------------------------------------------------------------------
+
+case "$CLANG_ARCH" in
+    arm64)  FFPLATFORM="ios-sim-arm64" ;;
+    x86_64) FFPLATFORM="ios-sim-x64" ;;
+    *) echo "unsupported sim arch: $CLANG_ARCH" >&2; exit 1 ;;
+esac
+FFPREFIX="$REPO_ROOT/player/vendor/$FFPLATFORM"
+SDK_PATH="$(xcrun --sdk iphonesimulator --show-sdk-path)"
+
+echo "==> Ensuring vendored FFmpeg ($FFPLATFORM)"
+bash "$REPO_ROOT/player/scripts/build-ffmpeg.sh" "$FFPLATFORM"
+
+# ffmpeg-sys-next builds for the iOS-sim target: pkg-config must find the
+# vendored .pc (cross + static), and bindgen needs the simulator sysroot to
+# parse FFmpeg's headers against iOS system headers.
+export PKG_CONFIG_PATH="$FFPREFIX/lib/pkgconfig"
+export PKG_CONFIG_ALLOW_CROSS=1
+export PKG_CONFIG_ALL_STATIC=1
+export BINDGEN_EXTRA_CLANG_ARGS="-isysroot $SDK_PATH -arch $CLANG_ARCH -mios-simulator-version-min=15.0"
+
+# ---------------------------------------------------------------------
 # 3. Build the Rust staticlib
 # ---------------------------------------------------------------------
 
@@ -80,6 +104,14 @@ SDK_PATH="$(xcrun --sdk iphonesimulator --show-sdk-path)"
 # friends come in via `#[link(name = ...)]` attributes on the player crate,
 # but the linker needs the search paths primed for the simulator SDK and
 # system libobjc / libSystem.
+#
+# The Rust staticlib references the FFmpeg audio decoders, but a Rust
+# staticlib carries no transitive link directives — so the FFmpeg static libs
+# (+ their Libs.private: bz2/z/iconv + system frameworks) must be added here.
+# pkg-config emits them in the right order; they go AFTER the staticlib so the
+# linker can resolve the staticlib's FFmpeg symbol references.
+FF_LIBS="$(pkg-config --static --libs \
+    libavformat libavcodec libavfilter libavdevice libswresample libswscale libavutil)"
 echo "==> Linking $BUNDLE_NAME.app/$BUNDLE_NAME"
 xcrun --sdk iphonesimulator clang \
     -arch "$CLANG_ARCH" \
@@ -103,6 +135,8 @@ xcrun --sdk iphonesimulator clang \
     -lc++ -liconv \
     "$SCRIPT_DIR/$BUNDLE_NAME/main.m" \
     "$STATICLIB" \
+    -L "$FFPREFIX/lib" \
+    $FF_LIBS \
     -o "$BIN"
 
 cp "$SCRIPT_DIR/$BUNDLE_NAME/Info.plist" "$BUILD_DIR/$BUNDLE_NAME.app/Info.plist"

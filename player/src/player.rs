@@ -238,6 +238,14 @@ pub struct Player<V: VideoSink = VideoRenderer, A: AudioSink = AudioRenderer> {
 
     video_renderer: Arc<V>,
     audio_renderer: Arc<A>,
+
+    /// Handle to the Tokio runtime the player was constructed in. Control
+    /// methods (`resize`, `seek`, track switches) spawn fire-and-forget tasks
+    /// through this instead of the ambient `tokio::spawn`, so they're safe to
+    /// call from a host thread that isn't itself inside the runtime — e.g. the
+    /// iOS UIKit layout callback or the Android JNI thread. Captured via
+    /// `Handle::current()` at construction (every ctor runs inside a runtime).
+    rt: tokio::runtime::Handle,
 }
 
 impl<V: VideoSink, A: AudioSink> Clone for Player<V, A> {
@@ -269,6 +277,7 @@ impl<V: VideoSink, A: AudioSink> Clone for Player<V, A> {
             subtitle_representation: Arc::clone(&self.subtitle_representation),
             video_renderer: Arc::clone(&self.video_renderer),
             audio_renderer: Arc::clone(&self.audio_renderer),
+            rt: self.rt.clone(),
         }
     }
 }
@@ -1685,6 +1694,12 @@ impl Player<VideoRenderer, AudioRenderer> {
 
             video_renderer,
             audio_renderer,
+
+            // Every constructor runs inside a Tokio runtime (desktop:
+            // `#[tokio::main]`; iOS/Android: the host enters the runtime before
+            // calling in), so a current handle is always available here. Storing
+            // it lets `resize`/`seek`/track-switch spawn from any thread later.
+            rt: tokio::runtime::Handle::current(),
         }
     }
 }
@@ -2050,7 +2065,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         let sink = self.video_renderer.clone();
         let active = Arc::clone(&self.subtitle_representation);
         let target_id = representation.id;
-        tokio::spawn(async move {
+        self.rt.spawn(async move {
             let res = text_play(repr, stop, stop_flag, http, sink, active, target_id).await;
             if let Err(e) = res {
                 log::warn!("[subs] text_play exited: {}", e);
@@ -2212,15 +2227,19 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             *self.stats.decoder_name.lock().unwrap() = probe.name().to_string();
         }
 
-        #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+        // macOS + iOS both use FFmpeg for audio (AudioToolbox AAC is broken when
+        // fed access units packet-by-packet); video stays native VideoToolbox.
+        #[cfg(any(
+            target_os = "windows",
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "ios"
+        ))]
         let audio_decoder: Box<dyn AudioDecoder> =
             Box::new(decoders::ffmpeg_audio::FfmpegAudioDecoder::new());
         #[cfg(target_os = "android")]
         let audio_decoder: Box<dyn AudioDecoder> =
             Box::new(decoders::mediacodec_audio::MediaCodecAudioDecoder::new());
-        #[cfg(target_os = "ios")]
-        let audio_decoder: Box<dyn AudioDecoder> =
-            Box::new(decoders::audiotoolbox::AudioToolboxDecoder::new());
 
         // Install a fresh per-play switch channel so apply_video_representation
         // can route ABR swaps into the supervisor. Dropped at end of play().
@@ -2395,7 +2414,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         let stop = self.stop.clone();
         let stop_flag = self.stop_flag.clone();
         let audio_sink = self.audio_renderer.clone();
-        tokio::spawn(async move {
+        self.rt.spawn(async move {
             {
                 let mut slot = seek_target.write().await;
                 *slot = Some(target);
@@ -2466,14 +2485,16 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
 
     pub fn resize(&self, size: PhysicalSize<u32>) {
         let video_sink = self.video_renderer.clone();
-        tokio::spawn(async move {
+        // self.rt.spawn (not tokio::spawn) so this works when called from a host
+        // thread outside the runtime (iOS UIKit layout / Android JNI).
+        self.rt.spawn(async move {
             video_sink.resize(size).await;
         });
     }
 
     fn change_frame_size(&self, size: PhysicalSize<u32>) {
         let video_sink = self.video_renderer.clone();
-        tokio::spawn(async move {
+        self.rt.spawn(async move {
             video_sink.change_frame_size(size).await;
         });
     }

@@ -17,11 +17,53 @@ mod video_directx;
 mod video_frame;
 #[cfg(target_os = "linux")]
 mod video_vaapi;
-// Vulkan import helper is only compiled on Windows/Linux — macOS uses Metal directly.
-#[cfg(any(target_os = "windows", target_os = "linux"))]
+// Vulkan import helper is shared by every backend that imports external GPU
+// memory through VK_*_external_memory_*: Windows (D3D11 shared handle),
+// Linux (DMA-BUF/VAAPI), and Android (AHardwareBuffer).
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "android"))]
 mod video_vulkan;
 #[cfg(target_os = "android")]
 mod video_gles_egl;
+#[cfg(target_os = "android")]
+mod video_mediacodec;
+
+/// Holds onto a GPU resource (AHB, VkDeviceMemory, …) for exactly long enough
+/// that the previous frame's GPU work has flushed before MediaCodec is allowed
+/// to recycle the source AHB. Each render path pushes its own concrete
+/// keepalive into the per-renderer ring; the trait exists only so the ring
+/// can store mixed types behind a single `Box<dyn ...>`.
+#[cfg(target_os = "android")]
+trait AndroidFrameKeepalive: Send + Sync {}
+
+#[cfg(target_os = "android")]
+impl AndroidFrameKeepalive for Arc<crate::decoders::SendableAhb> {}
+
+/// Vulkan render path keepalive: holds the AHB ref AND the externally-imported
+/// VkDeviceMemory that `create_vk_image_from_ahb` allocated. wgpu-hal destroys
+/// the VkImage when our wgpu::Texture drops, but the imported memory is the
+/// caller's responsibility — without an explicit `vkFreeMemory` here, Graphics
+/// PSS climbs to multiple GB within a minute on a 24 fps stream.
+#[cfg(target_os = "android")]
+struct VulkanFrameKeepalive {
+    _ahb: Arc<crate::decoders::SendableAhb>,
+    device: wgpu::Device,
+    memory: ash::vk::DeviceMemory,
+}
+
+#[cfg(target_os = "android")]
+impl AndroidFrameKeepalive for VulkanFrameKeepalive {}
+
+#[cfg(target_os = "android")]
+impl Drop for VulkanFrameKeepalive {
+    fn drop(&mut self) {
+        use wgpu::hal::api::Vulkan;
+        unsafe {
+            if let Some(raw_dev) = self.device.as_hal::<Vulkan>() {
+                raw_dev.raw_device().free_memory(self.memory, None);
+            }
+        }
+    }
+}
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 mod video_metal;
 
@@ -185,8 +227,13 @@ pub struct VideoRenderer {
     // GPU is still reading from it — the display shows torn / wrong-frame
     // content that looks like time-travel jumps. Keeping the last N AHBs
     // alive guarantees the GPU is done with each by the time it's dropped.
+    //
+    // On the Vulkan render path we also need to defer freeing the
+    // externally-imported VkDeviceMemory for the same reason. Use a single
+    // ring of trait-object keepalives so both paths share the depth-1
+    // contract without each having to maintain its own queue.
     #[cfg(target_os = "android")]
-    ahb_keepalive: Arc<std::sync::Mutex<std::collections::VecDeque<Arc<crate::decoders::SendableAhb>>>>,
+    ahb_keepalive: Arc<std::sync::Mutex<std::collections::VecDeque<Box<dyn AndroidFrameKeepalive>>>>,
     /// Zero-copy CVPixelBuffer → MTLTexture cache. None when the wgpu backend
     /// isn't Metal (shouldn't happen on Apple platforms but the constructor
     /// is fallible).
@@ -266,12 +313,15 @@ impl VideoRenderer {
         let backend = Backends::DX12;
         #[cfg(target_os = "linux")]
         let backend = Backends::VULKAN;
-        // Android: always use GLES. The AHB zero-copy path works directly with
-        // GL_TEXTURE_EXTERNAL_OES — no Vulkan AHB import needed. This avoids
-        // device-specific Vulkan driver bugs (MT8696 abort in BILParseStream,
-        // emulator vkCreateInstance failures) and follows the recommended path.
+        // Android: request Vulkan first, fall back to GLES. wgpu's adapter
+        // selection tries the backends in flag order and the first that
+        // returns a working adapter wins — so capable devices (e.g. Mali-G78
+        // on a S21) get the Vulkan zero-copy AHB-import path, while broken
+        // drivers (Google TV MT8696 BILParseStream abort, emulator
+        // vulkan.ranchu vkCreateInstance failure) silently slide onto GLES
+        // and the GL_TEXTURE_EXTERNAL_OES path.
         #[cfg(target_os = "android")]
-        let backend = Backends::GL;
+        let backend = Backends::VULKAN | Backends::GL;
         #[cfg(any(target_os = "ios", target_os = "macos"))]
         let backend = Backends::METAL;
 
@@ -567,7 +617,7 @@ impl VideoRenderer {
 
         #[cfg(target_os = "android")]
         let ahb_keepalive = Arc::new(std::sync::Mutex::new(
-            std::collections::VecDeque::<Arc<crate::decoders::SendableAhb>>::with_capacity(4),
+            std::collections::VecDeque::<Box<dyn AndroidFrameKeepalive>>::with_capacity(4),
         ));
 
         // Install the present hook on the GLES surface so OES rendering happens
@@ -1228,7 +1278,7 @@ impl VideoRenderer {
         // 32-slot ImageReader pool at segment boundaries.
         {
             let mut keep = self.ahb_keepalive.lock().unwrap();
-            keep.push_back(Arc::clone(&frame.buffer));
+            keep.push_back(Box::new(Arc::clone(&frame.buffer)));
             while keep.len() > 1 {
                 keep.pop_front();
             }
@@ -1237,7 +1287,221 @@ impl VideoRenderer {
 
     #[cfg(target_os = "android")]
     pub async fn render_android(&self, frame: crate::decoders::AndroidHardwareBufferFrame, desired_present_ns: i64) {
-        self.render_android_gles(frame, desired_present_ns).await;
+        if self.backend == wgpu::Backend::Vulkan {
+            self.render_android_vulkan(frame, desired_present_ns).await;
+        } else {
+            self.render_android_gles(frame, desired_present_ns).await;
+        }
+    }
+
+    /// Vulkan zero-copy AHB path: imports the AHB into a Vulkan VkImage via
+    /// VK_ANDROID_external_memory_android_hardware_buffer, wraps it as a
+    /// wgpu NV12 texture, and draws it through the shared NV12 pipeline that
+    /// the desktop VAAPI path also uses. `desired_present_ns` is currently
+    /// unused on this path — Vulkan's analog is VK_GOOGLE_display_timing,
+    /// which would need wiring through the queue's vkQueuePresentKHR call
+    /// chain. Without it, the compositor schedules each frame at the next
+    /// vsync after present() returns. The GLES path's eglPresentationTimeANDROID
+    /// hook is the only place we currently steer compositor timing.
+    #[cfg(target_os = "android")]
+    async fn render_android_vulkan(
+        &self,
+        frame: crate::decoders::AndroidHardwareBufferFrame,
+        _desired_present_ns: i64,
+    ) {
+        use ndk::hardware_buffer::HardwareBuffer;
+        use video_mediacodec::create_vk_image_from_ahb;
+        use video_vulkan::create_texture_from_vk_image;
+
+        // Without the NV12 pipeline + bind-group layout the rest of this path
+        // can't run — fall back to a blue clear so the swap chain keeps
+        // ticking and we surface a clear visual signal that the renderer is
+        // alive but un-pipelined.
+        let (Some(bgl), Some(pipeline), Some(vbuf)) = (
+            self.texture_bind_group_layout.as_ref(),
+            self.render_pipeline.as_ref(),
+            self.vertex_buffer.as_ref(),
+        ) else {
+            static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+            WARN_ONCE.call_once(|| {
+                log::warn!(
+                    "[android_vk] NV12 pipeline unavailable (adapter didn't expose TEXTURE_FORMAT_NV12) — blue clear"
+                );
+            });
+            let surface = self.surface.lock().await;
+            let surface_texture = match surface.get_current_texture() {
+                wgpu::CurrentSurfaceTexture::Success(t)
+                | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
+                other => {
+                    log::warn!("[android_vk] surface not available: {:?}", other);
+                    return;
+                }
+            };
+            let view = surface_texture
+                .texture
+                .create_view(&wgpu::TextureViewDescriptor {
+                    format: Some(self.surface_format),
+                    ..Default::default()
+                });
+            let mut encoder = self.device.create_command_encoder(&Default::default());
+            {
+                let _rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("android-vk-fallback-clear"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color {
+                                r: 0.1,
+                                g: 0.2,
+                                b: 0.4,
+                                a: 1.0,
+                            }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+            }
+            self.queue.submit([encoder.finish()]);
+            self.pre_present_notify();
+            self.queue.present(surface_texture);
+            return;
+        };
+
+        // Tight scope on the unowned HardwareBuffer view: it wraps a !Send
+        // pointer, so we MUST drop it before the next .await or the
+        // surrounding future loses its Send bound and the type-checker
+        // refuses to compile this as an async fn. The owned `frame.buffer`
+        // keeps the AHB alive across imports.
+        let img_mem = {
+            let hb_view = unsafe {
+                HardwareBuffer::from_ptr(
+                    std::ptr::NonNull::new(frame.buffer.as_ptr()).unwrap(),
+                )
+            };
+            match create_vk_image_from_ahb(&self.device, &hb_view, frame.width, frame.height) {
+                Ok(im) => im,
+                Err(e) => {
+                    log::warn!("[android_vk] AHB import failed: {}", e);
+                    return;
+                }
+            }
+        };
+
+        // `drop=true` hands VkImage destruction off to wgpu-hal when the wgpu
+        // texture below drops. The matching VkDeviceMemory is NOT released by
+        // hal — externally-imported memory has to be freed by the caller —
+        // so we stash it in `ahb_keepalive` alongside the AHB so its Drop
+        // impl can call vkFreeMemory after the GPU is done.
+        let raw_image = img_mem.raw_image;
+        let raw_memory = img_mem.memory;
+        let texture = create_texture_from_vk_image(
+            &self.device,
+            raw_image,
+            frame.width,
+            frame.height,
+            TextureFormat::NV12,
+            true,
+            true,
+        );
+
+        let y_view = texture.create_view(&wgpu::TextureViewDescriptor {
+            format: Some(TextureFormat::R8Unorm),
+            aspect: wgpu::TextureAspect::Plane0,
+            ..Default::default()
+        });
+        let uv_view = texture.create_view(&wgpu::TextureViewDescriptor {
+            format: Some(TextureFormat::Rg8Unorm),
+            aspect: wgpu::TextureAspect::Plane1,
+            ..Default::default()
+        });
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("android_vk_bind_group"),
+            layout: bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&y_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&uv_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+            ],
+        });
+
+        let surface = self.surface.lock().await;
+        let vbuf_read = vbuf.read().await;
+        let surface_texture = match surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(t) => t,
+            wgpu::CurrentSurfaceTexture::Suboptimal(_) => {
+                let _ = self.command_sender.try_send(VideoRendererCommand::Resize(
+                    *self.surface_size.read().unwrap(),
+                ));
+                return;
+            }
+            other => {
+                log::warn!("[android_vk] surface not available: {:?}", other);
+                return;
+            }
+        };
+        let view = surface_texture
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor {
+                format: Some(self.surface_format),
+                ..Default::default()
+            });
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        {
+            let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("android_vk_nv12"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            rp.set_pipeline(pipeline);
+            rp.set_bind_group(0, &bind_group, &[]);
+            rp.set_vertex_buffer(0, vbuf_read.slice(..));
+            rp.draw(0..6, 0..1);
+        }
+        self.queue.submit([encoder.finish()]);
+        self.pre_present_notify();
+        self.queue.present(surface_texture);
+
+        // Same one-frame keepalive contract as the GLES path, plus the
+        // VkDeviceMemory cleanup the GLES path doesn't need: AHB stays
+        // referenced until the GPU is done sampling, then VulkanFrameKeepalive's
+        // Drop calls vkFreeMemory on the imported memory we allocated above.
+        {
+            let mut keep = self.ahb_keepalive.lock().unwrap();
+            keep.push_back(Box::new(VulkanFrameKeepalive {
+                _ahb: Arc::clone(&frame.buffer),
+                device: self.device.clone(),
+                memory: raw_memory,
+            }));
+            while keep.len() > 1 {
+                keep.pop_front();
+            }
+        }
     }
 }
 

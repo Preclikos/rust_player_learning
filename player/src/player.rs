@@ -1327,6 +1327,28 @@ async fn text_play<V: VideoSink>(
             cues.len(),
             bytes.len()
         );
+        // Diagnostic for "Czech (or any non-ASCII) renders wrong" reports:
+        // if the source isn't UTF-8 (some Windows-1250 / ISO-8859-2 VTT
+        // files exist in the wild despite the spec) we'd see U+FFFD
+        // replacement chars in the text. If the source IS UTF-8 but the
+        // consumer's font lacks Latin Extended-A glyphs, the text here
+        // looks fine and the problem is the font. The byte preview lets
+        // us tell which.
+        if let Some(first) = cues.first() {
+            let head = first.text.chars().take(80).collect::<String>();
+            let raw_head: String = bytes
+                .iter()
+                .take(160)
+                .map(|b| format!("{:02x}", b))
+                .collect::<Vec<_>>()
+                .join(" ");
+            log::debug!(
+                "[subs] first cue text {:?} (chars={}); raw bytes head: {}",
+                head,
+                first.text.chars().count(),
+                raw_head
+            );
+        }
         if cues.is_empty() {
             // Dump a hex+ASCII preview of the first 256 bytes so future
             // "0 cues" reports show what we actually got — line endings,

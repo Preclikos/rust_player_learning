@@ -275,19 +275,19 @@ impl SubtitleOverlay {
         inner.cached = None;
     }
 
-    /// Called by the video sync loop before each render. Drives both
-    /// the active-cue picker and stale-cue eviction.
+    /// Called by the video sync loop before each render. Updates the
+    /// "current PTS" the cue picker reads, nothing else.
+    ///
+    /// We do NOT evict cues here: time-based eviction made backward
+    /// seeks lose subtitles permanently — once the user paused and
+    /// rewound 10s to re-read a missed line, the cue had already been
+    /// drained at the higher PTS and queue_cues never re-pushed it
+    /// (text_play fetches each VTT segment once per playback). The
+    /// `queue_cues` MAX_CUES cap is the only safety valve we need;
+    /// for typical 2h content with 1 cue per ~3s we're well below it.
     pub fn set_pts_ms(&self, pts_ms: i64) {
         let mut inner = self.inner.lock().unwrap();
         inner.current_pts_ms = pts_ms;
-        // Drop cues that ended more than ~5s ago — small slack so a
-        // brief backward seek still picks them up.
-        let cutoff = pts_ms - 5_000;
-        if let Some(idx) = inner.cues.iter().position(|c| c.end_ms > cutoff) {
-            if idx > 0 {
-                inner.cues.drain(0..idx);
-            }
-        }
     }
 
     /// Issue the draw into a caller-owned render pass. The caller has

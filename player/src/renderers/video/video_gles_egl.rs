@@ -70,11 +70,12 @@ in vec2 a_pos;
 in vec2 a_tex;
 uniform float u_scale_x;
 uniform float u_scale_y;
+uniform float u_tex_x_max;
 uniform float u_tex_y_max;
 out vec2 v_tex;
 void main() {
     gl_Position = vec4(a_pos.x * u_scale_x, a_pos.y * u_scale_y, 0.0, 1.0);
-    v_tex = vec2(a_tex.x, a_tex.y * u_tex_y_max);
+    v_tex = vec2(a_tex.x * u_tex_x_max, a_tex.y * u_tex_y_max);
 }";
 
 const FS_SRC: &str = "#version 300 es
@@ -106,6 +107,11 @@ pub struct GlesOesPendingFrame {
     pub ahb_ptr: usize,  // *mut AHardwareBuffer cast to usize
     pub scale_x: f32,
     pub scale_y: f32,
+    /// content_width / buffer_width — crops the right-edge codec padding so
+    /// we don't sample uninitialised memory (visible as a green rectangle on
+    /// PowerVR Rogue / MT8696 where the buffer is 1920×1088 for 1280×720
+    /// content). 1.0 = no horizontal padding.
+    pub tex_x_max: f32,
     pub tex_y_max: f32,
     /// CLOCK_MONOTONIC nanoseconds when this frame should appear on screen.
     /// Passed to eglPresentationTimeANDROID; 0 = no constraint.
@@ -123,6 +129,7 @@ pub struct GlesOesRenderer {
     oes_texture: glow::Texture,
     scale_x_loc: Option<glow::UniformLocation>,
     scale_y_loc: Option<glow::UniformLocation>,
+    tex_x_max_loc: Option<glow::UniformLocation>,
     tex_y_max_loc: Option<glow::UniformLocation>,
     // EGL extension function pointers stored as usize (makes the struct Send + Sync).
     fn_get_native_client_buffer: usize,  // eglGetNativeClientBufferANDROID
@@ -226,11 +233,17 @@ impl GlesOesRenderer {
         }
         let scale_x_loc = gl.get_uniform_location(program, "u_scale_x");
         let scale_y_loc = gl.get_uniform_location(program, "u_scale_y");
+        let tex_x_max_loc = gl.get_uniform_location(program, "u_tex_x_max");
         let tex_y_max_loc = gl.get_uniform_location(program, "u_tex_y_max");
         gl.use_program(None);
 
-        log::info!("[gles_oes] shader compiled, uniforms: scale_x={} scale_y={} tex_y_max={}",
-            scale_x_loc.is_some(), scale_y_loc.is_some(), tex_y_max_loc.is_some());
+        log::info!(
+            "[gles_oes] shader compiled, uniforms: scale_x={} scale_y={} tex_x_max={} tex_y_max={}",
+            scale_x_loc.is_some(),
+            scale_y_loc.is_some(),
+            tex_x_max_loc.is_some(),
+            tex_y_max_loc.is_some(),
+        );
 
         Ok(GlesOesRenderer {
             program,
@@ -239,6 +252,7 @@ impl GlesOesRenderer {
             oes_texture,
             scale_x_loc,
             scale_y_loc,
+            tex_x_max_loc,
             tex_y_max_loc,
             fn_get_native_client_buffer: fn_get_client,
             fn_egl_create_image: fn_create,
@@ -262,6 +276,7 @@ impl GlesOesRenderer {
         viewport_height: i32,
         scale_x: f32,
         scale_y: f32,
+        tex_x_max: f32,
         tex_y_max: f32,
         desired_present_ns: i64,     // CLOCK_MONOTONIC ns for this frame; 0 = unconstrained
     ) -> Result<(), String> {
@@ -335,6 +350,9 @@ impl GlesOesRenderer {
         }
         if let Some(ref loc) = self.scale_y_loc {
             gl.uniform_1_f32(Some(loc), scale_y);
+        }
+        if let Some(ref loc) = self.tex_x_max_loc {
+            gl.uniform_1_f32(Some(loc), tex_x_max);
         }
         if let Some(ref loc) = self.tex_y_max_loc {
             gl.uniform_1_f32(Some(loc), tex_y_max);

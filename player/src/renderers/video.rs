@@ -200,6 +200,7 @@ pub struct VideoRenderer {
     // Crop factor for the texture V-axis: content_height / buffer_height.
     // Always 1.0 on desktop; set to <1.0 on Android when the hardware codec
     // pads the output buffer taller than the visible frame (e.g. 736 for 720p).
+    tex_x_max: Arc<RwLock<f32>>,
     tex_y_max: Arc<RwLock<f32>>,
     surface: Arc<Mutex<wgpu::Surface<'static>>>,
     surface_format: TextureFormat,
@@ -313,15 +314,15 @@ impl VideoRenderer {
         let backend = Backends::DX12;
         #[cfg(target_os = "linux")]
         let backend = Backends::VULKAN;
-        // Android: request Vulkan first, fall back to GLES. wgpu's adapter
-        // selection tries the backends in flag order and the first that
-        // returns a working adapter wins — so capable devices (e.g. Mali-G78
-        // on a S21) get the Vulkan zero-copy AHB-import path, while broken
-        // drivers (Google TV MT8696 BILParseStream abort, emulator
-        // vulkan.ranchu vkCreateInstance failure) silently slide onto GLES
-        // and the GL_TEXTURE_EXTERNAL_OES path.
+        // Android: default to GLES across the board. The GL_TEXTURE_EXTERNAL_OES
+        // path works on every Android GPU we've tested (Mali-G78, PowerVR Rogue
+        // GE9215, Adreno) without per-device quirks; the Vulkan zero-copy AHB
+        // path (still implemented in render_android_vulkan / video_mediacodec.rs)
+        // exists for future opt-in but isn't safe as the default — drivers vary
+        // in whether vkCreateGraphicsPipeline survives the NV12 sampler config
+        // (PowerVR Rogue aborts inside the SPIR-V parser, for one).
         #[cfg(target_os = "android")]
-        let backend = Backends::VULKAN | Backends::GL;
+        let backend = Backends::GL;
         #[cfg(any(target_os = "ios", target_os = "macos"))]
         let backend = Backends::METAL;
 
@@ -644,6 +645,7 @@ impl VideoRenderer {
                                     h as i32,
                                     f.scale_x,
                                     f.scale_y,
+                                    f.tex_x_max,
                                     f.tex_y_max,
                                     f.desired_present_ns,
                                 )
@@ -677,6 +679,7 @@ impl VideoRenderer {
             backend,
             queue,
             frame_size: Arc::new(RwLock::new(size)),
+            tex_x_max: Arc::new(RwLock::new(1.0_f32)),
             tex_y_max: Arc::new(RwLock::new(1.0_f32)),
             surface: Arc::new(Mutex::new(surface)),
             surface_format,
@@ -1158,19 +1161,36 @@ impl VideoRenderer {
     /// Falls back to a blue-screen clear when the OES renderer is unavailable.
     #[cfg(target_os = "android")]
     async fn render_android_gles(&self, frame: crate::decoders::AndroidHardwareBufferFrame, desired_present_ns: i64) {
-        // Update tex_y_max when the codec buffer is taller than the visible content
-        // (e.g. PowerVR alignment padding: 1088-row buffer for 720p content).
-        // Only fire when buffer > content (stored.height < frame.height): if stored.height
-        // is still the window height (1080) and frame.height is content height (720),
-        // the condition would be inverted and produce tex_y_max > 1.0 which corrupts output.
+        // Update tex_x_max / tex_y_max when the codec buffer is larger than
+        // the visible content (e.g. PowerVR Rogue / MT8696 on Google TV
+        // Streamer: 1920×1088 buffer for 1280×720 content). Only fire when
+        // buffer > content: if stored.* is still the window dimensions
+        // (e.g. 1920×1080), the condition would be inverted and produce
+        // tex_*_max > 1.0 which corrupts output.
+        // The right-edge X padding is the worst offender visually — it
+        // contains uninitialised memory that samples as a solid green
+        // rectangle along the right side of the video.
         {
             let stored = self.frame_size.read().await;
+            if stored.width > 0 && frame.width > 0 && stored.width < frame.width {
+                let new_tx = stored.width as f32 / frame.width as f32;
+                let mut tx = self.tex_x_max.write().await;
+                if (*tx - new_tx).abs() > 0.001 {
+                    log::info!(
+                        "[gles_oes] codec padding X: content={}px buffer={}px tex_x_max={:.4}",
+                        stored.width,
+                        frame.width,
+                        new_tx
+                    );
+                    *tx = new_tx;
+                }
+            }
             if stored.height > 0 && frame.height > 0 && stored.height < frame.height {
                 let new_ty = stored.height as f32 / frame.height as f32;
                 let mut ty = self.tex_y_max.write().await;
                 if (*ty - new_ty).abs() > 0.001 {
                     log::info!(
-                        "[gles_oes] codec padding: content={}px buffer={}px tex_y_max={:.4}",
+                        "[gles_oes] codec padding Y: content={}px buffer={}px tex_y_max={:.4}",
                         stored.height,
                         frame.height,
                         new_ty
@@ -1238,6 +1258,7 @@ impl VideoRenderer {
         // Compute aspect-ratio-preserving scale factors.
         let window_size = self.inner_size();
         let frame_size = *self.frame_size.read().await;
+        let tex_x_max = *self.tex_x_max.read().await;
         let tex_y_max = *self.tex_y_max.read().await;
         let (scale_x, scale_y) = if frame_size.width > 0 && frame_size.height > 0 {
             let wa = window_size.width as f32 / window_size.height as f32;
@@ -1258,6 +1279,7 @@ impl VideoRenderer {
                 ahb_ptr: frame.buffer.as_ptr() as usize,
                 scale_x,
                 scale_y,
+                tex_x_max,
                 tex_y_max,
                 desired_present_ns,
             });

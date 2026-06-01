@@ -2,6 +2,8 @@ package cz.preclikos.rustplayer
 
 import android.app.Activity
 import android.content.Context
+import android.graphics.Color
+import android.graphics.drawable.ColorDrawable
 import android.os.Bundle
 import android.view.Surface
 import android.view.SurfaceHolder
@@ -25,6 +27,16 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         super.onCreate(savedInstanceState)
         // Keep the screen on during playback without a WakeLock.
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+
+        // Force the Activity window background to black so any region not
+        // overdrawn by the GLES OES present hook (the host SurfaceView area
+        // before the first frame, the pillarbox/letterbox gutters around the
+        // video, alpha-blended composition fallback paths on quirky drivers)
+        // shows up as black instead of the default theme background — observed
+        // as a green rectangle behind the video on Google TV Streamer
+        // (PowerVR Rogue GE9215) where the theme background was apparently
+        // green under composition.
+        window.setBackgroundDrawable(ColorDrawable(Color.BLACK))
 
         val view = SurfaceView(this)
         view.holder.addCallback(this)

@@ -5,10 +5,12 @@ fn main() {
 
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     if target_os == "windows" {
-        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+        // Compile the FFmpeg log shim. The shim forward-declares av_log_format_line2
+        // and av_log_set_callback without including libavutil/log.h, so no FFmpeg
+        // include path is needed here — symbols resolve against the libavutil
+        // already linked by ffmpeg-sys-next.
         cc::Build::new()
             .file("c/ffmpeg_log_shim.c")
-            .include(format!("{}/vendor/windows-x64/include", manifest_dir))
             .compile("ffmpeg_log_shim");
     }
 }

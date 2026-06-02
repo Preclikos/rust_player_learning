@@ -111,6 +111,7 @@ pub struct GlesOesPendingFrame {
     /// we don't sample uninitialised memory (visible as a green rectangle on
     /// PowerVR Rogue / MT8696 where the buffer is 1920×1088 for 1280×720
     /// content). 1.0 = no horizontal padding.
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
     pub tex_x_max: f32,
     pub tex_y_max: f32,
     /// CLOCK_MONOTONIC nanoseconds when this frame should appear on screen.

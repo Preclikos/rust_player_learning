@@ -67,6 +67,8 @@ mod imp {
         unsafe { sys::av_log_set_level(level.to_av()) };
         #[cfg(target_os = "linux")]
         super::linux_forwarder::install_once();
+        #[cfg(target_os = "windows")]
+        super::windows_forwarder::install_once();
     }
 }
 
@@ -126,6 +128,42 @@ mod linux_forwarder {
             log::Level::Trace
         };
         log::log!(target: "ffmpeg", rust_lvl, "{}", msg);
+    }
+}
+
+#[cfg(target_os = "windows")]
+mod windows_forwarder {
+    use ffmpeg_sys_next as sys;
+    use std::ffi::{c_char, c_int};
+    use std::sync::Once;
+
+    extern "C" {
+        fn ffmpeg_log_install(cb: unsafe extern "C" fn(c_int, *const c_char, c_int));
+    }
+
+    pub fn install_once() {
+        static INIT: Once = Once::new();
+        INIT.call_once(|| unsafe { ffmpeg_log_install(forward) });
+    }
+
+    unsafe extern "C" fn forward(level: c_int, msg: *const c_char, len: c_int) {
+        let bytes = unsafe { std::slice::from_raw_parts(msg as *const u8, len as usize) };
+        let s = match std::str::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let rust_lvl = if level <= sys::AV_LOG_ERROR {
+            log::Level::Error
+        } else if level <= sys::AV_LOG_WARNING {
+            log::Level::Warn
+        } else if level <= sys::AV_LOG_INFO {
+            log::Level::Info
+        } else if level <= sys::AV_LOG_VERBOSE {
+            log::Level::Debug
+        } else {
+            log::Level::Trace
+        };
+        log::log!(target: "ffmpeg", rust_lvl, "{}", s);
     }
 }
 

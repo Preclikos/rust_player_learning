@@ -52,11 +52,6 @@ pub struct VideoDecoderParams {
     /// Raw NALU bytes (no length prefix, no start code) — VPS/SPS/PPS for HEVC,
     /// extracted from the hvcC box in the init segment.
     pub hvcc_nalus: Vec<Vec<u8>>,
-    /// Luma bit depth from the hvcC `bitDepthLumaMinus8` field (8 for SDR
-    /// Main, 10 for HDR Main 10). Selects NV12 vs P010 for the D3D11VA
-    /// frames context's sw_format — guessing wrong makes
-    /// `av_hwframe_ctx_init` fail with AVERROR_UNKNOWN on Intel Arc.
-    pub bit_depth: u8,
 }
 
 pub struct DecodedVideoFrame {

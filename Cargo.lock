@@ -2364,6 +2364,7 @@ dependencies = [
  "async-trait",
  "bytemuck",
  "bytes",
+ "cc",
  "cpal",
  "ctr",
  "ffmpeg-next",

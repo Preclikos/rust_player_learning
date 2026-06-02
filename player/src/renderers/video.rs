@@ -197,10 +197,12 @@ pub struct VideoRenderer {
     /// yet — subtitle rendering there is a separate follow-up.
     subtitle_overlay: Arc<std::sync::Mutex<Option<Arc<super::subtitle::SubtitleOverlay>>>>,
     frame_size: Arc<RwLock<PhysicalSize<u32>>>,
-    // Crop factor for the texture V-axis: content_height / buffer_height.
+    // Crop factor for the texture axes: content / buffer size.
     // Always 1.0 on desktop; set to <1.0 on Android when the hardware codec
-    // pads the output buffer taller than the visible frame (e.g. 736 for 720p).
+    // pads the output buffer beyond the visible frame (e.g. 1920×1088 for 720p).
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
     tex_x_max: Arc<RwLock<f32>>,
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
     tex_y_max: Arc<RwLock<f32>>,
     surface: Arc<Mutex<wgpu::Surface<'static>>>,
     surface_format: TextureFormat,

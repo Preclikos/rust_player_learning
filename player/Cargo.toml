@@ -110,6 +110,9 @@ glow = "0.17"
 [target.'cfg(target_os = "ios")'.dependencies]
 reqwest = { version = "0.12.12", default-features = false, features = ["rustls-tls"] }
 
+[build-dependencies]
+cc = "1"
+
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [ "Win32_System_Com", "Win32_System_Console", "Win32_System_SystemServices", "Win32_UI_Shell", "Win32_Foundation", "Wdk_Foundation", "Win32_System_LibraryLoader",
              "Win32_Graphics_Dwm", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D11", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Dxgi", "Win32_Graphics_Direct3D12",

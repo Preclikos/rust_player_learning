@@ -126,27 +126,14 @@ impl Tracks {
             }
         };
 
-        let width = match &representation.width {
-            Some(value) => value,
-            None => {
-                return Err(format!(
-                    "Cannot get width from Representation Id: {}",
-                    representation.id
-                )
-                .into())
-            }
-        };
-
-        let height = match &representation.height {
-            Some(value) => value,
-            None => {
-                return Err(format!(
-                    "Cannot get height from Representation Id: {}",
-                    representation.id
-                )
-                .into())
-            }
-        };
+        // @width / @height are optional in DASH — some manifests (notably
+        // series episodes) omit them on the Representation. Default to 0 and let
+        // the decoder report the real dimensions from the bitstream / decoded
+        // frame (VideoToolbox via the CVPixelBuffer, FFmpeg via the stream,
+        // MediaCodec via INFO_OUTPUT_FORMAT_CHANGED), which is authoritative
+        // anyway — same as every other field we read from the bitstream.
+        let width = representation.width.unwrap_or(0);
+        let height = representation.height.unwrap_or(0);
 
         // @sar (Sample Aspect Ratio) is optional in DASH and defaults to
         // 1:1 per the spec. Don't reject the stream over a missing one.
@@ -248,8 +235,8 @@ impl Tracks {
             bandwidth: representation.bandwidth,
             codecs,
             mime_type: representation.mime_type.to_string(),
-            width: *width,
-            height: *height,
+            width,
+            height,
             sar,
             segment_init: init_segment,
             segment_range: index_segment,

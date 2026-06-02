@@ -732,6 +732,15 @@ impl VideoRenderer {
         tex_y_max: f32,
         vertex_buffer: Arc<RwLock<Buffer>>,
     ) {
+        // Frame dimensions can be 0 until the first frame is decoded — the
+        // manifest's @width/@height are optional, so we may not know the
+        // content size until the decoder reports it. Skip the aspect rebuild
+        // (which would divide by zero → NaN scale → a degenerate quad) and keep
+        // the current vertices; the decoded frame triggers a real rebuild.
+        if frame_size.width == 0 || frame_size.height == 0 {
+            return;
+        }
+
         let window_aspect = window_size.width as f32 / window_size.height as f32;
 
         let texture_aspect = frame_size.width as f32 / frame_size.height as f32;

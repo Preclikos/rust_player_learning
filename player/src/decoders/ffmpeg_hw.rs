@@ -7,9 +7,6 @@ use ffmpeg_sys_next::{
     av_buffer_ref, av_buffer_unref, av_hwdevice_ctx_create, AVBufferRef, AVCodecContext,
     AVHWDeviceType, AVPixelFormat,
 };
-#[cfg(target_os = "windows")]
-use ffmpeg_sys_next::{av_hwframe_ctx_alloc, av_hwframe_ctx_init, AVHWFramesContext};
-
 use crate::parsers::mp4::{apped_hevc_header, parse_hevc_nalu};
 
 use super::{DecodedVideoFrame, DecoderError, HwVideoDecoder, PlatformFrame, VideoCodec, VideoDecoderParams};
@@ -145,65 +142,13 @@ impl HwVideoDecoder for FfmpegHwDecoder {
             (*ctx.as_mut_ptr()).get_format = Some(select_hw_format);
         }
 
-        // Windows D3D11VA: pre-allocate `hw_frames_ctx` ourselves *before* the
-        // first send_packet. libavcodec's auto-allocation
-        // (avcodec_get_hw_frames_parameters → av_hwframe_ctx_init) returns
-        // ENOMEM on Intel Arc A750 the moment the first real slice arrives —
-        // observed regardless of `extra_hw_frames` value (64, 16, 0 all
-        // failed). Pre-allocating with explicit width/height/sw_format from
-        // the manifest sidesteps the auto-allocation path entirely.
-        //
-        // sw_format MUST match the stream's bit depth: NV12 for 8-bit HEVC
-        // Main, P010 for 10-bit Main 10 (HDR). Mismatch → CreateTexture2D
-        // refuses to allocate the pool and av_hwframe_ctx_init returns
-        // AVERROR_UNKNOWN (-1313558101). bit_depth comes from the hvcC
-        // box's bitDepthLumaMinus8 field, parsed in player.rs before this
-        // call.
-        #[cfg(target_os = "windows")]
-        unsafe {
-            // FFmpeg exposes P010 only as endian-tagged variants
-            // (`AV_PIX_FMT_P010LE` / `AV_PIX_FMT_P010BE`); the bare
-            // `AV_PIX_FMT_P010` is a C macro that bindgen doesn't surface.
-            // Every target we ship on (Windows / Linux / Android / Apple) is
-            // little-endian, so hard-code the LE form.
-            let sw_format = if params.bit_depth >= 10 {
-                AVPixelFormat::AV_PIX_FMT_P010LE
-            } else {
-                AVPixelFormat::AV_PIX_FMT_NV12
-            };
-            let frames_ref = av_hwframe_ctx_alloc(self.hw_device_ctx);
-            if frames_ref.is_null() {
-                return Err("av_hwframe_ctx_alloc returned null".into());
-            }
-            let frames_ctx = (*frames_ref).data as *mut AVHWFramesContext;
-            (*frames_ctx).format = AVPixelFormat::AV_PIX_FMT_D3D11;
-            (*frames_ctx).sw_format = sw_format;
-            (*frames_ctx).width = params.width as i32;
-            (*frames_ctx).height = params.height as i32;
-            // `initial_pool_size = 0` skips d3d11va_alloc_pool entirely —
-            // av_hwframe_ctx_init returns 0, and individual textures are
-            // CreateTexture2D'd lazily by av_hwframe_get_buffer. Static
-            // pool with size 20 returned AVERROR_UNKNOWN on Intel Arc
-            // A750 (the driver refused the 20-element NV12 Texture2DArray
-            // with BIND_DECODER | BIND_SHADER_RESOURCE flags). Dynamic
-            // pool sidesteps the array constraint.
-            (*frames_ctx).initial_pool_size = 0;
-
-            let ret = av_hwframe_ctx_init(frames_ref);
-            if ret < 0 {
-                let mut owned = frames_ref;
-                av_buffer_unref(&mut owned);
-                return Err(format!(
-                    "av_hwframe_ctx_init failed: {} (bit_depth={}, sw_format={:?}, {}x{})",
-                    ret, params.bit_depth, sw_format, params.width, params.height
-                )
-                .into());
-            }
-
-            (*ctx.as_mut_ptr()).hw_frames_ctx = av_buffer_ref(frames_ref);
-            let mut owned = frames_ref;
-            av_buffer_unref(&mut owned);
-        }
+        // No pre-allocated hw_frames_ctx: let hevc_d3d11va2 auto-create it
+        // inside its hwaccel->init() after get_format returns AV_PIX_FMT_D3D11.
+        // A manually pre-set context with format=AV_PIX_FMT_D3D11 caused the
+        // hwaccel to log "Invalid pixfmt for hwaccel!" and abort because the
+        // frames context format was evaluated before avctx->pix_fmt was set.
+        // FFmpeg auto-derives sw_format from the SPS (NV12 for Main 8-bit,
+        // P010 for Main 10), so the auto-allocated context is always correct.
 
         let mut decoder = ctx
             .decoder()

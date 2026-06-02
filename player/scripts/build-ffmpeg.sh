@@ -81,7 +81,7 @@ case "$PLATFORM" in
       --disable-pthreads
       --enable-d3d11va
       --enable-dxva2
-      --enable-hwaccel=h264_d3d11va,hevc_d3d11va,h264_dxva2,hevc_dxva2
+      --enable-hwaccel=h264_d3d11va,hevc_d3d11va,h264_d3d11va2,hevc_d3d11va2,h264_dxva2,hevc_dxva2
       --enable-bsf=h264_mp4toannexb,hevc_mp4toannexb
       "--extra-ldflags=-static-libgcc -static-libstdc++ -Wl,-Bstatic -lwinpthread -Wl,-Bdynamic"
     )

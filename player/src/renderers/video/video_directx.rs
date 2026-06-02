@@ -187,6 +187,11 @@ pub fn get_shared_texture_d3d11(
         desc.MiscFlags |= D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0 as u32
             | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX.0 as u32;
         desc.ArraySize = 1;
+        // The source texture has D3D11_BIND_DECODER only (no D3D11_BIND_SHADER_RESOURCE,
+        // which Intel Arc rejects). The intermediate shared texture is not decoded into —
+        // it just needs to be importable by D3D12/Vulkan via the NTHandle, so
+        // D3D11_BIND_SHADER_RESOURCE is the right flag here.
+        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE.0 as u32;
 
         let mut new_texture = None;
         device.CreateTexture2D(&desc, None, Some(&mut new_texture))?;

@@ -2412,7 +2412,11 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                     tokio::sync::watch::channel::<Option<VideoRepresenation>>(None);
                 *video_switch_slot.lock().unwrap() = Some(switch_tx);
 
-                let (frame_sender, frame_receiver) = mpsc::channel::<DecodedVideoFrame>(64);
+                // Capacity 8: keeps concurrent D3D11VA surfaces (DPB ~7 + pipeline)
+                // well under Intel Arc A750's driver limit of ~21 individual
+                // decoder surfaces. hevc_d3d11va2 auto-allocates a dynamic pool;
+                // this bound prevents the pipeline from accumulating too many refs.
+                let (frame_sender, frame_receiver) = mpsc::channel::<DecodedVideoFrame>(8);
                 let (sample_sender, sample_receiver) = mpsc::channel::<DecodedAudioFrame>(256);
 
                 let video = tokio::spawn(video_supervisor(

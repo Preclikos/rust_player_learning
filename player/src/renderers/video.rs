@@ -397,8 +397,12 @@ impl VideoRenderer {
         let is_hw_backend = backend == wgpu::Backend::Vulkan
             || backend == wgpu::Backend::Dx12
             || backend == wgpu::Backend::Metal;
+        // P010 (HEVC Main 10) goes through TextureFormat::P010, which wgpu gates
+        // behind a separate feature from NV12 — without enabling it the imported
+        // texture errors with "P010 cannot be used due to missing features".
         let required_features = if is_hw_backend && backend != wgpu::Backend::Metal {
             let desired = wgpu::Features::TEXTURE_FORMAT_NV12
+                | wgpu::Features::TEXTURE_FORMAT_P010
                 | wgpu::Features::TEXTURE_FORMAT_16BIT_NORM;
             adapter.features() & desired
         } else {

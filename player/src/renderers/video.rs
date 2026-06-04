@@ -215,6 +215,12 @@ pub struct VideoRenderer {
     vertex_buffer: Option<Arc<RwLock<wgpu::Buffer>>>,
     texture_bind_group_layout: Option<BindGroupLayout>,
     render_pipeline: Option<RenderPipeline>,
+    // P010 / HDR10 path. Built alongside `render_pipeline` and bound only when
+    // the imported frame texture is P010 (Main 10 HEVC). Same bind group
+    // layout as the SDR pipeline — Y and UV plane views are 16-bit instead of
+    // 8-bit but still float-sampled, so the layout is reused. None on devices
+    // where NV12 is unavailable (no 10-bit there either).
+    render_pipeline_hdr: Option<RenderPipeline>,
     command_sender: Sender<VideoRendererCommand>,
     // GLES zero-copy OES renderer for devices without working Vulkan (e.g. Google TV MT8696).
     // Arc so the renderer can be shared with the present hook closure.
@@ -504,7 +510,7 @@ impl VideoRenderer {
         // inside its SPIR-V parser during vkCreateGraphicsPipeline. Since the
         // clear-color fallback path never touches these objects, omitting them
         // is safe and avoids the native abort.
-        let (texture_bind_group_layout, render_pipeline, vertex_buffer) = if has_nv12_feature {
+        let (texture_bind_group_layout, render_pipeline, render_pipeline_hdr, vertex_buffer) = if has_nv12_feature {
             let layout =
                 device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                     entries: &[
@@ -539,6 +545,7 @@ impl VideoRenderer {
                 });
 
             let shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
+            let shader_hdr = device.create_shader_module(wgpu::include_wgsl!("shader_hdr.wgsl"));
 
             let pipeline_layout =
                 device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -547,31 +554,36 @@ impl VideoRenderer {
                     immediate_size: 0,
                 });
 
-            let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("Render Pipeline"),
-                layout: Some(&pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some("vs_main"),
-                    buffers: &[Some(Vertex::desc())],
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some("fs_main"),
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: surface_format,
-                        blend: Some(wgpu::BlendState::REPLACE),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                primitive: wgpu::PrimitiveState::default(),
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState::default(),
-                multiview_mask: None,
-                cache: None,
-            });
+            let make_pipeline = |label: &'static str, module: &wgpu::ShaderModule| {
+                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some(label),
+                    layout: Some(&pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module,
+                        entry_point: Some("vs_main"),
+                        buffers: &[Some(Vertex::desc())],
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module,
+                        entry_point: Some("fs_main"),
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: surface_format,
+                            blend: Some(wgpu::BlendState::REPLACE),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                    }),
+                    primitive: wgpu::PrimitiveState::default(),
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview_mask: None,
+                    cache: None,
+                })
+            };
+
+            let pipeline = make_pipeline("Render Pipeline (SDR/NV12)", &shader);
+            let pipeline_hdr = make_pipeline("Render Pipeline (HDR/P010)", &shader_hdr);
 
             let vertices = generate_verticles(1., 1., 1.);
             let vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -580,9 +592,9 @@ impl VideoRenderer {
                 usage: wgpu::BufferUsages::VERTEX,
             });
 
-            (Some(layout), Some(pipeline), Some(Arc::new(RwLock::new(vb))))
+            (Some(layout), Some(pipeline), Some(pipeline_hdr), Some(Arc::new(RwLock::new(vb))))
         } else {
-            (None, None, None)
+            (None, None, None, None)
         };
 
         // Capacity sized for drag-resize bursts: Win32 generates many WM_SIZE
@@ -690,6 +702,7 @@ impl VideoRenderer {
             vertex_buffer,
             texture_bind_group_layout,
             render_pipeline,
+            render_pipeline_hdr,
             command_sender,
             subtitle_overlay: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(target_os = "android")]
@@ -961,7 +974,15 @@ impl VideoRenderer {
             let surface = self.surface.lock().await;
             let vb_arc = self.vertex_buffer.as_ref().expect("no vertex buffer");
             let vertex_buffer = vb_arc.read().await;
-            let render_pipeline = self.render_pipeline.as_ref().expect("no render pipeline");
+            // P010 imported frames go through the HDR (Rec.2020 + PQ → SDR) pipeline;
+            // NV12 frames stay on the existing SDR pipeline.
+            let render_pipeline = match video_frame.get_texture().format() {
+                TextureFormat::P010 => self
+                    .render_pipeline_hdr
+                    .as_ref()
+                    .expect("no HDR render pipeline"),
+                _ => self.render_pipeline.as_ref().expect("no render pipeline"),
+            };
 
             let surface_texture = match surface.get_current_texture() {
                 wgpu::CurrentSurfaceTexture::Success(t) => t,

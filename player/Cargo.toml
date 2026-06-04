@@ -54,15 +54,21 @@ unicode-normalization = "0.1"
 # iOS links a STATIC, audio-only FFmpeg built by player/scripts/build-ffmpeg.sh
 # (ios-arm64 / ios-sim-*); see app-ios/ios/build_sim.sh for the cross link wiring.
 #
-# Pinned to 7.1 series across the workspace because all target platforms
-# ship FFmpeg 7.x system libs (avutil-59 / avcodec-61 / swresample-5).
-# Staying on the matching Rust crate series keeps its match arms aligned
-# with the bindgen-generated enum surface.
-# NOTE: ffmpeg-sys-next 7.1.x predates LLVM 22 — if your toolchain's
-# libclang is 22+, bindgen may fail and you'll need to bump back to 8.x.
+# Pinned to 8.1 series because ffmpeg-sys-next 7.1.x ships a bindgen that
+# breaks against LLVM 22+ libclang (emits opaque struct shells with broken
+# layout asserts — fails to compile under rustc 1.95+, which bundles LLVM 22).
+# 8.1's bindgen handles LLVM 22 cleanly.
+#
+# ffmpeg-next 8.1.0 itself is patched via the workspace [patch.crates-io] to
+# add `_ =>` wildcard arms to three match statements (AVCodecID,
+# AVFrameSideDataType, AVPacketSideDataType) so it builds against FFmpeg 8.1.1+
+# headers that have new enum variants (IAMF_*, DYNAMIC_HDR_SMPTE_2094_APP5, …).
+# All target platforms ship FFmpeg 7.x system libs but the 8.x crate's
+# bindings are generated against the system headers and have stayed ABI
+# compatible.
 [target.'cfg(any(target_os = "windows", target_os = "linux", target_os = "macos", target_os = "ios"))'.dependencies]
-ffmpeg-next = { version = "7.1" }
-ffmpeg-sys-next = { version = "7.1" }
+ffmpeg-next = { version = "8.1" }
+ffmpeg-sys-next = { version = "8.1" }
 
 # Win/Linux: native-tls (system OpenSSL/Schannel). macOS prefers rustls
 # so we don't drag native-tls + OpenSSL into the build.

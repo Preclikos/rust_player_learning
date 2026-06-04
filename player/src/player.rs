@@ -14,7 +14,7 @@ mod utils;
 // Public re-exports so downstream consumers (BlackZone Console etc.) can
 // implement RequestInterceptor / LicenseResolver against the player's
 // canonical types — see PLAYER_INTEGRATION.md.
-pub use abr::AbrStrategy;
+pub use abr::{AbrStrategy, AbrVideoProfile};
 pub use capabilities::{capabilities, probe_capabilities, PlayerCapabilities};
 pub use events::{
     BufferingReason, Fps, PlayerErrorKind, PlayerEvent, TrackInfo, TrackKind,
@@ -220,6 +220,13 @@ pub struct Player<V: VideoSink = VideoRenderer, A: AudioSink = AudioRenderer> {
     /// `change_video_track` so a user override always sticks.
     abr_strategy: Arc<ArcSwap<AbrStrategy>>,
 
+    /// HDR / bit-depth filter applied to ABR-eligible representations.
+    /// `Adaptive` by default (no filtering). Mutated by
+    /// `set_abr_video_profile`. Orthogonal to `abr_strategy` — `Manual`
+    /// ignores this profile, but `BandwidthEwma` consults it before
+    /// running the bitrate selector.
+    abr_video_profile: Arc<ArcSwap<AbrVideoProfile>>,
+
     /// Watch channel the running `play()` supervisor listens on for
     /// mid-flight representation swaps. Each `play()` call installs a
     /// fresh sender; sending `Some(repr)` triggers a soft swap (tear
@@ -275,6 +282,7 @@ impl<V: VideoSink, A: AudioSink> Clone for Player<V, A> {
             decryptor: Arc::clone(&self.decryptor),
             stats: Arc::clone(&self.stats),
             abr_strategy: Arc::clone(&self.abr_strategy),
+            abr_video_profile: Arc::clone(&self.abr_video_profile),
             video_switch_tx: Arc::clone(&self.video_switch_tx),
             buffer_target_secs: Arc::clone(&self.buffer_target_secs),
             subtitle_representation: Arc::clone(&self.subtitle_representation),
@@ -1715,6 +1723,7 @@ impl Player<VideoRenderer, AudioRenderer> {
 
             stats: Arc::new(StatsState::default()),
             abr_strategy: Arc::new(ArcSwap::from_pointee(AbrStrategy::default())),
+            abr_video_profile: Arc::new(ArcSwap::from_pointee(AbrVideoProfile::default())),
             video_switch_tx: Arc::new(StdMutex::new(None)),
             buffer_target_secs: Arc::new(AtomicU32::new(DEFAULT_BUFFER_TARGET_SECS)),
             subtitle_representation: Arc::new(StdMutex::new(None)),
@@ -2038,6 +2047,22 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         **self.abr_strategy.load()
     }
 
+    /// Set the HDR / bit-depth policy applied by ABR. Takes effect on the
+    /// next ABR tick (≤ 1s). Default is `Adaptive` (no filtering — every
+    /// representation in the adaptation set is eligible).
+    ///
+    /// The host UI should query `PlayerCapabilities` first: if `hdr10` is
+    /// `false` on the active device, force `SdrOnly` here so a manifest
+    /// with HDR reps doesn't auto-switch into an unrenderable one.
+    pub fn set_abr_video_profile(&self, profile: AbrVideoProfile) {
+        self.abr_video_profile.store(Arc::new(profile));
+    }
+
+    /// Returns the active HDR / bit-depth profile.
+    pub fn abr_video_profile(&self) -> AbrVideoProfile {
+        **self.abr_video_profile.load()
+    }
+
     /// How many seconds of media the player tries to keep buffered ahead
     /// of the renderer. Default is `DEFAULT_BUFFER_TARGET_SECS` (8s).
     /// Bumping this trades RAM for resilience against network jitter
@@ -2124,6 +2149,10 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
     /// One ABR reconsideration. Called from the per-second tick spawned in
     /// `play()`. No-op when the strategy is `Manual` or when the current
     /// adaptation has fewer than two representations to choose between.
+    ///
+    /// Two-stage selection: the `abr_video_profile` first filters the
+    /// candidate set (e.g. `SdrOnly` drops HDR10 reps), then the bitrate
+    /// selector picks the highest-bandwidth survivor that fits the EWMA.
     fn abr_tick(&self) {
         let strategy = **self.abr_strategy.load();
         let safety = match strategy {
@@ -2152,22 +2181,33 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             return;
         }
 
-        let bws: Vec<u64> = adaptation
-            .representations
+        // Stage 1: filter by HDR / bit-depth policy.
+        let profile = **self.abr_video_profile.load();
+        let candidate_indices = profile.filter_indices(&adaptation.representations);
+        if candidate_indices.is_empty() {
+            // Profile filtered everything out (e.g. SdrOnly on an HDR-only
+            // adaptation). Keep the currently-playing rep rather than
+            // picking one the policy forbids.
+            return;
+        }
+
+        // Stage 2: bitrate selector against the filtered set.
+        let bws: Vec<u64> = candidate_indices
             .iter()
-            .map(|r| r.bandwidth)
+            .map(|&i| adaptation.representations[i].bandwidth)
             .collect();
-        let pick_idx = match abr::pick_representation(&bws, ewma_bps, safety) {
+        let pick_local = match abr::pick_representation(&bws, ewma_bps, safety) {
             Some(i) => i,
             None => return,
         };
+        let pick_idx = candidate_indices[pick_local];
         let picked = &adaptation.representations[pick_idx];
         if Some(picked.id) == current_id {
             return;
         }
         log::info!(
-            "[abr] switch repr {:?} -> {} (ewma={}bps safety={})",
-            current_id, picked.id, ewma_bps, safety
+            "[abr] switch repr {:?} -> {} (ewma={}bps safety={} profile={:?})",
+            current_id, picked.id, ewma_bps, safety, profile
         );
         self.apply_video_representation_soft(picked);
     }

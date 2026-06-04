@@ -999,6 +999,10 @@ impl VideoRenderer {
                 }
                 other => {
                     log::warn!("surface texture not available: {:?}", other);
+                    #[cfg(target_os = "windows")]
+                    if self.backend == wgpu::Backend::Dx12 {
+                        video_directx::log_dx12_device_removed_reason(&self.device);
+                    }
                     return;
                 }
             };

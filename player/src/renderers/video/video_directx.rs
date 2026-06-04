@@ -182,6 +182,19 @@ pub fn get_shared_texture_d3d11(
         // We need to create a new texture and use texture copy from our original one.
         let mut desc = D3D11_TEXTURE2D_DESC::default();
         texture.GetDesc(&mut desc);
+        let src_format = desc.Format;
+        let src_bind = desc.BindFlags;
+        let src_misc = desc.MiscFlags;
+        log::debug!(
+            "[d3d11_shared] source texture: format={:?} {}x{} bind=0x{:x} misc=0x{:x} array={}",
+            src_format,
+            desc.Width,
+            desc.Height,
+            src_bind,
+            src_misc,
+            desc.ArraySize,
+        );
+
         desc.Width = width;
         desc.Height = height;
         desc.MiscFlags |= D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0 as u32
@@ -193,15 +206,50 @@ pub fn get_shared_texture_d3d11(
         // D3D11_BIND_SHADER_RESOURCE is the right flag here.
         desc.BindFlags = D3D11_BIND_SHADER_RESOURCE.0 as u32;
 
+        log::debug!(
+            "[d3d11_shared] intermediate desc: format={:?} {}x{} bind=0x{:x} misc=0x{:x}",
+            desc.Format,
+            desc.Width,
+            desc.Height,
+            desc.BindFlags,
+            desc.MiscFlags,
+        );
+
         let mut new_texture = None;
-        device.CreateTexture2D(&desc, None, Some(&mut new_texture))?;
+        if let Err(e) = device.CreateTexture2D(&desc, None, Some(&mut new_texture)) {
+            log::error!(
+                "[d3d11_shared] CreateTexture2D failed: hr=0x{:08x} ({}) — format={:?} bind=0x{:x} misc=0x{:x}",
+                e.code().0 as u32,
+                e.message(),
+                desc.Format,
+                desc.BindFlags,
+                desc.MiscFlags,
+            );
+            log_d3d11_device_removed_reason(device);
+            return Err(Box::new(e));
+        }
+
         if let Some(new_texture) = new_texture {
-            let dxgi_resource: IDXGIResource1 = new_texture.cast::<IDXGIResource1>()?;
-            let handle = dxgi_resource.CreateSharedHandle(
+            let dxgi_resource: IDXGIResource1 = new_texture.cast::<IDXGIResource1>().map_err(|e| {
+                log::error!("[d3d11_shared] cast to IDXGIResource1 failed: {:?}", e);
+                e
+            })?;
+            let handle = match dxgi_resource.CreateSharedHandle(
                 None,
                 DXGI_SHARED_RESOURCE_READ.0 | DXGI_SHARED_RESOURCE_WRITE.0,
                 None,
-            )?;
+            ) {
+                Ok(h) => h,
+                Err(e) => {
+                    log::error!(
+                        "[d3d11_shared] CreateSharedHandle failed: hr=0x{:08x} ({})",
+                        e.code().0 as u32,
+                        e.message(),
+                    );
+                    log_d3d11_device_removed_reason(device);
+                    return Err(Box::new(e));
+                }
+            };
 
             Ok((
                 handle,
@@ -211,7 +259,56 @@ pub fn get_shared_texture_d3d11(
                 },
             ))
         } else {
-            Err("Call to CreateTexture2D failed".into())
+            Err("Call to CreateTexture2D failed (no texture out)".into())
+        }
+    }
+}
+
+fn drr_name(code: u32) -> &'static str {
+    match code {
+        0x887A0005 => "DXGI_ERROR_DEVICE_REMOVED",
+        0x887A0006 => "DXGI_ERROR_DEVICE_HUNG (TDR)",
+        0x887A0007 => "DXGI_ERROR_DEVICE_RESET",
+        0x887A0020 => "DXGI_ERROR_DRIVER_INTERNAL_ERROR",
+        0x887A002D => "DXGI_ERROR_ACCESS_LOST",
+        _ => "unknown",
+    }
+}
+
+/// Query the D3D11 device for a removed/hung/reset reason and log it.
+/// Returns whether the device is in a removed state.
+fn log_d3d11_device_removed_reason(device: &ID3D11Device) -> bool {
+    unsafe {
+        match device.GetDeviceRemovedReason() {
+            Ok(()) => false,
+            Err(e) => {
+                let code = e.code().0 as u32;
+                log::error!(
+                    "[d3d11_shared] D3D11 device-removed reason: 0x{:08x} ({})",
+                    code,
+                    drr_name(code),
+                );
+                true
+            }
+        }
+    }
+}
+
+/// Same as above but for the DX12 device wgpu is holding.
+pub fn log_dx12_device_removed_reason(device: &wgpu::Device) {
+    unsafe {
+        let Some(hdevice) = device.as_hal::<Dx12>() else {
+            return;
+        };
+        let raw_device = hdevice.raw_device();
+        match raw_device.GetDeviceRemovedReason() {
+            Ok(()) => {
+                log::warn!("[dx12] device reports healthy via GetDeviceRemovedReason");
+            }
+            Err(e) => {
+                let code = e.code().0 as u32;
+                log::error!("[dx12] device-removed reason: 0x{:08x} ({})", code, drr_name(code));
+            }
         }
     }
 }
@@ -395,16 +492,34 @@ pub fn create_dx12_resource_from_d3d11_texture(
     region: Option<u32>,
 ) -> Result<Direct3D12::ID3D12Resource, Box<dyn std::error::Error>> {
     unsafe {
+        log::debug!(
+            "[dx12_import] begin: {}x{} region={:?}",
+            width,
+            height,
+            region
+        );
+
         let (handle, shared_texture) =
             get_shared_texture_d3d11(d3d11_device, texture, width, height)?;
+        log::debug!("[dx12_import] got shared NT handle, doing synchronized copy");
 
-        _ = shared_texture.synchronized_copy_from(
+        if let Err(e) = shared_texture.synchronized_copy_from(
             d3d11_device_context,
             texture,
             width,
             height,
             region,
-        );
+        ) {
+            log::error!(
+                "[dx12_import] synchronized_copy_from failed: hr=0x{:08x} ({})",
+                e.code().0 as u32,
+                e.message(),
+            );
+            log_d3d11_device_removed_reason(d3d11_device);
+            log_dx12_device_removed_reason(device);
+            let _ = CloseHandle(handle);
+            return Err(Box::new(e));
+        }
 
         let raw_image = {
             let hdevice = device
@@ -412,9 +527,28 @@ pub fn create_dx12_resource_from_d3d11_texture(
                 .ok_or("wgpu backend is not DX12")?;
             let raw_device = hdevice.raw_device();
             let mut resource = None::<Direct3D12::ID3D12Resource>;
-            raw_device.OpenSharedHandle(handle, &mut resource)?;
+            if let Err(e) = raw_device.OpenSharedHandle(handle, &mut resource) {
+                log::error!(
+                    "[dx12_import] OpenSharedHandle failed: hr=0x{:08x} ({})",
+                    e.code().0 as u32,
+                    e.message(),
+                );
+                log_d3d11_device_removed_reason(d3d11_device);
+                log_dx12_device_removed_reason(device);
+                let _ = CloseHandle(handle);
+                return Err(Box::new(e));
+            }
             let _ = CloseHandle(handle);
-            resource.ok_or("OpenSharedHandle returned no resource")?
+            let resource = resource.ok_or("OpenSharedHandle returned no resource")?;
+            let imported_desc = resource.GetDesc();
+            log::debug!(
+                "[dx12_import] OpenSharedHandle OK: format={:?} {}x{} flags=0x{:x}",
+                imported_desc.Format,
+                imported_desc.Width,
+                imported_desc.Height,
+                imported_desc.Flags.0,
+            );
+            resource
         };
 
         Ok(raw_image)

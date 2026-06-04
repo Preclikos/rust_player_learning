@@ -6,6 +6,27 @@
 //
 // HLG transfer is not handled — pq_eotf is hardcoded. Most HDR DASH content
 // is PQ; HLG support would need a uniform to switch transfer at draw time.
+//
+// ============================================================================
+// HDR → SDR LOOK TUNING
+// ============================================================================
+// Two knobs control how the HDR content lands on an SDR display:
+//
+//   HDR_REFERENCE_WHITE_NITS — what input nit level the tonemap treats as
+//     "SDR diffuse white" (i.e. ACES input 1.0). BT.2390 strictly says 100,
+//     but HDR content graded for 200-nit+ peak displays then looks
+//     under-exposed when reproduced on SDR. Lower this to brighten the
+//     output overall.
+//
+//   SHADOW_LIFT_GAMMA — applied as `pow(tonemap_output, gamma)` to lift
+//     dark midtones. Values <1 lift shadows + midtones (less contrasty
+//     look); =1 disables; >1 deepens shadows.
+//
+// Tune for "too dark / too contrasty": lower both values (40-60 / 0.80-0.85).
+// Tune for "washed out / no contrast": raise them (80-100 / 0.95-1.00).
+// ============================================================================
+const HDR_REFERENCE_WHITE_NITS: f32 = 60.0;
+const SHADOW_LIFT_GAMMA: f32 = 0.85;
 
 @group(0) @binding(0) var t_texture_y: texture_2d<f32>;
 @group(0) @binding(1) var t_texture_uv: texture_2d<f32>;
@@ -95,16 +116,24 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Decode PQ to linear cd/m².
     let nits = pq_eotf(vec3<f32>(r_pq, g_pq, b_pq));
 
-    // Scale 100 nits → 1.0 (SDR diffuse-white reference) so ACES sees the
-    // input domain it was fit for. HDR highlights above 100 nits get
-    // compressed by the tonemap's shoulder.
-    let lin_bt2020 = nits / 100.0;
+    // Scale so that HDR_REFERENCE_WHITE_NITS → 1.0. ACES was fit for input
+    // domain "1.0 ≈ diffuse white" so this places HDR diffuse content at the
+    // top of the curve's near-linear range. Highlights above the reference
+    // get smoothly compressed by the shoulder.
+    let lin_bt2020 = nits / HDR_REFERENCE_WHITE_NITS;
 
     // Tonemap in BT.2020 linear, then map primaries to BT.709 for the SDR
     // display. (Doing it in this order keeps highlight roll-off smooth; doing
     // BT.2020→BT.709 first can produce out-of-gamut negatives that get
     // clipped before the tonemap can resolve them.)
-    let tm = aces_tonemap(lin_bt2020);
+    let tm_raw = aces_tonemap(lin_bt2020);
+
+    // Post-tonemap perceptual lift. ACES' toe crushes near-black aggressively
+    // (cinema look); raising shadows here gives HDR content a less contrasty
+    // appearance on an SDR display without affecting highlights (high inputs
+    // already saturate near 1.0 so pow(x, <1) barely moves them).
+    let tm = pow(tm_raw, vec3<f32>(SHADOW_LIFT_GAMMA));
+
     let lin_bt709 = bt2020_to_bt709(tm);
 
     return vec4<f32>(srgb_oetf(lin_bt709), 1.0);

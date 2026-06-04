@@ -53,8 +53,10 @@ pub enum LogLevel {
 fn is_dxva_guid_dump(msg: &str) -> bool {
     let body = msg.split_once("] ").map(|(_, b)| b).unwrap_or(msg);
     let body = body.trim();
+    // Empty body (e.g. "[hevc @ 0xN] " with no payload) is part of FFmpeg's
+    // verbose GUID-list framing — pure noise, drop it too.
     if body.is_empty() {
-        return false;
+        return true;
     }
     if body == "Decoder GUIDs reported as supported:" {
         return true;

@@ -561,6 +561,13 @@ pub fn create_texture_from_dx12_resource(
     desc: &wgpu::TextureDescriptor,
 ) -> wgpu::Texture {
     unsafe {
+        log::debug!(
+            "[dx12_wrap] before texture_from_raw: format={:?} size={}x{}x{}",
+            desc.format,
+            desc.size.width,
+            desc.size.height,
+            desc.size.depth_or_array_layers,
+        );
         let texture = <Dx12 as wgpu::hal::Api>::Device::texture_from_raw(
             resource,
             desc.format,
@@ -569,12 +576,18 @@ pub fn create_texture_from_dx12_resource(
             1,
             1,
         );
+        log::debug!("[dx12_wrap] texture_from_raw OK; device pre-check:");
+        log_dx12_device_removed_reason(device);
 
-        device.create_texture_from_hal::<Dx12>(
+        log::debug!("[dx12_wrap] before create_texture_from_hal");
+        let result = device.create_texture_from_hal::<Dx12>(
             texture,
             desc,
             wgpu::wgt::TextureUses::RESOURCE | wgpu::wgt::TextureUses::COPY_SRC,
-        )
+        );
+        log::debug!("[dx12_wrap] create_texture_from_hal returned; device post-check:");
+        log_dx12_device_removed_reason(device);
+        result
     }
 }
 

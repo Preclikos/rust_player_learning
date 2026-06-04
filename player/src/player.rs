@@ -1,4 +1,5 @@
 mod abr;
+mod capabilities;
 mod crypto;
 mod decoders;
 mod events;
@@ -14,6 +15,7 @@ mod utils;
 // implement RequestInterceptor / LicenseResolver against the player's
 // canonical types — see PLAYER_INTEGRATION.md.
 pub use abr::AbrStrategy;
+pub use capabilities::{capabilities, probe_capabilities, PlayerCapabilities};
 pub use events::{
     BufferingReason, Fps, PlayerErrorKind, PlayerEvent, TrackInfo, TrackKind,
 };

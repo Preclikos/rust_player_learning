@@ -918,6 +918,19 @@ impl VideoRenderer {
     pub async fn render(&self, frame: Arc<Video>) {
         let video_frame = VideoFrame::new(self.device.clone(), self.backend, frame.clone());
 
+        // Granular checkpoint logging — Intel UHD reports INVALID_CALL → device-removed
+        // somewhere after a successful D3D11→DX12 P010 import. The cheap calls below
+        // each take a turn at the DX12 device (CreateShaderResourceView, descriptor
+        // allocation), so the last "step ok" log tells us which one the driver killed.
+        #[cfg(target_os = "windows")]
+        let is_p010_dbg = video_frame.get_texture().format() == TextureFormat::P010
+            && self.backend == wgpu::Backend::Dx12;
+        #[cfg(not(target_os = "windows"))]
+        let is_p010_dbg = false;
+        if is_p010_dbg {
+            log::debug!("[p010_render] step 1: creating Y plane view (R16Unorm, Plane0)");
+        }
+
         let (y_plane_view, uv_plane_view) = {
             let texture = video_frame.get_texture();
             let y = match texture.format() {
@@ -933,6 +946,12 @@ impl VideoRenderer {
                 }),
                 _ => panic!("Not supported"),
             };
+            if is_p010_dbg {
+                log::debug!("[p010_render] step 1 OK: Y plane view created");
+                #[cfg(target_os = "windows")]
+                video_directx::log_dx12_device_removed_reason(&self.device);
+                log::debug!("[p010_render] step 2: creating UV plane view (Rg16Unorm, Plane1)");
+            }
             let uv = match texture.format() {
                 TextureFormat::P010 => texture.create_view(&wgpu::TextureViewDescriptor {
                     format: Some(wgpu::TextureFormat::Rg16Unorm),
@@ -946,8 +965,17 @@ impl VideoRenderer {
                 }),
                 _ => panic!("Not supported"),
             };
+            if is_p010_dbg {
+                log::debug!("[p010_render] step 2 OK: UV plane view created");
+                #[cfg(target_os = "windows")]
+                video_directx::log_dx12_device_removed_reason(&self.device);
+            }
             (y, uv)
         };
+
+        if is_p010_dbg {
+            log::debug!("[p010_render] step 3: creating bind group");
+        }
 
         // Desktop path always has NV12 feature, so pipeline/buffer are always Some.
         let layout = self.texture_bind_group_layout.as_ref().expect("no bind group layout");
@@ -970,6 +998,13 @@ impl VideoRenderer {
             label: Some("texture_bind_group"),
         });
 
+        if is_p010_dbg {
+            log::debug!("[p010_render] step 3 OK: bind group created");
+            #[cfg(target_os = "windows")]
+            video_directx::log_dx12_device_removed_reason(&self.device);
+            log::debug!("[p010_render] step 4: acquiring surface + encoder");
+        }
+
         {
             let surface = self.surface.lock().await;
             let vb_arc = self.vertex_buffer.as_ref().expect("no vertex buffer");
@@ -984,6 +1019,9 @@ impl VideoRenderer {
                 _ => self.render_pipeline.as_ref().expect("no render pipeline"),
             };
 
+            if is_p010_dbg {
+                log::debug!("[p010_render] step 5: get_current_texture");
+            }
             let surface_texture = match surface.get_current_texture() {
                 wgpu::CurrentSurfaceTexture::Success(t) => t,
                 wgpu::CurrentSurfaceTexture::Suboptimal(t) => {
@@ -1026,6 +1064,11 @@ impl VideoRenderer {
                 (cfg.width, cfg.height)
             };
 
+            if is_p010_dbg {
+                log::debug!("[p010_render] step 6: create_command_encoder + begin_render_pass");
+                #[cfg(target_os = "windows")]
+                video_directx::log_dx12_device_removed_reason(&self.device);
+            }
             let mut encoder = self.device.create_command_encoder(&Default::default());
             {
                 let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1045,6 +1088,9 @@ impl VideoRenderer {
                     multiview_mask: None,
                 });
 
+                if is_p010_dbg {
+                    log::debug!("[p010_render] step 7: set_pipeline + set_bind_group + draw");
+                }
                 render_pass.set_pipeline(render_pipeline);
                 render_pass.set_bind_group(0, &texture_bind_group, &[]);
                 render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
@@ -1055,10 +1101,18 @@ impl VideoRenderer {
                 }
             }
 
+            if is_p010_dbg {
+                log::debug!("[p010_render] step 8: queue.submit + present");
+                #[cfg(target_os = "windows")]
+                video_directx::log_dx12_device_removed_reason(&self.device);
+            }
             // Submit the command in the queue to execute
             self.queue.submit([encoder.finish()]);
             self.pre_present_notify();
             self.queue.present(surface_texture);
+            if is_p010_dbg {
+                log::debug!("[p010_render] step 8 OK: frame presented");
+            }
         }
     }
 

@@ -42,6 +42,41 @@ pub enum LogLevel {
     Trace,
 }
 
+/// FFmpeg at AV_LOG_VERBOSE dumps the entire list of D3D11VA decoder GUIDs
+/// the GPU driver advertises (~70 lines per decoder open, plus a few profile
+/// numbers under each). It's noise for normal triage — we keep VERBOSE
+/// otherwise so D3D11VA HRESULTs surface — so downgrade just these lines.
+///
+/// Returns true if the line is a GUID-dump artifact and should be hidden
+/// (we still emit it at TRACE so a sufficiently verbose run can recover it).
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn is_dxva_guid_dump(msg: &str) -> bool {
+    let body = msg.split_once("] ").map(|(_, b)| b).unwrap_or(msg);
+    let body = body.trim();
+    if body.is_empty() {
+        return false;
+    }
+    if body == "Decoder GUIDs reported as supported:" {
+        return true;
+    }
+    // GUID lines: "{8-4-4-4-12 hex}" (length 38 with braces).
+    if body.len() == 38
+        && body.starts_with('{')
+        && body.ends_with('}')
+        && body[1..37]
+            .bytes()
+            .all(|c| c.is_ascii_hexdigit() || c == b'-')
+    {
+        return true;
+    }
+    // Profile-number lines under each GUID — short whitespace-padded digits
+    // like " 103" / " 106 107".
+    if body.len() <= 32 && body.bytes().all(|c| c.is_ascii_digit() || c == b' ') {
+        return true;
+    }
+    false
+}
+
 #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
 mod imp {
     use super::LogLevel;
@@ -116,7 +151,7 @@ mod linux_forwarder {
         if msg.is_empty() {
             return;
         }
-        let rust_lvl = if level <= sys::AV_LOG_ERROR {
+        let mut rust_lvl = if level <= sys::AV_LOG_ERROR {
             log::Level::Error
         } else if level <= sys::AV_LOG_WARNING {
             log::Level::Warn
@@ -127,6 +162,9 @@ mod linux_forwarder {
         } else {
             log::Level::Trace
         };
+        if super::is_dxva_guid_dump(msg) {
+            rust_lvl = log::Level::Trace;
+        }
         log::log!(target: "ffmpeg", rust_lvl, "{}", msg);
     }
 }
@@ -152,7 +190,7 @@ mod windows_forwarder {
             Ok(s) => s,
             Err(_) => return,
         };
-        let rust_lvl = if level <= sys::AV_LOG_ERROR {
+        let mut rust_lvl = if level <= sys::AV_LOG_ERROR {
             log::Level::Error
         } else if level <= sys::AV_LOG_WARNING {
             log::Level::Warn
@@ -163,6 +201,9 @@ mod windows_forwarder {
         } else {
             log::Level::Trace
         };
+        if super::is_dxva_guid_dump(s) {
+            rust_lvl = log::Level::Trace;
+        }
         log::log!(target: "ffmpeg", rust_lvl, "{}", s);
     }
 }

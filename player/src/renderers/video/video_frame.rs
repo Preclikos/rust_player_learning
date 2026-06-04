@@ -121,17 +121,26 @@ impl VideoFrame {
             let mut dx_desc = D3D11_TEXTURE2D_DESC::default();
             frame_texture.GetDesc(&mut dx_desc);
 
+            // FFmpeg's decoder texture is a DPB array (e.g. 2560×1536 for 2560×1440
+            // visible) with the source format set by the codec profile — NV12 for
+            // Main 8-bit, P010 for Main 10. The imported intermediate DX12 resource
+            // (built in create_dx12_resource_from_d3d11_texture) uses the visible
+            // dimensions `frame.width() × frame.height()`, so the wgpu descriptor
+            // must match those — not the decoder's padded dx_desc.Width/Height.
+            // Mismatch (wrong format OR wrong size) makes wgpu emit DX12 plane
+            // views with mismatched strides; on Intel UHD the driver kills the
+            // device with DXGI_ERROR_INVALID_CALL during the first draw.
             let desc = wgpu::TextureDescriptor {
                 label: None,
                 size: Extent3d {
-                    width: dx_desc.Width,
-                    height: dx_desc.Height,
+                    width: frame.width(),
+                    height: frame.height(),
                     depth_or_array_layers: 1,
                 },
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::NV12, //format_dxgi_to_wgpu(desc.Format),
+                format: format_dxgi_to_wgpu(dx_desc.Format),
                 usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC,
                 view_formats: &[],
             };

@@ -303,7 +303,7 @@ pub fn log_dx12_device_removed_reason(device: &wgpu::Device) {
         let raw_device = hdevice.raw_device();
         match raw_device.GetDeviceRemovedReason() {
             Ok(()) => {
-                log::warn!("[dx12] device reports healthy via GetDeviceRemovedReason");
+                log::trace!("[dx12] device reports healthy via GetDeviceRemovedReason");
             }
             Err(e) => {
                 let code = e.code().0 as u32;
@@ -492,7 +492,7 @@ pub fn create_dx12_resource_from_d3d11_texture(
     region: Option<u32>,
 ) -> Result<Direct3D12::ID3D12Resource, Box<dyn std::error::Error>> {
     unsafe {
-        log::debug!(
+        log::trace!(
             "[dx12_import] begin: {}x{} region={:?}",
             width,
             height,
@@ -501,7 +501,7 @@ pub fn create_dx12_resource_from_d3d11_texture(
 
         let (handle, shared_texture) =
             get_shared_texture_d3d11(d3d11_device, texture, width, height)?;
-        log::debug!("[dx12_import] got shared NT handle, doing synchronized copy");
+        log::trace!("[dx12_import] got shared NT handle, doing synchronized copy");
 
         if let Err(e) = shared_texture.synchronized_copy_from(
             d3d11_device_context,
@@ -541,7 +541,7 @@ pub fn create_dx12_resource_from_d3d11_texture(
             let _ = CloseHandle(handle);
             let resource = resource.ok_or("OpenSharedHandle returned no resource")?;
             let imported_desc = resource.GetDesc();
-            log::debug!(
+            log::trace!(
                 "[dx12_import] OpenSharedHandle OK: format={:?} {}x{} flags=0x{:x}",
                 imported_desc.Format,
                 imported_desc.Width,
@@ -561,7 +561,7 @@ pub fn create_texture_from_dx12_resource(
     desc: &wgpu::TextureDescriptor,
 ) -> wgpu::Texture {
     unsafe {
-        log::debug!(
+        log::trace!(
             "[dx12_wrap] before texture_from_raw: format={:?} size={}x{}x{}",
             desc.format,
             desc.size.width,
@@ -576,16 +576,16 @@ pub fn create_texture_from_dx12_resource(
             1,
             1,
         );
-        log::debug!("[dx12_wrap] texture_from_raw OK; device pre-check:");
+        log::trace!("[dx12_wrap] texture_from_raw OK; device pre-check:");
         log_dx12_device_removed_reason(device);
 
-        log::debug!("[dx12_wrap] before create_texture_from_hal");
+        log::trace!("[dx12_wrap] before create_texture_from_hal");
         let result = device.create_texture_from_hal::<Dx12>(
             texture,
             desc,
             wgpu::wgt::TextureUses::RESOURCE | wgpu::wgt::TextureUses::COPY_SRC,
         );
-        log::debug!("[dx12_wrap] create_texture_from_hal returned; device post-check:");
+        log::trace!("[dx12_wrap] create_texture_from_hal returned; device post-check:");
         log_dx12_device_removed_reason(device);
         result
     }

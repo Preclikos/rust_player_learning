@@ -53,6 +53,19 @@ impl VideoFrame {
 
             let descriptor = export_shared_handle(va_display, va_surface_id);
 
+            // Driven entirely by the VAAPI surface fourcc: NV12 → 8-bit SDR,
+            // P010 → 10-bit HDR10. The wgpu descriptor format MUST agree with
+            // the Vulkan image format that create_vk_image_from_dma_fd will
+            // pick (both derive from fourcc), otherwise stride math diverges
+            // and the driver tears the device down on first draw.
+            // See feedback_wgpu_external_texture_descriptor.md.
+            let wgpu_format = descriptor.fourcc.wgpu_format().unwrap_or_else(|| {
+                panic!(
+                    "VAAPI exported surface with unsupported fourcc {:?}",
+                    descriptor.fourcc.to_bytes(),
+                )
+            });
+
             let image_with_memory = create_vk_image_from_dma_fd(&wgpu_device, descriptor).unwrap();
 
             let desc = wgpu::TextureDescriptor {
@@ -65,7 +78,7 @@ impl VideoFrame {
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::NV12, //format_dxgi_to_wgpu(desc.Format),
+                format: wgpu_format,
                 usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
                 view_formats: &[],
             };

@@ -44,6 +44,7 @@ pub struct PrimeLayer {
     pitch: [u32; 4],
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PixelFormat(u32);
 
 /// Describes a DRM PRIME object, represented as a DMA-BUF file descriptor.
@@ -68,6 +69,11 @@ impl PixelFormat {
 
     /// Planar YUV 4:2:0 pixel format, with U and V swapped compared to `NV12`.
     pub const NV21: Self = f(b"NV21");
+
+    /// 10-bit planar YUV 4:2:0 — same layout as NV12 but each sample is stored
+    /// in the high 10 bits of a 16-bit container. The HEVC Main 10 / HDR10
+    /// hardware path produces this; the low 6 bits are unused padding.
+    pub const P010: Self = f(b"P010");
 
     /// Interleaved YUV 4:2:2, stored in memory as `yyyyyyyy uuuuuuuu YYYYYYYY vvvvvvvv`.
     ///
@@ -118,6 +124,29 @@ impl PixelFormat {
     pub const fn to_u32_le(self) -> u32 {
         self.0
     }
+
+    /// Vulkan multi-planar format matching this VAAPI surface fourcc.
+    /// Returns `None` for formats we don't currently import (the HW
+    /// decoder only ever produces NV12 / P010 in this player).
+    pub fn vk_format(self) -> Option<vk::Format> {
+        match self {
+            Self::NV12 => Some(vk::Format::G8_B8R8_2PLANE_420_UNORM),
+            Self::P010 => Some(vk::Format::G16_B16R16_2PLANE_420_UNORM),
+            _ => None,
+        }
+    }
+
+    /// wgpu TextureFormat matching this VAAPI surface fourcc. The wgpu
+    /// descriptor must agree with the Vulkan image we import — a
+    /// mismatch is silent until the first draw, where the driver tears
+    /// the device down.
+    pub fn wgpu_format(self) -> Option<wgpu::TextureFormat> {
+        match self {
+            Self::NV12 => Some(wgpu::TextureFormat::NV12),
+            Self::P010 => Some(wgpu::TextureFormat::P010),
+            _ => None,
+        }
+    }
 }
 
 const fn f(fourcc: &[u8; 4]) -> PixelFormat {
@@ -167,10 +196,20 @@ pub fn create_vk_image_from_dma_fd(
         let mut ext_create_info =
             vk::ExternalMemoryImageCreateInfo::default().handle_types(handle_type);
 
+        let vk_format = va_shared_prime_descriptor
+            .fourcc
+            .vk_format()
+            .ok_or_else(|| {
+                format!(
+                    "unsupported VAAPI surface fourcc {:?} (only NV12 / P010 are mapped)",
+                    va_shared_prime_descriptor.fourcc.to_bytes(),
+                )
+            })?;
+
         let image_create_info = ImageCreateInfo::default()
             .push_next(&mut ext_create_info)
             .image_type(vk::ImageType::TYPE_2D)
-            .format(vk::Format::G8_B8R8_2PLANE_420_UNORM)
+            .format(vk_format)
             .extent(vk::Extent3D {
                 width: va_shared_prime_descriptor.width,
                 height: va_shared_prime_descriptor.height,

@@ -200,12 +200,24 @@ impl Tracks {
         // sniff via `dvh1.*` is a fallback for malformed manifests). We
         // walk the raw XML of the AdaptationSet (which we can't parse via
         // serde — see manifest.rs note) plus the Representation block.
-        let codecs_for_dv = codecs.as_str();
-        let dv_codec_sniff = codecs_for_dv.starts_with("dvh1")
-            || codecs_for_dv.starts_with("dvhe")
-            || codecs_for_dv.starts_with("dvav");
+        let codecs_str = codecs.as_str();
+        let dv_codec_sniff = codecs_str.starts_with("dvh1")
+            || codecs_str.starts_with("dvhe")
+            || codecs_str.starts_with("dvav");
+        // HEVC Main10 / VP9 profile-2 == 10-bit. Real DASH manifests that
+        // carry these codecs almost always carry HDR10 content (no one
+        // ships Main10 SDR over DASH — they'd ship plain Main 8-bit and
+        // save ~10% bitrate). When the explicit Colour/Transfer
+        // metadata is missing, treat the 10-bit codec profile as
+        // sufficient evidence of HDR10. Inaccurate corner case (true
+        // 10-bit SDR) is preferable to false-negative HDR detection,
+        // which silently breaks AbrVideoProfile::SdrOnly / capability
+        // filtering downstream.
+        let hdr10_codec_sniff = codecs_str.starts_with("hvc1.2")
+            || codecs_str.starts_with("hev1.2")
+            || codecs_str.starts_with("vp09.2");
 
-        let mut hdr10 = false;
+        let mut hdr10 = hdr10_codec_sniff;
         let mut dolby_vision = dv_codec_sniff;
         if let Some(block) = adaptation_block {
             let rep_block =

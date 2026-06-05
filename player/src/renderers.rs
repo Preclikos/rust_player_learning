@@ -38,6 +38,13 @@ pub trait VideoSink: Send + Sync + 'static {
     /// much the segment timeline is shifted (commonly 7-60 s in real
     /// streams).
     fn set_subtitle_pts(&self, _pts_ms: i64) {}
+
+    /// Apply runtime-tunable HDR→SDR tonemap parameters. Default no-op so
+    /// alternate sinks (mocks, Apple's pre-tonemapped VideoToolbox path,
+    /// and Android's not-yet-wired P010 path) keep compiling.
+    /// Implementations that own the HDR shader (wgpu on Win/Linux) write
+    /// the values into their per-frame uniform buffer.
+    fn set_hdr_tonemap_params(&self, _params: crate::HdrTonemapParams) {}
 }
 
 /// Receives decoded PCM audio and feeds it to the output device.

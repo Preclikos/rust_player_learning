@@ -221,6 +221,18 @@ pub struct VideoRenderer {
     // 8-bit but still float-sampled, so the layout is reused. None on devices
     // where NV12 is unavailable (no 10-bit there either).
     render_pipeline_hdr: Option<RenderPipeline>,
+    /// Uniform buffer carrying the two HDR→SDR tonemap knobs (reference white
+    /// nits, shadow lift gamma) that the HDR fragment shader reads. Lives at
+    /// bind group 0 / binding 3. Always provided in the bind group on
+    /// platforms where the layout exists (so SDR draws keep a stable
+    /// descriptor shape) — the SDR shader simply doesn't reference it.
+    /// `None` on devices without NV12 (no shader pipeline at all).
+    hdr_tonemap_uniform: Option<wgpu::Buffer>,
+    /// Latest tonemap params pushed by `Player::set_hdr_tonemap`. Read on
+    /// each P010 frame before draw and uploaded into `hdr_tonemap_uniform`.
+    /// Defaults to `HdrTonemapParams::DEFAULT`. Storage is platform-agnostic
+    /// — sinks that don't have the HDR shader path simply ignore it.
+    hdr_tonemap_params: Arc<arc_swap::ArcSwap<crate::HdrTonemapParams>>,
     command_sender: Sender<VideoRendererCommand>,
     // GLES zero-copy OES renderer for devices without working Vulkan (e.g. Google TV MT8696).
     // Arc so the renderer can be shared with the present hook closure.
@@ -514,7 +526,7 @@ impl VideoRenderer {
         // inside its SPIR-V parser during vkCreateGraphicsPipeline. Since the
         // clear-color fallback path never touches these objects, omitting them
         // is safe and avoids the native abort.
-        let (texture_bind_group_layout, render_pipeline, render_pipeline_hdr, vertex_buffer) = if has_nv12_feature {
+        let (texture_bind_group_layout, render_pipeline, render_pipeline_hdr, vertex_buffer, hdr_tonemap_uniform) = if has_nv12_feature {
             let layout =
                 device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                     entries: &[
@@ -542,6 +554,20 @@ impl VideoRenderer {
                             binding: 2,
                             visibility: wgpu::ShaderStages::FRAGMENT,
                             ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                            count: None,
+                        },
+                        // HDR tonemap params uniform — read by shader_hdr.wgsl.
+                        // Provided in every bind group (including SDR / Apple
+                        // Metal) so the descriptor shape is stable; the SDR
+                        // shaders simply don't reference it. 8 bytes (2× f32).
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 3,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: std::num::NonZeroU64::new(8),
+                            },
                             count: None,
                         },
                     ],
@@ -596,9 +622,29 @@ impl VideoRenderer {
                 usage: wgpu::BufferUsages::VERTEX,
             });
 
-            (Some(layout), Some(pipeline), Some(pipeline_hdr), Some(Arc::new(RwLock::new(vb))))
+            // HDR tonemap uniform — 2× f32 (reference white nits, shadow lift
+            // gamma). Initialised to HdrTonemapParams::DEFAULT so the first
+            // HDR frame renders even when the host hasn't pushed a setting
+            // yet (matches the shader's prior compile-time defaults).
+            let defaults = crate::HdrTonemapParams::DEFAULT;
+            let tonemap_uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("HDR Tonemap Uniform"),
+                contents: bytemuck::cast_slice(&[
+                    defaults.reference_white_nits,
+                    defaults.shadow_lift_gamma,
+                ]),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
+
+            (
+                Some(layout),
+                Some(pipeline),
+                Some(pipeline_hdr),
+                Some(Arc::new(RwLock::new(vb))),
+                Some(tonemap_uniform),
+            )
         } else {
-            (None, None, None, None)
+            (None, None, None, None, None)
         };
 
         // Capacity sized for drag-resize bursts: Win32 generates many WM_SIZE
@@ -707,6 +753,10 @@ impl VideoRenderer {
             texture_bind_group_layout,
             render_pipeline,
             render_pipeline_hdr,
+            hdr_tonemap_uniform,
+            hdr_tonemap_params: Arc::new(arc_swap::ArcSwap::from_pointee(
+                crate::HdrTonemapParams::DEFAULT,
+            )),
             command_sender,
             subtitle_overlay: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(target_os = "android")]
@@ -983,6 +1033,23 @@ impl VideoRenderer {
 
         // Desktop path always has NV12 feature, so pipeline/buffer are always Some.
         let layout = self.texture_bind_group_layout.as_ref().expect("no bind group layout");
+        let tonemap_uniform = self
+            .hdr_tonemap_uniform
+            .as_ref()
+            .expect("no HDR tonemap uniform");
+
+        // P010 frames hit the HDR shader which reads these values; SDR frames
+        // also bind it but the SDR shader doesn't reference it (descriptor
+        // shape must still match the layout). The write itself is cheap (~8B
+        // staged into the queue), so we do it unconditionally per frame and
+        // avoid a fork between SDR / HDR paths here.
+        let params = **self.hdr_tonemap_params.load();
+        self.queue.write_buffer(
+            tonemap_uniform,
+            0,
+            bytemuck::cast_slice(&[params.reference_white_nits, params.shadow_lift_gamma]),
+        );
+
         let texture_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             layout,
             entries: &[
@@ -997,6 +1064,10 @@ impl VideoRenderer {
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: tonemap_uniform.as_entire_binding(),
                 },
             ],
             label: Some("texture_bind_group"),
@@ -1135,6 +1206,15 @@ impl VideoRenderer {
         let uv_plane_view = metal_frame.uv_texture.create_view(&Default::default());
 
         let layout = self.texture_bind_group_layout.as_ref().expect("no bind group layout");
+        // Apple Metal renders SDR-only (VideoToolbox tonemaps HDR internally
+        // before handing us NV12), but the shared layout still includes the
+        // tonemap uniform binding so the bind group has the same shape as
+        // Win/Linux. The SDR shader doesn't reference binding 3 — the
+        // uniform sits there unused. No per-frame write needed.
+        let tonemap_uniform = self
+            .hdr_tonemap_uniform
+            .as_ref()
+            .expect("no HDR tonemap uniform");
         let texture_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             layout,
             entries: &[
@@ -1149,6 +1229,10 @@ impl VideoRenderer {
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: tonemap_uniform.as_entire_binding(),
                 },
             ],
             label: Some("metal_nv12_bind_group"),
@@ -1682,5 +1766,13 @@ impl super::VideoSink for VideoRenderer {
         if let Some(ov) = self.subtitle_overlay.lock().unwrap().clone() {
             ov.set_pts_ms(pts_ms);
         }
+    }
+
+    fn set_hdr_tonemap_params(&self, params: crate::HdrTonemapParams) {
+        // Stored only; the next P010 frame's render() picks it up via
+        // ArcSwap::load() and writes it into the uniform buffer. On Apple,
+        // the uniform exists but the HDR pipeline is never bound — the
+        // value is functionally a no-op there.
+        self.hdr_tonemap_params.store(Arc::new(params));
     }
 }

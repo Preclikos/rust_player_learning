@@ -4,6 +4,7 @@ mod crypto;
 mod decoders;
 mod events;
 mod ffmpeg_log;
+mod hdr_tonemap;
 mod manifest;
 mod net;
 mod parsers;
@@ -20,6 +21,7 @@ pub use events::{
     BufferingReason, Fps, PlayerErrorKind, PlayerEvent, TrackInfo, TrackKind,
 };
 pub use ffmpeg_log::{set_log_level, LogLevel};
+pub use hdr_tonemap::HdrTonemapParams;
 pub use net::{
     BoxError, HttpClient, LicenseResolver, NoopInterceptor, PreparedRequest,
     RequestInterceptor, RequestKind, RetryPolicy,
@@ -2074,6 +2076,21 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
     /// Returns the active HDR / bit-depth profile.
     pub fn abr_video_profile(&self) -> AbrVideoProfile {
         **self.abr_video_profile.load()
+    }
+
+    /// Push new HDR→SDR tonemap parameters to the active video sink.
+    /// Values are sanitised into the safe rendering range (see
+    /// `HdrTonemapParams::sanitised`) so a typo'd extreme can't break
+    /// the output. On platforms where the OS owns HDR conversion
+    /// (macOS / iOS via VideoToolbox), this is a no-op — check
+    /// `PlayerCapabilities::hdr_tonemap_tunable` to decide whether to
+    /// show the setting in the UI at all.
+    ///
+    /// The player does **not** persist the value across runs; the host
+    /// is responsible for round-tripping the user's choice through its
+    /// own settings storage and calling this on every Player init.
+    pub fn set_hdr_tonemap(&self, params: HdrTonemapParams) {
+        self.video_renderer.set_hdr_tonemap_params(params.sanitised());
     }
 
     /// How many seconds of media the player tries to keep buffered ahead

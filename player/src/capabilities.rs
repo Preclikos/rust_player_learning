@@ -35,6 +35,15 @@ pub struct PlayerCapabilities {
     /// DV metadata parser and DV-only representations would fail at codec
     /// init.
     pub dolby_vision: bool,
+
+    /// `true` when the build's HDR→SDR conversion runs in the player's
+    /// own shader (Windows / Linux) and therefore responds to runtime
+    /// tuning via [`Player::set_hdr_tonemap`](crate::Player::set_hdr_tonemap).
+    /// `false` on platforms where the OS / decoder framework owns the
+    /// conversion (macOS + iOS = VideoToolbox internal tonemap;
+    /// Android — no HDR path yet). Settings UIs should hide the HDR
+    /// tonemap controls when this is `false`.
+    pub hdr_tonemap_tunable: bool,
 }
 
 /// Static, compile-time capabilities. Synchronous, no GPU probe.
@@ -63,6 +72,15 @@ pub const fn capabilities() -> PlayerCapabilities {
         )),
 
         dolby_vision: false,
+
+        // Tunable only where the player's own shader does the HDR→SDR
+        // conversion. macOS / iOS hand us pre-tonemapped 8-bit NV12 from
+        // VideoToolbox — the shader knobs would do nothing there, so
+        // hide the setting in the UI.
+        hdr_tonemap_tunable: cfg!(any(
+            target_os = "windows",
+            target_os = "linux",
+        )),
     }
 }
 

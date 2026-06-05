@@ -1832,6 +1832,19 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             subtitle_tracks: text,
         });
         self.manifest = Some(manifest);
+
+        // A new manifest is a fresh playback session — never inherit the
+        // `paused` flag from a prior session on this Player instance.
+        // Without this reset, calling open_url() while paused would leave
+        // the next play() parked on the very first frame until the host
+        // explicitly called resume(). That's surprising UX: switching
+        // channels / streams shouldn't carry transport state across.
+        // `audio_renderer.set_paused(false)` matches what `resume()` does
+        // so the audio output is ready when the new play() spins up.
+        if self.paused.swap(false, Ordering::Relaxed) {
+            self.audio_renderer.set_paused(false);
+        }
+
         Ok(())
     }
 

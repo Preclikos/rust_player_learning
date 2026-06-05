@@ -4,8 +4,8 @@ pub mod text;
 pub mod video;
 
 use crate::manifest::{
-    find_audio_channel_count, find_descriptor_values, slice_adaptation_set,
-    slice_representation, AdaptationSet, Representation, MPD,
+    find_audio_channel_count, find_descriptor_values, find_switchable_ids,
+    slice_adaptation_set, slice_representation, AdaptationSet, Representation, MPD,
 };
 use crate::net::{HttpClient, RequestKind};
 use crate::parsers::mp4::{parse_sidx, SidxBox};
@@ -357,12 +357,18 @@ impl Tracks {
         Ok(audio_representation)
     }
 
+    /// Parse one `<AdaptationSet contentType="video">` into a `VideoAdaptation`
+    /// plus the set of *other* AdaptationSet ids it advertises as
+    /// switching-equivalent via `urn:mpeg:dash:adaptation-set-switching:2016`.
+    /// The caller (`parse_tracks`) uses the second value to merge connected
+    /// components into a single logical adaptation before exposing the list
+    /// to the host.
     async fn parse_video_adaptation(
         base_url: &String,
         adaptation: &AdaptationSet,
         raw_mpd: &str,
         http: &HttpClient,
-    ) -> Result<VideoAdaptation, Box<dyn Error>> {
+    ) -> Result<(VideoAdaptation, Vec<u32>), Box<dyn Error>> {
         let mut video_representations: Vec<VideoRepresenation> = vec![];
 
         // DASH lets @frameRate, @maxWidth, @maxHeight live either on the
@@ -449,7 +455,13 @@ impl Tracks {
             representations: video_representations,
         };
 
-        Ok(video_adaptation)
+        // SwitchingProperty IDs come from the same adaptation_block we just
+        // sliced for HDR / DV detection — no second pass over raw_mpd.
+        let switchable_with = adaptation_block
+            .map(find_switchable_ids)
+            .unwrap_or_default();
+
+        Ok((video_adaptation, switchable_with))
     }
 
     async fn parse_audio_adaptation(
@@ -610,7 +622,9 @@ impl Tracks {
             }
         };
 
-        let mut video_adaptations: Vec<VideoAdaptation> = vec![];
+        // For video: collect (adaptation, switchable_with) so we can merge
+        // switching-equivalent adaptation sets after the loop.
+        let mut video_pairs: Vec<(VideoAdaptation, Vec<u32>)> = vec![];
         let mut audio_adaptations: Vec<AudioAdaptation> = vec![];
         let mut text_adaptations: Vec<TextAdaptation> = vec![];
 
@@ -619,11 +633,11 @@ impl Tracks {
             let content_type = adaptation.content_type.as_str();
             match content_type {
                 "video" => {
-                    let value = Self::parse_video_adaptation(
+                    let pair = Self::parse_video_adaptation(
                         &base_url, adaptation, raw_mpd, http,
                     )
                     .await?;
-                    video_adaptations.push(value);
+                    video_pairs.push(pair);
                 }
                 "audio" => {
                     let value = Self::parse_audio_adaptation(
@@ -640,10 +654,342 @@ impl Tracks {
             }
         }
 
+        let video_adaptations = merge_switchable_adaptations(video_pairs);
+
         Ok(TracksResult {
             video: video_adaptations,
             audio: audio_adaptations,
             text: text_adaptations,
         })
+    }
+}
+
+/// Merge AdaptationSets that declare themselves switching-equivalent via
+/// `urn:mpeg:dash:adaptation-set-switching:2016` into one logical
+/// `VideoAdaptation` per connected component. Sets with no switching links
+/// pass through unchanged.
+///
+/// The switching relation is treated as an undirected graph (the spec says
+/// it SHOULD be symmetric, but real manifests are sometimes one-sided —
+/// be defensive: an `A→B` edge implies `B→A`). Connected components are
+/// computed via a simple union-find on adaptation IDs.
+///
+/// Merge strategy for the resulting `VideoAdaptation`:
+///   * `id` — taken from the lowest-id member (stable ordering for callers)
+///   * `max_width` / `max_height` — element-wise max across members
+///   * `frame_rate` — taken from the member with the highest-bandwidth rep
+///   * `subsegment_alignment` — AND of all (conservative: a single non-aligned
+///     member disqualifies the whole pool)
+///   * `roles` — deduplicated union
+///   * `representations` — concatenated, sorted by bandwidth ascending so
+///     bitrate-based ABR sees a monotonic ladder (cheap, stable, matches
+///     the order most UIs want to render)
+fn merge_switchable_adaptations(
+    pairs: Vec<(VideoAdaptation, Vec<u32>)>,
+) -> Vec<VideoAdaptation> {
+    if pairs.is_empty() {
+        return vec![];
+    }
+
+    // Index by id so the switching declarations can resolve to positions.
+    let id_to_idx: std::collections::HashMap<u32, usize> = pairs
+        .iter()
+        .enumerate()
+        .map(|(i, (a, _))| (a.id, i))
+        .collect();
+
+    // Union-find over positions in `pairs`.
+    let n = pairs.len();
+    let mut parent: Vec<usize> = (0..n).collect();
+    fn find(parent: &mut [usize], mut x: usize) -> usize {
+        while parent[x] != x {
+            parent[x] = parent[parent[x]]; // path compression
+            x = parent[x];
+        }
+        x
+    }
+    fn union(parent: &mut [usize], a: usize, b: usize) {
+        let ra = find(parent, a);
+        let rb = find(parent, b);
+        if ra != rb {
+            // Attach larger-index root to smaller, so the *lowest* original
+            // adaptation id ends up as the component representative once
+            // we read back ids in member order. Order is insertion order
+            // (== MPD order), so this generally aligns with manifest id order.
+            if ra < rb {
+                parent[rb] = ra;
+            } else {
+                parent[ra] = rb;
+            }
+        }
+    }
+
+    for (i, (_, switchable)) in pairs.iter().enumerate() {
+        for sw_id in switchable {
+            if let Some(&j) = id_to_idx.get(sw_id) {
+                if j != i {
+                    union(&mut parent, i, j);
+                }
+            } else {
+                log::warn!(
+                    "[tracks] adaptation-set-switching: id {} not found among video adaptations — ignoring",
+                    sw_id,
+                );
+            }
+        }
+    }
+
+    // Group by component root, preserving insertion order.
+    let mut groups: std::collections::BTreeMap<usize, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for i in 0..n {
+        let r = find(&mut parent, i);
+        groups.entry(r).or_default().push(i);
+    }
+
+    // Materialise each group into a merged VideoAdaptation. Single-member
+    // groups pass through unchanged.
+    let mut pairs_opt: Vec<Option<(VideoAdaptation, Vec<u32>)>> =
+        pairs.into_iter().map(Some).collect();
+
+    groups
+        .into_values()
+        .map(|members| {
+            if members.len() == 1 {
+                pairs_opt[members[0]].take().expect("group member taken twice").0
+            } else {
+                let taken: Vec<VideoAdaptation> = members
+                    .iter()
+                    .map(|&i| pairs_opt[i].take().expect("group member taken twice").0)
+                    .collect();
+                merge_video_adaptation_group(taken)
+            }
+        })
+        .collect()
+}
+
+fn merge_video_adaptation_group(members: Vec<VideoAdaptation>) -> VideoAdaptation {
+    debug_assert!(members.len() >= 2);
+
+    let mut iter = members.into_iter();
+    let mut base = iter.next().expect("non-empty group");
+
+    // Find the rep with the highest bandwidth across the whole group; its
+    // adaptation's frame_rate wins (matches the fallback rule used for a
+    // single adaptation in parse_video_adaptation).
+    let mut best_fps_repr_bw = base
+        .representations
+        .iter()
+        .map(|r| r.bandwidth)
+        .max()
+        .unwrap_or(0);
+    let mut best_fps = base.frame_rate.clone();
+
+    for sibling in iter {
+        // ---- scalar fields ----
+        base.max_width = base.max_width.max(sibling.max_width);
+        base.max_height = base.max_height.max(sibling.max_height);
+        base.subsegment_alignment = base.subsegment_alignment && sibling.subsegment_alignment;
+        let sibling_max_bw = sibling
+            .representations
+            .iter()
+            .map(|r| r.bandwidth)
+            .max()
+            .unwrap_or(0);
+        if sibling_max_bw > best_fps_repr_bw {
+            best_fps_repr_bw = sibling_max_bw;
+            best_fps = sibling.frame_rate.clone();
+        }
+
+        // ---- roles: deduplicated union, insertion order ----
+        for role in sibling.roles {
+            if !base.roles.contains(&role) {
+                base.roles.push(role);
+            }
+        }
+
+        // ---- representations: append; final sort happens once below ----
+        base.representations.extend(sibling.representations);
+    }
+
+    base.frame_rate = best_fps;
+    base.representations
+        .sort_by_key(|r| r.bandwidth);
+
+    base
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tracks::segment::Segment;
+
+    fn stub_seg() -> Segment {
+        Segment::new(&String::new(), &String::new(), 0, 0, None, None, None)
+            .expect("stub segment")
+    }
+
+    fn rep(id: u32, bandwidth: u64, codecs: &str, w: u32, h: u32) -> VideoRepresenation {
+        VideoRepresenation {
+            id,
+            base_url: String::new(),
+            file_url: String::new(),
+            segment_init: stub_seg(),
+            segment_range: stub_seg(),
+            segments: Vec::new(),
+            bandwidth,
+            codecs: codecs.to_string(),
+            mime_type: "video/mp4".to_string(),
+            width: w,
+            height: h,
+            sar: "1:1".to_string(),
+            hdr10: false,
+            dolby_vision: false,
+        }
+    }
+
+    fn adaptation(
+        id: u32,
+        max_w: u32,
+        max_h: u32,
+        frame_rate: &str,
+        reps: Vec<VideoRepresenation>,
+    ) -> VideoAdaptation {
+        VideoAdaptation {
+            id,
+            frame_rate: frame_rate.to_string(),
+            max_width: max_w,
+            max_height: max_h,
+            subsegment_alignment: true,
+            roles: vec!["main".to_string()],
+            representations: reps,
+        }
+    }
+
+    #[test]
+    fn no_switching_passes_through_unchanged() {
+        let a1 = adaptation(1, 1920, 1080, "24/1", vec![rep(100, 6_000_000, "hvc1.1.6", 1920, 1080)]);
+        let a2 = adaptation(2, 3840, 2160, "24/1", vec![rep(200, 14_000_000, "hvc1.2.4", 3840, 2160)]);
+        let pairs = vec![(a1.clone(), vec![]), (a2.clone(), vec![])];
+
+        let out = merge_switchable_adaptations(pairs);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].id, 1);
+        assert_eq!(out[1].id, 2);
+    }
+
+    #[test]
+    fn mutual_switching_merges_into_one_adaptation() {
+        // Mirrors the user's real manifest: SDR 1080p adaptation declares
+        // switching to HDR 4K adaptation, and vice versa.
+        let sdr = adaptation(
+            223705,
+            1920,
+            1080,
+            "24/1",
+            vec![
+                rep(315074, 6_000_000, "hvc1.1.6.L120.90", 1920, 1080),
+                rep(315075, 3_000_000, "hvc1.1.6.L93.90", 1280, 720),
+                rep(315076, 1_500_000, "hvc1.1.6.L90.90", 854, 480),
+            ],
+        );
+        let hdr = adaptation(
+            223714,
+            3840,
+            2160,
+            "24/1",
+            vec![
+                rep(315086, 14_000_000, "hvc1.2.4.L150.90", 3840, 2160),
+                rep(315087, 8_000_000, "hvc1.2.4.L150.90", 2560, 1440),
+            ],
+        );
+        let pairs = vec![
+            (sdr, vec![223714]),
+            (hdr, vec![223705]),
+        ];
+
+        let out = merge_switchable_adaptations(pairs);
+        assert_eq!(out.len(), 1, "switchable adaptations should merge");
+
+        let merged = &out[0];
+        assert_eq!(merged.id, 223705, "lowest member id wins");
+        assert_eq!(merged.max_width, 3840, "max_width = max across members");
+        assert_eq!(merged.max_height, 2160, "max_height = max across members");
+        assert_eq!(merged.representations.len(), 5, "all 5 reps in pool");
+
+        // Reps sorted ascending by bandwidth so ABR sees a monotonic ladder.
+        let bandwidths: Vec<u64> =
+            merged.representations.iter().map(|r| r.bandwidth).collect();
+        assert_eq!(bandwidths, vec![1_500_000, 3_000_000, 6_000_000, 8_000_000, 14_000_000]);
+    }
+
+    #[test]
+    fn asymmetric_switching_still_merges() {
+        // Defensive: even if only one side declares the link, treat it as
+        // undirected so we don't strand the host on a half-broken manifest.
+        let a = adaptation(1, 1280, 720, "24/1", vec![rep(10, 3_000_000, "hvc1.1.6", 1280, 720)]);
+        let b = adaptation(2, 1920, 1080, "24/1", vec![rep(20, 6_000_000, "hvc1.1.6", 1920, 1080)]);
+        // Only `a` declares switching to `b`.
+        let pairs = vec![(a, vec![2]), (b, vec![])];
+
+        let out = merge_switchable_adaptations(pairs);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].representations.len(), 2);
+    }
+
+    #[test]
+    fn chain_switching_collapses_to_one_pool() {
+        // A↔B and B↔C — all three should land in the same component even
+        // though A and C don't directly mention each other.
+        let a = adaptation(1, 854, 480, "24/1", vec![rep(10, 1_000_000, "hvc1", 854, 480)]);
+        let b = adaptation(2, 1280, 720, "24/1", vec![rep(20, 3_000_000, "hvc1", 1280, 720)]);
+        let c = adaptation(3, 1920, 1080, "24/1", vec![rep(30, 6_000_000, "hvc1", 1920, 1080)]);
+        let pairs = vec![
+            (a, vec![2]),
+            (b, vec![1, 3]),
+            (c, vec![2]),
+        ];
+
+        let out = merge_switchable_adaptations(pairs);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].representations.len(), 3);
+        assert_eq!(out[0].max_width, 1920);
+    }
+
+    #[test]
+    fn switching_to_unknown_id_is_ignored() {
+        let a = adaptation(1, 1280, 720, "24/1", vec![rep(10, 3_000_000, "hvc1", 1280, 720)]);
+        // References id 99 which isn't in the video set (might be audio,
+        // or an MPD typo). Should be tolerated and `a` passes through alone.
+        let pairs = vec![(a, vec![99])];
+
+        let out = merge_switchable_adaptations(pairs);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id, 1);
+    }
+
+    #[test]
+    fn roles_are_deduplicated_on_merge() {
+        let mut a = adaptation(1, 1280, 720, "24/1", vec![rep(10, 3_000_000, "hvc1", 1280, 720)]);
+        a.roles = vec!["main".to_string()];
+        let mut b = adaptation(2, 1920, 1080, "24/1", vec![rep(20, 6_000_000, "hvc1", 1920, 1080)]);
+        b.roles = vec!["main".to_string(), "alternate".to_string()];
+
+        let pairs = vec![(a, vec![2]), (b, vec![1])];
+        let out = merge_switchable_adaptations(pairs);
+        assert_eq!(out[0].roles, vec!["main".to_string(), "alternate".to_string()]);
+    }
+
+    #[test]
+    fn subsegment_alignment_is_anded() {
+        let mut a = adaptation(1, 1280, 720, "24/1", vec![rep(10, 3_000_000, "hvc1", 1280, 720)]);
+        a.subsegment_alignment = true;
+        let mut b = adaptation(2, 1920, 1080, "24/1", vec![rep(20, 6_000_000, "hvc1", 1920, 1080)]);
+        b.subsegment_alignment = false;
+
+        let pairs = vec![(a, vec![2]), (b, vec![1])];
+        let out = merge_switchable_adaptations(pairs);
+        // Conservative: one non-aligned member disqualifies the merged pool.
+        assert!(!out[0].subsegment_alignment);
     }
 }

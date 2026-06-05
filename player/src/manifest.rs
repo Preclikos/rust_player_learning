@@ -215,6 +215,30 @@ pub fn find_descriptor_values(block: &str, scheme_substring: &str) -> Vec<String
     out
 }
 
+/// Parse the comma-separated `@value` of any
+/// `<SupplementalProperty schemeIdUri="urn:mpeg:dash:adaptation-set-switching:2016" value="..."/>`
+/// inside `block` and return the referenced AdaptationSet IDs.
+///
+/// Per ISO/IEC 23009-1 §5.8.5.6, this property declares the set of *other*
+/// AdaptationSet ids that the containing set can be seamlessly switched
+/// to/from. The relationship is meant to be symmetric: if A lists B, B
+/// should list A. Callers should still treat the resulting graph as
+/// undirected (be defensive against asymmetric manifests).
+///
+/// Multiple SupplementalProperty elements with this scheme are allowed and
+/// are concatenated. Non-integer values are skipped silently.
+pub fn find_switchable_ids(block: &str) -> Vec<u32> {
+    let mut out = Vec::new();
+    for raw_value in find_descriptor_values(block, "adaptation-set-switching:2016") {
+        for piece in raw_value.split(',') {
+            if let Ok(id) = piece.trim().parse::<u32>() {
+                out.push(id);
+            }
+        }
+    }
+    out
+}
+
 /// Return the integer value of the FIRST `<AudioChannelConfiguration value="N"/>`
 /// in `block`, e.g. for parsing audio channel counts from a Representation.
 pub fn find_audio_channel_count(block: &str) -> Option<u32> {

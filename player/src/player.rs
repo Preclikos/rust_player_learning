@@ -1808,16 +1808,19 @@ async fn video_supervisor(
             continue;
         }
 
-        // Start NEW on the segment CONTAINING the current playback position
+        // Switch at the NEXT segment boundary after the current position
         // (position_ms is 0-based; segment start_times are absolute → add
-        // origin). Its keyframe is at/before the splice, so once the decoder
-        // trims the overlap (SwapSplice) NEW's first shown frame is
-        // forward-contiguous with OLD's tail. Starting on the *next* segment
-        // (the old +1) left NEW's first frame up to a full segment in the
-        // future, which av_sync sat waiting for — a multi-second freeze on
-        // upswitches even though it never starved.
+        // origin). NEW starts on that keyframe-aligned boundary and OLD plays
+        // up to it (step 2.5), so the two are contiguous: NEW's first frame
+        // isn't in the future (no forward-PTS wait) and there's only a tiny
+        // ~buffer-sized overlap for the decoder to trim. Starting on the
+        // *current* segment instead made NEW decode seconds of throwaway frames
+        // to reach the splice and starved av_sync into buffering.
         let pos = Duration::from_millis(position_ms.load(Ordering::Relaxed)) + origin;
-        let new_start = find_segment_index(&new_repr.segments, pos);
+        let mut new_start = find_segment_index(&new_repr.segments, pos);
+        if new_start + 1 < new_repr.segments.len() {
+            new_start += 1;
+        }
         log::info!(
             "[abr] soft switch: repr {} -> {} from seg {} (pos {}ms)",
             current_repr.id, new_repr.id, new_start, pos.as_millis()
@@ -1900,6 +1903,59 @@ async fn video_supervisor(
                 old_done = true;
             }
         }
+
+        // --- step 2.5: let OLD play up to the chosen boundary so NEW (which
+        // starts there) isn't in the future. OLD keeps rendering at its current
+        // quality the whole time — no freeze; the switch just lands on a
+        // segment boundary, like every production DASH player. Cap OLD's
+        // download at the boundary so it can't run on while we wait.
+        cur_soft_end.store(new_start, Ordering::Relaxed);
+        let boundary_ms = new_repr
+            .segments
+            .get(new_start)
+            .map(|s| s.start_time().as_millis() as u64)
+            .unwrap_or(0);
+        // Begin the swap a touch before the boundary so NEW's first GOP is
+        // decoded by the time OLD's buffered tail drains.
+        const BOUNDARY_LEAD_MS: u64 = 150;
+        // Never wait forever (e.g. OLD stalls) — cap and switch anyway.
+        const MAX_BOUNDARY_WAIT: Duration = Duration::from_secs(15);
+        let wait_start = Instant::now();
+        while !old_done && boundary_ms != 0 {
+            let rendered_abs =
+                position_ms.load(Ordering::Relaxed) + origin.as_millis() as u64;
+            if rendered_abs + BOUNDARY_LEAD_MS >= boundary_ms {
+                break;
+            }
+            if wait_start.elapsed() >= MAX_BOUNDARY_WAIT {
+                log::warn!("[abr] boundary wait hit cap; switching mid-segment");
+                break;
+            }
+            let remaining = boundary_ms - (rendered_abs + BOUNDARY_LEAD_MS);
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(remaining.min(120))) => {}
+                _ = stop.notified() => {
+                    new_flag.store(true, Ordering::Relaxed);
+                    new_stop.notify_waiters();
+                    cur_flag.store(true, Ordering::Relaxed);
+                    cur_stop.notify_waiters();
+                    let _ = cur_handle.await;
+                    return Ok(());
+                }
+                res = &mut cur_handle => {
+                    if let Ok(Err(e)) = res {
+                        log::error!("[video] supervisor: pipeline failed during boundary wait: {}", e);
+                    }
+                    old_done = true;
+                }
+            }
+        }
+        log::info!(
+            "[abr] reached boundary {}ms after switch (pos≈{}ms boundary={}ms)",
+            swap_t0.elapsed().as_millis(),
+            position_ms.load(Ordering::Relaxed) + origin.as_millis() as u64,
+            boundary_ms
+        );
 
         let _ = events.send(PlayerEvent::TrackChanged {
             kind: TrackKind::Video,

@@ -25,9 +25,10 @@
 //     dark midtones. Values <1 lift shadows + midtones (less contrasty
 //     look); =1 disables; >1 deepens shadows.
 //
-// The renderer's HdrTonemapParams::DEFAULT (= 60.0 / 0.85) is uploaded at
+// The renderer's HdrTonemapParams::DEFAULT (= 400.0 / 0.95) is uploaded at
 // pipeline init so the first frame renders correctly even before the host
-// pushes a value.
+// pushes a value. That default is calibrated to approximate the SDR (BT.709)
+// grade of the test content — see player/HDR_TONEMAP.md.
 // ============================================================================
 struct HdrTonemapParams {
     reference_white_nits: f32,

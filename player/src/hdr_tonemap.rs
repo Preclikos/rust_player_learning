@@ -34,11 +34,14 @@
 pub struct HdrTonemapParams {
     /// What input nit level the ACES tonemap treats as "SDR diffuse
     /// white" (i.e. its input domain's 1.0 point). BT.2390 specifies
-    /// 100; HDR content graded for 200-nit+ peak displays consistently
-    /// looks under-exposed on SDR at that reference, so we default
-    /// lower. Smaller value = brighter overall output. Sensible range
-    /// roughly 30-150; clamped to [10, 400] in the setter so a typo'd
-    /// extreme can't divide-by-near-zero in the shader.
+    /// 100; smaller value = brighter overall output, larger = dimmer.
+    /// Matching the *actual* SDR (BT.709) grade of real graded content
+    /// needs a much higher value than the standards figure — the SDR
+    /// grade is darker/more contrasty than a naive 100-nit ACES map.
+    /// Calibrated against the test stream's SDR grade, the best fit
+    /// sits at the top of the range (see `player/HDR_TONEMAP.md`).
+    /// Clamped to [10, 400] in the setter so a typo'd extreme can't
+    /// divide-by-near-zero (tiny) or go full-black (huge) in the shader.
     pub reference_white_nits: f32,
 
     /// Post-tonemap perceptual gamma applied as `pow(tonemap_out, gamma)`.
@@ -50,12 +53,19 @@ pub struct HdrTonemapParams {
 }
 
 impl HdrTonemapParams {
-    /// Values matching the shader's compile-time defaults before this
-    /// API existed. Suitable as a fallback when the host has no
-    /// per-user persisted choice yet.
+    /// Calibrated to approximate the SDR (BT.709) grade of the test
+    /// content: an offline replica of `shader_hdr.wgsl` was swept over
+    /// both knobs against matched SDR/HDR frames of the same shots, and
+    /// these values minimised the difference (the old 60/0.85 default
+    /// rendered HDR ~0.3 brighter per channel than the SDR grade — badly
+    /// over-exposed). `reference_white_nits` is pinned at the clamp
+    /// ceiling because the SDR grade is darker than even a 400-nit ACES
+    /// map; see `player/HDR_TONEMAP.md` for the data. Used as the fallback
+    /// when the host has not pushed a per-user choice via
+    /// `Player::set_hdr_tonemap`.
     pub const DEFAULT: Self = Self {
-        reference_white_nits: 60.0,
-        shadow_lift_gamma: 0.85,
+        reference_white_nits: 400.0,
+        shadow_lift_gamma: 0.95,
     };
 
     /// Clamp into the ranges the shader can render without going
@@ -83,11 +93,13 @@ mod tests {
     #[test]
     fn default_matches_shader_constants() {
         // If this test ever fails, double-check that the WGSL
-        // shader_hdr.wgsl defaults and this struct's DEFAULT stay in
-        // sync — they're meant to render identically before any host
-        // override is pushed.
-        assert_eq!(HdrTonemapParams::DEFAULT.reference_white_nits, 60.0);
-        assert_eq!(HdrTonemapParams::DEFAULT.shadow_lift_gamma, 0.85);
+        // shader_hdr.wgsl comment + the renderer's uniform initialiser
+        // and this struct's DEFAULT stay in sync — they're meant to
+        // render identically before any host override is pushed.
+        assert_eq!(HdrTonemapParams::DEFAULT.reference_white_nits, 400.0);
+        assert_eq!(HdrTonemapParams::DEFAULT.shadow_lift_gamma, 0.95);
+        // DEFAULT must survive sanitisation unchanged (be in-range).
+        assert_eq!(HdrTonemapParams::DEFAULT, HdrTonemapParams::DEFAULT.sanitised());
     }
 
     #[test]

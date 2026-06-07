@@ -54,10 +54,10 @@ What HDR input nit level the tonemap treats as "SDR diffuse white"
 | Value  | Look                                                          |
 |--------|---------------------------------------------------------------|
 | 40     | Bright living-room: SDR diffuse white maps near peak output.  |
-| 60     | **Default** — slightly brighter than reference, low contrast. |
-| 80     | Closer to BT.2390 reference (100). Mild brightness reduction. |
-| 100    | Strict BT.2390. Tends to look under-exposed on consumer SDR.  |
-| 200    | "Cinema" look — darkest tonemap, lots of highlight headroom.  |
+| 60     | Slightly brighter than reference, low contrast.               |
+| 100    | Strict BT.2390. Brighter than most real SDR *grades* look.    |
+| 200    | "Cinema" look — much darker tonemap, lots of highlight headroom. |
+| 400    | **Default** — API ceiling. Matches the (dark) SDR grade of the test content; see *Measured fit* below. |
 
 Range accepted by the API: **[10, 400]** (clamped). Outside that the
 output goes degenerate (divide-by-near-zero for very small, near-black
@@ -77,8 +77,8 @@ values already saturate near 1.0 so `pow(x, <1)` barely moves them).
 | Value  | Look                                                                  |
 |--------|-----------------------------------------------------------------------|
 | 0.75   | Strong lift — flat, very TV-like. Useful for very dark mastering.     |
-| 0.85   | **Default** — moderate lift. Recovers midtone detail without flatness.|
-| 0.95   | Mild lift.                                                            |
+| 0.85   | Moderate lift. Recovers midtone detail without flatness.              |
+| 0.95   | **Default** — mild lift, essentially neutral (near pure ACES).        |
 | 1.00   | Pure ACES (no lift). Cinematic, deeper blacks.                        |
 | 1.15   | Inverse lift — deeper shadows, higher contrast.                       |
 
@@ -92,9 +92,9 @@ use these:
 | Preset name    | `reference_white_nits` | `shadow_lift_gamma` | When to pick                     |
 |----------------|------------------------|---------------------|-----------------------------------|
 | Brighter       | 50                     | 0.80                | Living-room TV, ambient light     |
-| **Standard**   | 60                     | 0.85                | Default, balanced                 |
-| Cinema         | 100                    | 1.00                | Dark room, want filmic look       |
-| Punchy         | 60                     | 1.10                | Liked the contrast but felt flat  |
+| Balanced       | 100                    | 0.95                | Brighter mid-ground, less extreme |
+| **SDR-match**  | 400                    | 0.95                | Default — tracks the SDR grade    |
+| Punchy         | 200                    | 1.10                | Dark with deeper shadows          |
 | Reference      | 100                    | 1.00                | Strict BT.2390 mapping            |
 
 The names are suggestions — pick whatever fits the host UI's voice.
@@ -154,9 +154,44 @@ settings format — `f32` JSON / proto / config-toml are all fine.
 Both `HdrTonemapParams::DEFAULT` and the shader's startup-time
 uniform initialiser use:
 
-- `reference_white_nits = 60.0`
-- `shadow_lift_gamma   = 0.85`
+- `reference_white_nits = 400.0`
+- `shadow_lift_gamma   = 0.95`
 
-These match the look used during development and reviewed by the
-project owner on Windows + Linux against real HDR10 content. If the
-host doesn't call `set_hdr_tonemap` at all, this is what the user sees.
+These are calibrated to approximate the SDR (BT.709) grade of the test
+content (see *Measured fit* below). If the host doesn't call
+`set_hdr_tonemap` at all, this is what the user sees.
+
+## Measured fit against the SDR grade
+
+The test stream (`preclikos.cz/examples/encrypted`) ships the same
+content as both an SDR BT.709 representation and an HDR10 PQ/BT.2020
+(Dolby Vision 8.1) representation. That gives matched SDR/HDR frames of
+the identical shot, so we can measure — not eyeball — which knob values
+make our HDR→SDR tonemap land on the SDR grade.
+
+Method: an offline NumPy replica of this shader (same PQ EOTF → ACES →
+gamma → BT.2020→709 → sRGB chain) was run on the *raw PQ* HDR frame and
+compared, per pixel (letterbox masked), to the BT.709-decoded SDR frame.
+Four shots (landscape + three portraits) were swept over the full clamp
+domain and optimised jointly.
+
+| Params          | Joint RMSE vs SDR | Note                                   |
+|-----------------|-------------------|----------------------------------------|
+| 60 / 0.85 (old) | 0.280             | ~+0.30 per-channel bias — over-exposed |
+| 400 / 0.95      | 0.096             | 66 % closer; chosen default            |
+
+Every individual shot's optimum landed at `reference_white_nits = 400`
+(the clamp ceiling): the SDR grade is *darker / more contrasty* than the
+ACES tonemap produces at any lower reference white, so the true optimum
+is pinned by the [10, 400] clamp. `shadow_lift_gamma` is only weakly
+constrained (per-shot optima 0.7–1.5); 0.95 is the joint best.
+
+Caveats:
+- The two knobs are achromatic (exposure + contrast). They **cannot**
+  fix the residual white-balance / saturation gap — the SDR grade is a
+  touch warmer + more saturated than two-knob tonemapping can reach.
+- The fit is calibrated to *this title's* SDR grade. Content graded
+  brighter may look dim at 400; that is what `set_hdr_tonemap` is for.
+- Because the optimum is clamped, fully matching darker SDR grades would
+  need either a higher `reference_white_nits` ceiling or a different
+  tone curve — a larger change than these two runtime knobs allow.

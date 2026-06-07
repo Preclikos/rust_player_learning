@@ -515,7 +515,27 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
         let base = *pts_base.get_or_insert(raw_pts_ms.saturating_sub(elapsed));
         let mut pts_ms = raw_pts_ms.saturating_sub(base);
 
-        if pts_ms < last_pts_ms {
+        // Big backward PTS jump (>1 s) means an ABR swap happened and the
+        // first NEW-pipeline frame's PTS landed lower than the OLD tail
+        // we'd already rendered. Reset `pts_base` so this frame becomes
+        // "on time" relative to wall clock, and clear `last_pts_ms` so
+        // subsequent frames compare against the new baseline rather than
+        // the stale OLD high-water. Without this the LATE path would
+        // drain the entire NEW pipeline trying to "catch up", manifesting
+        // as a permanent fast-forward burst.
+        const SWAP_JUMP_TOLERANCE_MS: u64 = 1000;
+        if pts_ms + SWAP_JUMP_TOLERANCE_MS < last_pts_ms {
+            log::info!(
+                "[vsync] big backward PTS jump ({} → {}); recalibrating base after ABR swap",
+                last_pts_ms,
+                pts_ms,
+            );
+            // New base = raw_pts - elapsed places this frame at pts_ms == elapsed.
+            let new_base = raw_pts_ms.saturating_sub(elapsed);
+            pts_base = Some(new_base);
+            pts_ms = raw_pts_ms.saturating_sub(new_base);
+            last_pts_ms = 0;
+        } else if pts_ms < last_pts_ms {
             log::warn!("[vsync] BACKWARD #{} pts={}ms last={}ms Δ=-{}ms elapsed={}ms",
                 frame_idx, pts_ms, last_pts_ms, last_pts_ms - pts_ms, elapsed);
         }
@@ -900,6 +920,15 @@ async fn video_decoder_task(
     video_ready: Arc<Notify>,
     track_crypto: Option<TrackCrypto>,
     stats: Arc<StatsState>,
+    // Local stop signal so the supervisor can abort the decoder MID-QUEUE
+    // on an ABR swap. Without this, decoder_task drains every segment
+    // already in download_rx before exiting — at 1× consumption that's
+    // up to `segments_in_flight` × segment_duration ≈ 24 s of OLD content
+    // playing after the swap request, then a PTS jump back to NEW's
+    // start. Reacting to stop here cuts the swap-to-NEW-frame latency
+    // to one in-flight segment + the few frames already buffered in
+    // `sender`.
+    stop_flag: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut first_frame_signaled = false;
 
@@ -916,6 +945,10 @@ async fn video_decoder_task(
     let mut reorder_buf: Vec<DecodedVideoFrame> = Vec::with_capacity(REORDER_DEPTH + 1);
 
     while let Some(segment) = receiver.recv().await {
+        if stop_flag.load(Ordering::Relaxed) {
+            log::debug!("[dec] stop signal received between segments; aborting drain");
+            break;
+        }
         log::debug!("[dec] consuming video segment: {}", segment.id);
 
         let mut data_vec = init_data.clone();
@@ -1160,6 +1193,7 @@ async fn video_play(
             dl_stats.last_decoded_pts_ms.store(pts_ms, Ordering::Relaxed);
         }
     });
+    let decoder_stop_flag = Arc::clone(&stop_flag);
     let download_task = task::spawn(download_task(
         segments,
         start_index,
@@ -1179,6 +1213,7 @@ async fn video_play(
         video_ready,
         track_crypto,
         stats,
+        decoder_stop_flag,
     ));
 
     let (dl_res, dec_res) = join!(download_task, decoder_task);
@@ -1655,15 +1690,24 @@ async fn video_supervisor(
             info: video_track_info(&new_repr),
         });
 
-        // Soft-cap OLD's downloads at new_start so its tail is preserved
-        // (no aborted in-flight downloads, no wasted bandwidth) and OLD's
-        // already-queued segments still flow through the decoder to
-        // av_sync. Then await OLD's natural completion before spawning
-        // NEW — running two video_play instances simultaneously trips
-        // HW decoder allocation on some drivers (Intel D3D11VA observed)
-        // which used to manifest as a permanent stall after the first
-        // ABR switch.
+        // Hard-stop OLD: abort in-flight downloads, signal decoder to
+        // break out of its receive loop mid-queue, and free the HW
+        // decoder slot so NEW can allocate. Without this, the decoder
+        // happily drains every segment already queued in `download_rx`
+        // (paced by av_sync at 1× real-time, ~6 s per segment), so a
+        // swap requested with 4 segments in flight didn't take effect
+        // for ~24 s — playback continued through OLD content well
+        // past the desired switch point, then NEW's first frame
+        // landed on the channel with a PTS that JUMPED BACKWARD
+        // relative to the OLD tail av_sync had just rendered.
+        //
+        // soft_end is still set (belt + braces — covers the narrow
+        // window between local_stop_flag.store and download_task's
+        // next iteration check) but stop_flag + notify do the heavy
+        // lifting now.
         soft_end.store(new_start, Ordering::Relaxed);
+        local_stop_flag.store(true, Ordering::Relaxed);
+        local_stop.notify_waiters();
         let _ = vp_handle.await;
 
         current_repr = new_repr;

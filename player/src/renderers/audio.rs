@@ -47,6 +47,38 @@ enum AudioRendererCommand {
     Stop,
 }
 
+/// iOS only: the OS-authoritative output sample rate, read from
+/// `AVAudioSession.sharedInstance().sampleRate`.
+///
+/// cpal's `default_output_config()` reports a canonical rate on iOS (often
+/// 48000) that does NOT necessarily match what RemoteIO actually runs at —
+/// that's governed by the active `AVAudioSession`, which is 44100 on some
+/// devices. Resampling to cpal's 48000 while the unit consumes at 44100 plays
+/// audio slow and low-pitched ("deep voice"). The session is the truth, so we
+/// read it directly and drive both the cpal stream and the resampler from it.
+///
+/// Returns `None` if the class/selector is unavailable or the value is absurd,
+/// in which case the caller falls back to cpal's reported rate. AVFoundation is
+/// linked by the iOS build (see app-ios/ios/build_sim.sh). Best read AFTER the
+/// host has configured + activated the session, else it may report a default.
+#[cfg(target_os = "ios")]
+fn ios_output_sample_rate() -> Option<u32> {
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
+    unsafe {
+        let session: *mut AnyObject = msg_send![class!(AVAudioSession), sharedInstance];
+        if session.is_null() {
+            return None;
+        }
+        let rate: f64 = msg_send![session, sampleRate];
+        if (8_000.0..=192_000.0).contains(&rate) {
+            Some(rate.round() as u32)
+        } else {
+            None
+        }
+    }
+}
+
 impl AudioRenderer {
     pub fn new() -> Self {
         let stop = Arc::new(Notify::new());
@@ -121,6 +153,11 @@ impl AudioRenderer {
         mut sample_receiver: Receiver<f32>,
         device: Device,
         config: SupportedStreamConfig,
+        // The rate to actually open the device at. Equals the device's reported
+        // rate everywhere except iOS, where it's the AVAudioSession rate (see
+        // `ios_output_sample_rate`). Kept in lock-step with the resampler target
+        // reported by `start_thread` so we never feed rate-mismatched samples.
+        out_rate: u32,
         volume: Arc<AtomicU32>,
         stop: Arc<Notify>,
         flush_flag: Arc<AtomicBool>,
@@ -129,7 +166,7 @@ impl AudioRenderer {
     ) {
         let stream_config = StreamConfig {
             channels: config.channels(),
-            sample_rate: config.sample_rate(),
+            sample_rate: out_rate,
             buffer_size: cpal::BufferSize::Default,
         };
 
@@ -196,12 +233,29 @@ impl AudioRenderer {
             .default_output_config()
             .expect("Failed to get default config");
 
+        // Resolve the true output rate. Everywhere but iOS this is the device's
+        // reported rate. On iOS cpal's report can disagree with the live
+        // AVAudioSession / RemoteIO rate, so we trust the session (the OS truth)
+        // and drive BOTH the cpal stream and the resampler target from it —
+        // otherwise we resample to e.g. 48000 while the unit runs 44100 and
+        // audio plays slow + low-pitched ("deep voice").
+        let device_rate: u32 = config.sample_rate();
+        #[cfg(target_os = "ios")]
+        let out_rate = ios_output_sample_rate().unwrap_or(device_rate);
+        #[cfg(not(target_os = "ios"))]
+        let out_rate = device_rate;
+        log::info!(
+            "[audio] device reports {} Hz; resampling + opening output at {} Hz",
+            device_rate, out_rate
+        );
+
         let stop_cpal = stop.clone();
         let config_cpal = config.clone();
         tokio::spawn(AudioRenderer::start_audio(
             sample_receiver,
             device,
             config_cpal,
+            out_rate,
             volume,
             stop_cpal,
             flush_flag,
@@ -220,7 +274,7 @@ impl AudioRenderer {
             }
         });
 
-        (sample_sender, config.sample_rate(), config.channels())
+        (sample_sender, out_rate, config.channels())
     }
 
     #[cfg(any(target_os = "windows", target_os = "linux"))]

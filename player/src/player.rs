@@ -423,6 +423,16 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
         // the wait so once both sides recover the next frame still
         // renders at its proper PTS instead of being declared LATE
         // by the wall-clock-based catch-up logic.
+        // Capture when this recv loop started so we can credit the FULL
+        // gap (not just the post-starvation portion) into pause_skew. Any
+        // gap longer than one frame interval (the GPU-render lead time)
+        // is treated as "video pipeline temporarily not producing" and
+        // rolls the effective playback clock back by that amount, so the
+        // next frame doesn't get declared LATE and trigger catch-up
+        // draining. This fixes the "fast-forward burst after ABR swap"
+        // artifact — those gaps are typically 100-300 ms (under the
+        // starvation threshold) but well over the 80 ms LATE threshold.
+        let recv_started = Instant::now();
         let mut frame = loop {
             // If the AUDIO side is currently stalled, park video here
             // until it recovers. Recv on input_rx with no timeout so
@@ -449,13 +459,7 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
                             .map(|t| t.elapsed().as_millis() as u64)
                             .unwrap_or(0);
                         log::info!("[vsync] starvation recovered after {}ms", waited);
-                        // Treat the time we were starving as paused
-                        // time so the recovered frame's pts_ms isn't
-                        // declared LATE by however many ms we sat
-                        // waiting for the network.
-                        if let Some(t) = starvation_started.take() {
-                            pause_skew += t.elapsed();
-                        }
+                        starvation_started = None;
                         starving = false;
                         if let StarvationTransition::ExitedBuffering =
                             report_starvation(&stats, StallSide::Video, false)
@@ -465,6 +469,21 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
                                 audio_sink.set_paused(false);
                             }
                         }
+                    }
+                    // Absorb the entire recv gap into pause_skew when
+                    // it's longer than one render budget. This is the
+                    // unified "the pipeline went quiet, don't blame the
+                    // frame for being late" treatment — it handles ABR
+                    // swap pauses, brief decoder hiccups, and full
+                    // starvation alike, replacing the previous
+                    // post-starvation-only accounting.
+                    let total_gap = recv_started.elapsed();
+                    if total_gap > Duration::from_millis(RENDER_BUDGET_MS) {
+                        pause_skew += total_gap;
+                        log::debug!(
+                            "[vsync] absorbed {}ms recv gap into pause_skew",
+                            total_gap.as_millis()
+                        );
                     }
                     break f;
                 }

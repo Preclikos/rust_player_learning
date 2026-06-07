@@ -515,22 +515,36 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
         let base = *pts_base.get_or_insert(raw_pts_ms.saturating_sub(elapsed));
         let mut pts_ms = raw_pts_ms.saturating_sub(base);
 
-        // Big backward PTS jump (>1 s) means an ABR swap happened and the
-        // first NEW-pipeline frame's PTS landed lower than the OLD tail
-        // we'd already rendered. Reset `pts_base` so this frame becomes
-        // "on time" relative to wall clock, and clear `last_pts_ms` so
-        // subsequent frames compare against the new baseline rather than
-        // the stale OLD high-water. Without this the LATE path would
-        // drain the entire NEW pipeline trying to "catch up", manifesting
-        // as a permanent fast-forward burst.
-        const SWAP_JUMP_TOLERANCE_MS: u64 = 1000;
-        if pts_ms + SWAP_JUMP_TOLERANCE_MS < last_pts_ms {
+        // ABR swaps can put NEW's first frame at a PTS that's far from
+        // the OLD high-water av_sync had rendered:
+        //   - BACKWARD jump (NEW's first segment PTS < OLD's last
+        //     emitted PTS) — happens when the supervisor hard-stopped
+        //     OLD with frames still in `frame_sender`, av_sync
+        //     finished them, and NEW starts at the next-segment
+        //     boundary which sits before the OLD tail.
+        //   - FORWARD jump (NEW's first segment PTS >> wall-clock
+        //     position) — happens when OLD drained fast and NEW
+        //     starts at a segment whose start_time is several
+        //     seconds ahead. Without rebasing, av_sync would
+        //     `sleep(pts_ms - elapsed)` — a multi-second freeze
+        //     before the first NEW frame renders.
+        //
+        // Either way, rebase `pts_base` so this frame becomes
+        // "on time" (pts_ms == elapsed). Subsequent frames advance
+        // naturally from there. `last_pts_ms = 0` so the BACKWARD
+        // detector below doesn't flag the next legitimate frame.
+        const SWAP_BACKWARD_TOLERANCE_MS: u64 = 1000;
+        const SWAP_FORWARD_TOLERANCE_MS: u64 = 2000;
+        let big_backward = pts_ms + SWAP_BACKWARD_TOLERANCE_MS < last_pts_ms;
+        let big_forward = last_pts_ms != 0
+            && pts_ms > last_pts_ms + SWAP_FORWARD_TOLERANCE_MS;
+        if big_backward || big_forward {
             log::info!(
-                "[vsync] big backward PTS jump ({} → {}); recalibrating base after ABR swap",
+                "[vsync] big PTS jump ({} → {}, Δ={}ms); recalibrating base after pipeline swap",
                 last_pts_ms,
                 pts_ms,
+                pts_ms as i64 - last_pts_ms as i64,
             );
-            // New base = raw_pts - elapsed places this frame at pts_ms == elapsed.
             let new_base = raw_pts_ms.saturating_sub(elapsed);
             pts_base = Some(new_base);
             pts_ms = raw_pts_ms.saturating_sub(new_base);
@@ -2463,22 +2477,30 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             "play(): buffer target {}s -> {} segments in flight",
             self.buffer_target_secs.load(Ordering::Relaxed), seg_in_flight
         );
+        // Oneshot used to kill the abr_tick task when this play() invocation
+        // ends FOR REAL (outer loop break — either no track selected or a
+        // genuine stop()). Critically NOT tied to `stop_flag`: that gets
+        // flipped by every `seek()` / `change_video_track()` to tear the
+        // sub-pipeline down, and if the abr_tick exited on it then a
+        // user-driven manual switch + `set_abr_strategy(BandwidthEwma)`
+        // afterwards would silently never fire any ticks again.
+        let (abr_kill_tx, mut abr_kill_rx) = tokio::sync::oneshot::channel::<()>();
         let play = tokio::spawn(async move {
-            // ABR tick runs once for the whole play() lifetime (survives the
-            // seek/track-switch restarts below), stopping with the play-level
-            // stop_flag. On Manual it's a no-op each tick.
-            let abr_stop_flag = abr_player.stop_flag.clone();
+            // ABR tick runs once for the whole play() lifetime (survives
+            // every seek/track-switch restart below). On Manual it's a
+            // no-op each tick.
             tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(Duration::from_secs(1));
                 ticker.set_missed_tick_behavior(
                     tokio::time::MissedTickBehavior::Skip,
                 );
                 loop {
-                    ticker.tick().await;
-                    if abr_stop_flag.load(Ordering::Relaxed) {
-                        break;
+                    tokio::select! {
+                        _ = ticker.tick() => {
+                            abr_player.abr_tick();
+                        }
+                        _ = &mut abr_kill_rx => break,
                     }
-                    abr_player.abr_tick();
                 }
             });
 
@@ -2662,6 +2684,9 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                     break;
                 }
             }
+            // Outer loop ended — this play() invocation is truly over.
+            // Kick the abr_tick task off the executor.
+            let _ = abr_kill_tx.send(());
         });
         Ok(play)
     }

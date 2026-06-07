@@ -13,40 +13,108 @@ use super::{DecodedVideoFrame, DecoderError, HwVideoDecoder, PlatformFrame, Vide
 
 pub struct FfmpegHwDecoder {
     decoder: Option<ffmpeg_next::decoder::Video>,
+    /// Owned hw-device — only created+held when this decoder was NOT handed a
+    /// `shared_device` (the legacy / fallback path). Null otherwise.
     hw_device_ctx: *mut AVBufferRef,
+    /// Preferred path: a hw-device created once per play() cycle and shared
+    /// across the initial decoder + every ABR-swap decoder, so a swap never
+    /// recreates the GPU device. See [`SharedHwDevice`].
+    shared_device: Option<Arc<SharedHwDevice>>,
 }
 
 unsafe impl Send for FfmpegHwDecoder {}
 
+/// Create a fresh platform hw-device context (D3D11VA on Windows, VAAPI on
+/// Linux). The caller owns the returned ref and must `av_buffer_unref` it.
+fn create_hwdevice_ctx() -> Result<*mut AVBufferRef, DecoderError> {
+    #[cfg(target_os = "windows")]
+    let device_type = AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA;
+    #[cfg(target_os = "linux")]
+    let device_type = AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI;
+
+    // Bump FFmpeg log level to VERBOSE and wire up the Rust log forwarder
+    // (installs av_log_set_callback the first time; idempotent after that).
+    // VERBOSE is needed to surface D3D11VA HRESULTs like 0x80070057 from
+    // CreateTexture2D — without it the error is wrapped as AVERROR_UNKNOWN
+    // with no driver detail.
+    crate::ffmpeg_log::set_log_level(crate::ffmpeg_log::LogLevel::Verbose);
+
+    let mut ctx: *mut AVBufferRef = std::ptr::null_mut();
+    let ret = unsafe {
+        av_hwdevice_ctx_create(&mut ctx, device_type, std::ptr::null(), std::ptr::null_mut(), 0)
+    };
+    if ret < 0 {
+        return Err(format!("av_hwdevice_ctx_create failed: {}", ret).into());
+    }
+    Ok(ctx)
+}
+
+/// A platform hw-device context created ONCE and shared (ref-counted) across
+/// every `FfmpegHwDecoder` spawned within a play() cycle.
+///
+/// Creating a D3D11VA / VAAPI device is slow, and on Windows it takes a
+/// driver/DXGI-global lock that serialises with the wgpu D3D12 present and the
+/// DWM compositor — so doing it on *every* ABR swap (the old behaviour, where
+/// each decoder called `av_hwdevice_ctx_create` in `configure`) hitched the
+/// whole desktop UI for a moment per switch. Sharing one device means a swap
+/// only re-opens the codec (cheap, no device creation, no compositor stall).
+///
+/// The underlying device is multithread-safe and `AVBufferRef` refcounting is
+/// atomic; we only ever `av_buffer_ref` / `av_buffer_unref` the pointer, so
+/// sharing it across threads is sound.
+pub struct SharedHwDevice {
+    ctx: *mut AVBufferRef,
+}
+
+unsafe impl Send for SharedHwDevice {}
+unsafe impl Sync for SharedHwDevice {}
+
+impl SharedHwDevice {
+    /// Create the device. Do this once at play() setup and hand clones of the
+    /// `Arc` to every decoder via [`FfmpegHwDecoder::new_shared`].
+    pub fn new() -> Result<Arc<Self>, DecoderError> {
+        Ok(Arc::new(Self {
+            ctx: create_hwdevice_ctx()?,
+        }))
+    }
+
+    /// A new owned reference to the shared context, for handing to a codec
+    /// context's `hw_device_ctx` (which takes ownership of the ref given).
+    fn new_ref(&self) -> *mut AVBufferRef {
+        unsafe { av_buffer_ref(self.ctx) }
+    }
+}
+
+impl Drop for SharedHwDevice {
+    fn drop(&mut self) {
+        if !self.ctx.is_null() {
+            unsafe { av_buffer_unref(&mut self.ctx) };
+        }
+    }
+}
+
 impl FfmpegHwDecoder {
+    /// Legacy / fallback: this decoder owns a freshly-created hw-device.
     pub fn new() -> Self {
         Self {
             decoder: None,
             hw_device_ctx: std::ptr::null_mut(),
+            shared_device: None,
+        }
+    }
+
+    /// Preferred: reuse a [`SharedHwDevice`] created once per play() cycle so
+    /// an ABR swap re-opens only the codec, never recreates the GPU device.
+    pub fn new_shared(device: Arc<SharedHwDevice>) -> Self {
+        Self {
+            decoder: None,
+            hw_device_ctx: std::ptr::null_mut(),
+            shared_device: Some(device),
         }
     }
 
     fn create_hw_device(&mut self) -> Result<(), DecoderError> {
-        #[cfg(target_os = "windows")]
-        let device_type = AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA;
-        #[cfg(target_os = "linux")]
-        let device_type = AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI;
-
-        // Bump FFmpeg log level to VERBOSE and wire up the Rust log forwarder
-        // (installs av_log_set_callback the first time; idempotent after that).
-        // VERBOSE is needed to surface D3D11VA HRESULTs like 0x80070057 from
-        // CreateTexture2D — without it the error is wrapped as AVERROR_UNKNOWN
-        // with no driver detail.
-        crate::ffmpeg_log::set_log_level(crate::ffmpeg_log::LogLevel::Verbose);
-
-        let mut ctx: *mut AVBufferRef = std::ptr::null_mut();
-        let ret = unsafe {
-            av_hwdevice_ctx_create(&mut ctx, device_type, std::ptr::null(), std::ptr::null_mut(), 0)
-        };
-        if ret < 0 {
-            return Err(format!("av_hwdevice_ctx_create failed: {}", ret).into());
-        }
-        self.hw_device_ctx = ctx;
+        self.hw_device_ctx = create_hwdevice_ctx()?;
         Ok(())
     }
 }
@@ -124,11 +192,21 @@ impl HwVideoDecoder for FfmpegHwDecoder {
 
         let mut ctx = ffmpeg_next::codec::Context::new_with_codec(codec);
 
-        if self.hw_device_ctx.is_null() {
-            self.create_hw_device()?;
-        }
+        // Hand the codec context a reference to the hw-device. Prefer the
+        // shared device (so an ABR swap never recreates the D3D11/VAAPI device
+        // — see SharedHwDevice); otherwise lazily create a decoder-owned one.
+        // The codec context takes ownership of the ref it is given and unrefs
+        // it on its own drop.
+        let device_ref = if let Some(shared) = &self.shared_device {
+            shared.new_ref()
+        } else {
+            if self.hw_device_ctx.is_null() {
+                self.create_hw_device()?;
+            }
+            unsafe { av_buffer_ref(self.hw_device_ctx) }
+        };
         unsafe {
-            (*ctx.as_mut_ptr()).hw_device_ctx = av_buffer_ref(self.hw_device_ctx);
+            (*ctx.as_mut_ptr()).hw_device_ctx = device_ref;
             (*ctx.as_mut_ptr()).get_format = Some(select_hw_format);
         }
 

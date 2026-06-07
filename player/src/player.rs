@@ -2589,7 +2589,33 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         let video_decoder_factory: VideoDecoderFactory = {
             #[cfg(any(target_os = "windows", target_os = "linux"))]
             {
-                Arc::new(|| Box::new(decoders::ffmpeg_hw::FfmpegHwDecoder::new()))
+                // Create the hw-device ONCE and share it across the initial
+                // decoder + every ABR-swap decoder, so a swap re-opens only the
+                // codec instead of recreating the D3D11/VAAPI device. Recreating
+                // it is slow and on Windows stalls the wgpu present + the DWM
+                // compositor, hitching the whole UI for a moment on each switch.
+                // Fall back to a per-decoder device if creation fails.
+                let factory: VideoDecoderFactory =
+                    match decoders::ffmpeg_hw::SharedHwDevice::new() {
+                        Ok(dev) => {
+                            log::info!("[video] shared hw-device created; ABR swaps reuse it");
+                            Arc::new(move || {
+                                Box::new(decoders::ffmpeg_hw::FfmpegHwDecoder::new_shared(
+                                    dev.clone(),
+                                )) as Box<dyn HwVideoDecoder>
+                            })
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "[video] shared hw-device init failed ({e}); per-decoder device fallback"
+                            );
+                            Arc::new(|| {
+                                Box::new(decoders::ffmpeg_hw::FfmpegHwDecoder::new())
+                                    as Box<dyn HwVideoDecoder>
+                            })
+                        }
+                    };
+                factory
             }
             #[cfg(target_os = "android")]
             {

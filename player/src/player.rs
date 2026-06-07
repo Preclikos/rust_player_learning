@@ -894,6 +894,12 @@ async fn video_decoder_task(
     // to one in-flight segment + the few frames already buffered in
     // `sender`.
     stop_flag: Arc<AtomicBool>,
+    // Diagnostics only: `Some(t)` for an ABR-swap pipeline, where `t` is
+    // stamped at OLD teardown. We log how long after teardown NEW's first
+    // frame reaches av_sync — the number that decides whether the swap
+    // outruns av_sync's ~333 ms buffer drain or trips its starvation pause.
+    // `None` for the initial pipeline (nothing to measure against).
+    swap_started: Option<Instant>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut first_frame_signaled = false;
 
@@ -983,6 +989,12 @@ async fn video_decoder_task(
                             if !first_frame_signaled {
                                 video_ready.notify_one();
                                 first_frame_signaled = true;
+                                if let Some(t) = swap_started {
+                                    log::info!(
+                                        "[abr] NEW first frame {}ms after OLD teardown",
+                                        t.elapsed().as_millis()
+                                    );
+                                }
                             }
                             // Stop-aware send: without this, the `await` on
                             // a full frame_sender (capacity 8) parks the
@@ -1248,6 +1260,8 @@ async fn run_decode(
     mut decoder: Box<dyn HwVideoDecoder>,
     stats: Arc<StatsState>,
     decoder_stop_flag: Arc<AtomicBool>,
+    // Diagnostics: `Some(teardown_instant)` on a swap, `None` initially.
+    swap_started: Option<Instant>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     decoder.configure(VideoDecoderParams {
         codec: VideoCodec::Hevc,
@@ -1265,6 +1279,7 @@ async fn run_decode(
         pf.track_crypto,
         stats,
         decoder_stop_flag,
+        swap_started,
     ));
 
     let (dl_res, dec_res) = join!(pf.download_handle, decoder_task);
@@ -1306,7 +1321,7 @@ async fn video_play(
         usize::MAX,
     )
     .await?;
-    run_decode(pf, sender, video_ready, decoder, stats, stop_flag).await
+    run_decode(pf, sender, video_ready, decoder, stats, stop_flag, None).await
 }
 
 async fn audio_play(
@@ -1773,6 +1788,7 @@ async fn video_supervisor(
             "[abr] soft switch: repr {} -> {} from seg {} (pos {}ms)",
             current_repr.id, new_repr.id, new_start, pos.as_millis()
         );
+        let swap_t0 = Instant::now();
 
         // --- Make-before-break, step 1: prefetch NEW while OLD keeps playing.
         // `video_prefetch` only downloads — it never allocates the HW decoder,
@@ -1823,9 +1839,14 @@ async fn video_supervisor(
         let primed = Arc::clone(&new_pf.primed);
         let mut old_done = false;
         tokio::select! {
-            _ = primed.notified() => {}
+            _ = primed.notified() => {
+                log::info!("[abr] NEW primed {}ms after switch", swap_t0.elapsed().as_millis());
+            }
             _ = tokio::time::sleep(PRIME_TIMEOUT) => {
-                log::warn!("[abr] prefetch prime timed out after {:?}; swapping anyway", PRIME_TIMEOUT);
+                log::warn!(
+                    "[abr] prefetch prime timed out after {}ms; swapping anyway",
+                    swap_t0.elapsed().as_millis()
+                );
             }
             _ = stop.notified() => {
                 // Tear NEW's prefetch down (the flag makes download_task exit;
@@ -1862,8 +1883,13 @@ async fn video_supervisor(
             cur_stop.notify_waiters();
             let _ = cur_handle.await;
         }
+        log::info!(
+            "[abr] OLD torn down {}ms after switch; starting NEW decode",
+            swap_t0.elapsed().as_millis()
+        );
 
         // OLD's decoder is dropped now — safe to allocate NEW's.
+        let decode_t0 = Instant::now();
         let decoder = decoder_factory();
         cur_handle = task::spawn(run_decode(
             new_pf,
@@ -1872,6 +1898,7 @@ async fn video_supervisor(
             decoder,
             Arc::clone(&stats),
             new_flag.clone(),
+            Some(decode_t0),
         ));
         cur_stop = new_stop;
         cur_flag = new_flag;

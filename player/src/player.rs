@@ -986,6 +986,18 @@ async fn video_decoder_task(
         let mut first_pts_us: Option<i64> = None;
         let mut last_pts_us: i64 = 0;
         for (offset, size, ts, ts_scale) in sample_info {
+            // Check stop_flag INSIDE the segment-processing loop too.
+            // Without this, an ABR swap fired mid-segment would wait for
+            // the current segment's frames to finish pacing through the
+            // 8-slot frame_sender at 1× (~6 s for a 144-frame segment),
+            // and only then notice the supervisor's stop signal. That's
+            // the "60 s before ABR takes effect" the user reported.
+            // Bailing mid-segment loses the rest of this segment but
+            // keeps the swap responsive.
+            if stop_flag.load(Ordering::Relaxed) {
+                log::debug!("[dec] stop signal received mid-segment; aborting drain");
+                return Ok(());
+            }
             if offset + size > data_vec.len() {
                 continue;
             }
@@ -1021,7 +1033,20 @@ async fn video_decoder_task(
                                 video_ready.notify_one();
                                 first_frame_signaled = true;
                             }
+                            // Stop-aware send: without this, the `await` on
+                            // a full frame_sender (capacity 8) parks the
+                            // decoder for ~333 ms before re-checking
+                            // stop_flag. Selecting against stop_flag's
+                            // associated Notify cuts that latency to
+                            // ~zero so the supervisor's await on vp_handle
+                            // returns promptly after the swap signal.
                             if sender.send(to_send).await.is_err() {
+                                return Ok(());
+                            }
+                            if stop_flag.load(Ordering::Relaxed) {
+                                log::debug!(
+                                    "[dec] stop signal received after send; aborting"
+                                );
                                 return Ok(());
                             }
                         }

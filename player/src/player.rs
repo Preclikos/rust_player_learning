@@ -64,7 +64,7 @@ use renderers::{AudioSink, VideoSink};
 use arc_swap::ArcSwap;
 use std::collections::HashMap;
 use std::error::Error;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 #[cfg(target_os = "android")]
 use libc;
 use std::sync::Mutex as StdMutex;
@@ -1074,6 +1074,10 @@ async fn video_play(
     http: Arc<HttpClient>,
     stats: Arc<StatsState>,
     segments_in_flight: usize,
+    // See `download_task::soft_end_exclusive`. Plumbed through so the
+    // supervisor can softly cap an old pipeline mid-flight without
+    // discarding its already-decoded tail.
+    soft_end_exclusive: Arc<AtomicUsize>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let (download_tx, download_rx) = mpsc::channel::<DataSegment>(segments_in_flight);
 
@@ -1146,6 +1150,7 @@ async fn video_play(
         http,
         Some(Arc::clone(&stats)),
         Some(on_video_dl),
+        soft_end_exclusive,
     ));
     let decoder_task = task::spawn(video_decoder_task(
         download_rx,
@@ -1280,6 +1285,10 @@ async fn audio_play(
         http,
         Some(Arc::clone(&stats)),
         Some(on_audio_dl),
+        // Audio doesn't ABR-switch in this player (single audio rep per
+        // session), so the soft-end mechanism is unused — usize::MAX
+        // disables the early break.
+        Arc::new(AtomicUsize::new(usize::MAX)),
     ));
     let decoder_task = task::spawn(audio_decoder_task(
         download_rx,
@@ -1472,14 +1481,24 @@ type VideoDecoderFactory = Arc<dyn Fn() -> Box<dyn HwVideoDecoder> + Send + Sync
 /// It spawns one `video_play` at a time and respawns on representation swap.
 ///
 /// Soft-switch flow on receiving a new representation:
-///   1. Tell the current `video_play` to stop via a local notify+flag pair
-///      (separate from the play-level `stop` so audio + av_sync survive).
-///   2. Await its termination, dropping its decoder cleanly.
-///   3. Compute the next segment in the new representation that's *after*
-///      the current playback PTS, so the first new frame can't land before
-///      the last old frame on the timeline.
-///   4. Spawn a fresh `video_play` with the new representation, the same
-///      shared frame `Sender` (so av_sync keeps consuming from one source).
+///   1. Compute the next segment in the NEW representation that starts
+///      after the current playback PTS, so the first new frame can't land
+///      before the last old frame on the timeline.
+///   2. Soft-cap the CURRENT pipeline at `new_start` via the shared
+///      `soft_end_exclusive` atomic — its download loop will exit at that
+///      segment boundary, draining whatever it has already queued in the
+///      download / decoder channels.
+///   3. Spawn the NEW `video_play` IN PARALLEL with the old's drain. While
+///      OLD is finishing the last few segments it already had in flight,
+///      NEW is already downloading the init segment + first media segment.
+///      This eliminates the visible buffer-empty stall the prior tear-it-
+///      down-first design produced: by the time OLD drops its sender,
+///      NEW typically has frames ready for av_sync.
+///   4. The OLD and NEW pipelines write to the same `frame_sender`, but
+///      their segment ranges are disjoint (`< new_start` vs `>= new_start`),
+///      so PTS order on the channel is preserved.
+///   5. Await OLD's natural completion. Install NEW's handle as the
+///      pipeline for the next supervisor iteration.
 ///
 /// Audio keeps playing throughout — only the video pipeline is touched.
 async fn video_supervisor(
@@ -1501,45 +1520,75 @@ async fn video_supervisor(
     // is 0-based, so we add this back to locate segments on a soft swap.
     origin: Duration,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let mut current_repr = initial_repr;
-    let mut current_start = initial_start_index;
-    loop {
-        // Per-iteration stop signal — only fires on representation swap,
-        // not on play-level stop. Keeping it separate means `seek()`
-        // semantics (play-level stop) still work as before.
-        let local_stop = Arc::new(Notify::new());
-        let local_stop_flag = Arc::new(AtomicBool::new(false));
-
-        let vp_handle = task::spawn(video_play(
-            current_repr.clone(),
-            current_start,
+    // Spawns a fresh `video_play` task and returns its handle plus its
+    // shared soft-end atomic (initially "no limit"). The supervisor
+    // tweaks that atomic on swap so the pipeline drains cleanly without
+    // a hard kill.
+    let spawn_pipeline = |repr: VideoRepresenation,
+                          start_index: usize,
+                          local_stop: Arc<Notify>,
+                          local_stop_flag: Arc<AtomicBool>|
+     -> (
+        tokio::task::JoinHandle<Result<(), Box<dyn Error + Send + Sync>>>,
+        Arc<AtomicUsize>,
+    ) {
+        let soft_end = Arc::new(AtomicUsize::new(usize::MAX));
+        let handle = task::spawn(video_play(
+            repr,
+            start_index,
             video_ready.clone(),
             frame_sender.clone(),
-            local_stop.clone(),
-            local_stop_flag.clone(),
+            local_stop,
+            local_stop_flag,
             decryptor.clone(),
             decoder_factory(),
             Arc::clone(&http),
             Arc::clone(&stats),
             segments_in_flight,
+            soft_end.clone(),
         ));
-        tokio::pin!(vp_handle);
+        (handle, soft_end)
+    };
 
-        // Race three outcomes: play-level stop, video_play finishing on
-        // its own (natural EOF), or a switch_rx update requesting a soft
-        // swap. The natural-EOF arm is essential: if we kept the
+    let mut current_repr = initial_repr;
+    // `current_start` is only used for the *first* spawn; after a swap the
+    // new pipeline is built with `new_start` directly. Don't carry it
+    // across iterations.
+    let current_start = initial_start_index;
+
+    // Handle / soft-end / stop pair for the CURRENTLY active pipeline.
+    // Pre-built on the first iteration; replaced atomically on each swap.
+    let mut current_local_stop = Arc::new(Notify::new());
+    let mut current_local_stop_flag = Arc::new(AtomicBool::new(false));
+    let (initial_handle, initial_soft_end) = spawn_pipeline(
+        current_repr.clone(),
+        current_start,
+        current_local_stop.clone(),
+        current_local_stop_flag.clone(),
+    );
+    let mut current_handle: tokio::task::JoinHandle<Result<(), Box<dyn Error + Send + Sync>>> =
+        initial_handle;
+    let mut current_soft_end = initial_soft_end;
+
+    loop {
+        // `JoinHandle` is `Unpin`, so `&mut current_handle` is enough — no
+        // `tokio::pin!` needed.
+
+        // Race three outcomes: play-level stop, current pipeline finishing
+        // on its own (natural EOF), or a switch_rx update requesting a
+        // soft swap. The natural-EOF arm is essential: if we kept the
         // keepalive frame_sender alive forever after the last segment
         // was decoded, the av_sync video_rx would never observe channel
         // close and `PlayerEvent::EndOfStream` would never fire.
         let new_repr: VideoRepresenation = loop {
             tokio::select! {
                 _ = stop.notified() => {
-                    local_stop_flag.store(true, Ordering::Relaxed);
-                    local_stop.notify_waiters();
-                    let _ = vp_handle.await;
+                    current_local_stop_flag.store(true, Ordering::Relaxed);
+                    current_local_stop.notify_waiters();
+                    let _ = current_handle.await;
                     return Ok(());
                 }
-                res = &mut vp_handle => {
+                res = &mut current_handle => {
                     // video_play returned without us asking. Either it
                     // ran out of segments (EOF) or it errored. Either
                     // way, exit the supervisor so the keepalive
@@ -1570,9 +1619,9 @@ async fn video_supervisor(
                     let _ = switch_rx.changed().await;
                 } => {
                     if stop_flag.load(Ordering::Relaxed) {
-                        local_stop_flag.store(true, Ordering::Relaxed);
-                        local_stop.notify_waiters();
-                        let _ = vp_handle.await;
+                        current_local_stop_flag.store(true, Ordering::Relaxed);
+                        current_local_stop.notify_waiters();
+                        let _ = current_handle.await;
                         return Ok(());
                     }
                     if let Some(new) = switch_rx.borrow_and_update().clone() {
@@ -1589,11 +1638,6 @@ async fn video_supervisor(
             continue;
         }
 
-        // Tear down the OLD pipeline cleanly.
-        local_stop_flag.store(true, Ordering::Relaxed);
-        local_stop.notify_waiters();
-        let _ = vp_handle.await;
-
         // Pick the segment in the new representation that *starts after*
         // the current playback position. This guarantees the first frame
         // emitted by the NEW pipeline has PTS > the last frame from the
@@ -1605,16 +1649,51 @@ async fn video_supervisor(
             new_start = new_start.saturating_add(1);
         }
         log::info!(
-            "[abr] soft switch: repr {} -> {} from seg {} (pos {}ms)",
+            "[abr] soft switch: repr {} -> {} from seg {} (pos {}ms) — old pipeline draining in parallel",
             current_repr.id, new_repr.id, new_start, pos.as_millis()
         );
         let _ = events.send(PlayerEvent::TrackChanged {
             kind: TrackKind::Video,
             info: video_track_info(&new_repr),
         });
+
+        // (1) Soft-cap the OLD pipeline: its download loop will exit when it
+        //     reaches `new_start`, draining whatever segments it already
+        //     queued ahead. No hard stop — frames in flight still reach
+        //     av_sync, no wasted bandwidth on cancelled downloads.
+        current_soft_end.store(new_start, Ordering::Relaxed);
+
+        // (2) Spawn the NEW pipeline IN PARALLEL with the old's drain.
+        //     The two write to the same `frame_sender`, but their segment
+        //     ranges are disjoint, so PTS order on the channel is preserved
+        //     as long as we don't reorder behind the scenes (we don't).
+        let next_local_stop = Arc::new(Notify::new());
+        let next_local_stop_flag = Arc::new(AtomicBool::new(false));
+        let (next_handle, next_soft_end) = spawn_pipeline(
+            new_repr.clone(),
+            new_start,
+            next_local_stop.clone(),
+            next_local_stop_flag.clone(),
+        );
+
+        // (3) Await the OLD pipeline's natural drain. While we sit here,
+        //     NEW is already downloading + decoding in the background, so
+        //     by the time OLD's last frame reaches av_sync, NEW typically
+        //     has its first frame ready in the channel — no perceptible
+        //     buffer-empty stall.
+        if let Err(e) = current_handle.await {
+            // Join error (panic) on old pipeline isn't fatal — its tail
+            // contributions are already on the channel. Log and continue
+            // with NEW as the active pipeline.
+            log::warn!("[video] supervisor: old pipeline task join failed during swap: {}", e);
+        }
+
+        // (4) Install NEW as the active pipeline for the next iteration.
         current_repr = new_repr;
-        current_start = new_start;
-        // Next iteration spawns the new video_play.
+        current_handle = next_handle;
+        current_soft_end = next_soft_end;
+        current_local_stop = next_local_stop;
+        current_local_stop_flag = next_local_stop_flag;
     }
 }
 
@@ -2671,6 +2750,13 @@ async fn download_task(
     http: Arc<HttpClient>,
     stats: Option<Arc<StatsState>>,
     on_segment_done: Option<SegmentDoneCallback>,
+    // Upper-exclusive segment index. Default `usize::MAX` means "no soft
+    // limit, run to natural EOF". The supervisor lowers this on ABR
+    // swaps so the OLD pipeline drains its already-downloaded tail
+    // cleanly (segments < new_start) while the NEW pipeline downloads
+    // from new_start in parallel — no PTS overlap because the two
+    // ranges are disjoint, and av_sync sees a continuous frame stream.
+    soft_end_exclusive: Arc<AtomicUsize>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     /// How long `download_task` keeps retrying a single failing
     /// segment before giving up and ending the pipeline. The inner
@@ -2684,6 +2770,19 @@ async fn download_task(
     let segment_slice = &segments[..];
     for i in start_index..segment_slice.len() {
         if stop_flag.load(Ordering::Relaxed) {
+            break;
+        }
+        // Soft end: supervisor sets this to the NEW pipeline's start
+        // index on an ABR swap so the OLD pipeline exits naturally at
+        // the swap boundary instead of needing a hard stop_flag.
+        // Re-read every iteration so an in-flight swap takes effect
+        // promptly.
+        if i >= soft_end_exclusive.load(Ordering::Relaxed) {
+            log::debug!(
+                "[dl] soft end at segment {} reached (limit={}); pipeline draining for swap",
+                i,
+                soft_end_exclusive.load(Ordering::Relaxed),
+            );
             break;
         }
         let seg = &segment_slice[i];

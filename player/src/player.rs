@@ -423,16 +423,6 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
         // the wait so once both sides recover the next frame still
         // renders at its proper PTS instead of being declared LATE
         // by the wall-clock-based catch-up logic.
-        // Capture when this recv loop started so we can credit the FULL
-        // gap (not just the post-starvation portion) into pause_skew. Any
-        // gap longer than one frame interval (the GPU-render lead time)
-        // is treated as "video pipeline temporarily not producing" and
-        // rolls the effective playback clock back by that amount, so the
-        // next frame doesn't get declared LATE and trigger catch-up
-        // draining. This fixes the "fast-forward burst after ABR swap"
-        // artifact — those gaps are typically 100-300 ms (under the
-        // starvation threshold) but well over the 80 ms LATE threshold.
-        let recv_started = Instant::now();
         let mut frame = loop {
             // If the AUDIO side is currently stalled, park video here
             // until it recovers. Recv on input_rx with no timeout so
@@ -459,7 +449,17 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
                             .map(|t| t.elapsed().as_millis() as u64)
                             .unwrap_or(0);
                         log::info!("[vsync] starvation recovered after {}ms", waited);
-                        starvation_started = None;
+                        // Roll the wall clock back by the time we sat
+                        // starving so the recovering frame's pts_ms
+                        // isn't declared LATE by however many ms we
+                        // were waiting. Audio was `set_paused(true)`
+                        // for the whole starvation window (see the
+                        // starvation-wait arm below), so it didn't
+                        // advance either — no separate `drop_ms`
+                        // needed to keep A/V locked.
+                        if let Some(t) = starvation_started.take() {
+                            pause_skew += t.elapsed();
+                        }
                         starving = false;
                         if let StarvationTransition::ExitedBuffering =
                             report_starvation(&stats, StallSide::Video, false)
@@ -469,21 +469,6 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
                                 audio_sink.set_paused(false);
                             }
                         }
-                    }
-                    // Absorb the entire recv gap into pause_skew when
-                    // it's longer than one render budget. This is the
-                    // unified "the pipeline went quiet, don't blame the
-                    // frame for being late" treatment — it handles ABR
-                    // swap pauses, brief decoder hiccups, and full
-                    // starvation alike, replacing the previous
-                    // post-starvation-only accounting.
-                    let total_gap = recv_started.elapsed();
-                    if total_gap > Duration::from_millis(RENDER_BUDGET_MS) {
-                        pause_skew += total_gap;
-                        log::debug!(
-                            "[vsync] absorbed {}ms recv gap into pause_skew",
-                            total_gap.as_millis()
-                        );
                     }
                     break f;
                 }
@@ -515,41 +500,7 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
         let base = *pts_base.get_or_insert(raw_pts_ms.saturating_sub(elapsed));
         let mut pts_ms = raw_pts_ms.saturating_sub(base);
 
-        // ABR swaps can put NEW's first frame at a PTS that's far from
-        // the OLD high-water av_sync had rendered:
-        //   - BACKWARD jump (NEW's first segment PTS < OLD's last
-        //     emitted PTS) — happens when the supervisor hard-stopped
-        //     OLD with frames still in `frame_sender`, av_sync
-        //     finished them, and NEW starts at the next-segment
-        //     boundary which sits before the OLD tail.
-        //   - FORWARD jump (NEW's first segment PTS >> wall-clock
-        //     position) — happens when OLD drained fast and NEW
-        //     starts at a segment whose start_time is several
-        //     seconds ahead. Without rebasing, av_sync would
-        //     `sleep(pts_ms - elapsed)` — a multi-second freeze
-        //     before the first NEW frame renders.
-        //
-        // Either way, rebase `pts_base` so this frame becomes
-        // "on time" (pts_ms == elapsed). Subsequent frames advance
-        // naturally from there. `last_pts_ms = 0` so the BACKWARD
-        // detector below doesn't flag the next legitimate frame.
-        const SWAP_BACKWARD_TOLERANCE_MS: u64 = 1000;
-        const SWAP_FORWARD_TOLERANCE_MS: u64 = 2000;
-        let big_backward = pts_ms + SWAP_BACKWARD_TOLERANCE_MS < last_pts_ms;
-        let big_forward = last_pts_ms != 0
-            && pts_ms > last_pts_ms + SWAP_FORWARD_TOLERANCE_MS;
-        if big_backward || big_forward {
-            log::info!(
-                "[vsync] big PTS jump ({} → {}, Δ={}ms); recalibrating base after pipeline swap",
-                last_pts_ms,
-                pts_ms,
-                pts_ms as i64 - last_pts_ms as i64,
-            );
-            let new_base = raw_pts_ms.saturating_sub(elapsed);
-            pts_base = Some(new_base);
-            pts_ms = raw_pts_ms.saturating_sub(new_base);
-            last_pts_ms = 0;
-        } else if pts_ms < last_pts_ms {
+        if pts_ms < last_pts_ms {
             log::warn!("[vsync] BACKWARD #{} pts={}ms last={}ms Δ=-{}ms elapsed={}ms",
                 frame_idx, pts_ms, last_pts_ms, last_pts_ms - pts_ms, elapsed);
         }

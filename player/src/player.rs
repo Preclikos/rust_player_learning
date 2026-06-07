@@ -894,12 +894,10 @@ async fn video_decoder_task(
     // to one in-flight segment + the few frames already buffered in
     // `sender`.
     stop_flag: Arc<AtomicBool>,
-    // Diagnostics only: `Some(t)` for an ABR-swap pipeline, where `t` is
-    // stamped at OLD teardown. We log how long after teardown NEW's first
-    // frame reaches av_sync — the number that decides whether the swap
-    // outruns av_sync's ~333 ms buffer drain or trips its starvation pause.
-    // `None` for the initial pipeline (nothing to measure against).
-    swap_started: Option<Instant>,
+    // `Some(..)` on an ABR-swap pipeline: trims NEW's overlap with OLD's tail
+    // (frames at/below `skip_below_pts_us`) so the splice is forward-contiguous,
+    // and stamps the first-frame-after-teardown timing log. `None` initially.
+    splice: Option<SwapSplice>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut first_frame_signaled = false;
 
@@ -986,13 +984,23 @@ async fn video_decoder_task(
                                 .map(|(i, _)| i)
                                 .unwrap();
                             let to_send = reorder_buf.swap_remove(min_idx);
+                            // ABR splice trim: drop NEW frames at/below the PTS
+                            // OLD last rendered so NEW joins forward-contiguous
+                            // — no rewind, and no future-PTS frame av_sync would
+                            // sit waiting for (the 1080→4K freeze).
+                            if let Some(sp) = &splice {
+                                if to_send.pts_us <= sp.skip_below_pts_us {
+                                    continue;
+                                }
+                            }
                             if !first_frame_signaled {
                                 video_ready.notify_one();
                                 first_frame_signaled = true;
-                                if let Some(t) = swap_started {
+                                if let Some(sp) = &splice {
                                     log::info!(
-                                        "[abr] NEW first frame {}ms after OLD teardown",
-                                        t.elapsed().as_millis()
+                                        "[abr] NEW first frame {}ms after OLD teardown (pts={}ms)",
+                                        sp.started.elapsed().as_millis(),
+                                        to_send.pts_us / 1000
                                     );
                                 }
                             }
@@ -1026,6 +1034,11 @@ async fn video_decoder_task(
     // Flush remaining frames in PTS order.
     reorder_buf.sort_by_key(|f| f.pts_us);
     for frame in reorder_buf.drain(..) {
+        if let Some(sp) = &splice {
+            if frame.pts_us <= sp.skip_below_pts_us {
+                continue;
+            }
+        }
         if !first_frame_signaled {
             video_ready.notify_one();
             first_frame_signaled = true;
@@ -1212,10 +1225,17 @@ async fn video_prefetch(
     let dl_stats = Arc::clone(&stats);
     let cb_primed = Arc::clone(&primed);
     let downloaded = Arc::new(AtomicUsize::new(0));
+    // Only the initial / OLD pipeline (prime_target == MAX) advances the
+    // download-time decoded-PTS high-water. A swap-prefetch must NOT touch it:
+    // the supervisor reads last_decoded_pts_ms at OLD teardown as the splice
+    // point, and NEW's downloaded-ahead segments would otherwise inflate it.
+    let track_dl_pts = prime_target == usize::MAX;
     let on_video_dl: SegmentDoneCallback = Arc::new(move |pts_ms| {
-        let prev = dl_stats.last_decoded_pts_ms.load(Ordering::Relaxed);
-        if pts_ms > prev {
-            dl_stats.last_decoded_pts_ms.store(pts_ms, Ordering::Relaxed);
+        if track_dl_pts {
+            let prev = dl_stats.last_decoded_pts_ms.load(Ordering::Relaxed);
+            if pts_ms > prev {
+                dl_stats.last_decoded_pts_ms.store(pts_ms, Ordering::Relaxed);
+            }
         }
         // `notify_one` (not `notify_waiters`) so the permit survives even if
         // the supervisor hasn't reached its `.notified()` await yet — avoids a
@@ -1249,6 +1269,19 @@ async fn video_prefetch(
     })
 }
 
+/// Carried into the decode half on an ABR swap so NEW splices cleanly onto
+/// OLD's tail. NEW is started on the segment *containing* the current playback
+/// position (its keyframe is therefore at/before the splice), then the decoder
+/// drops every frame at/below `skip_below_pts_us` — the absolute PTS OLD last
+/// rendered — so NEW's first *emitted* frame is the next one forward. That
+/// avoids both a backward rewind AND a future-PTS frame that av_sync would
+/// sit and wait for (the multi-second freeze seen on a 1080→4K upswitch, where
+/// NEW used to start a whole segment ahead). `started` is for the timing log.
+struct SwapSplice {
+    started: Instant,
+    skip_below_pts_us: i64,
+}
+
 /// Decode half: configure the HW decoder and run [`video_decoder_task`] against
 /// the segments [`video_prefetch`] is already streaming, joining both halves to
 /// completion. `decoder` (the scarce HW slot) must be created by the caller
@@ -1260,8 +1293,8 @@ async fn run_decode(
     mut decoder: Box<dyn HwVideoDecoder>,
     stats: Arc<StatsState>,
     decoder_stop_flag: Arc<AtomicBool>,
-    // Diagnostics: `Some(teardown_instant)` on a swap, `None` initially.
-    swap_started: Option<Instant>,
+    // `Some(..)` on an ABR swap (splice trim + timing), `None` initially.
+    splice: Option<SwapSplice>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     decoder.configure(VideoDecoderParams {
         codec: VideoCodec::Hevc,
@@ -1279,7 +1312,7 @@ async fn run_decode(
         pf.track_crypto,
         stats,
         decoder_stop_flag,
-        swap_started,
+        splice,
     ));
 
     let (dl_res, dec_res) = join!(pf.download_handle, decoder_task);
@@ -1775,15 +1808,16 @@ async fn video_supervisor(
             continue;
         }
 
-        // Pick the segment in NEW that *starts after* the current playback
-        // position. position_ms is 0-based; segment start_times are absolute →
-        // add origin. The +1 keeps NEW's first frame from landing before OLD's
-        // tail on the timeline.
+        // Start NEW on the segment CONTAINING the current playback position
+        // (position_ms is 0-based; segment start_times are absolute → add
+        // origin). Its keyframe is at/before the splice, so once the decoder
+        // trims the overlap (SwapSplice) NEW's first shown frame is
+        // forward-contiguous with OLD's tail. Starting on the *next* segment
+        // (the old +1) left NEW's first frame up to a full segment in the
+        // future, which av_sync sat waiting for — a multi-second freeze on
+        // upswitches even though it never starved.
         let pos = Duration::from_millis(position_ms.load(Ordering::Relaxed)) + origin;
-        let mut new_start = find_segment_index(&new_repr.segments, pos);
-        if new_start + 1 < new_repr.segments.len() {
-            new_start = new_start.saturating_add(1);
-        }
+        let new_start = find_segment_index(&new_repr.segments, pos);
         log::info!(
             "[abr] soft switch: repr {} -> {} from seg {} (pos {}ms)",
             current_repr.id, new_repr.id, new_start, pos.as_millis()
@@ -1883,9 +1917,16 @@ async fn video_supervisor(
             cur_stop.notify_waiters();
             let _ = cur_handle.await;
         }
+        // OLD is fully drained now, so last_decoded_pts_ms is its decoder's
+        // final high-water mark (the swap-prefetch deliberately left it
+        // untouched). It's the absolute PTS of the last frame OLD will show, so
+        // NEW trims everything at/below it and resumes on the very next frame —
+        // forward-contiguous, no rewind and no future-PTS frame to wait on.
+        let splice_pts_us = stats.last_decoded_pts_ms.load(Ordering::Relaxed) * 1000;
         log::info!(
-            "[abr] OLD torn down {}ms after switch; starting NEW decode",
-            swap_t0.elapsed().as_millis()
+            "[abr] OLD torn down {}ms after switch; NEW trimmed to pts>{}ms",
+            swap_t0.elapsed().as_millis(),
+            splice_pts_us / 1000
         );
 
         // OLD's decoder is dropped now — safe to allocate NEW's.
@@ -1898,7 +1939,10 @@ async fn video_supervisor(
             decoder,
             Arc::clone(&stats),
             new_flag.clone(),
-            Some(decode_t0),
+            Some(SwapSplice {
+                started: decode_t0,
+                skip_below_pts_us: splice_pts_us,
+            }),
         ));
         cur_stop = new_stop;
         cur_flag = new_flag;

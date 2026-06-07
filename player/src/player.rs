@@ -3005,3 +3005,174 @@ fn update_bandwidth_ewma(ewma: &AtomicU64, bytes: usize, elapsed: Duration) {
     };
     ewma.store(next, Ordering::Relaxed);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tracks::segment::Segment;
+
+    /// Build a segment whose `start_time` / `end_time` work out to the
+    /// passed-in milliseconds — handy because `find_segment_index` only
+    /// reads `end_time`. Uses timescale=1000 so the base values ARE the
+    /// ms values directly.
+    fn seg_ms(start_ms: u64, end_ms: u64) -> Segment {
+        Segment::new(
+            &String::new(),
+            &String::new(),
+            0,
+            0,
+            Some(start_ms),
+            Some(end_ms),
+            Some(1000),
+        )
+        .expect("stub segment")
+    }
+
+    // ---------------- find_segment_index ----------------
+
+    #[test]
+    fn find_segment_index_empty_returns_zero() {
+        // Empty slice — the function returns 0 as a "no-op safe" sentinel.
+        // Callers gate their use of the result on the segments being
+        // non-empty in practice, but the function itself shouldn't panic.
+        assert_eq!(find_segment_index(&[], Duration::from_secs(5)), 0);
+    }
+
+    #[test]
+    fn find_segment_index_picks_segment_containing_target() {
+        let segs = vec![
+            seg_ms(0, 5000),
+            seg_ms(5000, 10000),
+            seg_ms(10000, 15000),
+        ];
+        // 0 ms → segment 0 (end_time 5000 > 0)
+        assert_eq!(find_segment_index(&segs, Duration::ZERO), 0);
+        // 4999 ms → segment 0 (still inside)
+        assert_eq!(find_segment_index(&segs, Duration::from_millis(4999)), 0);
+        // 5000 ms → boundary; end_time>target so segment 1 (the one
+        // starting at 5000), not segment 0 (whose end_time IS 5000 — fails
+        // the strict `>` check).
+        assert_eq!(find_segment_index(&segs, Duration::from_millis(5000)), 1);
+        // 7500 ms → segment 1
+        assert_eq!(find_segment_index(&segs, Duration::from_millis(7500)), 1);
+        // 12500 ms → segment 2
+        assert_eq!(find_segment_index(&segs, Duration::from_millis(12500)), 2);
+    }
+
+    #[test]
+    fn find_segment_index_target_past_end_returns_last() {
+        let segs = vec![seg_ms(0, 5000), seg_ms(5000, 10000)];
+        // Target way past the last segment's end_time — falls through
+        // the loop, returns segments.len()-1 so the caller can still
+        // index into the slice without bounds checks.
+        assert_eq!(find_segment_index(&segs, Duration::from_secs(3600)), 1);
+    }
+
+    #[test]
+    fn find_segment_index_single_segment() {
+        let segs = vec![seg_ms(0, 5000)];
+        assert_eq!(find_segment_index(&segs, Duration::ZERO), 0);
+        assert_eq!(find_segment_index(&segs, Duration::from_millis(2500)), 0);
+        // Past end → still returns 0 (the last/only index).
+        assert_eq!(find_segment_index(&segs, Duration::from_secs(100)), 0);
+    }
+
+    #[test]
+    fn find_segment_index_real_dash_timings() {
+        // 6-second segments (real-world DASH cadence — matches the
+        // user's manifest where segment 0 spans pts 83..5964ms).
+        let segs: Vec<Segment> = (0..10)
+            .map(|i| seg_ms(i * 6000, (i + 1) * 6000))
+            .collect();
+
+        // Playback at 14.5 s → segment 2 (12-18 s window).
+        assert_eq!(find_segment_index(&segs, Duration::from_millis(14_500)), 2);
+        // Right after a segment boundary (24.001 s) → segment 4.
+        assert_eq!(find_segment_index(&segs, Duration::from_millis(24_001)), 4);
+    }
+
+    // ---------------- update_bandwidth_ewma ----------------
+
+    #[test]
+    fn ewma_seeds_with_instant_value_when_zero() {
+        let ewma = AtomicU64::new(0);
+        // 1 MB in 1 second = 8 Mbps.
+        update_bandwidth_ewma(&ewma, 1_000_000, Duration::from_secs(1));
+        assert_eq!(ewma.load(Ordering::Relaxed), 8_000_000);
+    }
+
+    #[test]
+    fn ewma_skips_zero_and_negative_inputs() {
+        let ewma = AtomicU64::new(5_000_000);
+        // Zero bytes — should not change EWMA.
+        update_bandwidth_ewma(&ewma, 0, Duration::from_secs(1));
+        assert_eq!(ewma.load(Ordering::Relaxed), 5_000_000);
+        // Zero elapsed — should not change EWMA (divide-by-zero guard).
+        update_bandwidth_ewma(&ewma, 1_000_000, Duration::ZERO);
+        assert_eq!(ewma.load(Ordering::Relaxed), 5_000_000);
+    }
+
+    #[test]
+    fn ewma_converges_with_repeated_samples() {
+        let ewma = AtomicU64::new(0);
+        // Seed with 1 Mbps.
+        update_bandwidth_ewma(&ewma, 125_000, Duration::from_secs(1)); // 1 Mbps
+        let seeded = ewma.load(Ordering::Relaxed);
+        assert_eq!(seeded, 1_000_000);
+
+        // Drive with 5 Mbps samples — EWMA should rise toward 5 Mbps.
+        for _ in 0..20 {
+            update_bandwidth_ewma(&ewma, 625_000, Duration::from_secs(1));
+        }
+        let after = ewma.load(Ordering::Relaxed);
+        // Analytical: y_n = 5_000_000 − (5_000_000 − 1_000_000) × (7/8)^n.
+        // After 20 samples that's ≈ 4_718_500 — 94% of the way to target.
+        // Lower bound below leaves a safety margin for integer-truncation
+        // jitter; upper bound asserts we never overshoot.
+        assert!(
+            (4_700_000..=5_000_000).contains(&after),
+            "EWMA didn't converge: {} (expected ~4.7M..5M after 20 samples)",
+            after
+        );
+    }
+
+    #[test]
+    fn ewma_steady_state_holds() {
+        // Once converged, repeated identical samples shouldn't drift.
+        let ewma = AtomicU64::new(5_000_000);
+        for _ in 0..50 {
+            update_bandwidth_ewma(&ewma, 625_000, Duration::from_secs(1));
+        }
+        let after = ewma.load(Ordering::Relaxed);
+        // Stay within 1% of seed value.
+        assert!(
+            (4_950_000..=5_050_000).contains(&after),
+            "EWMA drifted at steady state: {}",
+            after
+        );
+    }
+
+    #[test]
+    fn ewma_smooths_single_spike() {
+        // Steady 5 Mbps, then one 50 Mbps spike — EWMA shouldn't blow up.
+        let ewma = AtomicU64::new(0);
+        update_bandwidth_ewma(&ewma, 625_000, Duration::from_secs(1));
+        for _ in 0..30 {
+            update_bandwidth_ewma(&ewma, 625_000, Duration::from_secs(1));
+        }
+        let stable = ewma.load(Ordering::Relaxed);
+        assert!(stable > 4_900_000 && stable <= 5_000_000);
+
+        // One 50 Mbps sample.
+        update_bandwidth_ewma(&ewma, 6_250_000, Duration::from_secs(1));
+        let after_spike = ewma.load(Ordering::Relaxed);
+        // EWMA moves toward 50 Mbps by alpha=1/8, so jumps to ~5+(50-5)/8 ≈ 10.6 Mbps.
+        // Crucially it does NOT just snap to 50 Mbps.
+        assert!(
+            after_spike > 10_000_000 && after_spike < 12_000_000,
+            "spike absorption broken: stable={} after_spike={}",
+            stable,
+            after_spike
+        );
+    }
+}

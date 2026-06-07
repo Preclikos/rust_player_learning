@@ -230,3 +230,83 @@ impl HwVideoDecoder for FfmpegHwDecoder {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Platform smoke tests for the FFmpeg HW decoder path.
+    //!
+    //! These run on Windows + Linux only (mirroring the module's own
+    //! cfg gate) and verify the assumptions the rest of the player
+    //! makes about the local FFmpeg build:
+    //!
+    //!   - HEVC + H.264 decoders are linked in (we'd fail later at
+    //!     `decoder::find` with a less obvious message).
+    //!   - The HW pixel-format constant we look for matches the
+    //!     platform's hwaccel framework.
+    //!   - The HW device context can be created on this host.
+    //!     Skipped (not failed) on CI / headless boxes where no GPU
+    //!     is available — distinguishable from a code-level failure
+    //!     because the test runner reports "ok" with a log warning.
+    //!
+    //! Anything past this — `decoder.open(codec)`, `send_packet`,
+    //! `receive_frame` — needs real HEVC NALUs (SPS/PPS/VPS plus
+    //! sample data) and isn't worth carrying as test fixtures here.
+
+    use super::*;
+
+    #[test]
+    fn ffmpeg_finds_hevc_decoder() {
+        // This player only configures HEVC and H.264; if HEVC isn't
+        // in the local FFmpeg, the rest of the test suite is moot.
+        assert!(
+            ffmpeg_next::decoder::find(ffmpeg_next::codec::Id::HEVC).is_some(),
+            "FFmpeg build is missing the HEVC decoder",
+        );
+    }
+
+    #[test]
+    fn ffmpeg_finds_h264_decoder() {
+        assert!(
+            ffmpeg_next::decoder::find(ffmpeg_next::codec::Id::H264).is_some(),
+            "FFmpeg build is missing the H.264 decoder",
+        );
+    }
+
+    #[test]
+    fn wanted_hw_pixel_format_matches_platform() {
+        // Catches accidental cfg flips during a refactor — the format
+        // we ask the decoder to negotiate must match the device-type
+        // we register, otherwise get_format returns AV_PIX_FMT_NONE
+        // and decoder open aborts.
+        #[cfg(target_os = "windows")]
+        assert_eq!(WANTED_HW, AVPixelFormat::AV_PIX_FMT_D3D11);
+        #[cfg(target_os = "linux")]
+        assert_eq!(WANTED_HW, AVPixelFormat::AV_PIX_FMT_VAAPI);
+    }
+
+    #[test]
+    fn hw_device_create_against_real_driver() {
+        // Try to allocate the real HW device context. On a workstation
+        // with a working GPU this passes; on a headless CI runner
+        // av_hwdevice_ctx_create returns < 0 (no D3D11 device / no
+        // /dev/dri/renderD128). Skip-with-warning rather than fail so
+        // we don't break unrelated PR builds.
+        let mut decoder = FfmpegHwDecoder::new();
+        match decoder.create_hw_device() {
+            Ok(()) => {
+                assert!(
+                    !decoder.hw_device_ctx.is_null(),
+                    "create_hw_device returned Ok but left ctx null",
+                );
+                // Cleanup happens via Drop.
+            }
+            Err(e) => {
+                eprintln!(
+                    "hw_device_create: skipping live-driver check — {} \
+                     (headless / no GPU is OK here)",
+                    e
+                );
+            }
+        }
+    }
+}

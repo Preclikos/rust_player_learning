@@ -259,3 +259,240 @@ pub fn find_audio_channel_count(block: &str) -> Option<u32> {
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Fragment of the user's real DASH manifest — kept tight enough to read
+    /// at a glance but with all the elements the helpers below need to
+    /// distinguish (two switching-equivalent video AdaptationSets, an audio
+    /// adaptation with EC-3 channel config, multi-language text). When
+    /// adding new helper tests, prefer extracting the slice from this
+    /// fixture so they stay realistic.
+    /// Compact-but-realistic DASH fragment. Carries enough of the
+    /// elements the helpers below need to distinguish (two
+    /// switching-equivalent video AdaptationSets, an audio adaptation
+    /// with EC-3 channel config) so test failures point at real-world
+    /// breakages, not synthetic edge cases.
+    const REAL_MPD: &str = r#"<MPD mediaPresentationDuration="PT9382.375S">
+<Period id="0">
+<AdaptationSet id="223705" contentType="video" maxWidth="1920" maxHeight="1080">
+<ContentProtection schemeIdUri="urn:uuid:1077efec-c0b2-4d02-ace3-3c1e52e2fb4b"/>
+<Role schemeIdUri="urn:mpeg:dash:role:2011" value="main"/>
+<Representation id="315074" bandwidth="6000000" codecs="hvc1.1.6.L120.90" mimeType="video/mp4" width="1920" height="1080"><BaseURL>seg-315074/</BaseURL><SegmentBase indexRange="1130-19929"><Initialization range="0-1129"/></SegmentBase></Representation>
+<Representation id="315075" bandwidth="3000000" codecs="hvc1.1.6.L93.90" mimeType="video/mp4" width="1280" height="720"><BaseURL>seg-315075/</BaseURL><SegmentBase indexRange="1130-19929"><Initialization range="0-1129"/></SegmentBase></Representation>
+<SupplementalProperty schemeIdUri="urn:mpeg:dash:adaptation-set-switching:2016" value="223714"/>
+</AdaptationSet>
+<AdaptationSet id="223707" contentType="audio" lang="en">
+<Representation id="315079" bandwidth="768000" codecs="ec-3" mimeType="audio/mp4"><BaseURL>seg-315079/</BaseURL><AudioChannelConfiguration schemeIdUri="urn:mpeg:dash:23003:3:audio_channel_configuration:2011" value="6"/></Representation>
+</AdaptationSet>
+<AdaptationSet id="223714" contentType="video" maxWidth="3840" maxHeight="2160">
+<ContentProtection schemeIdUri="urn:uuid:1077efec-c0b2-4d02-ace3-3c1e52e2fb4b"/>
+<Role schemeIdUri="urn:mpeg:dash:role:2011" value="main"/>
+<SupplementalProperty schemeIdUri="urn:mpeg:dash:colour_primaries" value="9"/>
+<SupplementalProperty schemeIdUri="urn:mpeg:dash:TransferCharacteristics" value="16"/>
+<Representation id="315086" bandwidth="14000000" codecs="hvc1.2.4.L150.90" mimeType="video/mp4" width="3840" height="2160"><BaseURL>seg-315086/</BaseURL><SegmentBase indexRange="1130-19929"><Initialization range="0-1129"/></SegmentBase></Representation>
+<SupplementalProperty schemeIdUri="urn:mpeg:dash:adaptation-set-switching:2016" value="223705"/>
+</AdaptationSet>
+</Period>
+</MPD>"#;
+
+    // -------------------------------------------------------------------
+    // slice_adaptation_set
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn slice_adaptation_set_returns_block_for_matching_id() {
+        let block = slice_adaptation_set(REAL_MPD, 223705).expect("found");
+        assert!(block.contains("contentType=\"video\""));
+        assert!(block.contains("id=\"315074\""));
+        assert!(block.contains("id=\"315075\""));
+        // Must not bleed into the next AdaptationSet.
+        assert!(!block.contains("id=\"315086\""));
+        assert!(!block.contains("contentType=\"audio\""));
+    }
+
+    #[test]
+    fn slice_adaptation_set_handles_second_video_set() {
+        // 223714 sits AFTER an audio AdaptationSet — verifies the slicer
+        // doesn't terminate at the first </AdaptationSet> after `start`.
+        let block = slice_adaptation_set(REAL_MPD, 223714).expect("found");
+        assert!(block.contains("maxWidth=\"3840\""));
+        assert!(block.contains("id=\"315086\""));
+        assert!(!block.contains("id=\"315074\""));
+    }
+
+    #[test]
+    fn slice_adaptation_set_missing_id_returns_none() {
+        assert!(slice_adaptation_set(REAL_MPD, 999_999).is_none());
+    }
+
+    #[test]
+    fn slice_adaptation_set_prefix_id_doesnt_match() {
+        // "22370" must NOT match adaptation id "223705" because the
+        // needle ends with the closing `"` quote. Guards against future
+        // refactors that drop the quote and accidentally let `22370`
+        // match a longer id by prefix.
+        assert!(slice_adaptation_set(REAL_MPD, 22370).is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // slice_representation
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn slice_representation_pulls_inner_rep_block() {
+        let adapt = slice_adaptation_set(REAL_MPD, 223705).unwrap();
+        let rep = slice_representation(adapt, 315074).expect("rep found");
+        assert!(rep.contains("bandwidth=\"6000000\""));
+        assert!(rep.contains("width=\"1920\""));
+        assert!(!rep.contains("id=\"315075\""));
+    }
+
+    #[test]
+    fn slice_representation_missing_id_returns_none() {
+        let adapt = slice_adaptation_set(REAL_MPD, 223705).unwrap();
+        assert!(slice_representation(adapt, 999).is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // find_descriptor_values
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn find_descriptor_values_finds_supplemental_property_values() {
+        let adapt = slice_adaptation_set(REAL_MPD, 223714).unwrap();
+        let primaries = find_descriptor_values(adapt, "colour_primaries");
+        assert_eq!(primaries, vec!["9".to_string()]);
+        let xfer = find_descriptor_values(adapt, "TransferCharacteristics");
+        assert_eq!(xfer, vec!["16".to_string()]);
+    }
+
+    #[test]
+    fn find_descriptor_values_returns_empty_when_scheme_absent() {
+        let adapt = slice_adaptation_set(REAL_MPD, 223705).unwrap();
+        // No Dolby Vision essentials in this fragment.
+        let dv = find_descriptor_values(adapt, "dolby_vision");
+        assert!(dv.is_empty());
+    }
+
+    #[test]
+    fn find_descriptor_values_skips_non_property_elements_with_value_attr() {
+        // ContentProtection has a value-ish-looking schemeIdUri but isn't
+        // a *Property element, so it must NOT be returned.
+        let adapt = slice_adaptation_set(REAL_MPD, 223705).unwrap();
+        let cp = find_descriptor_values(adapt, "uuid:1077efec");
+        assert!(cp.is_empty());
+    }
+
+    #[test]
+    fn find_descriptor_values_can_find_multiple_matches() {
+        // Sanity-check with a hand-rolled fragment containing two
+        // SupplementalProperty elements with the same scheme.
+        let frag = r#"<AdaptationSet>
+            <SupplementalProperty schemeIdUri="urn:foo:bar" value="A"/>
+            <SupplementalProperty schemeIdUri="urn:foo:bar" value="B"/>
+            <SupplementalProperty schemeIdUri="urn:other" value="X"/>
+        </AdaptationSet>"#;
+        let vals = find_descriptor_values(frag, "foo:bar");
+        assert_eq!(vals, vec!["A".to_string(), "B".to_string()]);
+    }
+
+    // -------------------------------------------------------------------
+    // find_switchable_ids
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn find_switchable_ids_returns_single_id() {
+        let adapt = slice_adaptation_set(REAL_MPD, 223705).unwrap();
+        assert_eq!(find_switchable_ids(adapt), vec![223714]);
+    }
+
+    #[test]
+    fn find_switchable_ids_handles_comma_separated_list() {
+        let frag = r#"<AdaptationSet>
+            <SupplementalProperty
+                schemeIdUri="urn:mpeg:dash:adaptation-set-switching:2016"
+                value="1, 2,3 , 4"/>
+        </AdaptationSet>"#;
+        // Whitespace around commas is tolerated.
+        assert_eq!(find_switchable_ids(frag), vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn find_switchable_ids_skips_non_integer_pieces() {
+        let frag = r#"<AdaptationSet>
+            <SupplementalProperty
+                schemeIdUri="urn:mpeg:dash:adaptation-set-switching:2016"
+                value="42,not-a-number,99"/>
+        </AdaptationSet>"#;
+        assert_eq!(find_switchable_ids(frag), vec![42, 99]);
+    }
+
+    #[test]
+    fn find_switchable_ids_empty_when_property_absent() {
+        let frag = r#"<AdaptationSet>
+            <Role value="main"/>
+        </AdaptationSet>"#;
+        assert!(find_switchable_ids(frag).is_empty());
+    }
+
+    // -------------------------------------------------------------------
+    // find_audio_channel_count
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn find_audio_channel_count_reads_value() {
+        let audio_adapt = slice_adaptation_set(REAL_MPD, 223707).unwrap();
+        assert_eq!(find_audio_channel_count(audio_adapt), Some(6));
+    }
+
+    #[test]
+    fn find_audio_channel_count_none_when_absent() {
+        let video_adapt = slice_adaptation_set(REAL_MPD, 223705).unwrap();
+        // Video doesn't carry AudioChannelConfiguration.
+        assert_eq!(find_audio_channel_count(video_adapt), None);
+    }
+
+    #[test]
+    fn find_audio_channel_count_returns_first_match() {
+        let frag = r#"<Representation>
+            <AudioChannelConfiguration value="2"/>
+            <AudioChannelConfiguration value="6"/>
+        </Representation>"#;
+        // Spec-wise we only expect one per Representation, but if there
+        // are two the helper picks the first (consistent, predictable).
+        assert_eq!(find_audio_channel_count(frag), Some(2));
+    }
+
+    // -------------------------------------------------------------------
+    // Manifest::parse — round-trip a small MPD through serde
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn parse_accepts_realistic_two_video_adaptation_mpd() {
+        // Use from_str directly so any serde/quick-xml error surfaces in
+        // the test output instead of being swallowed by Manifest::parse's
+        // generic "Failed to parse MPD" wrap.
+        let mpd: MPD = quick_xml::de::from_str(REAL_MPD)
+            .unwrap_or_else(|e| panic!("MPD parse failed: {}\n--- input ---\n{}", e, REAL_MPD));
+        assert_eq!(mpd.periods.len(), 1);
+        let p = &mpd.periods[0];
+        // Three AdaptationSets: video, audio, video.
+        assert_eq!(p.adaptation_sets.len(), 3);
+        let video_ids: Vec<u32> = p
+            .adaptation_sets
+            .iter()
+            .filter(|a| a.content_type == "video")
+            .map(|a| a.id)
+            .collect();
+        assert_eq!(video_ids, vec![223705, 223714]);
+    }
+
+    #[test]
+    fn parse_rejects_malformed_xml() {
+        let bad = "<MPD><Period><AdaptationSet";
+        assert!(Manifest::parse(bad).is_err());
+    }
+}

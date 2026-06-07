@@ -219,3 +219,83 @@ impl AudioDecoder for FfmpegAudioDecoder {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Platform smoke tests for the FFmpeg audio decoder build.
+    //!
+    //! Catches the easy regressions:
+    //!   - FFmpeg was rebuilt without AAC / AC-3 / E-AC-3 support
+    //!     (we'd hit the lookup failure at runtime when the user
+    //!     opens an EC-3 audio adaptation — better to catch at CI).
+    //!   - ChannelLayout construction for the channel counts the
+    //!     player asks for (1/2/6/8) compiles and yields a layout
+    //!     with the right channel count.
+    //!   - The resampling output format we hand to ResampleCtx::get
+    //!     (F32 packed stereo) is still supported by this FFmpeg
+    //!     build.
+    //!
+    //! Real-decode tests would need PCM-back samples and are skipped
+    //! here — the integration smoke-app exercises that path.
+
+    use super::*;
+    use ffmpeg_next::util::channel_layout::ChannelLayout;
+    use ffmpeg_next::util::format::sample::{Sample, Type};
+
+    #[test]
+    fn ffmpeg_finds_aac_decoder() {
+        assert!(
+            ffmpeg_next::decoder::find(ffmpeg_next::codec::Id::AAC).is_some(),
+            "FFmpeg build is missing the AAC decoder",
+        );
+    }
+
+    #[test]
+    fn ffmpeg_finds_ac3_and_eac3_decoders() {
+        // Both AC-3 and E-AC-3 (a.k.a. EC-3) are in the user's manifest,
+        // exposed as `ac-3` and `ec-3` mime codec strings respectively.
+        assert!(
+            ffmpeg_next::decoder::find(ffmpeg_next::codec::Id::AC3).is_some(),
+            "FFmpeg build is missing the AC-3 decoder",
+        );
+        assert!(
+            ffmpeg_next::decoder::find(ffmpeg_next::codec::Id::EAC3).is_some(),
+            "FFmpeg build is missing the E-AC-3 decoder",
+        );
+    }
+
+    #[test]
+    fn channel_layout_constants_have_expected_channels() {
+        assert_eq!(ChannelLayout::MONO.channels(), 1);
+        assert_eq!(ChannelLayout::STEREO.channels(), 2);
+    }
+
+    #[test]
+    fn channel_layout_default_handles_5_1_and_7_1() {
+        // The player uses `ChannelLayout::default(N)` for unusual N
+        // (matching the EC-3 6-channel and Atmos 8-channel cases).
+        // ffmpeg-next's `default(i32) -> ChannelLayout` returns the
+        // FFmpeg-canonical layout for that channel count — verify it
+        // round-trips the count.
+        assert_eq!(ChannelLayout::default(6).channels(), 6);
+        assert_eq!(ChannelLayout::default(8).channels(), 8);
+    }
+
+    #[test]
+    fn resampler_can_be_built_for_typical_stream_params() {
+        // The "real" resampler config the player builds in `build_resampler`:
+        // F32 planar input, F32 packed stereo output, 48 kHz. Verifies
+        // ffmpeg-next + libswresample actually accept this combo on this
+        // platform — a build with libswresample missing would fail here
+        // at `ResampleCtx::get` long before any real audio frame.
+        let r = ffmpeg_next::software::resampling::Context::get(
+            Sample::F32(Type::Planar),
+            ChannelLayout::default(6),
+            48_000,
+            Sample::F32(Type::Packed),
+            ChannelLayout::STEREO,
+            48_000,
+        );
+        assert!(r.is_ok(), "resampler unavailable: {:?}", r.err());
+    }
+}

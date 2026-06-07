@@ -257,7 +257,13 @@ mod platform {
 
 async fn run_console(player: Player) {
     print_menu(&player);
-    println!("Commands: l = list, v <i> = video quality, a <i> = audio track");
+    println!("Commands:");
+    println!("  l        — list tracks");
+    println!("  v <i>    — pick video quality (HARD restart via seek)");
+    println!("  s <i>    — pick video quality (SOFT switch — tests ABR supervisor swap)");
+    println!("  a <i>    — pick audio track");
+    println!("  abr on   — enable bandwidth-EWMA ABR (safety_factor=1.25)");
+    println!("  abr off  — disable ABR (Manual)");
 
     let stdin = tokio::io::stdin();
     let mut reader = BufReader::new(stdin).lines();
@@ -275,11 +281,31 @@ async fn run_console(player: Player) {
                 Some(i) => pick_video(&player, i),
                 None => println!("usage: v <index>"),
             },
+            "s" => match arg.and_then(|s| s.parse::<usize>().ok()) {
+                Some(i) => pick_video_soft(&player, i),
+                None => println!("usage: s <index>"),
+            },
             "a" => match arg.and_then(|s| s.parse::<usize>().ok()) {
                 Some(i) => pick_audio(&player, i),
                 None => println!("usage: a <index>"),
             },
-            other => println!("unknown command: {} (try l, v <i>, a <i>)", other),
+            "abr" => match arg {
+                Some("on") => {
+                    player.set_abr_strategy(player::AbrStrategy::BandwidthEwma {
+                        safety_factor: 1.25,
+                    });
+                    println!("ABR enabled (BandwidthEwma, safety_factor=1.25)");
+                }
+                Some("off") => {
+                    player.set_abr_strategy(player::AbrStrategy::Manual);
+                    println!("ABR disabled (Manual)");
+                }
+                _ => println!("usage: abr on | abr off"),
+            },
+            other => println!(
+                "unknown command: {} (try l, v <i>, s <i>, a <i>, abr on|off)",
+                other
+            ),
         }
     }
 }
@@ -341,10 +367,32 @@ fn pick_video(player: &Player, index: usize) {
         for repr in &adaptation.representations {
             if i == index {
                 println!(
-                    "switching video to [{}] {}x{} bw={}",
+                    "switching video to [{}] {}x{} bw={} (HARD restart)",
                     i, repr.width, repr.height, repr.bandwidth
                 );
                 player.change_video_track(repr);
+                return;
+            }
+            i += 1;
+        }
+    }
+    println!("invalid video index");
+}
+
+fn pick_video_soft(player: &Player, index: usize) {
+    let tracks = match player.get_tracks() {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+    let mut i = 0;
+    for adaptation in &tracks.video {
+        for repr in &adaptation.representations {
+            if i == index {
+                println!(
+                    "soft-switching video to [{}] {}x{} bw={} (supervisor swap path)",
+                    i, repr.width, repr.height, repr.bandwidth
+                );
+                player.change_video_track_soft(repr);
                 return;
             }
             i += 1;

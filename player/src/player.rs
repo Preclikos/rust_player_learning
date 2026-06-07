@@ -1480,35 +1480,22 @@ type VideoDecoderFactory = Arc<dyn Fn() -> Box<dyn HwVideoDecoder> + Send + Sync
 /// Long-lived task that owns the video pipeline for a single `play()` call.
 /// It spawns one `video_play` at a time and respawns on representation swap.
 ///
-/// ## Per-pipeline local channel + supervisor merge
-///
-/// Each spawned `video_play` writes its decoded frames into a *local*
-/// mpsc channel; the supervisor forwards those frames into the shared
-/// `frame_sender` consumed by `av_sync`. On a soft swap, the supervisor
-/// continues draining the OLD pipeline's local channel before switching
-/// to the NEW one's — guaranteeing PTS ordering on `frame_sender`
-/// regardless of how fast either pipeline produces frames.
-///
-/// Without the merge step, OLD's queued-but-not-yet-decoded segments and
-/// NEW's freshly-decoded ones would race onto the same channel and
-/// interleave — av_sync would see PTS jump backwards and forwards
-/// (visible as "flickering between sources" during the swap window).
-///
 /// Soft-switch flow on receiving a new representation:
 ///   1. Compute the next segment in the NEW representation that starts
-///      after the current playback PTS.
+///      after the current playback PTS, so the first new frame can't land
+///      before the last old frame on the timeline.
 ///   2. Soft-cap the CURRENT pipeline at `new_start` via the shared
-///      `soft_end_exclusive` atomic — its download loop will exit at that
-///      segment boundary, draining whatever it has already queued in the
-///      download / decoder channels into its local frame channel.
-///   3. Spawn the NEW `video_play` IN PARALLEL with the old's drain. NEW
-///      starts downloading the init segment + first media segment while
-///      OLD is still finishing its tail. NEW's frames pile up in its
-///      local channel (bounded buffer) — they don't reach `frame_sender`
-///      until OLD's channel closes.
-///   4. Drain OLD's local channel into `frame_sender`. When it closes,
-///      switch the forwarding source to NEW's local channel.
-///   5. Continue normally.
+///      `soft_end_exclusive` atomic. Its download loop exits at that
+///      boundary without aborting any in-flight transfer, so segments
+///      already paid-for-with-bandwidth still reach the decoder and
+///      then `frame_sender` — av_sync gets every frame OLD downloaded.
+///   3. Await OLD's natural drain (download_task hits soft_end and
+///      drops its sender, decoder_task drains the queue and exits).
+///   4. Spawn NEW. Sequential w.r.t. OLD because some HW decoder paths
+///      (Intel D3D11VA, certain MediaCodec drivers) won't allocate a
+///      second decoder instance while the first is still live — running
+///      them in parallel during the swap window led to NEW failing in
+///      `configure()` and the supervisor exiting with av_sync EOF.
 ///
 /// Audio keeps playing throughout — only the video pipeline is touched.
 async fn video_supervisor(
@@ -1530,28 +1517,20 @@ async fn video_supervisor(
     // is 0-based, so we add this back to locate segments on a soft swap.
     origin: Duration,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    // Per-pipeline local channel buffer. Sized so NEW can pre-decode a few
-    // segments worth of frames while OLD drains. 64 ≈ 2-3 seconds at 24fps;
-    // smaller leaves NEW's decoder back-pressured during the swap window
-    // (defeating the parallelism), larger costs RAM for a marginal win.
-    const PIPELINE_BUFFER_FRAMES: usize = 64;
-
     let spawn_pipeline = |repr: VideoRepresenation,
                           start_index: usize,
                           local_stop: Arc<Notify>,
                           local_stop_flag: Arc<AtomicBool>|
      -> (
         tokio::task::JoinHandle<Result<(), Box<dyn Error + Send + Sync>>>,
-        mpsc::Receiver<DecodedVideoFrame>,
         Arc<AtomicUsize>,
     ) {
-        let (local_tx, local_rx) = mpsc::channel::<DecodedVideoFrame>(PIPELINE_BUFFER_FRAMES);
         let soft_end = Arc::new(AtomicUsize::new(usize::MAX));
         let handle = task::spawn(video_play(
             repr,
             start_index,
             video_ready.clone(),
-            local_tx,
+            frame_sender.clone(),
             local_stop,
             local_stop_flag,
             decryptor.clone(),
@@ -1561,42 +1540,46 @@ async fn video_supervisor(
             segments_in_flight,
             soft_end.clone(),
         ));
-        (handle, local_rx, soft_end)
+        (handle, soft_end)
     };
 
     let mut current_repr = initial_repr;
-    let current_start = initial_start_index;
-    let mut current_local_stop = Arc::new(Notify::new());
-    let mut current_local_stop_flag = Arc::new(AtomicBool::new(false));
-    let (mut current_handle, mut current_rx, mut current_soft_end) = spawn_pipeline(
-        current_repr.clone(),
-        current_start,
-        current_local_stop.clone(),
-        current_local_stop_flag.clone(),
-    );
-
+    let mut current_start = initial_start_index;
     loop {
-        // Forward frames from the active pipeline's local channel into
-        // `frame_sender` while watching for play-level stop, natural
-        // pipeline EOF, or a soft-swap request on `switch_rx`.
+        // Per-iteration stop signal — only fires on representation swap,
+        // not on play-level stop. Keeping it separate means `seek()`
+        // semantics (play-level stop) still work as before.
+        let local_stop = Arc::new(Notify::new());
+        let local_stop_flag = Arc::new(AtomicBool::new(false));
+
+        let (vp_handle, soft_end) = spawn_pipeline(
+            current_repr.clone(),
+            current_start,
+            local_stop.clone(),
+            local_stop_flag.clone(),
+        );
+        tokio::pin!(vp_handle);
+
+        // Race three outcomes: play-level stop, video_play finishing on
+        // its own (natural EOF), or a switch_rx update requesting a soft
+        // swap. The natural-EOF arm is essential: if we kept the
+        // keepalive frame_sender alive forever after the last segment
+        // was decoded, the av_sync video_rx would never observe channel
+        // close and `PlayerEvent::EndOfStream` would never fire.
         let new_repr: VideoRepresenation = loop {
             tokio::select! {
                 _ = stop.notified() => {
-                    current_local_stop_flag.store(true, Ordering::Relaxed);
-                    current_local_stop.notify_waiters();
-                    let _ = current_handle.await;
+                    local_stop_flag.store(true, Ordering::Relaxed);
+                    local_stop.notify_waiters();
+                    let _ = vp_handle.await;
                     return Ok(());
                 }
-                res = &mut current_handle => {
-                    // video_play returned without us asking. Drain any frames
-                    // still in its local channel — they're already decoded —
-                    // then exit so the keepalive frame_sender drops and
+                res = &mut vp_handle => {
+                    // video_play returned without us asking. Either it
+                    // ran out of segments (EOF) or it errored. Either
+                    // way, exit the supervisor so the keepalive
+                    // frame_sender drops, the video channel closes, and
                     // av_sync can fire EndOfStream.
-                    while let Some(frame) = current_rx.recv().await {
-                        if frame_sender.send(frame).await.is_err() {
-                            return Ok(());
-                        }
-                    }
                     match res {
                         Ok(Ok(())) => {
                             log::info!("[video] supervisor: video_play exited naturally; closing pipeline");
@@ -1610,35 +1593,6 @@ async fn video_supervisor(
                     }
                     return Ok(());
                 }
-                frame_opt = current_rx.recv() => {
-                    match frame_opt {
-                        Some(frame) => {
-                            if frame_sender.send(frame).await.is_err() {
-                                // av_sync consumer dropped — nothing left to do.
-                                return Ok(());
-                            }
-                        }
-                        None => {
-                            // Local channel closed but vp_handle hasn't
-                            // resolved yet — they fire near-simultaneously.
-                            // Await the handle to surface its result, then
-                            // exit (matches the `res = &mut current_handle`
-                            // arm path).
-                            match (&mut current_handle).await {
-                                Ok(Ok(())) => {
-                                    log::info!("[video] supervisor: local channel closed; pipeline done");
-                                }
-                                Ok(Err(e)) => {
-                                    log::error!("[video] supervisor: pipeline failed: {}", e);
-                                }
-                                Err(e) => {
-                                    log::error!("[video] supervisor: pipeline task panicked: {}", e);
-                                }
-                            }
-                            return Ok(());
-                        }
-                    }
-                }
                 _ = async {
                     if stop_flag.load(Ordering::Relaxed) {
                         return;
@@ -1646,9 +1600,9 @@ async fn video_supervisor(
                     let _ = switch_rx.changed().await;
                 } => {
                     if stop_flag.load(Ordering::Relaxed) {
-                        current_local_stop_flag.store(true, Ordering::Relaxed);
-                        current_local_stop.notify_waiters();
-                        let _ = current_handle.await;
+                        local_stop_flag.store(true, Ordering::Relaxed);
+                        local_stop.notify_waiters();
+                        let _ = vp_handle.await;
                         return Ok(());
                     }
                     if let Some(new) = switch_rx.borrow_and_update().clone() {
@@ -1666,16 +1620,15 @@ async fn video_supervisor(
         }
 
         // Pick the segment in the new representation that *starts after*
-        // the current playback position. PTS order on `frame_sender` is
-        // enforced by the supervisor's serialised forwarding below — we
-        // don't need new_start to be past OLD's high-water mark.
+        // the current playback position. position_ms is 0-based; segment
+        // start_times are absolute → add origin.
         let pos = Duration::from_millis(position_ms.load(Ordering::Relaxed)) + origin;
         let mut new_start = find_segment_index(&new_repr.segments, pos);
         if new_start + 1 < new_repr.segments.len() {
             new_start = new_start.saturating_add(1);
         }
         log::info!(
-            "[abr] soft switch: repr {} -> {} from seg {} (pos {}ms) — old pipeline draining in parallel",
+            "[abr] soft switch: repr {} -> {} from seg {} (pos {}ms)",
             current_repr.id, new_repr.id, new_start, pos.as_millis()
         );
         let _ = events.send(PlayerEvent::TrackChanged {
@@ -1683,66 +1636,20 @@ async fn video_supervisor(
             info: video_track_info(&new_repr),
         });
 
-        // (1) Soft-cap the OLD pipeline: its download loop will exit when
-        //     it reaches `new_start`, draining whatever segments it
-        //     already queued ahead.
-        current_soft_end.store(new_start, Ordering::Relaxed);
+        // Soft-cap OLD's downloads at new_start so its tail is preserved
+        // (no aborted in-flight downloads, no wasted bandwidth) and OLD's
+        // already-queued segments still flow through the decoder to
+        // av_sync. Then await OLD's natural completion before spawning
+        // NEW — running two video_play instances simultaneously trips
+        // HW decoder allocation on some drivers (Intel D3D11VA observed)
+        // which used to manifest as a permanent stall after the first
+        // ABR switch.
+        soft_end.store(new_start, Ordering::Relaxed);
+        let _ = vp_handle.await;
 
-        // (2) Spawn the NEW pipeline IN PARALLEL with the old's drain.
-        //     NEW writes to its OWN local channel — frames don't reach
-        //     `frame_sender` until OLD's channel has closed.
-        let next_local_stop = Arc::new(Notify::new());
-        let next_local_stop_flag = Arc::new(AtomicBool::new(false));
-        let (next_handle, next_rx, next_soft_end) = spawn_pipeline(
-            new_repr.clone(),
-            new_start,
-            next_local_stop.clone(),
-            next_local_stop_flag.clone(),
-        );
-
-        // (3) Drain OLD's local channel into frame_sender. NEW's decoder
-        //     is filling `next_rx` in parallel (up to PIPELINE_BUFFER_FRAMES
-        //     ahead before back-pressuring). When OLD's channel closes,
-        //     NEW takes over with no perceptible stall.
-        loop {
-            tokio::select! {
-                _ = stop.notified() => {
-                    current_local_stop_flag.store(true, Ordering::Relaxed);
-                    current_local_stop.notify_waiters();
-                    next_local_stop_flag.store(true, Ordering::Relaxed);
-                    next_local_stop.notify_waiters();
-                    let _ = current_handle.await;
-                    let _ = next_handle.await;
-                    return Ok(());
-                }
-                frame_opt = current_rx.recv() => {
-                    match frame_opt {
-                        Some(frame) => {
-                            if frame_sender.send(frame).await.is_err() {
-                                return Ok(());
-                            }
-                        }
-                        None => break,
-                    }
-                }
-            }
-        }
-
-        // OLD fully drained — wait for its task to actually finish so the
-        // decoder/HTTP resources are freed before we let NEW take over.
-        // The local channel closing usually means video_play is one poll
-        // away from returning; this await almost always resolves instantly.
-        if let Err(e) = current_handle.await {
-            log::warn!("[video] supervisor: old pipeline task join failed during swap: {}", e);
-        }
-
-        // (4) Install NEW as the active pipeline for the next iteration.
         current_repr = new_repr;
-        current_handle = next_handle;
-        current_rx = next_rx;
-        current_soft_end = next_soft_end;
-        current_local_stop = next_local_stop;
-        current_local_stop_flag = next_local_stop_flag;
+        current_start = new_start;
+        // Next iteration spawns the new video_play.
     }
 }
 
@@ -2133,6 +2040,15 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         // Hard restart — seek() flips stop_flag, the user-level play()
         // loop respawns with the freshly-stored representation.
         self.seek(self.position());
+    }
+
+    /// Trigger a soft (ABR-style) video representation swap directly,
+    /// bypassing the ABR engine. Primarily for testing the supervisor's
+    /// soft-swap path without simulating bandwidth changes. Unlike
+    /// `change_video_track`, this does NOT flip the ABR strategy back
+    /// to Manual — the next ABR tick can immediately re-evaluate.
+    pub fn change_video_track_soft(&self, representation: &VideoRepresenation) {
+        self.apply_video_representation_soft(representation);
     }
 
     /// ABR-driven swap. Soft: hands the new representation to the running

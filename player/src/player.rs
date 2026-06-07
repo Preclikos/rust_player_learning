@@ -1104,26 +1104,53 @@ async fn audio_decoder_task(
 // Download + decode pipeline builders (renderer-agnostic)
 // ---------------------------------------------------------------------------
 
-async fn video_play(
-    video_representation: VideoRepresenation,
+/// The download-side product of one representation's pipeline, ready to be
+/// handed to [`run_decode`]. Produced by [`video_prefetch`].
+///
+/// Splitting the pipeline into a download half (this) and a decode half lets
+/// the ABR supervisor fetch the NEW representation's first segments *while the
+/// OLD representation's decoder is still running* — the OLD HW decoder slot is
+/// untouched, so there's no second-instance allocation conflict, and av_sync
+/// keeps getting OLD frames the whole time. Only once NEW is buffered locally
+/// does OLD tear down and NEW's decode start, so the gap that used to trip the
+/// 300 ms starvation pause (the visible buffering freeze) collapses to a fast
+/// local configure + first-GOP decode.
+struct VideoPrefetch {
+    width: u32,
+    height: u32,
+    init_data: Vec<u8>,
+    hvcc_nalus: Vec<Vec<u8>>,
+    track_crypto: Option<TrackCrypto>,
+    download_rx: mpsc::Receiver<DataSegment>,
+    download_handle: JoinHandle<Result<(), Box<dyn Error + Send + Sync>>>,
+    /// Fired (once) when `prime_target` segments have been buffered into
+    /// `download_rx`. The supervisor awaits this before tearing OLD down.
+    primed: Arc<Notify>,
+}
+
+/// Download half of a video pipeline: fetch + parse the init segment, resolve
+/// the CENC key, and spawn [`download_task`] streaming media segments into a
+/// bounded channel. Touches the network only — never the HW decoder — so it is
+/// safe to run concurrently with another representation's live decoder.
+#[allow(clippy::too_many_arguments)]
+async fn video_prefetch(
+    repr: &VideoRepresenation,
     start_index: usize,
-    video_ready: Arc<Notify>,
-    sender: Sender<DecodedVideoFrame>,
     stop: Arc<Notify>,
     stop_flag: Arc<AtomicBool>,
     decryptor: Option<Arc<dyn Decryptor>>,
-    mut decoder: Box<dyn HwVideoDecoder>,
     http: Arc<HttpClient>,
     stats: Arc<StatsState>,
     segments_in_flight: usize,
-    // See `download_task::soft_end_exclusive`. Plumbed through so the
-    // supervisor can softly cap an old pipeline mid-flight without
-    // discarding its already-decoded tail.
     soft_end_exclusive: Arc<AtomicUsize>,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
+    // Notify `primed` once this many segments are buffered. `usize::MAX` means
+    // "never signal" — used for the initial pipeline, which has no OLD to
+    // overlap and so decodes immediately.
+    prime_target: usize,
+) -> Result<VideoPrefetch, Box<dyn Error + Send + Sync>> {
     let (download_tx, download_rx) = mpsc::channel::<DataSegment>(segments_in_flight);
 
-    let init_dl = video_representation
+    let init_dl = repr
         .segment_init
         .download(&http, RequestKind::InitSegment)
         .await
@@ -1168,23 +1195,25 @@ async fn video_play(
         }
     };
 
-    decoder.configure(VideoDecoderParams {
-        codec: VideoCodec::Hevc,
-        width: video_representation.width,
-        height: video_representation.height,
-        hvcc_nalus,
-    })?;
-
-    let segments = video_representation.segments.clone();
+    let segments = repr.segments.clone();
+    let primed = Arc::new(Notify::new());
     let dl_stats = Arc::clone(&stats);
+    let cb_primed = Arc::clone(&primed);
+    let downloaded = Arc::new(AtomicUsize::new(0));
     let on_video_dl: SegmentDoneCallback = Arc::new(move |pts_ms| {
         let prev = dl_stats.last_decoded_pts_ms.load(Ordering::Relaxed);
         if pts_ms > prev {
             dl_stats.last_decoded_pts_ms.store(pts_ms, Ordering::Relaxed);
         }
+        // `notify_one` (not `notify_waiters`) so the permit survives even if
+        // the supervisor hasn't reached its `.notified()` await yet — avoids a
+        // lost-wakeup race when a small segment finishes downloading fast.
+        let n = downloaded.fetch_add(1, Ordering::Relaxed) + 1;
+        if n == prime_target {
+            cb_primed.notify_one();
+        }
     });
-    let decoder_stop_flag = Arc::clone(&stop_flag);
-    let download_task = task::spawn(download_task(
+    let download_handle = task::spawn(download_task(
         segments,
         start_index,
         download_tx,
@@ -1195,21 +1224,89 @@ async fn video_play(
         Some(on_video_dl),
         soft_end_exclusive,
     ));
-    let decoder_task = task::spawn(video_decoder_task(
+
+    Ok(VideoPrefetch {
+        width: repr.width,
+        height: repr.height,
+        init_data,
+        hvcc_nalus,
+        track_crypto,
         download_rx,
+        download_handle,
+        primed,
+    })
+}
+
+/// Decode half: configure the HW decoder and run [`video_decoder_task`] against
+/// the segments [`video_prefetch`] is already streaming, joining both halves to
+/// completion. `decoder` (the scarce HW slot) must be created by the caller
+/// only *after* any previous representation's decoder has been dropped.
+async fn run_decode(
+    pf: VideoPrefetch,
+    sender: Sender<DecodedVideoFrame>,
+    video_ready: Arc<Notify>,
+    mut decoder: Box<dyn HwVideoDecoder>,
+    stats: Arc<StatsState>,
+    decoder_stop_flag: Arc<AtomicBool>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    decoder.configure(VideoDecoderParams {
+        codec: VideoCodec::Hevc,
+        width: pf.width,
+        height: pf.height,
+        hvcc_nalus: pf.hvcc_nalus,
+    })?;
+
+    let decoder_task = task::spawn(video_decoder_task(
+        pf.download_rx,
         sender,
         decoder,
-        init_data,
+        pf.init_data,
         video_ready,
-        track_crypto,
+        pf.track_crypto,
         stats,
         decoder_stop_flag,
     ));
 
-    let (dl_res, dec_res) = join!(download_task, decoder_task);
+    let (dl_res, dec_res) = join!(pf.download_handle, decoder_task);
     log_task_result("video download_task", dl_res);
     log_task_result("video decoder_task", dec_res);
     Ok(())
+}
+
+async fn video_play(
+    video_representation: VideoRepresenation,
+    start_index: usize,
+    video_ready: Arc<Notify>,
+    sender: Sender<DecodedVideoFrame>,
+    stop: Arc<Notify>,
+    stop_flag: Arc<AtomicBool>,
+    decryptor: Option<Arc<dyn Decryptor>>,
+    decoder: Box<dyn HwVideoDecoder>,
+    http: Arc<HttpClient>,
+    stats: Arc<StatsState>,
+    segments_in_flight: usize,
+    // See `download_task::soft_end_exclusive`. Plumbed through so the
+    // supervisor can softly cap an old pipeline mid-flight without
+    // discarding its already-decoded tail.
+    soft_end_exclusive: Arc<AtomicUsize>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    // Initial pipeline: nothing to overlap with, so download and decode run
+    // back to back. `prime_target = MAX` → the readiness signal never fires
+    // (only the supervisor's swap path consumes it).
+    let pf = video_prefetch(
+        &video_representation,
+        start_index,
+        stop,
+        Arc::clone(&stop_flag),
+        decryptor,
+        http,
+        Arc::clone(&stats),
+        segments_in_flight,
+        soft_end_exclusive,
+        usize::MAX,
+    )
+    .await?;
+    run_decode(pf, sender, video_ready, decoder, stats, stop_flag).await
 }
 
 async fn audio_play(
@@ -1522,24 +1619,27 @@ async fn text_play<V: VideoSink>(
 type VideoDecoderFactory = Arc<dyn Fn() -> Box<dyn HwVideoDecoder> + Send + Sync>;
 
 /// Long-lived task that owns the video pipeline for a single `play()` call.
-/// It spawns one `video_play` at a time and respawns on representation swap.
+/// It runs one representation's decode at a time and switches on ABR request.
 ///
-/// Soft-switch flow on receiving a new representation:
-///   1. Compute the next segment in the NEW representation that starts
-///      after the current playback PTS, so the first new frame can't land
-///      before the last old frame on the timeline.
-///   2. Soft-cap the CURRENT pipeline at `new_start` via the shared
-///      `soft_end_exclusive` atomic. Its download loop exits at that
-///      boundary without aborting any in-flight transfer, so segments
-///      already paid-for-with-bandwidth still reach the decoder and
-///      then `frame_sender` — av_sync gets every frame OLD downloaded.
-///   3. Await OLD's natural drain (download_task hits soft_end and
-///      drops its sender, decoder_task drains the queue and exits).
-///   4. Spawn NEW. Sequential w.r.t. OLD because some HW decoder paths
-///      (Intel D3D11VA, certain MediaCodec drivers) won't allocate a
-///      second decoder instance while the first is still live — running
-///      them in parallel during the swap window led to NEW failing in
-///      `configure()` and the supervisor exiting with av_sync EOF.
+/// Make-before-break soft-switch flow on receiving a new representation:
+///   1. Compute the next segment in the NEW representation that starts after
+///      the current playback PTS, so the first new frame can't land before the
+///      last old frame on the timeline.
+///   2. Prefetch NEW via [`video_prefetch`] — download its init + first
+///      segment(s) into a buffer — WHILE the OLD pipeline keeps decoding and
+///      feeding av_sync. Prefetch touches only the network, never the HW
+///      decoder, so it can't collide with OLD's live decoder slot.
+///   3. Once NEW has buffered `PRIME_TARGET` segments (or a timeout elapses),
+///      tear OLD down: drop `soft_end`/stop_flag so its download + decode exit
+///      and the single HW decoder slot frees.
+///   4. Start NEW's decode ([`run_decode`]) from the prefetched buffer. Decode
+///      is still sequential w.r.t. OLD — some HW decoder paths (Intel D3D11VA,
+///      certain MediaCodec drivers) won't allocate a second instance while the
+///      first is live — but because the segments are already local, NEW's first
+///      frame is just a configure + first-GOP decode away, well inside OLD's
+///      ~8-frame (~333 ms) buffer drain. So av_sync never starves and the swap
+///      no longer shows the buffering freeze it did when the whole NEW startup
+///      (download included) happened only after OLD stopped.
 ///
 /// Audio keeps playing throughout — only the video pipeline is touched.
 async fn video_supervisor(
@@ -1587,53 +1687,50 @@ async fn video_supervisor(
         (handle, soft_end)
     };
 
+    // The pipeline currently feeding av_sync. `cur_*` are reassigned on each
+    // swap. An ABR switch prefetches the NEW representation (network only — no
+    // HW decoder) WHILE this one keeps decoding, then tears OLD down and brings
+    // NEW's decode up from the prefetched buffer. That keeps av_sync fed across
+    // the swap so it never hits its 300 ms starvation pause (the visible
+    // "buffering" freeze): the gap shrinks from a full download + decode to a
+    // local configure + first-GOP decode.
     let mut current_repr = initial_repr;
-    let mut current_start = initial_start_index;
+    let mut cur_stop = Arc::new(Notify::new());
+    let mut cur_flag = Arc::new(AtomicBool::new(false));
+    let (mut cur_handle, mut cur_soft_end) = spawn_pipeline(
+        current_repr.clone(),
+        initial_start_index,
+        cur_stop.clone(),
+        cur_flag.clone(),
+    );
+
+    // Segments to buffer in NEW before tearing OLD down. One segment is
+    // seconds of frames, which a HW decoder chews through far faster than
+    // real-time, so NEW's first frame reaches av_sync inside OLD's ~8-frame
+    // (~333 ms) buffer drain.
+    const PRIME_TARGET: usize = 1;
+    // Cap on how long to wait for that prefetch. Past this we swap anyway and
+    // accept (for this one swap) the old freeze rather than stalling forever on
+    // a dead/slow segment.
+    const PRIME_TIMEOUT: Duration = Duration::from_secs(8);
+
     loop {
-        // Per-iteration stop signal — only fires on representation swap,
-        // not on play-level stop. Keeping it separate means `seek()`
-        // semantics (play-level stop) still work as before.
-        let local_stop = Arc::new(Notify::new());
-        let local_stop_flag = Arc::new(AtomicBool::new(false));
-
-        let (vp_handle, soft_end) = spawn_pipeline(
-            current_repr.clone(),
-            current_start,
-            local_stop.clone(),
-            local_stop_flag.clone(),
-        );
-        tokio::pin!(vp_handle);
-
-        // Race three outcomes: play-level stop, video_play finishing on
-        // its own (natural EOF), or a switch_rx update requesting a soft
-        // swap. The natural-EOF arm is essential: if we kept the
-        // keepalive frame_sender alive forever after the last segment
-        // was decoded, the av_sync video_rx would never observe channel
-        // close and `PlayerEvent::EndOfStream` would never fire.
+        // Race: play-level stop, the current pipeline finishing on its own
+        // (natural EOF — must propagate so the keepalive frame_sender drops,
+        // the channel closes, and av_sync fires EndOfStream), or an ABR switch.
         let new_repr: VideoRepresenation = loop {
             tokio::select! {
                 _ = stop.notified() => {
-                    local_stop_flag.store(true, Ordering::Relaxed);
-                    local_stop.notify_waiters();
-                    let _ = vp_handle.await;
+                    cur_flag.store(true, Ordering::Relaxed);
+                    cur_stop.notify_waiters();
+                    let _ = cur_handle.await;
                     return Ok(());
                 }
-                res = &mut vp_handle => {
-                    // video_play returned without us asking. Either it
-                    // ran out of segments (EOF) or it errored. Either
-                    // way, exit the supervisor so the keepalive
-                    // frame_sender drops, the video channel closes, and
-                    // av_sync can fire EndOfStream.
+                res = &mut cur_handle => {
                     match res {
-                        Ok(Ok(())) => {
-                            log::info!("[video] supervisor: video_play exited naturally; closing pipeline");
-                        }
-                        Ok(Err(e)) => {
-                            log::error!("[video] supervisor: video_play failed: {}", e);
-                        }
-                        Err(e) => {
-                            log::error!("[video] supervisor: video_play task panicked: {}", e);
-                        }
+                        Ok(Ok(())) => log::info!("[video] supervisor: pipeline exited naturally; closing"),
+                        Ok(Err(e)) => log::error!("[video] supervisor: pipeline failed: {}", e),
+                        Err(e) => log::error!("[video] supervisor: pipeline task panicked: {}", e),
                     }
                     return Ok(());
                 }
@@ -1644,9 +1741,9 @@ async fn video_supervisor(
                     let _ = switch_rx.changed().await;
                 } => {
                     if stop_flag.load(Ordering::Relaxed) {
-                        local_stop_flag.store(true, Ordering::Relaxed);
-                        local_stop.notify_waiters();
-                        let _ = vp_handle.await;
+                        cur_flag.store(true, Ordering::Relaxed);
+                        cur_stop.notify_waiters();
+                        let _ = cur_handle.await;
                         return Ok(());
                     }
                     if let Some(new) = switch_rx.borrow_and_update().clone() {
@@ -1663,9 +1760,10 @@ async fn video_supervisor(
             continue;
         }
 
-        // Pick the segment in the new representation that *starts after*
-        // the current playback position. position_ms is 0-based; segment
-        // start_times are absolute → add origin.
+        // Pick the segment in NEW that *starts after* the current playback
+        // position. position_ms is 0-based; segment start_times are absolute →
+        // add origin. The +1 keeps NEW's first frame from landing before OLD's
+        // tail on the timeline.
         let pos = Duration::from_millis(position_ms.load(Ordering::Relaxed)) + origin;
         let mut new_start = find_segment_index(&new_repr.segments, pos);
         if new_start + 1 < new_repr.segments.len() {
@@ -1675,34 +1773,110 @@ async fn video_supervisor(
             "[abr] soft switch: repr {} -> {} from seg {} (pos {}ms)",
             current_repr.id, new_repr.id, new_start, pos.as_millis()
         );
+
+        // --- Make-before-break, step 1: prefetch NEW while OLD keeps playing.
+        // `video_prefetch` only downloads — it never allocates the HW decoder,
+        // so it can't collide with OLD's live decoder slot.
+        let new_stop = Arc::new(Notify::new());
+        let new_flag = Arc::new(AtomicBool::new(false));
+        let new_soft_end = Arc::new(AtomicUsize::new(usize::MAX));
+        let new_pf = tokio::select! {
+            r = video_prefetch(
+                &new_repr,
+                new_start,
+                new_stop.clone(),
+                new_flag.clone(),
+                decryptor.clone(),
+                Arc::clone(&http),
+                Arc::clone(&stats),
+                segments_in_flight,
+                new_soft_end.clone(),
+                PRIME_TARGET,
+            ) => match r {
+                Ok(pf) => pf,
+                Err(e) => {
+                    // NEW couldn't even begin downloading — keep OLD playing.
+                    log::error!(
+                        "[abr] prefetch of repr {} failed; staying on {}: {}",
+                        new_repr.id, current_repr.id, e
+                    );
+                    continue;
+                }
+            },
+            _ = stop.notified() => {
+                cur_flag.store(true, Ordering::Relaxed);
+                cur_stop.notify_waiters();
+                let _ = cur_handle.await;
+                return Ok(());
+            }
+            res = &mut cur_handle => {
+                // OLD ended before NEW even started; nothing to swap into.
+                if let Ok(Err(e)) = res {
+                    log::error!("[video] supervisor: pipeline failed during prefetch: {}", e);
+                }
+                return Ok(());
+            }
+        };
+
+        // --- step 2: wait until NEW has buffered enough to decode without a
+        // network wait. OLD keeps feeding av_sync throughout.
+        let primed = Arc::clone(&new_pf.primed);
+        let mut old_done = false;
+        tokio::select! {
+            _ = primed.notified() => {}
+            _ = tokio::time::sleep(PRIME_TIMEOUT) => {
+                log::warn!("[abr] prefetch prime timed out after {:?}; swapping anyway", PRIME_TIMEOUT);
+            }
+            _ = stop.notified() => {
+                // Tear NEW's prefetch down (the flag makes download_task exit;
+                // dropping new_pf closes its channel too) and OLD, then exit.
+                new_flag.store(true, Ordering::Relaxed);
+                new_stop.notify_waiters();
+                cur_flag.store(true, Ordering::Relaxed);
+                cur_stop.notify_waiters();
+                let _ = cur_handle.await;
+                return Ok(());
+            }
+            res = &mut cur_handle => {
+                // OLD reached EOF while NEW was priming — bring NEW up anyway.
+                if let Ok(Err(e)) = res {
+                    log::error!("[video] supervisor: pipeline failed during prime: {}", e);
+                }
+                old_done = true;
+            }
+        }
+
         let _ = events.send(PlayerEvent::TrackChanged {
             kind: TrackKind::Video,
             info: video_track_info(&new_repr),
         });
 
-        // Hard-stop OLD: abort in-flight downloads, signal decoder to
-        // break out of its receive loop mid-queue, and free the HW
-        // decoder slot so NEW can allocate. Without this, the decoder
-        // happily drains every segment already queued in `download_rx`
-        // (paced by av_sync at 1× real-time, ~6 s per segment), so a
-        // swap requested with 4 segments in flight didn't take effect
-        // for ~24 s — playback continued through OLD content well
-        // past the desired switch point, then NEW's first frame
-        // landed on the channel with a PTS that JUMPED BACKWARD
-        // relative to the OLD tail av_sync had just rendered.
-        //
-        // soft_end is still set (belt + braces — covers the narrow
-        // window between local_stop_flag.store and download_task's
-        // next iteration check) but stop_flag + notify do the heavy
-        // lifting now.
-        soft_end.store(new_start, Ordering::Relaxed);
-        local_stop_flag.store(true, Ordering::Relaxed);
-        local_stop.notify_waiters();
-        let _ = vp_handle.await;
+        // --- step 3: tear OLD down (frees the single HW decoder slot), then
+        // start NEW's decode from the already-downloaded buffer. soft_end is
+        // belt-and-braces alongside the flag + notify. `cur_handle` is only
+        // awaited if it didn't already finish above (a JoinHandle must not be
+        // polled twice).
+        if !old_done {
+            cur_soft_end.store(new_start, Ordering::Relaxed);
+            cur_flag.store(true, Ordering::Relaxed);
+            cur_stop.notify_waiters();
+            let _ = cur_handle.await;
+        }
 
+        // OLD's decoder is dropped now — safe to allocate NEW's.
+        let decoder = decoder_factory();
+        cur_handle = task::spawn(run_decode(
+            new_pf,
+            frame_sender.clone(),
+            video_ready.clone(),
+            decoder,
+            Arc::clone(&stats),
+            new_flag.clone(),
+        ));
+        cur_stop = new_stop;
+        cur_flag = new_flag;
+        cur_soft_end = new_soft_end;
         current_repr = new_repr;
-        current_start = new_start;
-        // Next iteration spawns the new video_play.
     }
 }
 

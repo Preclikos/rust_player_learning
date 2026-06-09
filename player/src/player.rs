@@ -584,7 +584,7 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
             .saturating_sub(pause_skew)
             .as_millis() as u64;
         let interval_ms = if last_render_elapsed > 0 { render_start - last_render_elapsed } else { 0 };
-        let delta_pts = if pts_ms >= last_pts_ms { pts_ms - last_pts_ms } else { 0 };
+        let delta_pts = pts_ms.saturating_sub(last_pts_ms);
 
         last_pts_ms = pts_ms;
         last_render_elapsed = render_start;
@@ -1190,35 +1190,7 @@ async fn video_prefetch(
         }
     }
 
-    let track_crypto = match parse_tenc(&init_data) {
-        Some(tenc) => {
-            log::info!(
-                "video: CENC encrypted, KID={} iv_size={}",
-                kid_short(&tenc.default_kid),
-                tenc.default_iv_size
-            );
-            let dec = decryptor.ok_or(
-                "Track is CENC-encrypted but no decryptor configured (call Player::set_clearkey or set_license_resolver)",
-            )?;
-            // Resolve the key NOW (async, possibly via LicenseResolver).
-            // decrypt_sample is on the hot path and stays sync — it just
-            // hits the cache populated here.
-            dec.ensure_key_for(tenc.default_kid).await.map_err(
-                |e| -> Box<dyn Error + Send + Sync> {
-                    format!("license resolve (video kid={}): {}", kid_short(&tenc.default_kid), e).into()
-                },
-            )?;
-            Some(TrackCrypto {
-                decryptor: dec,
-                kid: tenc.default_kid,
-                iv_size: tenc.default_iv_size as usize,
-            })
-        }
-        None => {
-            log::info!("video: clear (no tenc box)");
-            None
-        }
-    };
+    let track_crypto = setup_track_crypto(&init_data, decryptor, "video").await?;
 
     let segments = repr.segments.clone();
     let primed = Arc::new(Notify::new());
@@ -1380,32 +1352,7 @@ async fn audio_play(
         .map_err(|e| -> Box<dyn Error + Send + Sync> { format!("audio init download: {}", e).into() })?;
     let init_data = init_dl.data;
 
-    let track_crypto = match parse_tenc(&init_data) {
-        Some(tenc) => {
-            log::info!(
-                "audio: CENC encrypted, KID={} iv_size={}",
-                kid_short(&tenc.default_kid),
-                tenc.default_iv_size
-            );
-            let dec = decryptor.ok_or(
-                "Audio track is CENC-encrypted but no decryptor configured (call Player::set_clearkey or set_license_resolver)",
-            )?;
-            dec.ensure_key_for(tenc.default_kid).await.map_err(
-                |e| -> Box<dyn Error + Send + Sync> {
-                    format!("license resolve (audio kid={}): {}", kid_short(&tenc.default_kid), e).into()
-                },
-            )?;
-            Some(TrackCrypto {
-                decryptor: dec,
-                kid: tenc.default_kid,
-                iv_size: tenc.default_iv_size as usize,
-            })
-        }
-        None => {
-            log::info!("audio: clear (no tenc)");
-            None
-        }
-    };
+    let track_crypto = setup_track_crypto(&init_data, decryptor, "audio").await?;
 
     let codecs_str = audio_representation.codecs.as_str();
     let codec = if codecs_str.starts_with("mp4a") {
@@ -3250,8 +3197,52 @@ fn log_task_result<T, E: std::fmt::Display>(
     }
 }
 
+/// Parse the `tenc` box from a track's init segment and, if the track is
+/// CENC-encrypted, resolve its content key up front (async — possibly via a
+/// `LicenseResolver`) so the per-sample `decrypt_sample` stays sync on the hot
+/// path. Returns `None` for a clear track. `label` ("video"/"audio") only
+/// flavours the log lines and the error text.
+async fn setup_track_crypto(
+    init_data: &[u8],
+    decryptor: Option<Arc<dyn Decryptor>>,
+    label: &str,
+) -> Result<Option<TrackCrypto>, Box<dyn Error + Send + Sync>> {
+    let tenc = match parse_tenc(init_data) {
+        Some(t) => t,
+        None => {
+            log::info!("{}: clear (no tenc box)", label);
+            return Ok(None);
+        }
+    };
+
+    log::info!(
+        "{}: CENC encrypted, KID={} iv_size={}",
+        label,
+        kid_short(&tenc.default_kid),
+        tenc.default_iv_size
+    );
+    let dec = decryptor.ok_or_else(|| -> Box<dyn Error + Send + Sync> {
+        format!(
+            "{} track is CENC-encrypted but no decryptor configured \
+             (call Player::set_clearkey or set_license_resolver)",
+            label
+        )
+        .into()
+    })?;
+    dec.ensure_key_for(tenc.default_kid)
+        .await
+        .map_err(|e| -> Box<dyn Error + Send + Sync> {
+            format!("license resolve ({} kid={}): {}", label, kid_short(&tenc.default_kid), e).into()
+        })?;
+    Ok(Some(TrackCrypto {
+        decryptor: dec,
+        kid: tenc.default_kid,
+        iv_size: tenc.default_iv_size as usize,
+    }))
+}
+
 fn decrypt_segment_in_place(
-    data_vec: &mut Vec<u8>,
+    data_vec: &mut [u8],
     track_crypto: Option<&TrackCrypto>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let tc = match track_crypto {

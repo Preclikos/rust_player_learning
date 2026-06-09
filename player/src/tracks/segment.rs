@@ -30,10 +30,7 @@ impl Segment {
         end_time_base: Option<u64>,
         timescale: Option<u32>,
     ) -> Result<Self, Box<dyn Error>> {
-        let timescale = match timescale {
-            Some(time) => time,
-            None => 0,
-        };
+        let timescale = timescale.unwrap_or_default();
 
         let to_duration = |time: u64| -> Duration {
             if timescale == 0 {

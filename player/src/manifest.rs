@@ -167,7 +167,7 @@ pub struct Initialization {
 /// Slice the substring `<AdaptationSet id="adaptation_id" ...>...</AdaptationSet>`
 /// out of the raw MPD content. Returns `None` if no AdaptationSet with
 /// that id is found (e.g. content_type mismatch in caller's mental model).
-pub fn slice_adaptation_set<'a>(content: &'a str, adaptation_id: u32) -> Option<&'a str> {
+pub fn slice_adaptation_set(content: &str, adaptation_id: u32) -> Option<&str> {
     let needle = format!("<AdaptationSet id=\"{}\"", adaptation_id);
     let start = content.find(&needle)?;
     let rest = &content[start..];
@@ -177,7 +177,7 @@ pub fn slice_adaptation_set<'a>(content: &'a str, adaptation_id: u32) -> Option<
 
 /// Slice the substring `<Representation id="rep_id" ...>...</Representation>`
 /// out of the given block (typically the result of `slice_adaptation_set`).
-pub fn slice_representation<'a>(block: &'a str, rep_id: u32) -> Option<&'a str> {
+pub fn slice_representation(block: &str, rep_id: u32) -> Option<&str> {
     let needle = format!("<Representation id=\"{}\"", rep_id);
     let start = block.find(&needle)?;
     let rest = &block[start..];

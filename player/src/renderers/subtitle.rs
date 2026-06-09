@@ -454,7 +454,7 @@ fn rasterize_cue(
     }
     // Font size: ~5% of video height, floored at 18px so things stay
     // readable on tiny preview windows.
-    let px_size = (target_h as f32 * 0.05).max(18.0).min(80.0);
+    let px_size = (target_h as f32 * 0.05).clamp(18.0, 80.0);
     let max_line_w = (target_w as f32 * 0.9) as i32;
     let line_height = (px_size * 1.25).ceil() as i32;
     let shadow = 2i32;

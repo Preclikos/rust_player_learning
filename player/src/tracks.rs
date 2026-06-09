@@ -346,10 +346,10 @@ impl Tracks {
         // other children.)
         let channels = adaptation_block
             .and_then(|b| slice_representation(b, representation.id))
-            .and_then(|rb| find_audio_channel_count(rb))
+            .and_then(find_audio_channel_count)
             .or_else(|| {
                 // Some manifests put it at AdaptationSet level instead.
-                adaptation_block.and_then(|b| find_audio_channel_count(b))
+                adaptation_block.and_then(find_audio_channel_count)
             });
 
         let audio_representation = AudioRepresentation {

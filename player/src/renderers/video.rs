@@ -137,27 +137,27 @@ impl Vertex {
 fn generate_verticles(scale_x: f32, scale_y: f32, tex_y_max: f32) -> [Vertex; 6] {
     [
         Vertex {
-            position: [-1. * scale_x, -1. * scale_y, 0.0],
+            position: [-scale_x, -scale_y, 0.0],
             tex_coords: [0., tex_y_max],
         }, // A
         Vertex {
-            position: [1. * scale_x, -1. * scale_y, 0.0],
+            position: [scale_x, -scale_y, 0.0],
             tex_coords: [1., tex_y_max],
         }, // B
         Vertex {
-            position: [-1. * scale_x, 1. * scale_y, 0.0],
+            position: [-scale_x, scale_y, 0.0],
             tex_coords: [0., 0.],
         }, // C
         Vertex {
-            position: [-1. * scale_x, 1. * scale_y, 0.0],
+            position: [-scale_x, scale_y, 0.0],
             tex_coords: [0., 0.],
         }, // D
         Vertex {
-            position: [1. * scale_x, -1. * scale_y, 0.0],
+            position: [scale_x, -scale_y, 0.0],
             tex_coords: [1., tex_y_max],
         }, // E
         Vertex {
-            position: [1. * scale_x, 1. * scale_y, 0.0],
+            position: [scale_x, scale_y, 0.0],
             tex_coords: [1., 0.],
         }, // F
     ]

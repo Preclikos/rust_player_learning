@@ -195,8 +195,8 @@ impl HttpClient {
         kind: RequestKind,
     ) -> Result<String, BoxError> {
         let bytes = self.dispatch(url, kind, None, None).await?;
-        Ok(String::from_utf8(bytes.to_vec())
-            .map_err(|e| -> BoxError { format!("response not utf-8: {}", e).into() })?)
+        String::from_utf8(bytes.to_vec())
+            .map_err(|e| -> BoxError { format!("response not utf-8: {}", e).into() })
     }
 
     pub async fn post(

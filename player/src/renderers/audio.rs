@@ -324,6 +324,10 @@ impl AudioRenderer {
             .expect("spawn audio output thread");
 
         tokio::spawn(async move {
+            // `Stop` is the only command today, so this drains exactly once —
+            // but the loop is kept so adding non-terminal commands later is a
+            // pure addition (new match arm) rather than a control-flow rewrite.
+            #[allow(clippy::never_loop)]
             while let Some(command) = command_receiver.recv().await {
                 match command {
                     AudioRendererCommand::Stop => {

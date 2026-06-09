@@ -173,7 +173,7 @@ impl AudioDecoder for FfmpegAudioDecoder {
         let mut frame = ffmpeg_next::util::frame::Audio::empty();
         match decoder.receive_frame(&mut frame) {
             Ok(()) => {
-                let pts_ms = frame.pts().unwrap_or(0) as i64;
+                let pts_ms = frame.pts().unwrap_or(0);
 
                 // Authoritative input format comes from the frame itself.
                 // For EAC-3 in particular, the manifest hint is unreliable —

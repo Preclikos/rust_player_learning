@@ -28,21 +28,16 @@ use crate::tracks::video::VideoRepresenation;
 
 /// Configures how the player picks among the video representations in the
 /// currently selected `VideoAdaptation`.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub enum AbrStrategy {
     /// Fixed selection — never auto-switch. The player respects whatever
     /// was passed to `set_video_track` / `change_video_track`.
+    #[default]
     Manual,
     /// Bandwidth-based ABR. On each tick, pick the highest representation
     /// whose `bitrate_bps * safety_factor <= ewma_bps`. A safety factor of
     /// `1.25` is a sane default: leaves 25% headroom for transient dips.
     BandwidthEwma { safety_factor: f32 },
-}
-
-impl Default for AbrStrategy {
-    fn default() -> Self {
-        AbrStrategy::Manual
-    }
 }
 
 /// Bit-depth / HDR policy applied to the candidate set *before* the bandwidth
@@ -52,7 +47,7 @@ impl Default for AbrStrategy {
 /// All variants are no-ops on adaptations that don't contain the relevant
 /// flavour (e.g. `HdrPreferred` is identical to `Adaptive` for an
 /// SDR-only stream).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum AbrVideoProfile {
     /// Only 8-bit SDR representations are eligible. HDR10 and Dolby Vision
     /// reps are filtered out even when present in the adaptation set.
@@ -75,13 +70,8 @@ pub enum AbrVideoProfile {
 
     /// No restriction — bitrate is the only criterion. Default. Matches
     /// the pre-AbrVideoProfile behaviour.
+    #[default]
     Adaptive,
-}
-
-impl Default for AbrVideoProfile {
-    fn default() -> Self {
-        AbrVideoProfile::Adaptive
-    }
 }
 
 impl AbrVideoProfile {

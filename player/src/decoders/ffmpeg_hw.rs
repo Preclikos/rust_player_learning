@@ -7,7 +7,7 @@ use ffmpeg_sys_next::{
     av_buffer_ref, av_buffer_unref, av_hwdevice_ctx_create, AVBufferRef, AVCodecContext,
     AVHWDeviceType, AVPixelFormat,
 };
-use crate::parsers::mp4::{apped_hevc_header, parse_hevc_nalu};
+use crate::parsers::mp4::{append_hevc_header, parse_hevc_nalu};
 
 use super::{DecodedVideoFrame, DecoderError, HwVideoDecoder, PlatformFrame, VideoCodec, VideoDecoderParams};
 
@@ -224,10 +224,10 @@ impl HwVideoDecoder for FfmpegHwDecoder {
             .map_err(|e| -> DecoderError { format!("decoder open: {}", e).into() })?;
 
         // Feed the hvcC NALUs (VPS/SPS/PPS) so the decoder can parse subsequent slices.
-        // Each element of `hvcc_nalus` is a raw NALU body (no prefix); apped_hevc_header
+        // Each element of `hvcc_nalus` is a raw NALU body (no prefix); append_hevc_header
         // prepends the 00 00 00 01 start code.
         for nalu_data in &params.hvcc_nalus {
-            let nalu = apped_hevc_header(nalu_data.clone());
+            let nalu = append_hevc_header(nalu_data.clone());
             let mut packet = Packet::new(nalu.len());
             packet.data_mut().unwrap().clone_from_slice(&nalu);
             decoder

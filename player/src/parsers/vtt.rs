@@ -121,10 +121,7 @@ fn parse_cue_block(block: &str) -> Option<VttCue> {
         first
     };
 
-    let (timings, rest) = match timing.split_once("-->") {
-        Some(x) => x,
-        None => return None,
-    };
+    let (timings, rest) = timing.split_once("-->")?;
     // `rest` typically starts with whitespace (`-->` and the end time
     // are space-separated). Trim FIRST, then split on the next
     // whitespace boundary to peel off the end time from any cue

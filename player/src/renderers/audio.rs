@@ -79,6 +79,32 @@ fn ios_output_sample_rate() -> Option<u32> {
     }
 }
 
+/// iOS only: the live output route's channel count, read from
+/// `AVAudioSession.sharedInstance().outputNumberOfChannels` (1 on the iPhone SE
+/// built-in speaker, 2 on headphones / AirPods / stereo speakers).
+///
+/// Read per play so whatever the user currently has plugged in is honoured —
+/// and crucially WITHOUT touching cpal's device/format enumeration, which
+/// hangs on a second playback (see `start_thread`). Returns `None` if the
+/// selector is unavailable or the value is absurd.
+#[cfg(target_os = "ios")]
+fn ios_output_channels() -> Option<u16> {
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
+    unsafe {
+        let session: *mut AnyObject = msg_send![class!(AVAudioSession), sharedInstance];
+        if session.is_null() {
+            return None;
+        }
+        let ch: i64 = msg_send![session, outputNumberOfChannels];
+        if (1..=8).contains(&ch) {
+            Some(ch as u16)
+        } else {
+            None
+        }
+    }
+}
+
 impl AudioRenderer {
     pub fn new() -> Self {
         let stop = Arc::new(Notify::new());
@@ -152,20 +178,24 @@ impl AudioRenderer {
     async fn start_audio(
         mut sample_receiver: Receiver<f32>,
         device: Device,
-        config: SupportedStreamConfig,
-        // The rate to actually open the device at. Equals the device's reported
-        // rate everywhere except iOS, where it's the AVAudioSession rate (see
-        // `ios_output_sample_rate`). Kept in lock-step with the resampler target
-        // reported by `start_thread` so we never feed rate-mismatched samples.
+        // Rate + channel count to open the device at, resolved in `start_thread`
+        // (rate from the iOS AVAudioSession; channels prefer stereo so the OS
+        // owns routing/downmix). Kept in lock-step with the resampler.
         out_rate: u32,
+        out_channels: u16,
         volume: Arc<AtomicU32>,
         stop: Arc<Notify>,
         flush_flag: Arc<AtomicBool>,
         paused_flag: Arc<AtomicBool>,
         drop_pending: Arc<std::sync::atomic::AtomicU64>,
     ) {
+        // The resampler always emits packed STEREO. With a stereo stream
+        // (the normal case) the callback copies 1:1; on a mono-only output it
+        // downmixes (L+R)/2 — otherwise stereo fed 1:1 into a mono stream plays
+        // at half speed (an octave low, "deep voice").
+        let out_ch = out_channels as usize;
         let stream_config = StreamConfig {
-            channels: config.channels(),
+            channels: out_channels,
             sample_rate: out_rate,
             buffer_size: cpal::BufferSize::Default,
         };
@@ -193,9 +223,19 @@ impl AudioRenderer {
                 return;
             }
             let vol = f32::from_bits(volume.load(Ordering::Relaxed));
-            for sample in data.iter_mut() {
-                let asample = sample_receiver.try_recv().unwrap_or(Sample::EQUILIBRIUM);
-                *sample = asample * vol;
+            if out_ch >= 2 {
+                for sample in data.iter_mut() {
+                    let asample = sample_receiver.try_recv().unwrap_or(Sample::EQUILIBRIUM);
+                    *sample = asample * vol;
+                }
+            } else {
+                // Mono output device: downmix the packed-stereo source (L+R)/2
+                // per output sample so playback runs at the correct speed/pitch.
+                for sample in data.iter_mut() {
+                    let l = sample_receiver.try_recv().unwrap_or(Sample::EQUILIBRIUM);
+                    let r = sample_receiver.try_recv().unwrap_or(l);
+                    *sample = (l + r) * 0.5 * vol;
+                }
             }
         };
 
@@ -229,39 +269,59 @@ impl AudioRenderer {
             .default_output_device()
             .expect("No output device");
 
-        let config: SupportedStreamConfig = device
-            .default_output_config()
-            .expect("Failed to get default config");
-
-        // Resolve the true output rate. Everywhere but iOS this is the device's
-        // reported rate. On iOS cpal's report can disagree with the live
-        // AVAudioSession / RemoteIO rate, so we trust the session (the OS truth)
-        // and drive BOTH the cpal stream and the resampler target from it —
-        // otherwise we resample to e.g. 48000 while the unit runs 44100 and
-        // audio plays slow + low-pitched ("deep voice").
-        let device_rate: u32 = config.sample_rate();
+        // Resolve the output rate + channel count.
+        //
+        // On iOS, read BOTH straight from the live AVAudioSession and do NOT
+        // call cpal's `default_output_config()` / `supported_output_configs()`:
+        // querying the audio device's formats right after the previous stream
+        // stopped HANGS the setup on a second playback ("Loading…" forever — the
+        // player rotates to landscape but never starts). AVAudioSession is the
+        // OS truth anyway: the RemoteIO rate (44100 on the SE, which disagrees
+        // with cpal's canonical 48000 → "deep voice" if mismatched) and the
+        // live route's channel count (mono on the SE speaker, stereo on
+        // headphones / AirPods). The resampler emits packed STEREO, so the
+        // callback downmixes (L+R)/2 when the output is mono.
         #[cfg(target_os = "ios")]
-        let out_rate = ios_output_sample_rate().unwrap_or(device_rate);
-        #[cfg(not(target_os = "ios"))]
-        let out_rate = device_rate;
-        log::info!(
-            "[audio] device reports {} Hz; resampling + opening output at {} Hz",
-            device_rate, out_rate
+        let (out_rate, out_channels): (u32, u16) = (
+            ios_output_sample_rate().unwrap_or(48_000),
+            ios_output_channels().unwrap_or(2),
         );
+        #[cfg(not(target_os = "ios"))]
+        let (out_rate, out_channels): (u32, u16) = {
+            let config: SupportedStreamConfig = device
+                .default_output_config()
+                .expect("Failed to get default config");
+            (config.sample_rate(), config.channels().max(1))
+        };
+
+        log::info!("[audio] opening output {} Hz / {} ch", out_rate, out_channels);
 
         let stop_cpal = stop.clone();
-        let config_cpal = config.clone();
-        tokio::spawn(AudioRenderer::start_audio(
+        // Run the cpal output stream on a DEDICATED OS thread, NOT a tokio
+        // worker. `start_audio` parks (pollster `block_on`) on `stop` for the
+        // whole playback; doing that on a tokio worker permanently consumes it.
+        // On a low-core device (2-core iPhone SE) the pool is then exhausted
+        // after the first play: the command loop that fires the stop
+        // notification can't get a worker, so the previous stream never tears
+        // down — and the SECOND play's spawned tasks (audio build, open_url)
+        // never get scheduled → stuck on "Loading…" forever. A plain thread
+        // keeps the blocking wait off the async runtime entirely. (Multi-core
+        // simulators have spare workers, which is why it only bit on device.)
+        let audio_fut = AudioRenderer::start_audio(
             sample_receiver,
             device,
-            config_cpal,
             out_rate,
+            out_channels,
             volume,
             stop_cpal,
             flush_flag,
             paused_flag,
             drop_pending,
-        ));
+        );
+        std::thread::Builder::new()
+            .name("bz-audio-out".into())
+            .spawn(move || audio_fut.block_on())
+            .expect("spawn audio output thread");
 
         tokio::spawn(async move {
             while let Some(command) = command_receiver.recv().await {
@@ -274,7 +334,7 @@ impl AudioRenderer {
             }
         });
 
-        (sample_sender, out_rate, config.channels())
+        (sample_sender, out_rate, out_channels)
     }
 
     #[cfg(any(target_os = "windows", target_os = "linux"))]

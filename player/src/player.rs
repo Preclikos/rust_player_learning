@@ -1973,12 +1973,24 @@ async fn video_supervisor(
             cur_stop.notify_waiters();
             let _ = cur_handle.await;
         }
-        // OLD is fully drained now, so last_decoded_pts_ms is its decoder's
-        // final high-water mark (the swap-prefetch deliberately left it
-        // untouched). It's the absolute PTS of the last frame OLD will show, so
-        // NEW trims everything at/below it and resumes on the very next frame —
-        // forward-contiguous, no rewind and no future-PTS frame to wait on.
-        let splice_pts_us = stats.last_decoded_pts_ms.load(Ordering::Relaxed) * 1000;
+        // Splice NEW onto OLD's tail at the last RENDERED pts so NEW resumes on
+        // the very next frame — forward-contiguous, no rewind and no future-PTS
+        // frame to wait on.
+        //
+        // This used to read `stats.last_decoded_pts_ms`, but that is the
+        // DOWNLOAD high-water (set in video_prefetch's segment-done callback),
+        // not the last frame OLD actually showed. On a low-bitrate OLD the
+        // downloader races many seconds ahead of the picture, so trimming NEW to
+        // it discarded every frame between the boundary and the download head —
+        // the renderer then had no frame at the current position and stalled
+        // ("[vsync] no frame → buffering") for seconds on every swap while audio
+        // (own clock) and the downloader kept running (the "everything plays but
+        // no frames reach the screen" freeze, on every platform). The render
+        // position (position_ms + origin, same expression the boundary wait
+        // above uses) is where OLD's picture actually is, so NEW splices there
+        // cleanly.
+        let rendered_abs_ms = position_ms.load(Ordering::Relaxed) + origin.as_millis() as u64;
+        let splice_pts_us = rendered_abs_ms as i64 * 1000;
         log::info!(
             "[abr] OLD torn down {}ms after switch; NEW trimmed to pts>{}ms",
             swap_t0.elapsed().as_millis(),

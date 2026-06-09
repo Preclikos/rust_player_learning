@@ -742,7 +742,13 @@ impl VideoRenderer {
             device,
             backend,
             queue,
-            frame_size: Arc::new(RwLock::new(size)),
+            // Unknown until the first frame / selected track reports the real
+            // content dimensions. Seeding this with the SURFACE size made a
+            // pre-track resize() compute scale (1,1) (frame_aspect == window_
+            // aspect) and stretch the video to fill — squished if the content
+            // is not exactly the surface aspect. change_vertex_buffer() skips
+            // the aspect rebuild while this is 0x0.
+            frame_size: Arc::new(RwLock::new(PhysicalSize::new(0, 0))),
             tex_x_max: Arc::new(RwLock::new(1.0_f32)),
             tex_y_max: Arc::new(RwLock::new(1.0_f32)),
             surface: Arc::new(Mutex::new(surface)),

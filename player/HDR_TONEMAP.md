@@ -1,27 +1,77 @@
-# HDR → SDR Tonemap Tuning
+# HDR → SDR Tonemap
 
 How the player converts HDR10 content into something a regular SDR display
-can show, and which knobs the host UI can expose so users can dial in the
-look they want.
+can show, what the host UI can tune, and **what changed for UI integrations**
+in the tonemap_opencl rework.
+
+## ⚠ Breaking change for host UIs (tonemap_opencl rework)
+
+The tonemap was replaced wholesale. The old ACES pipeline and its two knobs
+(`reference_white_nits`, `shadow_lift_gamma`) **no longer exist** — the
+fields are gone from `HdrTonemapParams`, so host code that constructed it
+field-by-field will not compile until updated.
+
+| | Old | New |
+|---|---|---|
+| Algorithm | ACES filmic (Narkowicz), static | FFmpeg `tonemap_opencl` port: Möbius + frame peak/average detection |
+| Output transfer | sRGB OETF | BT.1886-inverse (pure 1/2.4 power), like the filter's `t=bt709` |
+| Fields | `reference_white_nits`, `shadow_lift_gamma` | `tone_param`, `desat`, `peak`, `scene_threshold` |
+| Default look | hand-calibrated approximation of the SDR grade | **identical colour profile to the SDR ladder's reference transcode** |
+| Brightness adaptation | none | per-scene, 63-frame rolling window (like the offline transcode) |
+
+**What a UI app must do:**
+
+1. **Delete any persisted `reference_white_nits` / `shadow_lift_gamma`
+   values and their sliders/presets.** There is no mapping from old to new
+   values — the algorithms are unrelated. Don't try to migrate numbers.
+2. **The recommended setting is: don't call `set_hdr_tonemap` at all.**
+   `HdrTonemapParams::DEFAULT` reproduces the exact command the SDR ladder
+   was transcoded with, which is the whole point — an ABR switch between an
+   HDR and an SDR representation no longer changes the picture's colour
+   grade. Only expose the new knobs if you genuinely want a "custom HDR
+   look" feature.
+3. `PlayerCapabilities::hdr_tonemap_tunable` works as before — keep hiding
+   any tonemap UI when it's `false`.
+4. `set_hdr_tonemap` call semantics are unchanged: any thread, any time,
+   takes effect next frame, player does not persist.
 
 ## What the player does
 
-When the active video representation is HEVC Main 10 (HDR10), the
-decoder produces a P010 surface in BT.2020 + PQ colour space. The
-player's fragment shader (`player/src/renderers/shader_hdr.wgsl`) then:
+When the active video representation is HEVC Main 10 (HDR10), the decoder
+produces a P010 surface in BT.2020 + PQ. The player then runs a faithful
+WGSL port of FFmpeg's `tonemap_opencl` filter, configured like the
+reference transcode of this project's SDR ladder:
 
-1. Decodes the PQ EOTF → linear cd/m² (up to 10 000 nits).
-2. Normalises by a **reference white** so the bulk of HDR content
-   lands in the ACES tonemap's near-linear range.
-3. Runs the ACES filmic tonemap (Narkowicz fit) — soft shoulder for
-   highlights, gentle toe for blacks.
-4. Applies a **shadow lift gamma** to recover midtone visibility that
-   ACES would otherwise crush.
-5. Maps BT.2020 → BT.709 primaries.
-6. Encodes sRGB OETF for the display.
+```
+tonemap_opencl=tonemap=mobius:param=0.01:desat=0:r=tv:p=bt709:t=bt709:m=bt709
+```
 
-The host controls steps 2 and 4 at runtime by pushing an
-`HdrTonemapParams` value into `Player::set_hdr_tonemap`.
+Per frame, entirely on the GPU (zero-copy — the imported decoder texture is
+read in place, statistics live in a 536-byte GPU buffer, nothing is ever
+read back to the CPU):
+
+1. Three small compute passes (`shader_hdr_detect.wgsl`) update the
+   frame peak/average statistics — the filter's libplacebo-derived
+   `detect_peak_avg`: per-workgroup average signal, 63-frame rolling
+   window, scene-change reset.
+2. The fragment shader (`shader_hdr.wgsl`) decodes limited-range
+   BT.2020-NCL Y'CbCr, linearises with the ST 2084 (PQ) EOTF, converts
+   primaries BT.2020 → BT.709, tonemaps the max RGB component with the
+   Möbius curve scaled by the detected peak/average, and encodes with the
+   filter's bt709 "delinearize" (pure 1/2.4 power).
+
+The offline transcode packs that result into BT.709 TV-range NV12; the
+player's SDR shader decodes such files straight back to the same R'G'B'.
+Net effect: **playing the HDR representation and playing the
+ffmpeg-transcoded SDR representation of the same content display the same
+image** (up to the transcode's 4:2:0 chroma subsampling and encoder
+quantisation).
+
+The SDR NV12 shader was fixed as part of this work — it previously
+under-scaled luma (white at ~86 %), skipped the chroma range expansion and
+used BT.601-ish coefficients, so SDR representations rendered darker and
+duller than the correctly-decoded grade on Windows/Linux/Android-Vulkan
+paths. It now does an exact limited-range BT.709 decode.
 
 ## Where this works
 
@@ -32,166 +82,95 @@ The host controls steps 2 and 4 at runtime by pushing an
 | macOS / iOS     | ❌       | VideoToolbox tonemaps internally before our shader |
 | Android         | ❌       | No HDR path wired yet                              |
 
-Check `PlayerCapabilities::hdr_tonemap_tunable` at startup and **hide
-the settings UI entirely** when it's `false`. The API still accepts
-the call (no-op) so cross-platform host code doesn't need cfg gates,
-but the user can't see the effect on platforms where the OS owns the
-conversion.
+Check `PlayerCapabilities::hdr_tonemap_tunable` at startup and **hide the
+settings UI entirely** when it's `false`. The API still accepts the call
+(no-op) so cross-platform host code doesn't need cfg gates.
 
-## The two parameters
+## The parameters
 
-### `reference_white_nits: f32`
+All four are 1:1 mirrors of the `tonemap_opencl` options of the same name.
+Defaults (= `HdrTonemapParams::DEFAULT`) reproduce the reference transcode.
 
-What HDR input nit level the tonemap treats as "SDR diffuse white"
-(the curve's input domain `1.0`).
+### `tone_param: f32` — default `0.01`
 
-- **Lower** = brighter overall output. Most HDR content sits in the
-  tonemap's near-linear range; less compression.
-- **Higher** = dimmer overall output. Bigger headroom for highlights,
-  but typical content (a face under indoor light, ~50 nits) drops
-  into the steeper "shadow" part of the curve and looks dim.
+The Möbius knee point `j` (the filter's `param`). Signal below `j` passes
+through linearly; above it is compressed so the source peak lands at 1.0.
+Smaller = softer/flatter highlights, larger = more linear with a harder
+shoulder. FFmpeg's own default is 0.3; the reference transcode uses 0.01.
+Clamped to **[0.001, 0.999]**.
 
-| Value  | Look                                                          |
-|--------|---------------------------------------------------------------|
-| 40     | Bright living-room: SDR diffuse white maps near peak output.  |
-| 60     | Slightly brighter than reference, low contrast.               |
-| 100    | Strict BT.2390. Brighter than most real SDR *grades* look.    |
-| 200    | "Cinema" look — much darker tonemap, lots of highlight headroom. |
-| 400    | **Default** — API ceiling. Matches the (dark) SDR grade of the test content; see *Measured fit* below. |
+### `desat: f32` — default `0.0` (off)
 
-Range accepted by the API: **[10, 400]** (clamped). Outside that the
-output goes degenerate (divide-by-near-zero for very small, near-black
-output for very large).
+Highlight desaturation strength (the filter's `desat`). 0 disables — the
+reference transcode's choice. FFmpeg's own default is 0.5; values around
+there bleach very bright highlights toward white instead of letting them
+clip saturated. Clamped to **[0, 100]**.
 
-### `shadow_lift_gamma: f32`
+### `peak: f32` — default `0.0` (auto)
 
-Applied as `pow(tonemap_output, gamma)` after ACES. Affects
-shadows + midtones most, highlights almost not at all (high
-values already saturate near 1.0 so `pow(x, <1)` barely moves them).
+Source signal peak override in 100-nit units (the filter's `peak`: 100.0 =
+10 000 nits). 0 = auto, i.e. the PQ untagged-source fallback of 100. Only
+seeds the very first frame of a scene — the frame detection takes over
+immediately — so leave it at 0 unless you're debugging. Clamped to
+**[1, 200]** when non-zero.
 
-- **<1** = lift shadows + midtones. Less contrasty / more
-  "TV-like" appearance. Recovers detail crushed by the ACES toe.
-- **= 1** = identity. Pure ACES output.
-- **>1** = deepen shadows. More "cinematic" / "punchy" look.
+### `scene_threshold: f32` — default `0.2`
 
-| Value  | Look                                                                  |
-|--------|-----------------------------------------------------------------------|
-| 0.75   | Strong lift — flat, very TV-like. Useful for very dark mastering.     |
-| 0.85   | Moderate lift. Recovers midtone detail without flatness.              |
-| 0.95   | **Default** — mild lift, essentially neutral (near pure ACES).        |
-| 1.00   | Pure ACES (no lift). Cinematic, deeper blacks.                        |
-| 1.15   | Inverse lift — deeper shadows, higher contrast.                       |
-
-Range accepted by the API: **[0.5, 1.5]** (clamped).
-
-## Suggested presets
-
-Host UIs that want a simple preset selector instead of two sliders can
-use these:
-
-| Preset name    | `reference_white_nits` | `shadow_lift_gamma` | When to pick                     |
-|----------------|------------------------|---------------------|-----------------------------------|
-| Brighter       | 50                     | 0.80                | Living-room TV, ambient light     |
-| Balanced       | 100                    | 0.95                | Brighter mid-ground, less extreme |
-| **SDR-match**  | 400                    | 0.95                | Default — tracks the SDR grade    |
-| Punchy         | 200                    | 1.10                | Dark with deeper shadows          |
-| Reference      | 100                    | 1.00                | Strict BT.2390 mapping            |
-
-The names are suggestions — pick whatever fits the host UI's voice.
-What matters is that the player sees the two `f32`s.
+Scene-change threshold of the brightness detection (the filter's
+`threshold`). When a frame's average signal differs from the rolling
+average by more than this, the 63-frame window resets so the curve adapts
+instantly instead of fading over a second. 0 disables scene resets.
+Clamped to **[0, 10]**.
 
 ## API usage
 
 ```rust
 use player::{HdrTonemapParams, Player};
 
+// Recommended: do nothing. DEFAULT == the reference transcode profile.
+
+// Or explicitly (equivalent to the default):
+player.set_hdr_tonemap(HdrTonemapParams::DEFAULT);
+
+// Custom look, e.g. FFmpeg's stock mobius with highlight desaturation:
 let caps = player::capabilities();
 if caps.hdr_tonemap_tunable {
-    // Show HDR tonemap controls in the settings UI.
-
-    let user_choice = HdrTonemapParams {
-        reference_white_nits: 50.0,
-        shadow_lift_gamma: 0.80,
-    };
-    player.set_hdr_tonemap(user_choice);
+    player.set_hdr_tonemap(HdrTonemapParams {
+        tone_param: 0.3,
+        desat: 0.5,
+        ..HdrTonemapParams::DEFAULT
+    });
 }
-```
-
-Or with `Default`:
-
-```rust
-player.set_hdr_tonemap(HdrTonemapParams::default()); // = ::DEFAULT
 ```
 
 ## Persistence
 
-The **player does not persist** the value across runs. It only holds
-the current setting in memory for the lifetime of the `Player`
-instance. The host must:
-
-1. Load the user's saved preference from its own settings storage at
-   app launch.
-2. Call `set_hdr_tonemap(loaded_params)` once after `Player` is
-   created (even before `open_url`).
-3. Save the new value to its own storage when the user changes it.
-
-The clamp range above is safe to round-trip through any host
-settings format — `f32` JSON / proto / config-toml are all fine.
+Unchanged: the **player does not persist** the value across runs. A host
+that exposes custom values must round-trip them through its own settings
+storage and call `set_hdr_tonemap` once per `Player` init. Hosts that stick
+with the default need no persistence at all.
 
 ## Timing
 
 - `set_hdr_tonemap` is **safe to call from any thread, at any time**.
-- The change takes effect on **the next P010 frame rendered** —
-  roughly one frame of latency. Fluid for slider UIs.
-- The setter is **cheap** (one `Arc` swap, no GPU calls). Spamming
-  it at slider drag rates is fine.
-- The player does not expose a getter — the host already has the
-  value it pushed (and persists it in its own settings storage, see
-  Persistence above).
+- Takes effect on **the next P010 frame rendered** (~one frame of latency).
+- The setter is **cheap** (one `Arc` swap, no GPU calls) — slider-drag
+  rates are fine.
+- No getter — the host owns the value it pushed.
 
-## Defaults
+## Fidelity notes (vs. the ffmpeg filter)
 
-Both `HdrTonemapParams::DEFAULT` and the shader's startup-time
-uniform initialiser use:
+Intentional, visually irrelevant differences from `tonemap_opencl`:
 
-- `reference_white_nits = 400.0`
-- `shadow_lift_gamma   = 0.95`
-
-These are calibrated to approximate the SDR (BT.709) grade of the test
-content (see *Measured fit* below). If the host doesn't call
-`set_hdr_tonemap` at all, this is what the user sees.
-
-## Measured fit against the SDR grade
-
-The test stream (`preclikos.cz/examples/encrypted`) ships the same
-content as both an SDR BT.709 representation and an HDR10 PQ/BT.2020
-(Dolby Vision 8.1) representation. That gives matched SDR/HDR frames of
-the identical shot, so we can measure — not eyeball — which knob values
-make our HDR→SDR tonemap land on the SDR grade.
-
-Method: an offline NumPy replica of this shader (same PQ EOTF → ACES →
-gamma → BT.2020→709 → sRGB chain) was run on the *raw PQ* HDR frame and
-compared, per pixel (letterbox masked), to the BT.709-decoded SDR frame.
-Four shots (landscape + three portraits) were swept over the full clamp
-domain and optimised jointly.
-
-| Params          | Joint RMSE vs SDR | Note                                   |
-|-----------------|-------------------|----------------------------------------|
-| 60 / 0.85 (old) | 0.280             | ~+0.30 per-channel bias — over-exposed |
-| 400 / 0.95      | 0.096             | 66 % closer; chosen default            |
-
-Every individual shot's optimum landed at `reference_white_nits = 400`
-(the clamp ceiling): the SDR grade is *darker / more contrasty* than the
-ACES tonemap produces at any lower reference white, so the true optimum
-is pinned by the [10, 400] clamp. `shadow_lift_gamma` is only weakly
-constrained (per-shot optima 0.7–1.5); 0.95 is the joint best.
-
-Caveats:
-- The two knobs are achromatic (exposure + contrast). They **cannot**
-  fix the residual white-balance / saturation gap — the SDR grade is a
-  touch warmer + more saturated than two-knob tonemapping can reach.
-- The fit is calibrated to *this title's* SDR grade. Content graded
-  brighter may look dim at 400; that is what `set_hdr_tonemap` is for.
-- Because the optimum is clamped, fully matching darker SDR grades would
-  need either a higher `reference_white_nits` ceiling or a different
-  tone curve — a larger change than these two runtime knobs allow.
+- Chroma is sampled bilinearly; the filter uses nearest within its 2×2
+  work-item quad. Spatial difference only — tone and colour are identical.
+- The filter bakes its colour matrices into the kernel at 4 decimal places
+  (`%.4f`); the shaders use the same matrices at full precision (≤ 5×10⁻⁵
+  per coefficient apart).
+- Mastering-display/MaxCLL metadata is not parsed, so the first frame
+  seeds with the untagged-PQ peak (100) even when the stream carries
+  metadata — the filter would seed with the tagged value. The detection
+  replaces the seed from frame 2 onward either way.
+- Detection statistics roll one frame later than the filter's (which
+  folds detection into the tonemap kernel itself); the published values
+  cover "previous frames only" in both cases.

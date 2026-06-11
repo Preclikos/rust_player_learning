@@ -116,6 +116,12 @@ glow = "0.17"
 [target.'cfg(target_os = "ios")'.dependencies]
 reqwest = { version = "0.12.12", default-features = false, features = ["rustls-tls"] }
 
+[dev-dependencies]
+# Shader validation tests parse the WGSL with the same naga revision the
+# wgpu fork compiles it with at runtime — a typo in a .wgsl otherwise only
+# surfaces as a create_shader_module panic on the first rendered frame.
+naga = { git = "https://github.com/Preclikos/wgpu.git", features = ["wgsl-in"] }
+
 [build-dependencies]
 cc = "1"
 

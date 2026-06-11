@@ -1,3 +1,18 @@
+// SDR (BT.709) NV12 display path.
+//
+// Limited-range 8-bit BT.709 Y'CbCr → R'G'B', emitted to the (non-sRGB)
+// swapchain as-is — video R'G'B' values are already display-referred, so
+// no transfer conversion happens here. This is the exact inverse of the
+// rgb2yuv leg of FFmpeg's tonemap_opencl (yuv_matrix = BT.709,
+// r=tv), which produced this project's SDR ladder — keeping it inverse-
+// exact makes an SDR representation land on the same displayed values as
+// the player's own HDR tonemap of the HDR sibling (see shader_hdr.wgsl).
+//
+// The previous version of this shader expanded Y to [0, 219/255] (white
+// rendered ~14 % dark), dropped the /224 chroma normalisation and used
+// BT.601-ish coefficients (1.403/1.779) — SDR content played visibly
+// darker and duller than the same frame's HDR rendering.
+
 @group(0) @binding(0) var t_texture_y: texture_2d<f32>;
 @group(0) @binding(1) var t_texture_uv: texture_2d<f32>;
 @group(0) @binding(2) var s_sampler: sampler;
@@ -23,52 +38,22 @@ fn vs_main(
     out.clip_position = vec4<f32>(model.position, 1.0);
     return out;
 }
-/*
-@fragment
-fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    // Sample the Y component
-    let y = textureSample(t_texture_y, s_sampler, in.tex_coords).r;
-    
-    // Convert Y to full range [0, 1]
-    let y_full = (y * 255.0 - 16.0) / 255.0; 
-
-    // Display grayscale using Y channel for RGB
-    return vec4<f32>(y_full, y_full, y_full, 1.0);
-}
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    // Sample the UV texture
-    let uv = textureSample(t_texture_uv, s_sampler, in.tex_coords);
-    
-    // Convert UV to full range [-1, 1]
-    let u_full = (uv.r * 255.0 - 128.0) / 255.0; // U channel
-    let v_full = (uv.g * 255.0 - 128.0) / 255.0; // V channel
+    let y_code = textureSample(t_texture_y, s_sampler, in.tex_coords).r;
+    let uv     = textureSample(t_texture_uv, s_sampler, in.tex_coords).rg;
 
-    // Visualize UV as false-color: U in Red, V in Blue
-    return vec4<f32>(u_full + 0.5, 0.5, 0.5, 1.0);
-}
-*/
-@fragment
-fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    // Sample Y, U, and V components from the textures
-    let y = textureSample(t_texture_y, s_sampler, in.tex_coords).r;
-    let uv = textureSample(t_texture_uv, s_sampler, in.tex_coords);
-    
-    let y_full = (y * 255.0 - 16.0);// * (219.0 / 219.0); // Scale Y from [16, 235] -> [0, 219] (not fully 0-255!)
-    let u_full = (uv.r * 255.0 - 128.0); // Center U around 0 (was [-112,112])
-    let v_full = (uv.g * 255.0 - 128.0); // Center V around 0
-    
-    // Increase saturation by scaling U and V components
-    let saturation_factor = 1.00; // Adjust this to control saturation strength
-    let u_sat = u_full * saturation_factor;
-    let v_sat = v_full * saturation_factor;
+    // Limited (TV) range expansion: Y' 16..235 → [0, 1], Cb/Cr 16..240
+    // → [-0.5, 0.5] (the same normalised form colorspace_common.cl uses).
+    let y_ = (y_code * 255.0 -  16.0) / 219.0;
+    let cb = (uv.r   * 255.0 - 128.0) / 224.0;
+    let cr = (uv.g   * 255.0 - 128.0) / 224.0;
 
-    // YUV to RGB conversion using BT.709 coefficients (standard for video)
-    var rr = y_full + 1.403 * v_sat;
-    var gg = y_full - 0.344 * u_sat - 0.7169 * v_sat;
-    var bb = y_full + 1.779 * u_sat;
+    // BT.709 Y'CbCr → R'G'B' (Kr = 0.2126, Kb = 0.0722).
+    let r = y_ + 1.5748 * cr;
+    let g = y_ - 0.18733 * cb - 0.46813 * cr;
+    let b = y_ + 1.8556 * cb;
 
-    // Return the final color with alpha = 1 for full opacity
-    return vec4<f32>(rr / 255.0, gg / 255.0, bb / 255.0, 1.0); // BGRA format
+    return vec4<f32>(r, g, b, 1.0);
 }

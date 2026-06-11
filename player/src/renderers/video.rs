@@ -216,18 +216,30 @@ pub struct VideoRenderer {
     texture_bind_group_layout: Option<BindGroupLayout>,
     render_pipeline: Option<RenderPipeline>,
     // P010 / HDR10 path. Built alongside `render_pipeline` and bound only when
-    // the imported frame texture is P010 (Main 10 HEVC). Same bind group
-    // layout as the SDR pipeline — Y and UV plane views are 16-bit instead of
-    // 8-bit but still float-sampled, so the layout is reused. None on devices
-    // where NV12 is unavailable (no 10-bit there either).
+    // the imported frame texture is P010 (Main 10 HEVC). Same group-0 bind
+    // group layout as the SDR pipeline — Y and UV plane views are 16-bit
+    // instead of 8-bit but still float-sampled, so the layout is reused —
+    // plus a group-1 storage binding for the frame peak/average detection
+    // result. None on devices where NV12 is unavailable (no 10-bit there
+    // either).
     render_pipeline_hdr: Option<RenderPipeline>,
-    /// Uniform buffer carrying the two HDR→SDR tonemap knobs (reference white
-    /// nits, shadow lift gamma) that the HDR fragment shader reads. Lives at
-    /// bind group 0 / binding 3. Always provided in the bind group on
-    /// platforms where the layout exists (so SDR draws keep a stable
-    /// descriptor shape) — the SDR shader simply doesn't reference it.
-    /// `None` on devices without NV12 (no shader pipeline at all).
+    /// Uniform buffer carrying the HDR→SDR tonemap parameters (the FFmpeg
+    /// tonemap_opencl-style tone_param / desat / peak / scene_threshold,
+    /// plus the detection pass's workgroup count and frame dimensions).
+    /// Lives at bind group 0 / binding 3 and is shared by the HDR fragment
+    /// shader and the detection compute passes. Always provided in the bind
+    /// group on platforms where the layout exists (so SDR draws keep a
+    /// stable descriptor shape) — the SDR shader simply doesn't reference
+    /// it. `None` on devices without NV12 (no shader pipeline at all).
     hdr_tonemap_uniform: Option<wgpu::Buffer>,
+    /// GPU-side frame peak/average detection for the HDR tonemap (the
+    /// tonemap_opencl detect_peak_avg port — see shader_hdr_detect.wgsl).
+    /// Fully zero-copy: the compute passes read the already-imported P010
+    /// plane views and keep their rolling statistics in a small storage
+    /// buffer that never leaves the GPU; the HDR fragment shader reads the
+    /// published result straight from that buffer. `None` on devices
+    /// without NV12.
+    hdr_detect: Option<HdrDetect>,
     /// Latest tonemap params pushed by `Player::set_hdr_tonemap`. Read on
     /// each P010 frame before draw and uploaded into `hdr_tonemap_uniform`.
     /// Defaults to `HdrTonemapParams::DEFAULT`. Storage is platform-agnostic
@@ -260,6 +272,37 @@ pub struct VideoRenderer {
     /// is fallible).
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     metal_cache: Option<Arc<MetalTextureCache>>,
+}
+
+/// Size of the HDR tonemap uniform (TonemapUniforms in shader_hdr.wgsl /
+/// shader_hdr_detect.wgsl): 4× f32 params + 3× u32 detection geometry + pad.
+const HDR_TONEMAP_UNIFORM_SIZE: u64 = 32;
+/// Size of the detection state buffer (DetectionBuf in
+/// shader_hdr_detect.wgsl): two 64-slot u32 rings + 4 totals/indices +
+/// 2 f32 result slots — the tonemap_opencl util_buf layout plus the
+/// published result. wgpu zero-initialises it, which is the detection's
+/// valid starting state (scene_frame_num == 0 → seed values used).
+const HDR_DETECT_BUFFER_SIZE: u64 = (64 + 64 + 4 + 2) * 4;
+
+/// GPU resources of the frame peak/average detection that drives the HDR
+/// tonemap (port of tonemap_opencl's detect_peak_avg — three compute
+/// passes encoded before each P010 draw; see shader_hdr_detect.wgsl).
+/// Everything stays on the GPU: textures in, statistics in `buffer`,
+/// result consumed by the HDR fragment shader via `frag_bind_group`.
+struct HdrDetect {
+    /// Rolling detection state + published result (HDR_DETECT_BUFFER_SIZE).
+    buffer: wgpu::Buffer,
+    /// Group-1 bind group of the HDR render pipeline (read-only view of
+    /// `buffer`). Created once — the buffer never changes identity.
+    frag_bind_group: wgpu::BindGroup,
+    /// Layout for the per-frame compute bind group (Y view, UV view,
+    /// tonemap uniform, `buffer` read-write).
+    compute_layout: BindGroupLayout,
+    /// detect publish/accumulate/finalize kernels (one module, three entry
+    /// points) — dispatched in this order before the HDR draw.
+    publish: wgpu::ComputePipeline,
+    accumulate: wgpu::ComputePipeline,
+    finalize: wgpu::ComputePipeline,
 }
 
 pub enum VideoRendererCommand {
@@ -526,7 +569,7 @@ impl VideoRenderer {
         // inside its SPIR-V parser during vkCreateGraphicsPipeline. Since the
         // clear-color fallback path never touches these objects, omitting them
         // is safe and avoids the native abort.
-        let (texture_bind_group_layout, render_pipeline, render_pipeline_hdr, vertex_buffer, hdr_tonemap_uniform) = if has_nv12_feature {
+        let (texture_bind_group_layout, render_pipeline, render_pipeline_hdr, vertex_buffer, hdr_tonemap_uniform, hdr_detect) = if has_nv12_feature {
             let layout =
                 device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                     entries: &[
@@ -556,17 +599,20 @@ impl VideoRenderer {
                             ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                             count: None,
                         },
-                        // HDR tonemap params uniform — read by shader_hdr.wgsl.
-                        // Provided in every bind group (including SDR / Apple
-                        // Metal) so the descriptor shape is stable; the SDR
-                        // shaders simply don't reference it. 8 bytes (2× f32).
+                        // HDR tonemap params uniform — read by shader_hdr.wgsl
+                        // and the detection compute passes. Provided in every
+                        // bind group (including SDR / Apple Metal) so the
+                        // descriptor shape is stable; the SDR shaders simply
+                        // don't reference it.
                         wgpu::BindGroupLayoutEntry {
                             binding: 3,
                             visibility: wgpu::ShaderStages::FRAGMENT,
                             ty: wgpu::BindingType::Buffer {
                                 ty: wgpu::BufferBindingType::Uniform,
                                 has_dynamic_offset: false,
-                                min_binding_size: std::num::NonZeroU64::new(8),
+                                min_binding_size: std::num::NonZeroU64::new(
+                                    HDR_TONEMAP_UNIFORM_SIZE,
+                                ),
                             },
                             count: None,
                         },
@@ -574,8 +620,32 @@ impl VideoRenderer {
                     label: Some("texture_bind_group_layout"),
                 });
 
+            // Group 1 of the HDR pipeline only: the frame peak/average
+            // detection result (read-only storage). A separate group keeps
+            // the SDR / Apple Metal pipelines on the untouched group-0
+            // layout — no storage-buffer requirement leaks into paths that
+            // never run the HDR shader.
+            let hdr_detect_frag_layout =
+                device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    entries: &[wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: std::num::NonZeroU64::new(
+                                HDR_DETECT_BUFFER_SIZE,
+                            ),
+                        },
+                        count: None,
+                    }],
+                    label: Some("hdr_detect_frag_layout"),
+                });
+
             let shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
             let shader_hdr = device.create_shader_module(wgpu::include_wgsl!("shader_hdr.wgsl"));
+            let shader_hdr_detect =
+                device.create_shader_module(wgpu::include_wgsl!("shader_hdr_detect.wgsl"));
 
             let pipeline_layout =
                 device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -583,11 +653,19 @@ impl VideoRenderer {
                     bind_group_layouts: &[Some(&layout)],
                     immediate_size: 0,
                 });
+            let pipeline_layout_hdr =
+                device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("Pipeline Layout (HDR)"),
+                    bind_group_layouts: &[Some(&layout), Some(&hdr_detect_frag_layout)],
+                    immediate_size: 0,
+                });
 
-            let make_pipeline = |label: &'static str, module: &wgpu::ShaderModule| {
+            let make_pipeline = |label: &'static str,
+                                 module: &wgpu::ShaderModule,
+                                 pl: &wgpu::PipelineLayout| {
                 device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                     label: Some(label),
-                    layout: Some(&pipeline_layout),
+                    layout: Some(pl),
                     vertex: wgpu::VertexState {
                         module,
                         entry_point: Some("vs_main"),
@@ -612,8 +690,9 @@ impl VideoRenderer {
                 })
             };
 
-            let pipeline = make_pipeline("Render Pipeline (SDR/NV12)", &shader);
-            let pipeline_hdr = make_pipeline("Render Pipeline (HDR/P010)", &shader_hdr);
+            let pipeline = make_pipeline("Render Pipeline (SDR/NV12)", &shader, &pipeline_layout);
+            let pipeline_hdr =
+                make_pipeline("Render Pipeline (HDR/P010)", &shader_hdr, &pipeline_layout_hdr);
 
             let vertices = generate_verticles(1., 1., 1.);
             let vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -622,19 +701,113 @@ impl VideoRenderer {
                 usage: wgpu::BufferUsages::VERTEX,
             });
 
-            // HDR tonemap uniform — 2× f32 (reference white nits, shadow lift
-            // gamma). Initialised to HdrTonemapParams::DEFAULT so the first
-            // HDR frame renders even when the host hasn't pushed a setting
-            // yet (matches the shader's prior compile-time defaults).
-            let defaults = crate::HdrTonemapParams::DEFAULT;
+            // HDR tonemap uniform — zero-filled at creation; the render path
+            // writes the real values (current HdrTonemapParams + detection
+            // geometry) before every draw, so the first frame is already
+            // correct.
             let tonemap_uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("HDR Tonemap Uniform"),
-                contents: bytemuck::cast_slice(&[
-                    defaults.reference_white_nits,
-                    defaults.shadow_lift_gamma,
-                ]),
+                contents: &[0u8; HDR_TONEMAP_UNIFORM_SIZE as usize],
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             });
+
+            // Frame peak/average detection state. Plain STORAGE usage — the
+            // statistics accumulate and are consumed entirely on the GPU
+            // (zero-copy: no readback, no CPU staging).
+            let detect_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("HDR Detect Buffer"),
+                size: HDR_DETECT_BUFFER_SIZE,
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            });
+
+            let detect_frag_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                layout: &hdr_detect_frag_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: detect_buffer.as_entire_binding(),
+                }],
+                label: Some("hdr_detect_frag_bind_group"),
+            });
+
+            // Detection compute side: Y + UV plane views (textureLoad only),
+            // the shared tonemap uniform, and the state buffer read-write.
+            let detect_compute_layout =
+                device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 2,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: std::num::NonZeroU64::new(
+                                    HDR_TONEMAP_UNIFORM_SIZE,
+                                ),
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 3,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                                has_dynamic_offset: false,
+                                min_binding_size: std::num::NonZeroU64::new(
+                                    HDR_DETECT_BUFFER_SIZE,
+                                ),
+                            },
+                            count: None,
+                        },
+                    ],
+                    label: Some("hdr_detect_compute_layout"),
+                });
+
+            let detect_pipeline_layout =
+                device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("HDR Detect Pipeline Layout"),
+                    bind_group_layouts: &[Some(&detect_compute_layout)],
+                    immediate_size: 0,
+                });
+            let make_detect_pipeline = |label: &'static str, entry: &'static str| {
+                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some(label),
+                    layout: Some(&detect_pipeline_layout),
+                    module: &shader_hdr_detect,
+                    entry_point: Some(entry),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    cache: None,
+                })
+            };
+
+            let hdr_detect = HdrDetect {
+                buffer: detect_buffer,
+                frag_bind_group: detect_frag_bind_group,
+                compute_layout: detect_compute_layout,
+                publish: make_detect_pipeline("HDR Detect (publish)", "cs_publish"),
+                accumulate: make_detect_pipeline("HDR Detect (accumulate)", "cs_accumulate"),
+                finalize: make_detect_pipeline("HDR Detect (finalize)", "cs_finalize"),
+            };
 
             (
                 Some(layout),
@@ -642,9 +815,10 @@ impl VideoRenderer {
                 Some(pipeline_hdr),
                 Some(Arc::new(RwLock::new(vb))),
                 Some(tonemap_uniform),
+                Some(hdr_detect),
             )
         } else {
-            (None, None, None, None, None)
+            (None, None, None, None, None, None)
         };
 
         // Capacity sized for drag-resize bursts: Win32 generates many WM_SIZE
@@ -760,6 +934,7 @@ impl VideoRenderer {
             render_pipeline,
             render_pipeline_hdr,
             hdr_tonemap_uniform,
+            hdr_detect,
             hdr_tonemap_params: Arc::new(arc_swap::ArcSwap::from_pointee(
                 crate::HdrTonemapParams::DEFAULT,
             )),
@@ -1044,16 +1219,39 @@ impl VideoRenderer {
             .as_ref()
             .expect("no HDR tonemap uniform");
 
-        // P010 frames hit the HDR shader which reads these values; SDR frames
-        // also bind it but the SDR shader doesn't reference it (descriptor
-        // shape must still match the layout). The write itself is cheap (~8B
-        // staged into the queue), so we do it unconditionally per frame and
-        // avoid a fork between SDR / HDR paths here.
+        // P010 frames hit the HDR shader + detection passes which read these
+        // values; SDR frames also bind the uniform but never reference it
+        // (descriptor shape must still match the layout). The write is cheap
+        // (32 B staged into the queue), so it happens unconditionally per
+        // frame to avoid forking SDR / HDR paths here.
         let params = **self.hdr_tonemap_params.load();
+        // The filter's `peak` resolution: explicit override, else the
+        // ff_determine_signal_peak fallback for an untagged PQ source
+        // (10 000 nits = 100 in REFERENCE_WHITE units). Mastering metadata
+        // isn't plumbed from the bitstream — and like in tonemap_opencl the
+        // seed only matters until the frame detection takes over (one frame).
+        let peak_seed = if params.peak > 0.0 { params.peak } else { 100.0 };
+        let (frame_w, frame_h) = (frame.width(), frame.height());
+        let (uv_w, uv_h) = (frame_w.div_ceil(2), frame_h.div_ceil(2));
+        // Detection accumulate grid: one invocation per UV texel, 16×16 per
+        // workgroup, grid rounded UP like ff_opencl_filter_work_size_from_image
+        // (edge overflow clamps into the frame and still counts — see
+        // shader_hdr_detect.wgsl).
+        let (wg_x, wg_y) = (uv_w.div_ceil(16), uv_h.div_ceil(16));
         self.queue.write_buffer(
             tonemap_uniform,
             0,
-            bytemuck::cast_slice(&[params.reference_white_nits, params.shadow_lift_gamma]),
+            bytemuck::cast_slice(&[
+                params.tone_param,
+                params.desat,
+                peak_seed,
+                params.scene_threshold,
+            ]),
+        );
+        self.queue.write_buffer(
+            tonemap_uniform,
+            16,
+            bytemuck::cast_slice(&[wg_x * wg_y, frame_w, frame_h, 0u32]),
         );
 
         let texture_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1078,6 +1276,41 @@ impl VideoRenderer {
             ],
             label: Some("texture_bind_group"),
         });
+
+        // HDR-only: per-frame bind group for the detection compute passes
+        // (the plane views change per frame; the uniform + state buffer
+        // don't). SDR frames skip detection entirely. All inputs/outputs
+        // are GPU-resident — the imported decoder texture is read in place,
+        // nothing is staged back to the CPU.
+        let is_hdr = video_frame.get_texture().format() == TextureFormat::P010;
+        let detect_bind_group = if is_hdr && frame_w > 0 && frame_h > 0 {
+            self.hdr_detect.as_ref().map(|det| {
+                self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    layout: &det.compute_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(&y_plane_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(&uv_plane_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: tonemap_uniform.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: det.buffer.as_entire_binding(),
+                        },
+                    ],
+                    label: Some("hdr_detect_bind_group"),
+                })
+            })
+        } else {
+            None
+        };
 
         if is_p010_dbg {
             log::trace!("[p010_render] step 3 OK: bind group created");
@@ -1151,6 +1384,28 @@ impl VideoRenderer {
                 video_directx::log_dx12_device_removed_reason(&self.device);
             }
             let mut encoder = self.device.create_command_encoder(&Default::default());
+
+            // Frame peak/average detection (tonemap_opencl detect_peak_avg)
+            // — HDR frames only, entirely on the GPU. `publish` runs FIRST
+            // so this draw maps with previous-frames statistics, exactly
+            // like the filter (its kernel reads the rolling totals before
+            // the last workgroup advances them).
+            if let Some(detect_group) = detect_bind_group.as_ref() {
+                let det = self
+                    .hdr_detect
+                    .as_ref()
+                    .expect("detect bind group exists without resources");
+                let mut cpass =
+                    encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+                cpass.set_pipeline(&det.publish);
+                cpass.set_bind_group(0, detect_group, &[]);
+                cpass.dispatch_workgroups(1, 1, 1);
+                cpass.set_pipeline(&det.accumulate);
+                cpass.dispatch_workgroups(wg_x, wg_y, 1);
+                cpass.set_pipeline(&det.finalize);
+                cpass.dispatch_workgroups(1, 1, 1);
+            }
+
             {
                 let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: None,
@@ -1174,6 +1429,13 @@ impl VideoRenderer {
                 }
                 render_pass.set_pipeline(render_pipeline);
                 render_pass.set_bind_group(0, &texture_bind_group, &[]);
+                // The HDR pipeline's group 1 = detection result (read-only
+                // storage). SDR pipelines have no group 1.
+                if is_hdr {
+                    if let Some(det) = self.hdr_detect.as_ref() {
+                        render_pass.set_bind_group(1, &det.frag_bind_group, &[]);
+                    }
+                }
                 render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
                 render_pass.draw(0..6, 0..1);
 
@@ -1639,6 +1901,18 @@ impl VideoRenderer {
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                // The shared layout carries the tonemap uniform at binding 3
+                // (the SDR shader never reads it, but the bind group must
+                // match the layout's entry count — omitting it fails wgpu
+                // validation before the first draw).
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: self
+                        .hdr_tonemap_uniform
+                        .as_ref()
+                        .expect("layout exists without tonemap uniform")
+                        .as_entire_binding(),
                 },
             ],
         });

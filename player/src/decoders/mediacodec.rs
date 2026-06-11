@@ -279,13 +279,16 @@ impl HwVideoDecoder for MediaCodecDecoder {
             }
         };
 
-        // Get the unowned HardwareBuffer reference from the Image, then
-        // acquire a strong ref so it survives the Image's drop.
+        // Get the unowned HardwareBuffer reference from the Image and acquire
+        // a strong ref, but keep the Image itself inside the frame: deleting
+        // the AImage returns the slot to the ImageReader's free pool and lets
+        // MediaCodec overwrite the pixels with a future frame while this one
+        // is still queued for render (the scene-cut flicker). The slot is
+        // held until the renderer's keepalive ring drops the last Arc clone.
         let hb_unowned = image
             .hardware_buffer()
             .map_err(|e| -> DecoderError { format!("Image::hardware_buffer: {:?}", e).into() })?;
-        let buffer = Arc::new(SendableAhb(hb_unowned.acquire()));
-        // image is dropped here; the AHB stays alive via `buffer`.
+        let buffer = Arc::new(SendableAhb::new(hb_unowned.acquire(), image, Arc::clone(reader)));
 
         Ok(Some(DecodedVideoFrame {
             pts_us,

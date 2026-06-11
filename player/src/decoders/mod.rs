@@ -127,11 +127,30 @@ impl Drop for CvPixelBufferOwned {
 unsafe impl Send for CvPixelBufferOwned {}
 
 #[cfg(target_os = "android")]
-pub struct SendableAhb(pub ndk::hardware_buffer::HardwareBufferRef);
+pub struct SendableAhb {
+    buffer: ndk::hardware_buffer::HardwareBufferRef,
+    // The acquired AImage is what keeps this buffer OUT of the ImageReader's
+    // free pool. AHardwareBuffer_acquire alone only pins the allocation —
+    // once the AImage is deleted, MediaCodec may dequeue the slot and decode
+    // a FUTURE frame into the same memory while this frame is still queued
+    // for render (channel + reorder buffer ≈ half a second). On screen that
+    // is invisible mid-scene but flashes back and forth at scene cuts.
+    // Deleting the image (and thus releasing the slot) only when the last
+    // Arc clone drops — including the renderer's keepalive ring — is what
+    // actually implements the "released back to the pool when all clones
+    // are dropped" contract documented on AndroidHardwareBufferFrame.
+    _image: Option<ndk::media::image_reader::Image>,
+    // Keeps the ImageReader alive until every in-flight image from it has
+    // been deleted, so a decoder teardown (ABR swap, loop restart) can't
+    // pull the reader out from under queued frames.
+    _reader: Option<std::sync::Arc<ndk::media::image_reader::ImageReader>>,
+}
 
 // HardwareBufferRef wraps NonNull<AHardwareBuffer>. AHardwareBuffer itself is
 // reference-counted (AHardwareBuffer_acquire/release) and thread-safe per
-// Android docs, so it's safe to share refs across threads.
+// Android docs, so it's safe to share refs across threads. AImage/AImageReader
+// carry no documented thread affinity; AImage_delete from the dropping thread
+// is the same pattern MediaCodecDecoder itself relies on (unsafe impl Send).
 #[cfg(target_os = "android")]
 unsafe impl Send for SendableAhb {}
 #[cfg(target_os = "android")]
@@ -139,8 +158,16 @@ unsafe impl Sync for SendableAhb {}
 
 #[cfg(target_os = "android")]
 impl SendableAhb {
+    pub fn new(
+        buffer: ndk::hardware_buffer::HardwareBufferRef,
+        image: ndk::media::image_reader::Image,
+        reader: std::sync::Arc<ndk::media::image_reader::ImageReader>,
+    ) -> Self {
+        Self { buffer, _image: Some(image), _reader: Some(reader) }
+    }
+
     pub fn as_ptr(&self) -> *mut ndk_sys::AHardwareBuffer {
-        self.0.as_ptr()
+        self.buffer.as_ptr()
     }
 }
 

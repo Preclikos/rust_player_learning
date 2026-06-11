@@ -131,9 +131,12 @@ impl Vertex {
     }
 }
 
-// tex_y_max: normally 1.0; set to content_height/buffer_height (<1.0) when
-// the codec produces a taller buffer than the visible frame (e.g. 736 for 720p
-// HEVC on Exynos) so we don't sample codec-alignment padding rows.
+// tex_y_max: normally 1.0; set to (content_height - 1) / buffer_height (<1.0)
+// when the codec produces a taller buffer than the visible frame (e.g. 736 for
+// 720p HEVC on Exynos) so we don't sample codec-alignment padding rows. The
+// 1-texel inset on the cropped edge keeps bilinear filtering (and the half-res
+// chroma plane of NV12) from reaching into the padding — same rule as AOSP
+// SurfaceTexture::computeTransformMatrix.
 fn generate_verticles(scale_x: f32, scale_y: f32, tex_y_max: f32) -> [Vertex; 6] {
     [
         Vertex {
@@ -1614,10 +1617,18 @@ impl VideoRenderer {
         // The right-edge X padding is the worst offender visually — it
         // contains uninitialised memory that samples as a solid green
         // rectangle along the right side of the video.
+        // The crop edge is inset by 1 full texel — content/buffer alone puts
+        // the edge fragments' bilinear footprint half a texel INTO the
+        // padding (a 1-px green stripe along the cropped edge), and because
+        // NV12 chroma is half-res, a half-texel luma inset would still let
+        // chroma bleed. 1 luma texel = the last content chroma texel's
+        // center, so the padding weight is exactly zero for both planes.
+        // Same inset AOSP SurfaceTexture::computeTransformMatrix applies to
+        // cropped edges of possibly-YUV buffers.
         {
             let stored = self.frame_size.read().await;
             if stored.width > 0 && frame.width > 0 && stored.width < frame.width {
-                let new_tx = stored.width as f32 / frame.width as f32;
+                let new_tx = (stored.width as f32 - 1.0) / frame.width as f32;
                 let mut tx = self.tex_x_max.write().await;
                 if (*tx - new_tx).abs() > 0.001 {
                     log::info!(
@@ -1630,7 +1641,7 @@ impl VideoRenderer {
                 }
             }
             if stored.height > 0 && frame.height > 0 && stored.height < frame.height {
-                let new_ty = stored.height as f32 / frame.height as f32;
+                let new_ty = (stored.height as f32 - 1.0) / frame.height as f32;
                 let mut ty = self.tex_y_max.write().await;
                 if (*ty - new_ty).abs() > 0.001 {
                     log::info!(

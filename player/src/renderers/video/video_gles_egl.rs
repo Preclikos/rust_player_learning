@@ -107,10 +107,12 @@ pub struct GlesOesPendingFrame {
     pub ahb_ptr: usize,  // *mut AHardwareBuffer cast to usize
     pub scale_x: f32,
     pub scale_y: f32,
-    /// content_width / buffer_width — crops the right-edge codec padding so
-    /// we don't sample uninitialised memory (visible as a green rectangle on
-    /// PowerVR Rogue / MT8696 where the buffer is 1920×1088 for 1280×720
-    /// content). 1.0 = no horizontal padding.
+    /// (content_width - 1) / buffer_width — crops the right-edge codec
+    /// padding so we don't sample uninitialised memory (visible as a green
+    /// rectangle on PowerVR Rogue / MT8696 where the buffer is 1920×1088 for
+    /// 1280×720 content). Inset by 1 texel so bilinear filtering and the
+    /// half-res NV12 chroma plane can't bleed padding into the edge pixels
+    /// (see the padding-update block in video.rs). 1.0 = no padding.
     #[cfg_attr(not(target_os = "android"), allow(dead_code))]
     pub tex_x_max: f32,
     pub tex_y_max: f32,

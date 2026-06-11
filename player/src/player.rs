@@ -515,7 +515,6 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
                 // (the channel can hold 64 frames = 2.7 s) causing a jarring
                 // jump. Draining exactly late_ms/frame_interval frames brings
                 // pts ≈ elapsed with no overshoot and no content skip.
-                let pts_before_drain = pts_ms;
                 let max_drain = (late_ms / 42).saturating_sub(1) as usize;
                 let mut drained = 0usize;
                 loop {
@@ -533,17 +532,19 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
                     stats
                         .video_frames_dropped
                         .fetch_add(drained as u64, Ordering::Relaxed);
-                    // Drop the matching amount of audio so the speaker
-                    // jumps forward in lock-step with video. Without
-                    // this, audio kept playing the pre-drop samples
-                    // queued in cpal — so every dropped batch shifted
-                    // A/V sync by ~drained × frame_interval ms in the
-                    // audio-leads direction, and the shift accumulated
-                    // visibly across multiple late events.
-                    let audio_skip_ms = pts_ms.saturating_sub(pts_before_drain);
-                    if audio_skip_ms > 0 {
-                        audio_sink.drop_ms(audio_skip_ms);
-                    }
+                    // Audio is deliberately NOT skipped in lock-step. The cpal
+                    // sink consumes samples at device rate on its own timer,
+                    // so when video falls behind the wall clock (decoder
+                    // hiccup, ABR-swap decoder spin-up) audio is still exactly
+                    // AT the clock — draining stale video frames re-aligns
+                    // video to that same clock and the two meet. Skipping
+                    // audio by the drained span too (the old drop_ms call)
+                    // pushed audio AHEAD of the clock by that span on every
+                    // LATE event: each ABR swap leaked ~150-250 ms of
+                    // audio-leads offset (the swap gap minus the frame-channel
+                    // cushion), and repeated auto-ABR switches accumulated it
+                    // into a gross lip-sync error while fixed-quality playback
+                    // stayed clean.
                 }
             }
         } else {

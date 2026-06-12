@@ -126,6 +126,27 @@ struct Inner {
     /// changes or the target width drifts more than 5% from the
     /// cached size.
     cached: Option<CachedCue>,
+    /// CPU-side variant of `cached` for the GLES hook path (Android),
+    /// which uploads the bitmap into a GL texture itself. Same identity
+    /// rule; `generation` bumps on every rebuild so the hook can skip
+    /// redundant uploads.
+    cpu_cached: Option<std::sync::Arc<SubtitleBitmap>>,
+    generation: u64,
+}
+
+/// A rasterized cue as plain pixels, for sinks that own their texture
+/// upload (the Android GLES hook). The same `rasterize_cue` output the
+/// wgpu path uploads — a libass backend would feed this exact shape.
+pub struct SubtitleBitmap {
+    pub rgba: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+    /// Monotonic content identity — changes whenever the visible bitmap
+    /// changes. Lets callers cache uploads and detect updates cheaply.
+    pub generation: u64,
+    /// Identity for cache validation (mirrors CachedCue).
+    text: String,
+    target_w: u32,
 }
 
 impl SubtitleOverlay {
@@ -234,6 +255,8 @@ impl SubtitleOverlay {
                 current_pts_ms: 0,
                 font: None,
                 cached: None,
+                cpu_cached: None,
+                generation: 0,
             }),
         }
     }
@@ -273,6 +296,49 @@ impl SubtitleOverlay {
         let mut inner = self.inner.lock().unwrap();
         inner.cues.clear();
         inner.cached = None;
+        inner.cpu_cached = None;
+    }
+
+    /// GLES-hook variant of `draw_into`: resolve the cue active at the
+    /// current PTS and return its rasterized bitmap (cached across calls;
+    /// `generation` identifies the content). `None` = nothing to show.
+    pub fn active_bitmap(
+        &self,
+        target_w: u32,
+        target_h: u32,
+    ) -> Option<std::sync::Arc<SubtitleBitmap>> {
+        let mut inner = self.inner.lock().unwrap();
+        let pts = inner.current_pts_ms;
+        let active = inner.cues.iter().find(|c| c.is_active(pts)).cloned()?;
+        let font = inner.font.as_ref()?.clone();
+
+        let rebuild = match &inner.cpu_cached {
+            Some(c) => {
+                c.text != active.text
+                    || (c.target_w as i64 - target_w as i64).abs()
+                        > (target_w as i64 / 20).max(8)
+            }
+            None => true,
+        };
+        if rebuild {
+            let (width, height, rgba) =
+                rasterize_cue(&font, &active.text, target_w, target_h)?;
+            inner.generation += 1;
+            let generation = inner.generation;
+            log::debug!(
+                "[subs] rasterized cue gen={} {}x{} (pts={}ms)",
+                generation, width, height, pts
+            );
+            inner.cpu_cached = Some(std::sync::Arc::new(SubtitleBitmap {
+                rgba,
+                width,
+                height,
+                generation,
+                text: active.text.clone(),
+                target_w,
+            }));
+        }
+        inner.cpu_cached.clone()
     }
 
     /// Called by the video sync loop before each render. Updates the

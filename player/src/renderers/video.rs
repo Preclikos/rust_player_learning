@@ -333,6 +333,11 @@ pub struct VideoRenderer {
     /// SDR↔HDR transition; SDR frames are up-converted to PQ instead.
     #[cfg(target_os = "android")]
     android_pq_session: std::sync::atomic::AtomicBool,
+    /// Subtitle generation last presented on the overlay surface in
+    /// direct mode (0 = nothing). The overlay only re-presents when this
+    /// changes — the GL surface stays untouched during cue-less playback.
+    #[cfg(target_os = "android")]
+    overlay_presented_gen: std::sync::atomic::AtomicU64,
 }
 
 /// Size of the HDR tonemap uniform (TonemapUniforms in shader_hdr.wgsl /
@@ -959,6 +964,7 @@ impl VideoRenderer {
                                     f.tex_y_max,
                                     f.desired_present_ns,
                                     f.mode,
+                                    f.subtitle,
                                 )
                             } {
                                 log::warn!("[gles_oes] hook render failed: {}", e);
@@ -1027,11 +1033,64 @@ impl VideoRenderer {
             android_window: 0,
             #[cfg(target_os = "android")]
             android_pq_session: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(target_os = "android")]
+            overlay_presented_gen: std::sync::atomic::AtomicU64::new(0),
         };
 
         renderer.spawn_command_thread(command_receiver);
 
         renderer
+    }
+
+    /// Direct mode: present the overlay surface when (and only when) the
+    /// active subtitle changed — appearing, changing text, or clearing.
+    /// Video rides its own surface plane, so the GL surface stays
+    /// completely idle during cue-less playback.
+    #[cfg(target_os = "android")]
+    async fn present_subtitle_overlay(&self) {
+        if self.gles_oes_renderer.is_none() {
+            return;
+        }
+        let size = self.inner_size();
+        let subtitle = {
+            let overlay = self.subtitle_overlay.lock().unwrap().clone();
+            overlay.and_then(|o| o.active_bitmap(size.width, size.height))
+        };
+        let gen = subtitle.as_ref().map(|b| b.generation).unwrap_or(0);
+        if self
+            .overlay_presented_gen
+            .swap(gen, std::sync::atomic::Ordering::Relaxed)
+            == gen
+        {
+            return;
+        }
+        log::debug!("[subs] presenting overlay gen={} (subtitle={})", gen, subtitle.is_some());
+
+        let surface = self.surface.lock().await;
+        let surface_texture = match surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(t)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
+            other => {
+                log::warn!("[gles_oes] overlay surface not available: {:?}", other);
+                return;
+            }
+        };
+        {
+            let mut pending = self.gles_oes_pending.lock().unwrap();
+            *pending = Some(video_gles_egl::GlesOesPendingFrame {
+                ahb_ptr: 0,
+                scale_x: 1.0,
+                scale_y: 1.0,
+                tex_x_max: 1.0,
+                tex_y_max: 1.0,
+                desired_present_ns: 0,
+                mode: video_gles_egl::OesRenderMode::Sdr,
+                subtitle,
+            });
+        }
+        self.queue.submit([]);
+        self.pre_present_notify();
+        self.queue.present(surface_texture);
     }
 
     /// Last known drawable size (device pixels), kept current by the host via
@@ -1228,6 +1287,7 @@ impl VideoRenderer {
                 // OS video pipeline owns scaling, colour and HDR from
                 // here; the wgpu surface only carries subtitles/UI.
                 direct.render_at(desired_present_ns.max(1));
+                self.present_subtitle_overlay().await;
             }
             #[cfg(any(target_os = "ios", target_os = "macos"))]
             PlatformFrame::CvPixelBuffer(cv_buf) => {
@@ -2009,6 +2069,12 @@ impl VideoRenderer {
             video_gles_egl::OesRenderMode::Sdr
         };
 
+        // Active subtitle cue for this frame (None = no cue / no track).
+        let subtitle = {
+            let overlay = self.subtitle_overlay.lock().unwrap().clone();
+            overlay.and_then(|o| o.active_bitmap(window_size.width, window_size.height))
+        };
+
         // Publish frame data for the present hook to consume.
         {
             let mut pending = self.gles_oes_pending.lock().unwrap();
@@ -2020,6 +2086,7 @@ impl VideoRenderer {
                 tex_y_max,
                 desired_present_ns,
                 mode,
+                subtitle,
             });
         }
 

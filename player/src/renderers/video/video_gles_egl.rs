@@ -299,6 +299,29 @@ void main() {
     out_color = vec4(mean_pq, mean_pq, 0.0, 1.0);
 }";
 
+// Subtitle quad: a plain 2D texture (the CPU-rasterized cue bitmap)
+// alpha-blended at a uniform-supplied NDC rectangle. Drawn after the
+// video (or over the transparent clear in direct mode, where video rides
+// its own surface below this one).
+const VS_SUB_SRC: &str = "#version 300 es
+in vec2 a_pos;
+in vec2 a_tex;
+uniform vec4 u_rect; // center_x, center_y, half_w, half_h (NDC)
+out vec2 v_tex;
+void main() {
+    gl_Position = vec4(a_pos * u_rect.zw + u_rect.xy, 0.0, 1.0);
+    v_tex = a_tex;
+}";
+
+const FS_SUB_SRC: &str = "#version 300 es
+precision mediump float;
+uniform sampler2D u_texture;
+in vec2 v_tex;
+out vec4 out_color;
+void main() {
+    out_color = texture(u_texture, v_tex);
+}";
+
 // SDR (BT.709, display gamma) → PQ BT.2020 up-conversion, for SDR frames
 // rendered while the surface is locked to the BT2020_PQ dataspace (ABR
 // switched to an SDR rep mid-HDR-session). BT.2408: SDR reference white
@@ -577,7 +600,12 @@ const EGL_DRAW: i32 = 0x3059;
 /// Frame data passed from the render thread to the present hook.
 /// Stored as primitive types so the struct is Send (raw pointers are stored as usize).
 pub struct GlesOesPendingFrame {
-    pub ahb_ptr: usize,  // *mut AHardwareBuffer cast to usize
+    /// *mut AHardwareBuffer cast to usize. 0 = overlay-only present
+    /// (direct mode: video rides its own surface plane below; this
+    /// surface gets a TRANSPARENT clear + the subtitle quad only).
+    pub ahb_ptr: usize,
+    /// Rasterized cue to draw over the frame; None = no active cue.
+    pub subtitle: Option<std::sync::Arc<crate::renderers::subtitle::SubtitleBitmap>>,
     pub scale_x: f32,
     pub scale_y: f32,
     /// (content_width - 1) / buffer_width — crops the right-edge codec
@@ -657,6 +685,9 @@ pub struct GlesOesRenderer {
     /// BT2020_PQ passthrough session. None → SDR frames render through
     /// the plain program (washed out on an HDR surface, but alive).
     sdr_to_pq: Option<BasicProgram>,
+    /// Subtitle quad program + the persistent texture its bitmap lives
+    /// in. None when compilation failed (subtitles silently absent).
+    subtitle: Option<SubtitleGl>,
     // EGL extension function pointers stored as usize (makes the struct Send + Sync).
     fn_get_native_client_buffer: usize,  // eglGetNativeClientBufferANDROID
     fn_egl_create_image: usize,          // eglCreateImageKHR
@@ -673,6 +704,17 @@ pub struct GlesOesRenderer {
 
 unsafe impl Send for GlesOesRenderer {}
 unsafe impl Sync for GlesOesRenderer {}
+
+/// Subtitle drawing state: program, NDC-rect uniform, and the GL texture
+/// the cue bitmap is uploaded into (re-uploaded only when the bitmap
+/// generation changes).
+struct SubtitleGl {
+    program: glow::Program,
+    rect_loc: Option<glow::UniformLocation>,
+    texture: glow::Texture,
+    /// Generation of the bitmap currently in `texture` (0 = none yet).
+    uploaded_generation: std::sync::atomic::AtomicU64,
+}
 
 /// A program with just the geometry/crop uniforms (SDR→PQ up-convert).
 struct BasicProgram {
@@ -882,6 +924,36 @@ impl GlesOesRenderer {
         })
         .ok();
 
+        // Subtitle program + persistent texture (optional like the rest).
+        let subtitle = (|| -> Result<SubtitleGl, String> {
+            let vs = compile_shader(gl, glow::VERTEX_SHADER, VS_SUB_SRC)?;
+            let fs = compile_shader(gl, glow::FRAGMENT_SHADER, FS_SUB_SRC)?;
+            let program = link_program(gl, vs, fs)?;
+            gl.delete_shader(vs);
+            gl.delete_shader(fs);
+            gl.use_program(Some(program));
+            if let Some(loc) = gl.get_uniform_location(program, "u_texture") {
+                gl.uniform_1_i32(Some(&loc), 1); // unit 1: unit 0 carries the OES binding
+            }
+            let rect_loc = gl.get_uniform_location(program, "u_rect");
+            gl.use_program(None);
+            let texture = gl.create_texture().map_err(|e| e.to_string())?;
+            gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+            gl.bind_texture(glow::TEXTURE_2D, None);
+            Ok(SubtitleGl {
+                program,
+                rect_loc,
+                texture,
+                uploaded_generation: std::sync::atomic::AtomicU64::new(0),
+            })
+        })()
+        .map_err(|e| log::warn!("[gles_oes] subtitle program unavailable: {}", e))
+        .ok();
+
         Ok(GlesOesRenderer {
             program,
             vao,
@@ -894,6 +966,7 @@ impl GlesOesRenderer {
             hdr,
             hdr_detect,
             sdr_to_pq,
+            subtitle,
             fn_get_native_client_buffer: fn_get_client,
             fn_egl_create_image: fn_create,
             fn_egl_destroy_image: fn_destroy,
@@ -962,6 +1035,7 @@ impl GlesOesRenderer {
         tex_y_max: f32,
         desired_present_ns: i64,     // CLOCK_MONOTONIC ns for this frame; 0 = unconstrained
         mode: OesRenderMode,
+        subtitle: Option<std::sync::Arc<crate::renderers::subtitle::SubtitleBitmap>>,
     ) -> Result<(), String> {
         let get_client: FnEglGetNativeClientBufferANDROID =
             std::mem::transmute(self.fn_get_native_client_buffer);
@@ -971,36 +1045,45 @@ impl GlesOesRenderer {
             std::mem::transmute(self.fn_gl_egl_image_target_texture);
         let display = self.egl_display as *mut c_void;
 
-        // Step 1: AHardwareBuffer* → EGLClientBuffer
-        // eglCreateImageKHR with EGL_NATIVE_BUFFER_ANDROID expects an EGLClientBuffer,
-        // NOT a raw AHardwareBuffer*. eglGetNativeClientBufferANDROID does the conversion.
-        let _ = eglGetError(); // clear any pending error
-        let client_buffer = get_client(ahb_ptr as *const c_void);
-        if client_buffer.is_null() {
-            return Err(format!(
-                "eglGetNativeClientBufferANDROID returned null (ahb={:?}, eglErr={:#x})",
-                ahb_ptr,
-                eglGetError()
-            ));
-        }
+        // ahb_ptr == 0 → overlay-only present (direct mode): no video
+        // import/draw on this surface, transparent clear + subtitle quad.
+        let overlay_only = ahb_ptr.is_null();
 
-        // Step 2: EGLClientBuffer → EGLImageKHR (GPU-side zero-copy import)
-        let _ = eglGetError(); // clear
-        let egl_image = egl_create(
-            display,
-            std::ptr::null_mut(), // EGL_NO_CONTEXT
-            EGL_NATIVE_BUFFER_ANDROID,
-            client_buffer,
-            std::ptr::null(), // no extra attributes
-        );
-        let egl_err = eglGetError();
-        if egl_image.is_null() {
-            return Err(format!(
-                "eglCreateImageKHR returned EGL_NO_IMAGE_KHR (eglErr={:#x})",
-                egl_err
-            ));
-        }
-        log::debug!("[gles_oes] EGLImage={:?}", egl_image);
+        let egl_image = if overlay_only {
+            std::ptr::null_mut()
+        } else {
+            // Step 1: AHardwareBuffer* → EGLClientBuffer
+            // eglCreateImageKHR with EGL_NATIVE_BUFFER_ANDROID expects an EGLClientBuffer,
+            // NOT a raw AHardwareBuffer*. eglGetNativeClientBufferANDROID does the conversion.
+            let _ = eglGetError(); // clear any pending error
+            let client_buffer = get_client(ahb_ptr as *const c_void);
+            if client_buffer.is_null() {
+                return Err(format!(
+                    "eglGetNativeClientBufferANDROID returned null (ahb={:?}, eglErr={:#x})",
+                    ahb_ptr,
+                    eglGetError()
+                ));
+            }
+
+            // Step 2: EGLClientBuffer → EGLImageKHR (GPU-side zero-copy import)
+            let _ = eglGetError(); // clear
+            let egl_image = egl_create(
+                display,
+                std::ptr::null_mut(), // EGL_NO_CONTEXT
+                EGL_NATIVE_BUFFER_ANDROID,
+                client_buffer,
+                std::ptr::null(), // no extra attributes
+            );
+            let egl_err = eglGetError();
+            if egl_image.is_null() {
+                return Err(format!(
+                    "eglCreateImageKHR returned EGL_NO_IMAGE_KHR (eglErr={:#x})",
+                    egl_err
+                ));
+            }
+            log::debug!("[gles_oes] EGLImage={:?}", egl_image);
+            egl_image
+        };
 
         // Step 3: draw OES texture directly to FBO 0 (window surface).
         // DRAW_FRAMEBUFFER is already bound to 0 by wgpu's present() before the hook fires.
@@ -1013,9 +1096,21 @@ impl GlesOesRenderer {
         gl.disable(glow::BLEND);
         gl.disable(glow::SCISSOR_TEST);
 
-        // Clear to black first so letterbox bars around the video are black.
-        gl.clear_color(0.0, 0.0, 0.0, 1.0);
+        // Clear first: black behind video (letterbox bars), TRANSPARENT for
+        // an overlay-only present (direct mode — the video plane below this
+        // surface must show through; the host window is TRANSLUCENT).
+        if overlay_only {
+            gl.clear_color(0.0, 0.0, 0.0, 0.0);
+        } else {
+            gl.clear_color(0.0, 0.0, 0.0, 1.0);
+        }
         gl.clear(glow::COLOR_BUFFER_BIT);
+
+        if overlay_only {
+            gl.viewport(0, 0, viewport_width, viewport_height);
+            self.draw_subtitle(gl, subtitle.as_deref(), viewport_width, viewport_height);
+            return Ok(());
+        }
 
         // Attach the EGL image to the OES texture and draw the fullscreen quad.
         gl.active_texture(glow::TEXTURE0);
@@ -1137,6 +1232,10 @@ impl GlesOesRenderer {
             log::warn!("[gles_oes] GL error after draw_arrays: {:#x}", gl_err);
         }
 
+        // Subtitle quad over the video (non-direct GLES path; in direct
+        // mode the overlay-only branch above handles it).
+        self.draw_subtitle(gl, subtitle.as_deref(), viewport_width, viewport_height);
+
         // Static HDR metadata, once per surface, on the first passthrough
         // frame — the MTK HWC composites PQ layers into an SDR output
         // unless the buffer carries mastering metadata.
@@ -1167,6 +1266,61 @@ impl GlesOesRenderer {
         egl_destroy(display, egl_image);
 
         Ok(())
+    }
+
+    /// Draw the rasterized cue bottom-center with alpha blending. The
+    /// bitmap is uploaded into the persistent GL texture only when its
+    /// generation changes (texts persist across many frames).
+    unsafe fn draw_subtitle(
+        &self,
+        gl: &glow::Context,
+        bitmap: Option<&crate::renderers::subtitle::SubtitleBitmap>,
+        viewport_width: i32,
+        viewport_height: i32,
+    ) {
+        let (Some(bmp), Some(sub)) = (bitmap, &self.subtitle) else {
+            return;
+        };
+        if bmp.width == 0 || bmp.height == 0 || viewport_width <= 0 || viewport_height <= 0 {
+            return;
+        }
+        gl.active_texture(glow::TEXTURE1);
+        gl.bind_texture(glow::TEXTURE_2D, Some(sub.texture));
+        if sub
+            .uploaded_generation
+            .swap(bmp.generation, std::sync::atomic::Ordering::Relaxed)
+            != bmp.generation
+        {
+            gl.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                glow::RGBA as i32,
+                bmp.width as i32,
+                bmp.height as i32,
+                0,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(Some(&bmp.rgba)),
+            );
+        }
+
+        gl.enable(glow::BLEND);
+        gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
+        gl.use_program(Some(sub.program));
+        // Bottom-center with a 7% safe area — mirrors SubtitleOverlay::draw_into.
+        let half_w = bmp.width as f32 / viewport_width as f32;
+        let half_h = bmp.height as f32 / viewport_height as f32;
+        let center_y = -1.0 + half_h + 0.14; // 7% of full height in NDC
+        if let Some(ref loc) = sub.rect_loc {
+            gl.uniform_4_f32(Some(loc), 0.0, center_y, half_w, half_h);
+        }
+        gl.bind_vertex_array(Some(self.vao));
+        gl.draw_arrays(glow::TRIANGLES, 0, 6);
+        gl.bind_vertex_array(None);
+        gl.use_program(None);
+        gl.disable(glow::BLEND);
+        gl.bind_texture(glow::TEXTURE_2D, None);
+        gl.active_texture(glow::TEXTURE0);
     }
 }
 

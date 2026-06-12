@@ -191,6 +191,31 @@ pub async fn run_test_playback(mut player: Player) {
         audio_repr.codecs, audio_repr.bandwidth
     );
 
+    // Subtitles: pick the first text track when the manifest has one and a
+    // font is available. Android always has Roboto; desktop honours
+    // RUST_PLAYER_FONT. Opt out by deleting the track from the manifest —
+    // this is a smoke-test shell, visibility beats configurability.
+    if let Some(text_repr) = tracks
+        .text
+        .first()
+        .and_then(|a| a.representations.first())
+    {
+        let font_path = std::env::var("RUST_PLAYER_FONT").ok();
+        #[cfg(target_os = "android")]
+        let font_path = font_path.or(Some("/system/fonts/Roboto-Regular.ttf".to_string()));
+        match font_path.map(std::fs::read) {
+            Some(Ok(bytes)) => match player.set_subtitle_font(bytes) {
+                Ok(()) => {
+                    player.set_subtitle_track(text_repr);
+                    log::info!("selected subtitle track {}", text_repr.id);
+                }
+                Err(e) => log::warn!("subtitle font rejected: {}", e),
+            },
+            Some(Err(e)) => log::warn!("subtitle font unreadable: {}", e),
+            None => log::info!("subtitle track present but no font configured — skipping"),
+        }
+    }
+
     // Re-spawn the play() task on natural exit so the stream loops
     // continuously — useful for soak testing the pipeline.
     let player_for_loop = player.clone();

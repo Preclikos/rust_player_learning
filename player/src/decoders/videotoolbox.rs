@@ -90,6 +90,10 @@ const K_CF_NUMBER_SINT32_TYPE: CFIndex = 3;
 // VTDecompressionSession yields by default with the matching key in the
 // destination image buffer dict.
 const K_CV_PIXEL_FORMAT_TYPE_420_YPCBCR8_BIPLANAR_VIDEO_RANGE: i32 = 0x34323076;
+// kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange = 'x420'. P010-style
+// layout: 10-bit codes in the high bits of 16-bit containers, biplanar
+// Y + interleaved CbCr — exactly what shader_hdr.wgsl expects.
+const K_CV_PIXEL_FORMAT_TYPE_420_YPCBCR10_BIPLANAR_VIDEO_RANGE: i32 = 0x78343230;
 
 #[link(name = "CoreFoundation", kind = "framework")]
 #[link(name = "CoreMedia", kind = "framework")]
@@ -305,47 +309,53 @@ impl HwVideoDecoder for VideoToolboxDecoder {
         self.format_desc = format_desc;
 
         // Destination image buffer attributes:
-        //   PixelFormatType = NV12 (420v, video range)
+        //   PixelFormatType = NV12 (420v) for SDR, or the P010-layout
+        //   10-bit biplanar format ('x420') for PQ/HLG streams so the
+        //   renderer's own tonemap (shader_hdr.wgsl) gets the full-depth
+        //   PQ signal instead of VideoToolbox's internal conversion.
         //   MetalCompatibility = true (request IOSurface usable from Metal)
         //   IOSurfaceProperties = empty dict (signals "use IOSurface backing")
-        let dest_attrs = unsafe {
-            let d = CFDictionaryCreateMutable(
-                ptr::null(),
-                3,
-                &kCFTypeDictionaryKeyCallBacks as *const _ as *const c_void,
-                &kCFTypeDictionaryValueCallBacks as *const _ as *const c_void,
-            );
+        // Builds the dict for one pixel format; called again for the 8-bit
+        // fallback if the 10-bit session is refused.
+        let make_dest_attrs = |fmt: i32| -> CFDictionaryRef {
+            unsafe {
+                let d = CFDictionaryCreateMutable(
+                    ptr::null(),
+                    3,
+                    &kCFTypeDictionaryKeyCallBacks as *const _ as *const c_void,
+                    &kCFTypeDictionaryValueCallBacks as *const _ as *const c_void,
+                );
 
-            let fmt: i32 = K_CV_PIXEL_FORMAT_TYPE_420_YPCBCR8_BIPLANAR_VIDEO_RANGE;
-            let fmt_num = CFNumberCreate(
-                ptr::null(),
-                K_CF_NUMBER_SINT32_TYPE,
-                &fmt as *const _ as *const c_void,
-            );
-            CFDictionaryAddValue(d, kCVPixelBufferPixelFormatTypeKey as CFTypeRef, fmt_num);
-            CFRelease(fmt_num);
+                let fmt_num = CFNumberCreate(
+                    ptr::null(),
+                    K_CF_NUMBER_SINT32_TYPE,
+                    &fmt as *const _ as *const c_void,
+                );
+                CFDictionaryAddValue(d, kCVPixelBufferPixelFormatTypeKey as CFTypeRef, fmt_num);
+                CFRelease(fmt_num);
 
-            CFDictionaryAddValue(
-                d,
-                kCVPixelBufferMetalCompatibilityKey as CFTypeRef,
-                kCFBooleanTrue as CFTypeRef,
-            );
+                CFDictionaryAddValue(
+                    d,
+                    kCVPixelBufferMetalCompatibilityKey as CFTypeRef,
+                    kCFBooleanTrue as CFTypeRef,
+                );
 
-            // Empty IOSurface properties dict — its mere presence is the signal.
-            let io_props = CFDictionaryCreateMutable(
-                ptr::null(),
-                0,
-                &kCFTypeDictionaryKeyCallBacks as *const _ as *const c_void,
-                &kCFTypeDictionaryValueCallBacks as *const _ as *const c_void,
-            );
-            CFDictionaryAddValue(
-                d,
-                kCVPixelBufferIOSurfacePropertiesKey as CFTypeRef,
-                io_props as CFTypeRef,
-            );
-            CFRelease(io_props as CFTypeRef);
+                // Empty IOSurface properties dict — its mere presence is the signal.
+                let io_props = CFDictionaryCreateMutable(
+                    ptr::null(),
+                    0,
+                    &kCFTypeDictionaryKeyCallBacks as *const _ as *const c_void,
+                    &kCFTypeDictionaryValueCallBacks as *const _ as *const c_void,
+                );
+                CFDictionaryAddValue(
+                    d,
+                    kCVPixelBufferIOSurfacePropertiesKey as CFTypeRef,
+                    io_props as CFTypeRef,
+                );
+                CFRelease(io_props as CFTypeRef);
 
-            d as CFDictionaryRef
+                d as CFDictionaryRef
+            }
         };
 
         // Output callback: refcon = Arc<SharedState> pointer. We keep our
@@ -358,20 +368,46 @@ impl HwVideoDecoder for VideoToolboxDecoder {
             decompression_output_refcon: refcon,
         };
 
+        // HDR (PQ/HLG) wants the 10-bit surface so the wgpu tonemap path
+        // runs; everything else (incl. rare 10-bit SDR, which must NOT hit
+        // the HDR shader) decodes to 8-bit NV12 exactly as before.
+        let mut formats: Vec<i32> = Vec::with_capacity(2);
+        if params.color.is_hdr() {
+            formats.push(K_CV_PIXEL_FORMAT_TYPE_420_YPCBCR10_BIPLANAR_VIDEO_RANGE);
+        }
+        formats.push(K_CV_PIXEL_FORMAT_TYPE_420_YPCBCR8_BIPLANAR_VIDEO_RANGE);
+
         let mut session: VTDecompressionSessionRef = ptr::null_mut();
-        let st = unsafe {
-            VTDecompressionSessionCreate(
-                ptr::null(),
-                self.format_desc,
-                ptr::null(),
-                dest_attrs,
-                &cb_record,
-                &mut session,
-            )
-        };
-        unsafe { CFRelease(dest_attrs) };
-        if st != 0 || session.is_null() {
-            return Err(format!("VTDecompressionSessionCreate: {}", st).into());
+        let mut last_status: OSStatus = 0;
+        for (i, fmt) in formats.iter().enumerate() {
+            let dest_attrs = make_dest_attrs(*fmt);
+            let st = unsafe {
+                VTDecompressionSessionCreate(
+                    ptr::null(),
+                    self.format_desc,
+                    ptr::null(),
+                    dest_attrs,
+                    &cb_record,
+                    &mut session,
+                )
+            };
+            unsafe { CFRelease(dest_attrs) };
+            last_status = st;
+            if st == 0 && !session.is_null() {
+                if i > 0 && params.color.is_hdr() {
+                    log::warn!(
+                        "VideoToolbox: 10-bit destination refused — falling back to \
+                         8-bit NV12 (VT-internal HDR conversion)"
+                    );
+                } else if params.color.is_hdr() {
+                    log::info!("VideoToolbox: 10-bit P010 destination (player tonemap)");
+                }
+                break;
+            }
+            session = ptr::null_mut();
+        }
+        if session.is_null() {
+            return Err(format!("VTDecompressionSessionCreate: {}", last_status).into());
         }
         self.session = session;
         self.color = params.color;

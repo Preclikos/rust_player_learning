@@ -463,6 +463,12 @@ impl VideoRenderer {
                 | wgpu::Features::TEXTURE_FORMAT_P010
                 | wgpu::Features::TEXTURE_FORMAT_16BIT_NORM;
             adapter.features() & desired
+        } else if backend == wgpu::Backend::Metal {
+            // Metal imports CVPixelBuffer planes as separate textures, so it
+            // needs neither NV12 nor P010 — but the 10-bit ('x420') planes
+            // are R16Unorm/Rg16Unorm, which wgpu gates behind
+            // TEXTURE_FORMAT_16BIT_NORM (Metal hardware always has it).
+            adapter.features() & wgpu::Features::TEXTURE_FORMAT_16BIT_NORM
         } else {
             wgpu::Features::empty()
         };
@@ -1482,16 +1488,48 @@ impl VideoRenderer {
         let y_plane_view = metal_frame.y_texture.create_view(&Default::default());
         let uv_plane_view = metal_frame.uv_texture.create_view(&Default::default());
 
+        // 16-bit planes = a 10-bit P010-layout CVPixelBuffer ('x420') from
+        // VideoToolbox — PQ signal that goes through the HDR tonemap
+        // pipeline + detection passes, mirroring the desktop P010 path.
+        // 8-bit planes stay on the SDR pipeline (incl. HDR content VT
+        // already converted internally when the 10-bit destination was
+        // refused).
+        let is_hdr = metal_frame.y_texture.format() == TextureFormat::R16Unorm;
+        let (frame_w, frame_h) = (
+            metal_frame.y_texture.width(),
+            metal_frame.y_texture.height(),
+        );
+        let (uv_w, uv_h) = (frame_w.div_ceil(2), frame_h.div_ceil(2));
+        let (wg_x, wg_y) = (uv_w.div_ceil(16), uv_h.div_ceil(16));
+
         let layout = self.texture_bind_group_layout.as_ref().expect("no bind group layout");
-        // Apple Metal renders SDR-only (VideoToolbox tonemaps HDR internally
-        // before handing us NV12), but the shared layout still includes the
-        // tonemap uniform binding so the bind group has the same shape as
-        // Win/Linux. The SDR shader doesn't reference binding 3 — the
-        // uniform sits there unused. No per-frame write needed.
+        // The shared layout includes the tonemap uniform binding so the
+        // bind group has the same shape as Win/Linux. The SDR shader
+        // doesn't reference binding 3; for HDR frames the uniform is
+        // written per frame exactly like the desktop p010_render.
         let tonemap_uniform = self
             .hdr_tonemap_uniform
             .as_ref()
             .expect("no HDR tonemap uniform");
+        if is_hdr {
+            let params = **self.hdr_tonemap_params.load();
+            let peak_seed = if params.peak > 0.0 { params.peak } else { 100.0 };
+            self.queue.write_buffer(
+                tonemap_uniform,
+                0,
+                bytemuck::cast_slice(&[
+                    params.tone_param,
+                    params.desat,
+                    peak_seed,
+                    params.scene_threshold,
+                ]),
+            );
+            self.queue.write_buffer(
+                tonemap_uniform,
+                16,
+                bytemuck::cast_slice(&[wg_x * wg_y, frame_w, frame_h, 0u32]),
+            );
+        }
         let texture_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             layout,
             entries: &[
@@ -1515,10 +1553,47 @@ impl VideoRenderer {
             label: Some("metal_nv12_bind_group"),
         });
 
+        // HDR-only: per-frame bind group for the detection compute passes
+        // (same layout/dispatch as the desktop p010_render).
+        let detect_bind_group = if is_hdr && frame_w > 0 && frame_h > 0 {
+            self.hdr_detect.as_ref().map(|det| {
+                self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    layout: &det.compute_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(&y_plane_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(&uv_plane_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: tonemap_uniform.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: det.buffer.as_entire_binding(),
+                        },
+                    ],
+                    label: Some("hdr_detect_bind_group (metal)"),
+                })
+            })
+        } else {
+            None
+        };
+
         let surface = self.surface.lock().await;
         let vb_arc = self.vertex_buffer.as_ref().expect("no vertex buffer");
         let vertex_buffer = vb_arc.read().await;
-        let render_pipeline = self.render_pipeline.as_ref().expect("no render pipeline");
+        let render_pipeline = if is_hdr {
+            self.render_pipeline_hdr
+                .as_ref()
+                .expect("no HDR render pipeline")
+        } else {
+            self.render_pipeline.as_ref().expect("no render pipeline")
+        };
 
         let surface_texture = match surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t) => t,
@@ -1547,6 +1622,24 @@ impl VideoRenderer {
         };
 
         let mut encoder = self.device.create_command_encoder(&Default::default());
+
+        // Frame peak/average detection — HDR frames only, publish first so
+        // this draw maps with previous-frames statistics (see p010_render).
+        if let Some(detect_group) = detect_bind_group.as_ref() {
+            let det = self
+                .hdr_detect
+                .as_ref()
+                .expect("detect bind group exists without resources");
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+            cpass.set_pipeline(&det.publish);
+            cpass.set_bind_group(0, detect_group, &[]);
+            cpass.dispatch_workgroups(1, 1, 1);
+            cpass.set_pipeline(&det.accumulate);
+            cpass.dispatch_workgroups(wg_x, wg_y, 1);
+            cpass.set_pipeline(&det.finalize);
+            cpass.dispatch_workgroups(1, 1, 1);
+        }
+
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
@@ -1567,6 +1660,13 @@ impl VideoRenderer {
 
             render_pass.set_pipeline(render_pipeline);
             render_pass.set_bind_group(0, &texture_bind_group, &[]);
+            // The HDR pipeline's group 1 = detection result (read-only
+            // storage). The SDR pipeline has no group 1.
+            if is_hdr {
+                if let Some(det) = self.hdr_detect.as_ref() {
+                    render_pass.set_bind_group(1, &det.frag_bind_group, &[]);
+                }
+            }
             render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
             render_pass.draw(0..6, 0..1);
 

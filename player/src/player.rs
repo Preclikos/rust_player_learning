@@ -987,30 +987,110 @@ async fn video_decoder_task(
     let reorder_depth: usize = if decoder.is_direct() { 2 } else { 4 };
     let mut reorder_buf: Vec<DecodedVideoFrame> = Vec::with_capacity(reorder_depth + 1);
 
-    while let Some(segment) = receiver.recv().await {
+    // Segment preparation (init concat + CENC decrypt + mp4 parse) runs on
+    // a BLOCKING thread, overlapped with feeding the previous segment.
+    // Software AES on 32-bit devices costs ~0.5 s per 4K segment — done
+    // inline (the old shape) that was a guaranteed codec starvation +
+    // LATE drain at every segment boundary; overlapped it disappears into
+    // the ~6 s feed window of the segment before it.
+    struct PreparedSegment {
+        id: usize,
+        data_vec: Vec<u8>,
+        sample_info: Vec<(usize, usize, i64, u64)>,
+    }
+    let init_data = Arc::new(init_data);
+    let prepare = {
+        let init_data = Arc::clone(&init_data);
+        let crypto = track_crypto.clone();
+        move |segment: DataSegment| {
+            let init_data = Arc::clone(&init_data);
+            let crypto = crypto.clone();
+            tokio::task::spawn_blocking(
+                move || -> Result<PreparedSegment, Box<dyn Error + Send + Sync>> {
+                    let mut data_vec =
+                        Vec::with_capacity(init_data.len() + segment.data.len());
+                    data_vec.extend_from_slice(&init_data);
+                    data_vec.extend_from_slice(&segment.data[..]);
+                    decrypt_segment_in_place(&mut data_vec, crypto.as_ref())?;
+                    let sample_info: Vec<(usize, usize, i64, u64)> = {
+                        let mp4 = Mp4::read_bytes(&data_vec).map_err(
+                            |e| -> Box<dyn Error + Send + Sync> { format!("mp4: {}", e).into() },
+                        )?;
+                        let (_id, track) = mp4.tracks().first_key_value().ok_or_else(
+                            || -> Box<dyn Error + Send + Sync> { "no track".into() },
+                        )?;
+                        track
+                            .samples
+                            .iter()
+                            .map(|s| {
+                                (
+                                    s.offset as usize,
+                                    s.size as usize,
+                                    s.composition_timestamp,
+                                    s.timescale,
+                                )
+                            })
+                            .collect()
+                    };
+                    Ok(PreparedSegment {
+                        id: segment.id,
+                        data_vec,
+                        sample_info,
+                    })
+                },
+            )
+        }
+    };
+
+    let mut pending_prepare: Option<
+        tokio::task::JoinHandle<Result<PreparedSegment, Box<dyn Error + Send + Sync>>>,
+    > = None;
+    loop {
+        let boundary_t0 = Instant::now();
+        let prepared = match pending_prepare.take() {
+            // Steady state: the next segment was prepared while the
+            // previous one fed — this await is ~0.
+            Some(handle) => handle
+                .await
+                .map_err(|e| -> Box<dyn Error + Send + Sync> {
+                    format!("prepare task: {}", e).into()
+                })??,
+            // Startup / buffer-dry case: wait for a download, prepare it
+            // (nothing to overlap with).
+            None => {
+                let Some(segment) = receiver.recv().await else {
+                    break;
+                };
+                if stop_flag.load(Ordering::Relaxed) {
+                    log::debug!("[dec] stop signal received between segments; aborting drain");
+                    break;
+                }
+                prepare(segment)
+                    .await
+                    .map_err(|e| -> Box<dyn Error + Send + Sync> {
+                        format!("prepare task: {}", e).into()
+                    })??
+            }
+        };
         if stop_flag.load(Ordering::Relaxed) {
-            log::debug!("[dec] stop signal received between segments; aborting drain");
             break;
         }
-        log::debug!("[dec] consuming video segment: {}", segment.id);
-
-        let mut data_vec = init_data.clone();
-        data_vec.extend_from_slice(&segment.data[..]);
-        decrypt_segment_in_place(&mut data_vec, track_crypto.as_ref())?;
-
-        let sample_info: Vec<(usize, usize, i64, u64)> = {
-            let mp4 = Mp4::read_bytes(&data_vec)
-                .map_err(|e| -> Box<dyn Error + Send + Sync> { format!("mp4: {}", e).into() })?;
-            let (_id, track) = mp4
-                .tracks()
-                .first_key_value()
-                .ok_or_else(|| -> Box<dyn Error + Send + Sync> { "no track".into() })?;
-            track
-                .samples
-                .iter()
-                .map(|s| (s.offset as usize, s.size as usize, s.composition_timestamp, s.timescale))
-                .collect()
-        };
+        // Kick off the NEXT segment's preparation before feeding this one
+        // — downloads run ~4 segments ahead, so it's normally buffered.
+        if let Ok(next) = receiver.try_recv() {
+            pending_prepare = Some(prepare(next));
+        }
+        let boundary_ms = boundary_t0.elapsed().as_millis();
+        if boundary_ms > 50 {
+            log::info!(
+                "[dec] segment {} boundary stall {}ms ({} samples, {} KiB)",
+                prepared.id, boundary_ms,
+                prepared.sample_info.len(), prepared.data_vec.len() / 1024
+            );
+        }
+        log::debug!("[dec] consuming video segment: {}", prepared.id);
+        let data_vec = prepared.data_vec;
+        let sample_info = prepared.sample_info;
 
         let mut first_pts_us: Option<i64> = None;
         let mut last_pts_us: i64 = 0;

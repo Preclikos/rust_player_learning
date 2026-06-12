@@ -4,6 +4,13 @@ How the player converts HDR10 content into something a regular SDR display
 can show, what the host UI can tune, and **what changed for UI integrations**
 in the tonemap_opencl rework.
 
+> **Scope note:** this document covers the in-player tonemap — the path
+> used when the DISPLAY can't take HDR. On Android the production path
+> for HDR-capable displays is **direct mode** (`set_video_output_window`),
+> where the decoder renders to a hardware video plane and the OS/display
+> pipeline owns HDR10/HDR10+/Dolby Vision end-to-end — no tonemap, and
+> none of the knobs below apply. See `PLAYER_INTEGRATION.md` §3.2/§8.
+
 ## ⚠ Breaking change for host UIs (tonemap_opencl rework)
 
 The tonemap was replaced wholesale. The old ACES pipeline and its two knobs
@@ -75,16 +82,36 @@ paths. It now does an exact limited-range BT.709 decode.
 
 ## Where this works
 
-| Platform        | Tunable? | Why                                                |
-|-----------------|----------|----------------------------------------------------|
-| Windows         | ✅       | Player's own shader runs the tonemap (DX12 P010)   |
-| Linux           | ✅       | Same (Vulkan VAAPI P010)                           |
-| macOS / iOS     | ❌       | VideoToolbox tonemaps internally before our shader |
-| Android         | ❌       | No HDR path wired yet                              |
+| Platform        | Tunable? | How the tonemap runs                                   |
+|-----------------|----------|--------------------------------------------------------|
+| Windows         | ✅       | wgpu shader (DX12, P010 import) + compute detection    |
+| Linux           | ✅       | Same (Vulkan, VAAPI P010 import)                       |
+| macOS / iOS     | ✅       | Same shader — VideoToolbox decodes to a 10-bit `x420` destination imported as R16/RG16 Metal planes. Falls back to VT's internal 8-bit conversion (then NOT tunable) if the 10-bit destination is refused. |
+| Android (GL path) | ✅     | GLSL ES port of the same math in the OES present hook; scene detection via a GL reduction pass + PBO readback (no compute in ES 3.0) |
+| Android (direct mode) | n/a | No tonemap — the display pipeline owns HDR. |
 
 Check `PlayerCapabilities::hdr_tonemap_tunable` at startup and **hide the
 settings UI entirely** when it's `false`. The API still accepts the call
 (no-op) so cross-platform host code doesn't need cfg gates.
+
+### Android GL-path specifics
+
+- Colorimetry comes from the **SPS VUI** (the MPD routinely mis-signals
+  BT.709 on PQ representations), parsed per representation and stamped
+  on every frame — ABR SDR↔HDR swaps switch shaders on exactly the
+  right frame.
+- The OES sampler already applies the Y'CbCr matrix for the buffer's
+  dataspace, so the GLES shader starts at the PQ-EOTF step.
+- Scene peak/average detection mirrors the desktop semantics (max over
+  block MEANS, 63-frame window, scene-change reset) but runs as a
+  fragment-shader reduction into an 80×45 grid read back through
+  double-buffered PBOs (2-frame latency, never stalls the pipeline).
+- Peak priority when detection has no window yet: explicit
+  `set_hdr_tonemap` peak > per-frame bitstream metadata (HDR10+
+  ST 2094-40 maxscl, static MaxCLL/mastering SEI — parsed on Android) >
+  1000-nit default.
+- HLG transfer is detected but still renders through the SDR program
+  (same hardcoded-PQ limitation as the desktop shader).
 
 ## The parameters
 
@@ -167,10 +194,13 @@ Intentional, visually irrelevant differences from `tonemap_opencl`:
 - The filter bakes its colour matrices into the kernel at 4 decimal places
   (`%.4f`); the shaders use the same matrices at full precision (≤ 5×10⁻⁵
   per coefficient apart).
-- Mastering-display/MaxCLL metadata is not parsed, so the first frame
-  seeds with the untagged-PQ peak (100) even when the stream carries
-  metadata — the filter would seed with the tagged value. The detection
-  replaces the seed from frame 2 onward either way.
+- On desktop/Apple, mastering-display/MaxCLL metadata is not consulted —
+  the first frame seeds with the untagged-PQ peak (100) and the
+  detection replaces the seed from frame 2 onward. On Android the SEI
+  metadata IS parsed (it also feeds direct-mode passthrough) and seeds
+  the GLES tonemap until its detection window fills.
 - Detection statistics roll one frame later than the filter's (which
   folds detection into the tonemap kernel itself); the published values
-  cover "previous frames only" in both cases.
+  cover "previous frames only" in both cases. The Android GL reduction
+  adds one more frame of latency (PBO readback) — still "previous
+  frames only", just two of them.

@@ -1,722 +1,304 @@
-# Player Integration Spec — request for `rust_player_learning`
+# Player Integration Reference
 
-> **Audience:** AI / engineer working on `rust_player_learning`.
-> **Author:** BlackZone Console client team.
-> **Status:** request — please review, comment, and implement.
-
-This document describes what the `player` crate needs to expose so that a
-real‑world streaming client (BlackZone Console — a Rust TUI) can drive it.
-Everything below is additive: existing tests and the `app/` desktop binary
-must keep working unchanged.
-
-> ### ⚠ Important — provider‑agnostic only
+> **Audience:** engineers embedding the `player` crate into a host
+> application (TUI remote-control shells, Android/iOS apps, TV boxes).
+> **Status:** describes the **implemented** API surface. The original
+> request spec this file grew from has been fully delivered; sections
+> below document behaviour as it exists in code today.
 >
-> **Nothing in this document asks you to add provider‑specific code to
-> the `player` crate.** No BlackZone strings, hostnames, URL patterns,
-> license body formats, header names, regex, or business logic should
-> appear in the player. The player should only expose generic
-> primitives (interceptor trait, license resolver trait, event stream,
-> IPC binary). All BlackZone‑specific behaviour (URL rewrites, bearer
-> tokens, license POST body shape, etc.) is implemented in a **separate
-> downstream crate** that consumes the player. References to BlackZone
-> below appear only to explain why these generic primitives are shaped
-> the way they are — they are **consumer context, not implementation
-> tasks**.
+> Provider-agnostic rule still applies: the player exposes only generic
+> primitives (interceptor, license resolver, event stream, sinks).
+> All provider-specific behaviour (URL rewrites, auth headers, license
+> body shapes) lives in downstream consumer crates.
 
 ---
 
-## 1. Context
+## 1. Big picture
 
-**Consumer:** `BlackZoneConsole` — cross‑platform Rust TUI (Windows / Linux /
-macOS) using `ratatui`. It already authenticates via Keycloak, browses the
-catalogue, and obtains a DASH manifest URL from
-`GET https://api.blackzone.site/api/manifest/{type}/{id}`. Playback is
-currently stubbed.
+```
+host app
+  │  open_url / prepare / tracks / play / seek / events()
+  ▼
+Player<VideoSink, AudioSink>          one tokio runtime, host-provided
+  │            │
+  │            ├── download tasks (HttpClient + RequestInterceptor)
+  │            ├── CENC ClearKey (set_clearkey / LicenseResolver)
+  │            ├── per-platform HW decoder (HwVideoDecoder)
+  │            └── A/V sync loops (wall clock + audio device clock)
+  ▼
+VideoRenderer / AudioRenderer         platform render + output paths
+```
 
-**What's missing in `player` for us to wire it up:**
+Key properties:
 
-1. We can't add `Authorization: Bearer <token>` to outgoing requests.
-2. DASH segment URLs in the manifest use a pseudo‑URI form
-   `<storageId>:<slug>` that must be resolved at request time via
-   `GET /api/Link/{storageId}/{slug}` → `{validUntil, link}`, with the
-   resolved link cached until `validUntil`. (Android does this via
-   ExoPlayer's `ResolvingDataSource`.)
-3. The stream is ClearKey‑encrypted with keys served from
-   `POST /api/licence`. `set_clearkey(HashMap)` requires keys upfront —
-   we need a callback fired when a new KID is encountered.
-4. The TUI needs an event stream (state, position, buffer, bitrate, frame
-   stats). Today only `position()` polling is exposed.
+- **One `Player` per playback surface.** `Player` is `Clone` (cheap —
+  shared `Arc` state); clones control the same playback.
+- **The host owns windows/surfaces and the process model.** The player
+  never creates windows.
+- **Everything is event-driven**: subscribe via
+  `player.events() -> broadcast::Receiver<PlayerEvent>` (64-deep ring,
+  laggy subscribers get `Lagged` and continue from newest).
 
-**Architecturally we'd like player to run in a separate process** (winit
-window) talking to the TUI over stdio, so neither side can crash the
-other. See §6.
+## 2. Lifecycle
 
----
+```rust
+let player = /* platform constructor, see §3 */;
 
-## 2. Goals (priority order)
+player.set_request_interceptor(my_interceptor);   // optional
+player.set_clearkey(kid_to_key_hex_map)?;          // and/or set_license_resolver
+player.open_url(manifest_url).await?;              // MPD fetch + parse
+player.prepare().await?;                           // init segments, codec probing
+let tracks = player.get_tracks()?;
+player.set_video_track(&adaptation, &representation);
+player.set_audio_track(&adaptation, &representation);
+player.set_subtitle_font(font_bytes)?;             // optional, enables subtitles
+player.set_subtitle_track(&text_representation);   // optional
+let handle = player.play()?;                       // spawns the pipeline
+// ... events drive the UI; seek()/pause()/resume()/stop() any time
+```
 
-| Pri | Item | Section |
+`play()` returns a `JoinHandle` that completes when playback truly ends
+(EndOfStream, stop, or exhausted error retries). Internally, `seek()`
+and track changes restart the pipeline without the handle completing.
+
+### Resume semantics (important for retry UX)
+
+When the video pipeline fails mid-stream (network death, decoder
+fault), the player **retries internally from the current position**
+(3 attempts with 1/2/3 s backoff; the budget refills after >10 s of
+successful playback). The consumer sees `Buffering { Stall }` during
+recovery. Only after exhausting the budget does it emit
+`Error { kind: Decoder, .. }` and end playback — **parking the playback
+position**. The next `play()` call resumes from that parked position
+(priority: explicit `seek()` target > parked resume > start of
+content). A consumer "Retry" button is therefore just `play()`.
+
+## 3. Platform embedding
+
+### 3.1 Desktop (Windows / Linux / macOS) — raw window handle
+
+```rust
+let player = Player::new_from_raw_handle(raw_window_handle, raw_display_handle, w, h);
+player.resize(PhysicalSize::new(w, h));   // forward layout changes
+```
+
+The host keeps the window alive for the player's lifetime. Backends:
+DX12 (Windows), Vulkan (Linux), Metal (macOS). HDR10 (P010) decodes via
+D3D11VA / VAAPI / VideoToolbox and tonemaps in the player's wgpu shader
+(see `player/HDR_TONEMAP.md`).
+
+### 3.2 Android — embed model with TWO surfaces
+
+The reference shell is `app-android` (`MainActivity.kt` + `lib.rs`).
+A real host replicates this shape:
+
+```
+FrameLayout
+ ├── videoView   : SurfaceView          ← MediaCodec renders here (direct mode)
+ │     (wrapped in an aspect-ratio FrameLayout; see onVideoSize below)
+ └── overlayView : SurfaceView (top)    ← wgpu/GLES — subtitles/UI, or video
+       setZOrderMediaOverlay(true)         itself in the non-direct mode
+       holder.setFormat(TRANSLUCENT)
+```
+
+```rust
+// JNI side (both Surfaces acquired via ANativeWindow_fromSurface):
+let player = Player::new_from_android_surface(overlay_window, w, h);
+player.set_display_hdr_types(mask);             // Display.getHdrCapabilities bitmask
+player.set_video_output_window(video_window);   // enables DIRECT mode
+```
+
+**Direct mode** (`set_video_output_window`) is the production path for
+TV boxes: the decoder renders straight into the video `Surface`, frames
+ride a hardware video plane, and **HDR10 / HDR10+ / Dolby Vision —
+including dynamic metadata — reach the display exactly as the OS video
+pipeline delivers them** (verified: a Google TV Streamer switches the
+TV into HDR10+ mode; DV plays through the platform `video/dolby-vision`
+decoder with RPUs intact). The overlay surface then only presents when
+the active subtitle cue changes.
+
+Without a video window the player renders video itself on the overlay
+surface via GLES (OES external textures) with its own HDR→SDR tonemap —
+the right mode for SDR displays and for hosts that can't provide a
+second surface.
+
+Host responsibilities in direct mode:
+
+- **Aspect ratio**: MediaCodec stretches to fill the surface. Listen to
+  `PlayerEvent::Stats { current_resolution }` and resize the video
+  SurfaceView to the content aspect (see `MainActivity.onVideoSize`).
+- **Display HDR caps**: pass `Display.getHdrCapabilities` types as a
+  bitmask (bit 0 = Dolby Vision, 1 = HDR10, 2 = HLG, 3 = HDR10+).
+- **Window lifetime**: both `ANativeWindow` refs must outlive the
+  player; release them after dropping it.
+
+The non-direct GLES path additionally supports **HDR passthrough**
+(surface dataspace BT2020_PQ + SMPTE 2086/CTA-861.3 metadata) when the
+display reports HDR10 — but HWCs on HDMI boxes typically refuse to
+switch the HDMI output for GPU-composited layers (measured on MT8696),
+so treat GL passthrough as phone-panel-only and prefer direct mode.
+
+### 3.3 iOS / macOS — CAMetalLayer
+
+```rust
+let player = Player::new_from_metal_layer(layer_ptr, w, h);
+```
+
+Video decodes via `VTDecompressionSession`; HDR10 (PQ/HLG) requests a
+10-bit (`x420`) destination and runs the same wgpu tonemap + scene
+detection as desktop, falling back to VideoToolbox's internal 8-bit
+conversion when the 10-bit destination is refused. Audio decodes via
+FFmpeg (AudioToolbox's AAC decoder mishandles packetised access units).
+
+Full Dolby Vision / HDR10+ passthrough on tvOS will use
+`AVSampleBufferDisplayLayer` (the direct-mode analog); not implemented
+yet.
+
+## 4. Network injection
+
+Implemented exactly as originally specced — summary:
+
+- `HttpClient` is the single HTTP entry point; the host injects an
+  `Arc<dyn RequestInterceptor>` via `player.set_request_interceptor`.
+  `intercept(url, RequestKind) -> PreparedRequest` may rewrite the URL,
+  add headers, override method/body. `RequestKind` distinguishes
+  `Manifest` / `InitSegment` / `Segment` / `License`.
+- `LicenseResolver::resolve(kid: [u8;16]) -> [u8;16]` is consulted on
+  cache miss; `set_clearkey(HashMap)` pre-populates the cache so the
+  resolver is never called for known keys.
+- Both callbacks are time-boxed (~10 s, `set_callback_timeout`);
+  failures surface as `Error { Interceptor | LicenseResolver }`.
+- Retry policy for transient HTTP/transport errors:
+  `set_retry_policy(RetryPolicy)` — defaults 3 attempts, 250 ms initial,
+  ×2 backoff, ±20 % jitter; retryable statuses 408/425/429/5xx.
+
+## 5. Events
+
+`player.events()` — `tokio::sync::broadcast::Receiver<PlayerEvent>`:
+
+| Event | When | Payload highlights |
 |---|---|---|
-| **P0** | Centralised `HttpClient` injected everywhere | §3.1 |
-| **P0** | `RequestInterceptor` trait + setter on `Player` | §3.2 |
-| **P0** | `LicenseResolver` trait + setter on `Player` | §3.3 |
-| **P1** | `PlayerEvent` enum + `Player::events()` watch channel | §4 |
-| **P1** | `pause()` / `resume()` / `is_paused()` | §4.3 |
-| **P1** | Track‑metadata accessors (codec, channels, label, HDR/DV flags) | §5 |
-| **P2** | Frame/underrun stats, ABR strategy, subtitle cues | §6 |
+| `Idle` | construction | |
+| `ManifestLoaded` | `open_url` ok | duration, track counts |
+| `Prepared` | `prepare()` ok | |
+| `Buffering { reason }` | initial / stall / seek / track switch | |
+| `Playing` | first frame after any buffering | |
+| `Paused` | `pause()` | |
+| `Position` | ≤ 4 Hz | `position`, `duration`, `buffered_ahead_secs`, `bandwidth_bps` |
+| `TrackChanged` | selection or ABR switch | `TrackKind`, `TrackInfo` |
+| `GlitchRecovered` | recovered hiccup | detail |
+| `Stats` | ≤ 1 Hz | see below |
+| `EndOfStream` | natural end only (never on errors) | |
+| `Error { kind, detail }` | fatal after internal retries | `PlayerErrorKind` |
 
-P0+P1 is the whole ask. P2 is polish, can wait.
+`Stats` fields: `video_frames_decoded`, `video_frames_dropped`,
+`audio_underruns`, `net_stall_ms` (blocked-on-network ms in the last
+second), `decoder_name` (e.g. `"MediaCodec"`, `"D3D11VA HEVC"`),
+`current_resolution` (post-ABR, drives Android aspect),
+`audio_peak_db: Option<[f32; 2]>` (VU meter),
+`av_drift_ms: Option<i64>` — measured video-wall-clock minus
+audio-device-clock drift since pipeline start. Expect a slow linear
+trend from crystal mismatch (10–100 ppm); jumps indicate sync bugs.
+The player logs a warning above |100 ms|.
 
-> ### Window / process model = consumer responsibility
->
-> `Player::new(window: Arc<winit::window::Window>)` already takes the
-> window from the caller — that's the right shape and we don't want it
-> changed. Each consumer creates its own surface and pushes it into the
-> player: Android does it via the NativeActivity, iOS via UIView, our
-> downstream crate does it by spawning a sibling process that opens a
-> standalone winit window and hosts the `Player`. The player crate
-> stays out of the windowing / process / IPC business entirely.
+`buffered_ahead_secs` = min(video, audio) decoded high-water PTS minus
+current playback PTS — media that survives a network drop right now.
 
----
+## 6. Tracks and metadata
 
-## 3. P0 — Network injection
-
-### 3.1 Centralise HTTP
-
-Today three places construct their own `reqwest::Client`:
-
-- `manifest.rs:25` — `Client::new()` in `Manifest::download`
-- `tracks/segment.rs:75` — `Client::new()` in `Segment::download`
-- `networking.rs::HttpClient::new` — exists but unused
-
-**Change:**
-
-- Promote `networking::HttpClient` to the canonical entry point. Strip
-  the debug `println!`s.
-- Internally owns a single `Arc<reqwest::Client>` (reqwest's Client is
-  already an Arc; cloning is cheap and shares the connection pool).
-- Methods:
-  ```rust
-  impl HttpClient {
-      pub fn new() -> Self;
-      pub async fn get(&self, url: String, kind: RequestKind) -> Result<bytes::Bytes, BoxError>;
-      pub async fn get_range(&self, url: String, kind: RequestKind, start: u64, end: u64)
-          -> Result<bytes::Bytes, BoxError>;
-      pub async fn get_text(&self, url: String, kind: RequestKind) -> Result<String, BoxError>;
-      pub async fn post(&self, url: String, kind: RequestKind, body: bytes::Bytes, content_type: &str)
-          -> Result<bytes::Bytes, BoxError>;
-      pub fn set_interceptor(&self, interceptor: Arc<dyn RequestInterceptor>);
-  }
-  ```
-- `Player` holds `Arc<HttpClient>`. `Manifest::new`, `Tracks::new`,
-  `Segment::download` take `&HttpClient` (or `Arc<HttpClient>`) instead
-  of creating their own.
-
-### 3.2 `RequestInterceptor` trait
-
-New file `player/src/net.rs` (or add to `networking.rs`):
+`get_tracks() -> Tracks { video, audio, text }` — adaptations with
+representations. Useful accessors:
 
 ```rust
-use std::error::Error;
-pub type BoxError = Box<dyn Error + Send + Sync>;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RequestKind {
-    /// DASH MPD document.
-    Manifest,
-    /// MP4 init segment (moov + sidx, no media data).
-    InitSegment,
-    /// MP4 media segment (a few seconds of A/V).
-    Segment,
-    /// ClearKey / Widevine license POST.
-    License,
-}
-
-#[derive(Default, Debug)]
-pub struct PreparedRequest {
-    /// Final URL to fetch. Interceptor may rewrite this completely.
-    pub url: String,
-    /// Headers to ADD (existing client defaults are not removed).
-    pub headers: Vec<(String, String)>,
-    /// Optional method override (defaults: GET for everything except License = POST).
-    pub method: Option<reqwest::Method>,
-    /// Optional body substitution (for License only).
-    pub body: Option<bytes::Bytes>,
-}
-
-#[async_trait::async_trait]
-pub trait RequestInterceptor: Send + Sync + 'static {
-    /// Called once per outgoing request, BEFORE it is sent. The
-    /// returned `PreparedRequest` is what `HttpClient` actually
-    /// dispatches. Returning `Err` aborts the request — the original
-    /// caller sees a network error.
-    async fn intercept(
-        &self,
-        url: String,
-        kind: RequestKind,
-    ) -> Result<PreparedRequest, BoxError>;
-}
-
-/// Default — pass URL through, no headers added. Used by the existing
-/// `app/` binary so behaviour for current tests is unchanged.
-pub struct NoopInterceptor;
-
-#[async_trait::async_trait]
-impl RequestInterceptor for NoopInterceptor {
-    async fn intercept(&self, url: String, _kind: RequestKind)
-        -> Result<PreparedRequest, BoxError>
-    {
-        Ok(PreparedRequest { url, ..Default::default() })
-    }
-}
+// VideoRepresenation
+r.label()                  // "1080p HEVC 10-bit · 8.5 Mbps · HDR10"
+r.codec_short()            // "HEVC" / "H.264" / "AV1" / "Dolby Vision"
+r.is_hdr10() / r.is_dolby_vision() / r.is_10bit()
+r.dv_profile()             // Some(8) for dvh1.08.06
+r.dv_base_layer_playable() // false for profile 5 (needs a platform DV decoder)
 ```
 
-Setter on Player:
+Colorimetry note: the player does **not** trust MPD colour signalling
+(real streams mis-declare BT.709 on PQ content). The decode pipeline
+parses the SPS VUI from the init segment — `transfer_characteristics`
+16 (PQ) / 18 (HLG), BT.2020 primaries, bit depth — and that drives the
+HDR path selection per representation, including mid-stream ABR
+SDR↔HDR swaps. The manifest flags above are for UI/ABR filtering only.
+
+Dolby Vision representations commonly live in their **own adaptation
+set** — enumerate all of `tracks.video`, not just the first.
+
+## 7. ABR
 
 ```rust
-impl<V, A> Player<V, A> {
-    pub fn set_request_interceptor(&self, interceptor: Arc<dyn RequestInterceptor>);
-}
+player.set_abr_strategy(AbrStrategy::BandwidthEwma { safety_factor: 1.25 });
+player.set_abr_video_profile(AbrVideoProfile::HdrPreferred); // or SdrOnly / LockedDepth(8|10) / Adaptive
 ```
 
-`HttpClient` dispatch shape:
+Manual `change_video_track()` wins over ABR (resets strategy to
+`Manual`). DV representations whose base layer can't play (profile 5
+without a platform DV decoder) are never auto-selected.
+
+## 8. HDR / Dolby Vision
+
+Per-platform behaviour (details in `player/HDR_TONEMAP.md`):
+
+| Platform | HDR10 | HDR10+ dynamic | Dolby Vision | Output |
+|---|---|---|---|---|
+| Windows / Linux | ✅ tonemap (wgpu mobius + scene detection) | metadata parsed, detection preferred | profile 7/8 base layer | SDR |
+| macOS / iOS | ✅ tonemap (same shader, 10-bit VT dest) | as above | profile 7/8 base layer | SDR |
+| Android, GL path | ✅ tonemap (GLES port + GL scene detection) or GL passthrough on capable panels | SEI parsed → tonemap peak | profile 7/8 base layer | SDR / panel HDR |
+| **Android, direct mode** | ✅ **native** | ✅ **native (ST 2094-40 reaches the display)** | ✅ **native (platform `video/dolby-vision` decoder, RPUs intact; profile 5 included)** | display-negotiated |
+
+Host controls:
+
+- `capabilities()` / `probe_capabilities()` — what this build can play.
+- `set_display_hdr_types(mask)` — display capability hint (Android).
+- `set_video_output_window(ptr)` — enable direct mode (Android).
+- `set_hdr_tonemap(HdrTonemapParams)` — tonemap tuning where
+  `hdr_tonemap_tunable` is true; default reproduces the SDR ladder's
+  reference transcode. Irrelevant in direct mode (display tonemaps).
+
+## 9. Subtitles
 
 ```rust
-async fn get(&self, url: String, kind: RequestKind) -> Result<Bytes, BoxError> {
-    let prep = self.interceptor.load().intercept(url, kind).await?;
-    let mut req = self.client.request(
-        prep.method.unwrap_or(reqwest::Method::GET),
-        &prep.url,
-    );
-    for (k, v) in prep.headers { req = req.header(k, v); }
-    if let Some(b) = prep.body { req = req.body(b); }
-    let resp = req.send().await?.error_for_status()?;
-    Ok(resp.bytes().await?)
-}
+player.set_subtitle_font(ttf_bytes)?;            // required before cues render
+player.set_subtitle_track(&text_representation); // WebVTT (single file or segmented)
+player.clear_subtitle_track();
 ```
 
-> **Caveat:** `intercept()` is async and can fail (e.g. token refresh
-> hit the network and lost). The player must propagate that error
-> cleanly — no `unwrap`.
+Rendering is built in on every platform: wgpu overlay pass on
+desktop/Apple, GLES quad on Android (including direct mode, where the
+translucent overlay surface presents only when the active cue changes).
+Styling is fixed phase-1 (white, drop shadow, bottom-center, 7 % safe
+area). The rasterizer feeds plain RGBA bitmaps into the renderers — a
+future libass backend slots in at that same boundary.
 
-### 3.3 `LicenseResolver` trait
+On Android a system font works fine:
+`std::fs::read("/system/fonts/Roboto-Regular.ttf")`.
 
-```rust
-#[async_trait::async_trait]
-pub trait LicenseResolver: Send + Sync + 'static {
-    /// Given a 16‑byte key ID found in a `tenc` box, return the AES‑128
-    /// key. The player caches `(kid → key)` for the rest of the
-    /// session. If the key is permanently unavailable, return Err —
-    /// the player treats this as a fatal stream error.
-    async fn resolve(&self, kid: [u8; 16]) -> Result<[u8; 16], BoxError>;
-}
+## 10. Error semantics
 
-impl<V, A> Player<V, A> {
-    pub fn set_license_resolver(&self, resolver: Arc<dyn LicenseResolver>);
-}
-```
-
-**Where it plugs in:** `crypto.rs` currently constructs
-`ClearKeyDecryptor` from a static `HashMap<String, String>` via
-`set_clearkey`. Wrap that map in a cache and add a fallback:
-
-```rust
-async fn key_for(&self, kid: [u8; 16]) -> Result<[u8; 16], BoxError> {
-    if let Some(k) = self.cache.lock().unwrap().get(&kid).copied() {
-        return Ok(k);
-    }
-    let resolver = self.resolver.as_ref()
-        .ok_or("no license resolver set and key not in cache")?;
-    let k = resolver.resolve(kid).await?;
-    self.cache.lock().unwrap().insert(kid, k);
-    Ok(k)
-}
-```
-
-`set_clearkey(HashMap)` becomes sugar that pre‑populates the cache —
-existing tests with hardcoded `preclikos.cz` keys keep working without
-ever calling the resolver.
-
-### 3.4 Consumer context — do **NOT** put any of this in the player crate
-
-This subsection exists only so the player team understands the shape of
-real consumer workloads when designing the trait. **None of the
-behaviour below is implemented in `player`** — it lives in the
-downstream BlackZone Console crate, which provides its own
-`impl RequestInterceptor`.
-
-- Some segment URLs use a `<storageId>:<slug>` pseudo‑URI form that
-  the consumer's interceptor rewrites into a real CDN URL (with
-  expiration caching).
-- Some requests need a bearer token + custom headers when targeting a
-  specific host; others (CDN) don't.
-- The license endpoint expects a specific JSON body shape and returns
-  a specific JSON shape — the consumer's interceptor handles that
-  transformation via `PreparedRequest.body`.
-
-All host names, header names, URL patterns, and body formats live in
-the consumer. The player just executes whatever `PreparedRequest` it's
-handed.
-
----
-
-## 4. P1 — Player events
-
-### 4.1 `PlayerEvent` enum
-
-```rust
-use std::time::Duration;
-
-#[derive(Clone, Debug)]
-pub enum PlayerEvent {
-    /// Initial — before `open_url`.
-    Idle,
-    /// `open_url` succeeded.
-    ManifestLoaded {
-        duration: Duration,
-        video_tracks: usize,
-        audio_tracks: usize,
-        subtitle_tracks: usize,
-    },
-    /// `prepare()` done — init segments fetched, decoders ready.
-    Prepared,
-    /// Waiting for media data.
-    Buffering { reason: BufferingReason },
-    /// Playback active.
-    Playing,
-    /// Paused by user (see §4.3).
-    Paused,
-    /// Periodic — emitted at ≤ 4 Hz during playback.
-    Position {
-        position: Duration,
-        duration: Duration,
-        /// Seconds of decoded video ahead of `position`.
-        buffered_ahead_secs: f32,
-        /// EWMA bytes/s over last N segment downloads.
-        bandwidth_bps: u64,
-    },
-    /// Track selection changed (initial or user switch or ABR).
-    TrackChanged { kind: TrackKind, info: TrackInfo },
-    /// Decoder hiccup that the player recovered from. UI hint, not fatal.
-    GlitchRecovered { detail: String },
-    /// Cumulative stats — emitted at ≤ 1 Hz.
-    Stats {
-        video_frames_decoded: u64,
-        video_frames_dropped: u64,
-        audio_underruns: u64,
-        /// Wall‑clock ms the decoder was blocked waiting on network in
-        /// the last second (0 = healthy).
-        net_stall_ms: u64,
-    },
-    /// End of media reached.
-    EndOfStream,
-    /// Fatal — playback cannot continue. `kind` lets the consumer
-    /// branch (retry, re‑auth, abandon) without parsing `detail`.
-    Error { kind: PlayerErrorKind, detail: String },
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PlayerErrorKind {
-    /// TCP/TLS/DNS — transient connectivity problem.
-    Network,
-    /// HTTP non‑2xx that wasn't recovered by retry.
-    Http { status: u16 },
-    /// `RequestInterceptor::intercept` returned Err.
-    Interceptor,
-    /// `LicenseResolver::resolve` returned Err.
-    LicenseResolver,
-    /// MPD parse failed or has unsupported structure (e.g. multi‑period).
-    ManifestParse,
-    /// Decoder pipeline failed unrecoverably.
-    Decoder,
-    Other,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub enum TrackKind { Video, Audio, Subtitle }
-
-#[derive(Clone, Copy, Debug)]
-pub enum BufferingReason {
-    Initial,
-    Stall,
-    Seek,
-    TrackSwitch,
-}
-
-/// Exact frame rate. DASH carries fractional rates like NTSC drop‑frame
-/// (`30000/1001` → 29.97) and cinema NTSC (`24000/1001` → 23.976).
-/// Storing num/den preserves precision; f32 doesn't.
-#[derive(Clone, Copy, Debug)]
-pub struct Fps {
-    pub num: u32,
-    pub den: u32, // typically 1, 1000, or 1001
-}
-
-impl Fps {
-    pub fn as_f32(&self) -> f32 { self.num as f32 / self.den as f32 }
-}
-
-impl std::fmt::Display for Fps {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // 24000/1001 → "23.976", 30/1 → "30"
-        let v = self.as_f32();
-        if self.den == 1 { write!(f, "{}", self.num) }
-        else { write!(f, "{:.3}", v) }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct TrackInfo {
-    pub representation_id: u32,
-    pub codec: String,         // simplified: "HEVC", "H.264", "AAC", "DDP"
-    pub bitrate_bps: u64,
-    pub width: Option<u32>,
-    pub height: Option<u32>,
-    pub fps: Option<Fps>,
-    pub channels: Option<u32>,
-    pub sample_rate_hz: Option<u32>,
-    pub language: Option<String>,
-    pub label: String,         // pre‑formatted, e.g. "1080p HEVC · 8.5 Mbps"
-    pub hdr10: bool,
-    pub dolby_vision: bool,
-}
-```
-
-`buffered_ahead_secs` in `Position` is defined precisely as:
-**(end PTS of the latest segment whose download AND decode both
-completed) minus (current playback PTS)**. I.e. the amount of media
-that's safe to play through if the network drops *right now*. It does
-**not** include segments that are merely downloaded but not yet
-decoded, nor ones queued for download.
-
-### 4.2 Exposure
-
-```rust
-impl<V, A> Player<V, A> {
-    /// Subscribe to the event stream. Each subscriber gets every event
-    /// from the moment of subscription forward (broadcast semantics).
-    /// The channel buffer holds 64 events; if a subscriber falls
-    /// behind by more, it receives `RecvError::Lagged(n)` and continues
-    /// from the newest event — this is acceptable for UI subscribers
-    /// (they just re-render with the latest state).
-    pub fn events(&self) -> tokio::sync::broadcast::Receiver<PlayerEvent>;
-
-    /// Convenience: synchronous read of the latest `Position` for code
-    /// that doesn't want to subscribe (e.g. one-shot polling).
-    pub fn position(&self) -> std::time::Duration;
-}
-```
-
-**Why `broadcast` instead of `watch`:** lifecycle events
-(`ManifestLoaded`, `Prepared`, `EndOfStream`, `Error`) MUST NOT be
-lost. `watch` only keeps the latest value, so a fast sequence
-`Buffering → Playing → Error` would lose the middle two if the
-subscriber reads slowly. `broadcast(64)` keeps a 64-event ring buffer
-— since `Position` is rate-limited to 4 Hz that's 16 seconds of slack,
-plenty for any subscriber.
-
-**Implementation hint:** `Arc<broadcast::Sender<PlayerEvent>>`
-initialized in `Player::new()`. Every transition does
-`let _ = sender.send(ev);` — `send` only errors when there are no
-subscribers, which is fine to ignore.
-
-**Position emission cadence:** in `video_sync_loop` after each rendered
-frame, rate‑limited to every 250 ms.
-
-**Bandwidth:** EWMA over the last ~8 segment downloads.
-`Segment::download` already knows byte count and elapsed time — surface
-that.
-
-**`buffered_ahead_secs`:** end PTS of the last queued segment minus
-current playback PTS.
-
-### 4.3 Pause support
-
-Player has no pause today. Add:
-
-```rust
-impl<V, A> Player<V, A> {
-    pub fn pause(&self);
-    pub fn resume(&self);
-    pub fn is_paused(&self) -> bool;
-}
-```
-
-Internally: `Arc<AtomicBool>` checked in `video_sync_loop` and the
-audio output. While paused both loops park on a `Notify`; PTS does not
-advance; cpal stream is paused (`stream.pause()`).
-
----
-
-## 5. P1 — Track metadata accessors
-
-`Tracks` already exposes `AudioAdaptation` / `VideoAdaptation` with raw
-MPD fields. The TUI needs human‑friendly labels. Add (no new state, just
-derivations):
-
-```rust
-impl VideoRepresenation {
-    pub fn label(&self) -> String;        // "1080p HEVC 10‑bit · 8.5 Mbps"
-    pub fn codec_short(&self) -> &str;    // "HEVC", "H.264", "AV1"
-    pub fn is_hdr10(&self) -> bool;
-    pub fn is_dolby_vision(&self) -> bool;
-}
-
-impl AudioRepresentation {
-    pub fn label(&self) -> String;        // "EN · 5.1 · DDP · 384 kbps"
-    pub fn channels(&self) -> Option<u32>;
-    pub fn codec_short(&self) -> &str;    // "AAC", "DDP", "DD"
-}
-
-impl AudioAdaptation {
-    pub fn language(&self) -> Option<&str>;
-    pub fn role(&self) -> Option<&str>;   // "main" / "dub" / "commentary"
-}
-```
-
-Codec mapping for `codec_short` (from MPD `@codecs` strings):
-- `hev1.*` / `hvc1.*` → `HEVC`
-- `avc1.*` / `avc3.*` → `H.264`
-- `av01.*` → `AV1`
-- `mp4a.40.2` → `AAC`
-- `mp4a.40.5` → `AAC‑HE`
-- `ec-3` → `DDP`
-- `ac-3` → `DD`
-
-HDR/DV detection — check `Representation` siblings/parents:
-- HDR10: `<SupplementalProperty schemeIdUri=".../colour_primaries" value="9"/>`
-  or `transfer_characteristics` value 16/18
-- Dolby Vision: `<EssentialProperty schemeIdUri="…dolby_vision_profile"/>`
-
----
-
-## 6. P2 — Nice‑to‑haves
-
-### 6.1 Extra stats fields (cheap to add)
-
-Extend `PlayerEvent::Stats` and the matching event JSON:
-
-- `decoder_name: String` — e.g. `"D3D11VA HEVC"`, `"MediaCodec H.264"`,
-  `"FFmpeg software AV1"`. Known to the player internally.
-- `current_resolution: Option<(u32, u32)>` — what's actually rendered
-  post‑ABR, not the chosen representation.
-- `audio_peak_db: Option<[f32; 2]>` — last‑frame L/R peak in dB
-  (range typically −60..=0). Cheap to compute in the audio renderer.
-  Lets the TUI draw a tiny VU meter next to the position bar.
-
-### 6.2 ABR strategy
-
-```rust
-pub enum AbrStrategy {
-    Manual,                          // current behaviour
-    BandwidthEwma { safety_factor: f32 },  // default 1.25
-}
-
-impl<V, A> Player<V, A> {
-    pub fn set_abr_strategy(&self, strategy: AbrStrategy);
-}
-```
-
-`BandwidthEwma`: pick the highest representation whose
-`bitrate_bps * safety_factor ≤ ewma_bps`. On switch, emit
-`TrackChanged` so UI updates.
-
-### 6.3 Subtitles
-
-DASH typically carries subs as a separate `AdaptationSet`
-(`contentType="text"`, mimeType `application/mp4` with WebVTT in
-fragments, or `application/ttml+xml`).
-
-- Phase 1: just enumerate them in `Tracks` so the consumer can list
-  them.
-- Phase 2: expose decoded cues via a callback/channel:
-  ```rust
-  pub fn subtitle_cues(&self) -> tokio::sync::broadcast::Receiver<SubtitleCue>;
-
-  pub struct SubtitleCue {
-      pub start: Duration,
-      pub end: Duration,
-      pub text: String,
-  }
-  ```
-  Rendering them on screen is the consumer's choice.
-
----
-
-## 7. Error semantics
-
-| Situation | Player behaviour | Surfaced as |
+| Situation | Behaviour | Surfaced as |
 |---|---|---|
-| Manifest fetch returns non‑2xx | After retries: `Error` | `Http { status }` |
-| Segment 404 / 5xx — transient | Retry per `RetryPolicy`. If success → `GlitchRecovered`. If exhausted → `Error` | `Http { status }` |
-| Segment 401 / 403 | **Not retried** — surfaced immediately | `Http { status }` |
-| TCP/DNS/TLS error | Retry per `RetryPolicy` | `Network` |
-| `RequestInterceptor::intercept` returns `Err` | Not retried — surfaced immediately | `Interceptor` |
-| `LicenseResolver::resolve` returns `Err` | Not retried — surfaced immediately | `LicenseResolver` |
-| MPD parse failed / multi-period MPD | `Error` from `open_url` | `ManifestParse` |
-| Decoder fault — recoverable single GOP | `GlitchRecovered`, continue | — |
-| Decoder fault — unrecoverable | `Error` | `Decoder` |
-| EOS | `EndOfStream` | — |
+| Manifest non-2xx after retries | error from `open_url` | `Http { status }` |
+| Segment transient (408/425/429/5xx, transport) | retried per `RetryPolicy` | `GlitchRecovered` on success |
+| Segment 401/403/404 | not retried | `Http { status }` |
+| Interceptor / resolver `Err` or timeout | not retried | `Interceptor` / `LicenseResolver` |
+| Multi-period MPD | rejected in `open_url` | `ManifestParse` |
+| Video pipeline death mid-play | internal retry from current position (3×, backoff, budget refills with progress) | `Buffering { Stall }` while retrying; `Error { Decoder }` + parked resume position when exhausted |
+| DV profile 5 without platform DV decoder | rejected at pipeline start | `Decoder` (Android: clear message) |
+| Natural end | — | `EndOfStream` (guaranteed NOT emitted for error stops) |
 
-### 7.1 RetryPolicy
+Known gap (tracked): the **audio** pipeline has no internal retry yet —
+an audio-side death parks playback in `Buffering { Stall }`.
 
-```rust
-#[derive(Clone, Copy, Debug)]
-pub struct RetryPolicy {
-    pub max_attempts: u32,        // including the first try
-    pub initial_delay: Duration,
-    pub max_delay: Duration,
-    pub multiplier: f32,           // back-off multiplier
-    pub jitter: f32,               // 0.0..=1.0 — relative jitter band
-}
+## 11. Backward compatibility
 
-impl Default for RetryPolicy {
-    fn default() -> Self {
-        Self {
-            max_attempts: 3,
-            initial_delay: Duration::from_millis(250),
-            max_delay: Duration::from_secs(4),
-            multiplier: 2.0,
-            jitter: 0.2,           // ±20%
-        }
-    }
-}
-
-impl<V, A> Player<V, A> {
-    pub fn set_retry_policy(&self, policy: RetryPolicy);
-}
-```
-
-Retry-able status codes: **408, 425, 429, 500, 502, 503, 504**. All
-others (incl. 401, 403, 404) are surfaced after the first failure.
-TCP/TLS/DNS errors are always retry-able.
-
-### 7.2 Interceptor / resolver timeouts
-
-The player never blocks indefinitely on consumer callbacks. After
-~10 s with no response, the in‑flight `intercept` / `resolve` future
-is dropped and surfaced as `Error{kind: Interceptor, ...}` or
-`{kind: LicenseResolver, ...}`. Timeout is configurable via
-`Player::set_callback_timeout(Duration)` if 10 s is wrong.
-
----
-
-## 8. Backward compatibility
-
-Existing test path (`https://preclikos.cz/examples/encrypted/manifest.mpd`
-+ hardcoded keys) MUST keep working without changes to `app/`. Concretely:
-
-- Default `RequestInterceptor` = `NoopInterceptor` (no rewrite, no headers).
-- Default `LicenseResolver` = `None`; `set_clearkey(...)` pre‑populates
-  the key cache so the resolver is never asked.
-- `Player::events()` always returns a valid receiver (sender created
-  in `Player::new()`).
-- `app/` does not need a single line changed.
-
----
-
-## 9. Acceptance criteria
-
-The work is done when:
-
-1. `cargo test -p player` still passes (no regressions).
-2. `cargo run -p app` still plays the existing test stream
-   end‑to‑end unchanged.
-3. A new integration test in `player/tests/` exercises the injection
-   flow with a fake interceptor:
-   ```rust
-   #[tokio::test]
-   async fn interceptor_can_rewrite_url_and_add_header() {
-       struct FakeInterceptor;
-       #[async_trait::async_trait]
-       impl RequestInterceptor for FakeInterceptor {
-           async fn intercept(&self, url: String, _kind: RequestKind)
-               -> Result<PreparedRequest, BoxError>
-           {
-               Ok(PreparedRequest {
-                   url: rewrite_to_local_fixture(&url),
-                   headers: vec![("X-Test".into(), "yes".into())],
-                   ..Default::default()
-               })
-           }
-       }
-       // ... assert ManifestLoaded → Prepared within 2 s
-   }
-   ```
-4. All new traits / structs / event variants have `///` rustdoc.
-
-That's it — no binary, no IPC, no protocol to ship. The consumer
-handles its own window and process model.
-
----
-
-## 10. Downstream context — what the consumer side looks like
-
-**Not to be implemented in the player crate.** Included so the player
-team can see how the proposed primitives are consumed end‑to‑end and
-sanity‑check whether the event stream and traits carry enough
-information.
-
-The consumer (BlackZone Console) is a `ratatui` raw‑mode TUI. To play
-video it spawns a **separate sibling process** it owns (a small Rust
-binary in its own repo) which:
-
-- creates a `winit::Window`
-- constructs `Player::new(window)`
-- installs a `RequestInterceptor` that talks to the parent TUI over
-  stdin/stdout for URL rewrites + auth headers
-- installs a `LicenseResolver` that does the same for ClearKey lookups
-- forwards `Player::events()` items as JSON lines on stdout
-
-That subprocess + IPC protocol live in the consumer's repo, not in
-`rust_player_learning`. The player crate only sees its own traits
-being called.
-
-The TUI itself shows:
-
-```
-┌─ Now Playing ─────────────────────────────────────────────────┐
-│ ┌─poster─┐  Inception                                         │
-│ │ ASCII  │  2010 · 148 min · EN · HDR · DV                    │
-│ │ poster │                                                    │
-│ │        │  ━━━━━━━━━━━━━●─────────────  01:23:45 / 02:28:01  │
-│ │        │  buffer ▓▓▓▓▓▓░░░░  5.3s ahead                     │
-│ └────────┘  ▶ Playing · 8.5 Mbps · D3D11VA · drops 0          │
-├────────────────┬────────────────┬─────────────────────────────┤
-│  Video         │  Audio         │  Subtitles                  │
-│ ▶ 1080p HEVC10 │ ▶ CZ · 5.1 DDP │ ▶ Off                       │
-│   720p HEVC    │   EN · 5.1 DDP │   Czech                     │
-│   480p H.264   │   EN · 2.0 AAC │   English                   │
-│   Auto (ABR)   │                │                             │
-├────────────────┴────────────────┴─────────────────────────────┤
-│ Space ⏯  ←/→ ±10s  Shift+←/→ ±60s  +/− vol  M mute  V/A/S focus│
-└───────────────────────────────────────────────────────────────┘
-```
-
-The position bar reads from `PlayerEvent::Position { position,
-duration }`. The buffer bar reads from `buffered_ahead_secs`. The
-status line reads from the current state (`Buffering` / `Playing` /
-`Paused` / `Error`). Track lists come from `Tracks` returned by
-`Player::get_tracks()`. Track selection calls
-`Player::change_video_track()` / `change_audio_track()`.
-
-The video itself appears in the winit window owned by the child
-process — **not** in the terminal. The TUI is purely a remote
-control.
-
----
-
-## 11. Out of scope (explicit)
-
-- **DRM other than ClearKey** — only ClearKey is needed.
-- **License renewal** — ClearKey keys don't expire mid‑stream; a
-  single `resolve` per KID is enough. If renewal is anticipated,
-  please flag and we'll add a `revoke(kid)` to the resolver API.
-- **Multi‑period MPDs** — if `mpd.periods.len() > 1` during
-  `open_url`, return
-  `Err(PlayerErrorKind::ManifestParse, "multi-period MPD not
-  supported (got N periods)")` immediately. Don't silently play
-  period 0 — that masks bugs.
-
-Thanks! Ping us once any of P0/P1 lands and we'll wire up our
-downstream subprocess + interceptor against the new traits.
+The original guarantees hold: `NoopInterceptor` default,
+`set_clearkey` pre-populates the key cache, `events()` always valid,
+and the bundled test shells (`app/`, `app-android/`, `app-ios/`) play
+`https://preclikos.cz/examples/encrypted/manifest.mpd` end-to-end with
+hardcoded keys. Additions since the original spec are strictly
+additive; the only signature-level changes were new optional fields on
+`PlayerEvent::Stats` (consumers matching with `..` are unaffected).

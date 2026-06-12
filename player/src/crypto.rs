@@ -321,6 +321,48 @@ pub fn parse_hvcc_bit_depth(init_data: &[u8]) -> Option<u8> {
     Some(8 + (hvcc[17] & 0x07))
 }
 
+/// Dolby Vision decoder configuration (`dvcC` / `dvvC` box, ETSI GS CCM 001).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DoviConfig {
+    pub profile: u8,
+    pub level: u8,
+    pub rpu_present: bool,
+    pub el_present: bool,
+    pub bl_present: bool,
+    /// 0 = none (profile 5), 1 = HDR10, 2 = SDR, 4 = HLG, 6 = Blu-ray HDR10.
+    pub bl_signal_compatibility_id: u8,
+}
+
+/// Extract the Dolby Vision configuration from the init segment. `dvcC`
+/// (profiles ≤ 7) and `dvvC` (profile 8+) share the same layout:
+/// version_major(8) version_minor(8) profile(7) level(6) rpu(1) el(1)
+/// bl(1) compatibility_id(4) ...
+pub fn parse_dovi_config(init_data: &[u8]) -> Option<DoviConfig> {
+    let moov = find_top_box(init_data, b"moov")?;
+    let dv = find_descendant(moov, b"dvvC").or_else(|| find_descendant(moov, b"dvcC"))?;
+    if dv.len() < 4 {
+        return None;
+    }
+    // Bytes 2..4 after the two version bytes:
+    //   dv[2]: profile(7) | level high bit
+    //   dv[3]: level low 5 bits | rpu | el | bl
+    //   dv[4]: compatibility_id(4) | reserved
+    let profile = dv[2] >> 1;
+    let level = ((dv[2] & 0x01) << 5) | (dv[3] >> 3);
+    let rpu_present = dv[3] & 0x04 != 0;
+    let el_present = dv[3] & 0x02 != 0;
+    let bl_present = dv[3] & 0x01 != 0;
+    let bl_signal_compatibility_id = if dv.len() > 4 { dv[4] >> 4 } else { 0 };
+    Some(DoviConfig {
+        profile,
+        level,
+        rpu_present,
+        el_present,
+        bl_present,
+        bl_signal_compatibility_id,
+    })
+}
+
 /// Extract VPS/SPS/PPS NALUs from the `hvcC` box (HEVC decoder configuration record).
 pub fn parse_hvcc_nalus(init_data: &[u8]) -> Option<Vec<Vec<u8>>> {
     let moov = find_top_box(init_data, b"moov")?;

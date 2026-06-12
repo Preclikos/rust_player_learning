@@ -1187,6 +1187,41 @@ async fn video_prefetch(
     let hvcc_nalus = parse_hvcc_nalus(&init_data)
         .ok_or_else(|| -> Box<dyn Error + Send + Sync> { "no hvcC in init segment".into() })?;
 
+    // Dolby Vision policy: profiles 7/8 carry a decodable HEVC base layer
+    // (HDR10/SDR/HLG-compatible, correctly signalled in the SPS VUI), so
+    // they play through the normal Main10 + tonemap path; the RPU NAL is
+    // dropped before MediaCodec. Profile 5 (IPTPQc2) has no compatible
+    // base layer and would render as green/purple garbage — refuse it
+    // up front with an actionable error.
+    if let Some(dovi) = crate::crypto::parse_dovi_config(&init_data) {
+        log::info!(
+            "video: Dolby Vision profile {}.{} (rpu={} el={} bl={} compat_id={})",
+            dovi.profile,
+            dovi.level,
+            dovi.rpu_present,
+            dovi.el_present,
+            dovi.bl_present,
+            dovi.bl_signal_compatibility_id
+        );
+        match dovi.profile {
+            7 | 8 => {
+                if dovi.el_present {
+                    log::warn!(
+                        "video: DV enhancement layer present — ignored, playing the base layer only"
+                    );
+                }
+            }
+            p => {
+                return Err(format!(
+                    "Dolby Vision profile {} has no backward-compatible base layer \
+                     (needs RPU reshaping) — unsupported",
+                    p
+                )
+                .into());
+            }
+        }
+    }
+
     // Colour info comes from the SPS VUI — the MPD is not trustworthy here
     // (our test stream signals BT.709 on PQ representations). Fall back to
     // the hvcC bit depth when the SPS doesn't parse.

@@ -115,6 +115,10 @@ pub fn nal_unit_type(nalu: &[u8]) -> Option<u8> {
 
 pub const NAL_SPS: u8 = 33;
 pub const NAL_SEI_PREFIX: u8 = 39;
+/// Unspecified NAL types carrying Dolby Vision data in single-track
+/// streams: 62 = RPU (reshaping/DM metadata), 63 = enhancement layer.
+pub const NAL_DV_RPU: u8 = 62;
+pub const NAL_DV_EL: u8 = 63;
 
 /// Parse colour info from the first SPS found in `nalus` (raw NALU bytes,
 /// no start code / length prefix — the shape `parse_hvcc_nalus` returns).

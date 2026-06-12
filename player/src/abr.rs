@@ -93,6 +93,11 @@ impl AbrVideoProfile {
     }
 
     fn allows(&self, r: &VideoRepresenation, any_hdr_in_set: bool) -> bool {
+        // A Dolby Vision rep without a playable base layer (profile 5
+        // IPTPQc2) can never render correctly — no profile may select it.
+        if r.dolby_vision && !r.dv_base_layer_playable() {
+            return false;
+        }
         match self {
             AbrVideoProfile::SdrOnly => !r.hdr10 && !r.dolby_vision,
             AbrVideoProfile::HdrPreferred => {
@@ -198,14 +203,17 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_lets_everything_through() {
+    fn adaptive_lets_everything_playable_through() {
         let reps = vec![
             make_rep(1, "hvc1.1.6.L120.90", false, false),
             make_rep(2, "hvc1.2.4.L120.90", true, false),
             make_rep(3, "dvh1.05.06", false, true),
+            make_rep(4, "dvh1.08.06", false, true),
         ];
         let idx = AbrVideoProfile::Adaptive.filter_indices(&reps);
-        assert_eq!(idx, vec![0, 1, 2]);
+        // DV profile 5 (IPTPQc2, no compatible base layer) is never
+        // eligible; profile 8 plays via its HDR10-compatible BL.
+        assert_eq!(idx, vec![0, 1, 3]);
     }
 
     #[test]
@@ -254,10 +262,21 @@ mod tests {
         let reps = vec![
             make_rep(1, "hvc1.1.6.L120.90", false, false),
             make_rep(2, "hvc1.2.4.L120.90", true, false),
-            make_rep(3, "dvh1.05.06", false, true),
+            make_rep(3, "dvh1.08.06", false, true),
         ];
         let idx = AbrVideoProfile::LockedDepth(10).filter_indices(&reps);
-        // Both Main10 (id 2) and Dolby Vision (id 3) are 10-bit.
+        // Both Main10 (id 2) and Dolby Vision profile 8 (id 3) are 10-bit.
         assert_eq!(idx, vec![1, 2]);
+    }
+
+    #[test]
+    fn dv_profile_5_never_eligible() {
+        let reps = vec![
+            make_rep(1, "dvh1.05.06", false, true),
+            make_rep(2, "dvhe.08.06", false, true),
+        ];
+        assert_eq!(AbrVideoProfile::Adaptive.filter_indices(&reps), vec![1]);
+        assert_eq!(AbrVideoProfile::HdrPreferred.filter_indices(&reps), vec![1]);
+        assert_eq!(AbrVideoProfile::LockedDepth(10).filter_indices(&reps), vec![1]);
     }
 }

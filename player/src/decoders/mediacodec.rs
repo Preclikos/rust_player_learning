@@ -219,10 +219,18 @@ impl HwVideoDecoder for MediaCodecDecoder {
             // pair it with the frame by pts (one access unit per submit).
             // Only bother for HDR streams; the parse is cheap but pointless
             // on the SDR ladder.
+            // NALUs here carry the 4-byte start code prefix.
+            let body = n.strip_prefix(&[0, 0, 0, 1][..]).unwrap_or(&n);
+            let nal_type = hevc::nal_unit_type(body);
+            // Dolby Vision RPU / enhancement-layer NALs: MediaCodec's plain
+            // video/hevc decoder doesn't know them — most ignore unspecified
+            // NAL types, but some vendor decoders throw. We only play the
+            // backward-compatible base layer, so drop them at the door.
+            if matches!(nal_type, Some(hevc::NAL_DV_RPU) | Some(hevc::NAL_DV_EL)) {
+                continue;
+            }
             if self.color.is_hdr() {
-                // NALUs here carry the 4-byte start code prefix.
-                let body = n.strip_prefix(&[0, 0, 0, 1][..]).unwrap_or(&n);
-                if hevc::nal_unit_type(body) == Some(hevc::NAL_SEI_PREFIX) {
+                if nal_type == Some(hevc::NAL_SEI_PREFIX) {
                     let meta = hevc::parse_sei_hdr_metadata(body);
                     if let Some(hp) = meta.hdr10plus {
                         self.pending_hdr_meta.insert(

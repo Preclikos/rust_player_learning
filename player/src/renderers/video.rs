@@ -889,6 +889,7 @@ impl VideoRenderer {
                                     f.tex_x_max,
                                     f.tex_y_max,
                                     f.desired_present_ns,
+                                    f.hdr,
                                 )
                             } {
                                 log::warn!("[gles_oes] hook render failed: {}", e);
@@ -1131,6 +1132,8 @@ impl VideoRenderer {
         // offset (commonly several seconds in real DASH streams).
         #[cfg(target_os = "android")]
         let desired_present_ns = frame.desired_present_ns;
+        #[cfg(target_os = "android")]
+        let frame_color = frame.color;
         match frame.native {
             #[cfg(any(target_os = "windows", target_os = "linux"))]
             PlatformFrame::FfmpegVideo(ffmpeg_frame) => {
@@ -1138,7 +1141,7 @@ impl VideoRenderer {
             }
             #[cfg(target_os = "android")]
             PlatformFrame::HardwareBuffer(ahb) => {
-                self.render_android(ahb, desired_present_ns).await;
+                self.render_android(ahb, desired_present_ns, frame_color).await;
             }
             #[cfg(any(target_os = "ios", target_os = "macos"))]
             PlatformFrame::CvPixelBuffer(cv_buf) => {
@@ -1607,7 +1610,12 @@ impl VideoRenderer {
     /// directly to FBO 0, then eglSwapBuffers presents it.
     /// Falls back to a blue-screen clear when the OES renderer is unavailable.
     #[cfg(target_os = "android")]
-    async fn render_android_gles(&self, frame: crate::decoders::AndroidHardwareBufferFrame, desired_present_ns: i64) {
+    async fn render_android_gles(
+        &self,
+        frame: crate::decoders::AndroidHardwareBufferFrame,
+        desired_present_ns: i64,
+        color: crate::decoders::VideoColorInfo,
+    ) {
         // Update tex_x_max / tex_y_max when the codec buffer is larger than
         // the visible content (e.g. PowerVR Rogue / MT8696 on Google TV
         // Streamer: 1920×1088 buffer for 1280×720 content). Only fire when
@@ -1727,6 +1735,33 @@ impl VideoRenderer {
             (1.0_f32, 1.0_f32)
         };
 
+        // Resolve the HDR tonemap inputs for this frame. PQ only — the
+        // tonemap shader hardcodes eotf_st2084 (HLG would need the
+        // inverse_oetf_hlg variant, same as the desktop shader's TODO),
+        // so HLG falls through to the SDR program.
+        let hdr = if matches!(color.transfer, crate::decoders::TransferFunction::Pq) {
+            let params = **self.hdr_tonemap_params.load();
+            // Peak resolution differs from the desktop path on purpose: the
+            // wgpu pipeline seeds 100.0 (10 000 nits) and lets the per-frame
+            // detection refine it within one frame, but the GLES hook has no
+            // detection pass. A 10 000-nit assumption would render typical
+            // 1000-nit content several stops too dark for its whole runtime,
+            // so default to 10.0 (1000 nits — the common mastering peak)
+            // until stream metadata (HDR10+ / mastering display SEI)
+            // provides the real value. Explicit params.peak still wins.
+            let peak = if params.peak > 0.0 { params.peak } else { 10.0 };
+            Some(video_gles_egl::HdrFrameParams {
+                tone_param: params.tone_param,
+                desat: params.desat,
+                peak,
+                // SDR_AVG — keeps the slope compensation inactive, exactly
+                // like the desktop detection's first-frame seed.
+                average: 0.25,
+            })
+        } else {
+            None
+        };
+
         // Publish frame data for the present hook to consume.
         {
             let mut pending = self.gles_oes_pending.lock().unwrap();
@@ -1737,6 +1772,7 @@ impl VideoRenderer {
                 tex_x_max,
                 tex_y_max,
                 desired_present_ns,
+                hdr,
             });
         }
 
@@ -1763,11 +1799,26 @@ impl VideoRenderer {
     }
 
     #[cfg(target_os = "android")]
-    pub async fn render_android(&self, frame: crate::decoders::AndroidHardwareBufferFrame, desired_present_ns: i64) {
+    pub async fn render_android(
+        &self,
+        frame: crate::decoders::AndroidHardwareBufferFrame,
+        desired_present_ns: i64,
+        color: crate::decoders::VideoColorInfo,
+    ) {
         if self.backend == wgpu::Backend::Vulkan {
+            // The Vulkan AHB path has no tonemap stage — PQ content renders
+            // through the NV12 pipeline washed out. All current Android
+            // targets run the GLES path; warn so a Vulkan+HDR combination
+            // is visible in the log if it ever materialises.
+            if color.is_hdr() {
+                static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+                WARN_ONCE.call_once(|| {
+                    log::warn!("[android_vk] HDR stream on the Vulkan path — no tonemap wired, colours will be washed out");
+                });
+            }
             self.render_android_vulkan(frame, desired_present_ns).await;
         } else {
-            self.render_android_gles(frame, desired_present_ns).await;
+            self.render_android_gles(frame, desired_present_ns, color).await;
         }
     }
 

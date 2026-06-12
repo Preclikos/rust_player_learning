@@ -88,6 +88,95 @@ void main() {
     out_color = texture(u_texture, v_tex);
 }";
 
+// HDR10 (PQ / BT.2020) → SDR fragment shader. GLSL ES port of
+// shader_hdr.wgsl, which is itself an exact port of FFmpeg's
+// tonemap_opencl (mobius). One difference from the wgpu path: the OES
+// sampler has already applied the Y'CbCr→R'G'B' matrix for the buffer's
+// dataspace (BT.2020 limited for MediaCodec HDR output), so sampling
+// yields PQ-ENCODED BT.2020 R'G'B' directly — we start the pipeline at
+// the eotf_st2084 step. And there is no compute-pass scene detection
+// here (the hook draws with a bare ES 3.0 context): peak/average come
+// from uniforms — static metadata, HDR10+/DV dynamic metadata, or the
+// 1000-nit fallback — resolved per frame on the CPU.
+//
+// highp is required: PQ code values need the full 10-bit significand
+// and mediump is only guaranteed ~10 bits of *relative* precision.
+const FS_HDR_SRC: &str = "#version 300 es
+#extension GL_OES_EGL_image_external_essl3 : require
+precision highp float;
+uniform samplerExternalOES u_texture;
+uniform float u_tone_param; // mobius knee j (filter `param`)
+uniform float u_desat;      // desaturation strength (filter `desat`)
+uniform float u_peak;       // signal peak, 1.0 = 100 nits
+uniform float u_average;    // scene average, 1.0 = 100 nits
+in vec2 v_tex;
+out vec4 out_color;
+
+const float REFERENCE_WHITE = 100.0;
+const float SDR_AVG = 0.25;
+const vec3 LUMA_DST = vec3(0.2126, 0.7152, 0.0722);
+
+// SMPTE ST 2084 (PQ) EOTF: non-linear signal -> linear light where
+// 1.0 = 100 nits (so 10 000-nit peak = 100.0).
+float eotf_st2084(float x) {
+    const float m1 = 0.1593017578125;
+    const float m2 = 78.84375;
+    const float c1 = 0.8359375;
+    const float c2 = 18.8515625;
+    const float c3 = 18.6875;
+    float p = pow(max(x, 0.0), 1.0 / m2);
+    float num = max(p - c1, 0.0);
+    float den = max(c2 - c3 * p, 1e-6);
+    float c = pow(num / den, 1.0 / m1);
+    return x > 0.0 ? c * 10000.0 / REFERENCE_WHITE : 0.0;
+}
+
+// BT.2020 -> BT.709 primaries (linear light), ITU-R BT.2087 matrix.
+vec3 bt2020_to_bt709(vec3 c) {
+    return vec3(
+         1.6605 * c.r - 0.5876 * c.g - 0.0728 * c.b,
+        -0.1246 * c.r + 1.1329 * c.g - 0.0083 * c.b,
+        -0.0182 * c.r - 0.1006 * c.g + 1.1187 * c.b);
+}
+
+float mobius(float s, float peak) {
+    float j = u_tone_param;
+    if (s <= j) {
+        return s;
+    }
+    float a = -j * j * (peak - 1.0) / (j * j - 2.0 * j + peak);
+    float b = (j * j - 2.0 * j * peak + peak) / max(peak - 1.0, 1e-6);
+    return (b * b + 2.0 * b * j + j * j) / (b - a) * (s + a) / (s + b);
+}
+
+vec3 map_one_pixel_rgb(vec3 rgb) {
+    float sig = max(max(rgb.r, max(rgb.g, rgb.b)), 1e-6);
+    float sig_old = sig;
+    float slope = min(1.0, SDR_AVG / u_average);
+    sig = sig * slope;
+    float peak = u_peak * slope;
+    if (u_desat > 0.0) {
+        float luma = dot(LUMA_DST, rgb);
+        float coeff = max(sig - 0.18, 1e-6) / max(sig, 1e-6);
+        coeff = pow(coeff, 10.0 / u_desat);
+        rgb = mix(rgb, vec3(luma), vec3(coeff));
+        sig = mix(sig, luma * slope, coeff);
+    }
+    sig = min(mobius(sig, peak), 1.0);
+    return rgb * (sig / sig_old);
+}
+
+void main() {
+    // PQ-encoded BT.2020 R'G'B' (the driver already applied the YCbCr
+    // matrix for the buffer's dataspace).
+    vec3 c_pq = texture(u_texture, v_tex).rgb;
+    vec3 c = vec3(eotf_st2084(c_pq.r), eotf_st2084(c_pq.g), eotf_st2084(c_pq.b));
+    c = bt2020_to_bt709(c);
+    c = map_one_pixel_rgb(c);
+    // inverse_eotf_bt1886 (pure 1/2.4) -> display-referred R'G'B'.
+    out_color = vec4(pow(max(c, vec3(0.0)), vec3(1.0 / 2.4)), 1.0);
+}";
+
 // libEGL.so is always present on Android.
 // eglGetProcAddress loads EGL/GL extension entry points at runtime.
 // eglGetCurrentDisplay/eglGetCurrentSurface return the EGL display/surface for
@@ -119,6 +208,21 @@ pub struct GlesOesPendingFrame {
     /// CLOCK_MONOTONIC nanoseconds when this frame should appear on screen.
     /// Passed to eglPresentationTimeANDROID; 0 = no constraint.
     pub desired_present_ns: i64,
+    /// HDR tonemap parameters for this frame; `None` = SDR (plain OES
+    /// passthrough shader). Resolved per frame in render_android_gles so
+    /// ABR SDR↔HDR swaps switch shaders on exactly the right frame.
+    pub hdr: Option<HdrFrameParams>,
+}
+
+/// Per-frame mobius tonemap inputs for the HDR fragment shader.
+/// Peak/average are in REFERENCE_WHITE units (1.0 = 100 nits) — the same
+/// scale the wgpu detection buffer publishes on desktop.
+#[derive(Clone, Copy, Debug)]
+pub struct HdrFrameParams {
+    pub tone_param: f32,
+    pub desat: f32,
+    pub peak: f32,
+    pub average: f32,
 }
 
 /// Renders AHardwareBuffer frames directly to FBO 0 (window surface) via GL_TEXTURE_EXTERNAL_OES.
@@ -134,6 +238,10 @@ pub struct GlesOesRenderer {
     scale_y_loc: Option<glow::UniformLocation>,
     tex_x_max_loc: Option<glow::UniformLocation>,
     tex_y_max_loc: Option<glow::UniformLocation>,
+    /// HDR (PQ→SDR mobius tonemap) program. None if its compilation failed
+    /// at init — HDR frames then render through the SDR program (washed
+    /// out, but alive) with a one-time warning.
+    hdr: Option<HdrProgram>,
     // EGL extension function pointers stored as usize (makes the struct Send + Sync).
     fn_get_native_client_buffer: usize,  // eglGetNativeClientBufferANDROID
     fn_egl_create_image: usize,          // eglCreateImageKHR
@@ -146,6 +254,19 @@ pub struct GlesOesRenderer {
 
 unsafe impl Send for GlesOesRenderer {}
 unsafe impl Sync for GlesOesRenderer {}
+
+/// The HDR program and its uniform locations.
+struct HdrProgram {
+    program: glow::Program,
+    scale_x_loc: Option<glow::UniformLocation>,
+    scale_y_loc: Option<glow::UniformLocation>,
+    tex_x_max_loc: Option<glow::UniformLocation>,
+    tex_y_max_loc: Option<glow::UniformLocation>,
+    tone_param_loc: Option<glow::UniformLocation>,
+    desat_loc: Option<glow::UniformLocation>,
+    peak_loc: Option<glow::UniformLocation>,
+    average_loc: Option<glow::UniformLocation>,
+}
 
 impl GlesOesRenderer {
     /// Initialise the GL program, VAO/VBO, and OES texture.
@@ -248,6 +369,43 @@ impl GlesOesRenderer {
             tex_y_max_loc.is_some(),
         );
 
+        // The HDR program is optional — a compile failure must not take the
+        // SDR path down with it.
+        let hdr = (|| -> Result<HdrProgram, String> {
+            let vs = compile_shader(gl, glow::VERTEX_SHADER, VS_SRC)?;
+            let fs = compile_shader(gl, glow::FRAGMENT_SHADER, FS_HDR_SRC)?;
+            let program = link_program(gl, vs, fs)?;
+            gl.delete_shader(vs);
+            gl.delete_shader(fs);
+            gl.use_program(Some(program));
+            if let Some(loc) = gl.get_uniform_location(program, "u_texture") {
+                gl.uniform_1_i32(Some(&loc), 0);
+            }
+            let p = HdrProgram {
+                scale_x_loc: gl.get_uniform_location(program, "u_scale_x"),
+                scale_y_loc: gl.get_uniform_location(program, "u_scale_y"),
+                tex_x_max_loc: gl.get_uniform_location(program, "u_tex_x_max"),
+                tex_y_max_loc: gl.get_uniform_location(program, "u_tex_y_max"),
+                tone_param_loc: gl.get_uniform_location(program, "u_tone_param"),
+                desat_loc: gl.get_uniform_location(program, "u_desat"),
+                peak_loc: gl.get_uniform_location(program, "u_peak"),
+                average_loc: gl.get_uniform_location(program, "u_average"),
+                program,
+            };
+            gl.use_program(None);
+            Ok(p)
+        })();
+        let hdr = match hdr {
+            Ok(p) => {
+                log::info!("[gles_oes] HDR tonemap shader compiled");
+                Some(p)
+            }
+            Err(e) => {
+                log::warn!("[gles_oes] HDR shader unavailable: {} — HDR frames will render through the SDR program", e);
+                None
+            }
+        };
+
         Ok(GlesOesRenderer {
             program,
             vao,
@@ -257,6 +415,7 @@ impl GlesOesRenderer {
             scale_y_loc,
             tex_x_max_loc,
             tex_y_max_loc,
+            hdr,
             fn_get_native_client_buffer: fn_get_client,
             fn_egl_create_image: fn_create,
             fn_egl_destroy_image: fn_destroy,
@@ -271,6 +430,7 @@ impl GlesOesRenderer {
     /// Called from the wgpu present hook after `make_current(window_surface)` and
     /// `glBindFramebuffer(DRAW_FRAMEBUFFER, 0)` — so FBO 0 (the EGL window surface)
     /// is the render target. eglSwapBuffers follows immediately after this returns.
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn render(
         &self,
         gl: &glow::Context,
@@ -282,6 +442,7 @@ impl GlesOesRenderer {
         tex_x_max: f32,
         tex_y_max: f32,
         desired_present_ns: i64,     // CLOCK_MONOTONIC ns for this frame; 0 = unconstrained
+        hdr: Option<HdrFrameParams>, // Some = run the PQ→SDR tonemap program
     ) -> Result<(), String> {
         let get_client: FnEglGetNativeClientBufferANDROID =
             std::mem::transmute(self.fn_get_native_client_buffer);
@@ -347,18 +508,55 @@ impl GlesOesRenderer {
         }
 
         gl.viewport(0, 0, viewport_width, viewport_height);
-        gl.use_program(Some(self.program));
-        if let Some(ref loc) = self.scale_x_loc {
-            gl.uniform_1_f32(Some(loc), scale_x);
-        }
-        if let Some(ref loc) = self.scale_y_loc {
-            gl.uniform_1_f32(Some(loc), scale_y);
-        }
-        if let Some(ref loc) = self.tex_x_max_loc {
-            gl.uniform_1_f32(Some(loc), tex_x_max);
-        }
-        if let Some(ref loc) = self.tex_y_max_loc {
-            gl.uniform_1_f32(Some(loc), tex_y_max);
+        match (hdr, &self.hdr) {
+            (Some(p), Some(h)) => {
+                gl.use_program(Some(h.program));
+                if let Some(ref loc) = h.scale_x_loc {
+                    gl.uniform_1_f32(Some(loc), scale_x);
+                }
+                if let Some(ref loc) = h.scale_y_loc {
+                    gl.uniform_1_f32(Some(loc), scale_y);
+                }
+                if let Some(ref loc) = h.tex_x_max_loc {
+                    gl.uniform_1_f32(Some(loc), tex_x_max);
+                }
+                if let Some(ref loc) = h.tex_y_max_loc {
+                    gl.uniform_1_f32(Some(loc), tex_y_max);
+                }
+                if let Some(ref loc) = h.tone_param_loc {
+                    gl.uniform_1_f32(Some(loc), p.tone_param);
+                }
+                if let Some(ref loc) = h.desat_loc {
+                    gl.uniform_1_f32(Some(loc), p.desat);
+                }
+                if let Some(ref loc) = h.peak_loc {
+                    gl.uniform_1_f32(Some(loc), p.peak);
+                }
+                if let Some(ref loc) = h.average_loc {
+                    gl.uniform_1_f32(Some(loc), p.average);
+                }
+            }
+            (hdr_wanted, _) => {
+                if hdr_wanted.is_some() {
+                    static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+                    WARN_ONCE.call_once(|| {
+                        log::warn!("[gles_oes] HDR frame but no HDR program — SDR passthrough");
+                    });
+                }
+                gl.use_program(Some(self.program));
+                if let Some(ref loc) = self.scale_x_loc {
+                    gl.uniform_1_f32(Some(loc), scale_x);
+                }
+                if let Some(ref loc) = self.scale_y_loc {
+                    gl.uniform_1_f32(Some(loc), scale_y);
+                }
+                if let Some(ref loc) = self.tex_x_max_loc {
+                    gl.uniform_1_f32(Some(loc), tex_x_max);
+                }
+                if let Some(ref loc) = self.tex_y_max_loc {
+                    gl.uniform_1_f32(Some(loc), tex_y_max);
+                }
+            }
         }
         gl.bind_vertex_array(Some(self.vao));
         gl.draw_arrays(glow::TRIANGLES, 0, 6);

@@ -1221,6 +1221,14 @@ impl VideoRenderer {
                 self.render_android(ahb, desired_present_ns, frame_color, frame_hdr_meta)
                     .await;
             }
+            #[cfg(target_os = "android")]
+            PlatformFrame::MediaCodecDirect(direct) => {
+                // Direct mode: "rendering" = queueing the codec output
+                // buffer to the video Surface for the target vsync. The
+                // OS video pipeline owns scaling, colour and HDR from
+                // here; the wgpu surface only carries subtitles/UI.
+                direct.render_at(desired_present_ns.max(1));
+            }
             #[cfg(any(target_os = "ios", target_os = "macos"))]
             PlatformFrame::CvPixelBuffer(cv_buf) => {
                 self.render_cv_pixel_buffer(cv_buf).await;

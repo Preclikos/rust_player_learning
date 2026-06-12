@@ -43,6 +43,11 @@ pub struct MediaCodecDecoder {
     // keeps the Surface internally too via its NativeWindow.
     reader: Option<Arc<ImageReader>>,
     codec: Option<MediaCodec>,
+    /// Direct mode (raw FFI codec rendering into the app's video Surface).
+    /// Mutually exclusive with `codec`/`reader`.
+    direct: Option<Arc<SharedDirectCodec>>,
+    /// `ANativeWindow*` (as usize) for direct mode; 0 = ImageReader mode.
+    direct_window: usize,
     width: u32,
     height: u32,
     last_decoded_pts_us: i64,
@@ -59,6 +64,97 @@ pub struct MediaCodecDecoder {
     static_hdr_meta: Option<HdrFrameMeta>,
 }
 
+// ---------------------------------------------------------------------------
+// Direct mode: MediaCodec renders straight into the host's video Surface.
+// Raw ndk_sys FFI — the safe `ndk` wrapper hides the output-buffer index,
+// which is exactly what the deferred timed release needs.
+// ---------------------------------------------------------------------------
+
+/// The codec shared between the decoder (input/dequeue side) and in-flight
+/// frames (release side). AMediaCodec is not documented thread-safe, so
+/// every call goes through `call_lock`; each call is microseconds.
+pub struct SharedDirectCodec {
+    raw: *mut ndk_sys::AMediaCodec,
+    call_lock: std::sync::Mutex<()>,
+    /// Set before stop() during teardown — release handles become no-ops
+    /// (their buffer indices died with the stop).
+    stopped: std::sync::atomic::AtomicBool,
+}
+
+unsafe impl Send for SharedDirectCodec {}
+unsafe impl Sync for SharedDirectCodec {}
+
+impl SharedDirectCodec {
+    /// Queue the buffer to the video Surface for display at `present_ns`
+    /// (CLOCK_MONOTONIC). `present_ns <= now` displays ASAP.
+    fn release_at(&self, index: usize, present_ns: i64) {
+        if self.stopped.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        let _l = self.call_lock.lock().unwrap();
+        let st = unsafe {
+            ndk_sys::AMediaCodec_releaseOutputBufferAtTime(self.raw, index, present_ns)
+        };
+        if st != ndk_sys::media_status_t::AMEDIA_OK {
+            log::trace!("[mc-direct] releaseAtTime({}) -> {:?}", index, st);
+        }
+    }
+
+    /// Return the buffer to the codec without rendering (dropped frame).
+    fn release_drop(&self, index: usize) {
+        if self.stopped.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        let _l = self.call_lock.lock().unwrap();
+        let _ = unsafe { ndk_sys::AMediaCodec_releaseOutputBuffer(self.raw, index, false) };
+    }
+
+    /// Teardown: invalidate all outstanding release handles, then stop.
+    fn stop(&self) {
+        self.stopped.store(true, std::sync::atomic::Ordering::Release);
+        let _l = self.call_lock.lock().unwrap();
+        unsafe {
+            ndk_sys::AMediaCodec_stop(self.raw);
+        }
+    }
+}
+
+impl Drop for SharedDirectCodec {
+    fn drop(&mut self) {
+        // Last reference (decoder + every in-flight frame) gone.
+        unsafe {
+            ndk_sys::AMediaCodec_delete(self.raw);
+        }
+    }
+}
+
+/// A decoded frame living inside the codec: the renderer releases it to
+/// the video Surface with a presentation timestamp; dropping it unrendered
+/// hands the buffer back to the codec (LATE drains, teardown).
+pub struct DirectVideoFrame {
+    codec: Arc<SharedDirectCodec>,
+    index: usize,
+    released: std::sync::atomic::AtomicBool,
+}
+
+impl DirectVideoFrame {
+    /// Queue for display at `present_ns` (CLOCK_MONOTONIC nanoseconds;
+    /// values in the past display at the next vsync).
+    pub fn render_at(&self, present_ns: i64) {
+        if !self.released.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            self.codec.release_at(self.index, present_ns);
+        }
+    }
+}
+
+impl Drop for DirectVideoFrame {
+    fn drop(&mut self) {
+        if !self.released.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            self.codec.release_drop(self.index);
+        }
+    }
+}
+
 // MediaCodec/ImageReader wrap NonNull pointers and aren't auto-Send.
 // Single-threaded ownership inside the decoder task is fine.
 unsafe impl Send for MediaCodecDecoder {}
@@ -68,6 +164,8 @@ impl MediaCodecDecoder {
         Self {
             reader: None,
             codec: None,
+            direct: None,
+            direct_window: 0,
             width: 0,
             height: 0,
             last_decoded_pts_us: -1,
@@ -75,6 +173,219 @@ impl MediaCodecDecoder {
             color: Default::default(),
             pending_hdr_meta: Default::default(),
             static_hdr_meta: None,
+        }
+    }
+
+    /// Direct-mode configure: raw FFI codec attached to the video Surface.
+    fn configure_direct(&mut self, params: &VideoDecoderParams, mime: &str) -> Result<(), DecoderError> {
+        use std::ffi::CString;
+        unsafe {
+            let mime_c = CString::new(mime).unwrap();
+            let codec = ndk_sys::AMediaCodec_createDecoderByType(mime_c.as_ptr());
+            if codec.is_null() {
+                return Err(format!("AMediaCodec_createDecoderByType({}) failed", mime).into());
+            }
+
+            let format = ndk_sys::AMediaFormat_new();
+            let key_mime = CString::new("mime").unwrap();
+            ndk_sys::AMediaFormat_setString(format, key_mime.as_ptr(), mime_c.as_ptr());
+            let key_w = CString::new("width").unwrap();
+            let key_h = CString::new("height").unwrap();
+            ndk_sys::AMediaFormat_setInt32(format, key_w.as_ptr(), params.width as i32);
+            ndk_sys::AMediaFormat_setInt32(format, key_h.as_ptr(), params.height as i32);
+            if !params.hvcc_nalus.is_empty() {
+                let mut csd = Vec::new();
+                for n in &params.hvcc_nalus {
+                    csd.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+                    csd.extend_from_slice(n);
+                }
+                let key_csd = CString::new("csd-0").unwrap();
+                ndk_sys::AMediaFormat_setBuffer(
+                    format,
+                    key_csd.as_ptr(),
+                    csd.as_ptr() as *const _,
+                    csd.len(),
+                );
+            }
+
+            let st = ndk_sys::AMediaCodec_configure(
+                codec,
+                format,
+                self.direct_window as *mut ndk_sys::ANativeWindow,
+                std::ptr::null_mut(),
+                0,
+            );
+            ndk_sys::AMediaFormat_delete(format);
+            if st != ndk_sys::media_status_t::AMEDIA_OK {
+                ndk_sys::AMediaCodec_delete(codec);
+                return Err(format!("AMediaCodec_configure(direct): {:?}", st).into());
+            }
+            let st = ndk_sys::AMediaCodec_start(codec);
+            if st != ndk_sys::media_status_t::AMEDIA_OK {
+                ndk_sys::AMediaCodec_delete(codec);
+                return Err(format!("AMediaCodec_start(direct): {:?}", st).into());
+            }
+
+            self.direct = Some(Arc::new(SharedDirectCodec {
+                raw: codec,
+                call_lock: std::sync::Mutex::new(()),
+                stopped: std::sync::atomic::AtomicBool::new(false),
+            }));
+        }
+        log::info!(
+            "MediaCodecDecoder: configured {} DIRECT to video surface, {}x{}",
+            mime,
+            params.width,
+            params.height
+        );
+        Ok(())
+    }
+
+    /// Direct-mode submit: same Annex-B conversion, raw FFI input queue.
+    fn submit_direct(&mut self, annex_b: &[u8], pts_us: i64) -> Result<(), DecoderError> {
+        let direct = self.direct.as_ref().unwrap();
+        unsafe {
+            let idx = {
+                let mut retries = 0u32;
+                loop {
+                    let idx = {
+                        let _l = direct.call_lock.lock().unwrap();
+                        ndk_sys::AMediaCodec_dequeueInputBuffer(direct.raw, 5_000)
+                    };
+                    if idx >= 0 {
+                        break idx as usize;
+                    }
+                    if idx != -1 {
+                        // Anything but AMEDIACODEC_INFO_TRY_AGAIN_LATER (-1).
+                        return Err(format!("dequeueInputBuffer(direct): {}", idx).into());
+                    }
+                    retries += 1;
+                    if retries % 200 == 0 {
+                        log::warn!(
+                            "[mc-direct] dequeue_input stall {}x5ms pts={}",
+                            retries,
+                            pts_us / 1000
+                        );
+                    }
+                    std::thread::yield_now();
+                }
+            };
+            let mut cap: usize = 0;
+            let buf = {
+                let _l = direct.call_lock.lock().unwrap();
+                ndk_sys::AMediaCodec_getInputBuffer(direct.raw, idx, &mut cap)
+            };
+            if buf.is_null() {
+                return Err("getInputBuffer(direct) returned null".into());
+            }
+            let len = annex_b.len().min(cap);
+            std::ptr::copy_nonoverlapping(annex_b.as_ptr(), buf, len);
+            let st = {
+                let _l = direct.call_lock.lock().unwrap();
+                ndk_sys::AMediaCodec_queueInputBuffer(direct.raw, idx, 0, len, pts_us as u64, 0)
+            };
+            if st != ndk_sys::media_status_t::AMEDIA_OK {
+                return Err(format!("queueInputBuffer(direct): {:?}", st).into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Direct-mode try_recv: dequeue an output buffer and wrap its index in
+    /// a deferred-release frame.
+    fn try_recv_direct(&mut self) -> Result<Option<DecodedVideoFrame>, DecoderError> {
+        let direct = Arc::clone(self.direct.as_ref().unwrap());
+        unsafe {
+            let mut info: ndk_sys::AMediaCodecBufferInfo = std::mem::zeroed();
+            let idx = {
+                let _l = direct.call_lock.lock().unwrap();
+                ndk_sys::AMediaCodec_dequeueOutputBuffer(direct.raw, &mut info, 0)
+            };
+            if idx >= 0 {
+                let pts_us = info.presentationTimeUs;
+                let frame_idx = self.decoded_frame_idx;
+                if self.last_decoded_pts_us >= 0 && pts_us < self.last_decoded_pts_us {
+                    log::warn!(
+                        "[mc-direct] BACKWARD #{} pts={}ms last={}ms",
+                        frame_idx,
+                        pts_us / 1000,
+                        self.last_decoded_pts_us / 1000
+                    );
+                }
+                self.last_decoded_pts_us = pts_us;
+                self.decoded_frame_idx += 1;
+                let hdr_meta = self
+                    .pending_hdr_meta
+                    .remove(&pts_us)
+                    .or(self.static_hdr_meta);
+                return Ok(Some(DecodedVideoFrame {
+                    pts_us,
+                    width: self.width,
+                    height: self.height,
+                    native: PlatformFrame::MediaCodecDirect(DirectVideoFrame {
+                        codec: direct,
+                        index: idx as usize,
+                        released: std::sync::atomic::AtomicBool::new(false),
+                    }),
+                    desired_present_ns: 0,
+                    color: self.color,
+                    hdr_meta,
+                }));
+            }
+            // Negative status codes: ndk_sys exposes them as i32 constants.
+            const TRY_AGAIN: isize = -1; // AMEDIACODEC_INFO_TRY_AGAIN_LATER
+            const FORMAT_CHANGED: isize = -2; // AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED
+            const BUFFERS_CHANGED: isize = -3; // AMEDIACODEC_INFO_OUTPUT_BUFFERS_CHANGED
+            match idx {
+                TRY_AGAIN | BUFFERS_CHANGED => Ok(None),
+                FORMAT_CHANGED => {
+                    let fmt = {
+                        let _l = direct.call_lock.lock().unwrap();
+                        ndk_sys::AMediaCodec_getOutputFormat(direct.raw)
+                    };
+                    if !fmt.is_null() {
+                        // Prefer the crop rect (true content size; NDK key
+                        // "crop" as an AMediaFormat Rect — the Java-style
+                        // crop-left/right int keys are absent here). The
+                        // codec scales the crop to the surface, so this is
+                        // what the aspect logic needs.
+                        let crop_key = std::ffi::CString::new("crop").unwrap();
+                        let (mut l, mut t, mut r, mut b) = (0i32, 0i32, 0i32, 0i32);
+                        let (w, h) = if ndk_sys::AMediaFormat_getRect(
+                            fmt,
+                            crop_key.as_ptr(),
+                            &mut l,
+                            &mut t,
+                            &mut r,
+                            &mut b,
+                        ) && r > l
+                            && b > t
+                        {
+                            ((r - l + 1) as u32, (b - t + 1) as u32)
+                        } else {
+                            let get = |name: &str| -> Option<i32> {
+                                let key = std::ffi::CString::new(name).unwrap();
+                                let mut v: i32 = 0;
+                                if ndk_sys::AMediaFormat_getInt32(fmt, key.as_ptr(), &mut v) {
+                                    Some(v)
+                                } else {
+                                    None
+                                }
+                            };
+                            (
+                                get("width").unwrap_or(self.width as i32) as u32,
+                                get("height").unwrap_or(self.height as i32) as u32,
+                            )
+                        };
+                        self.width = w;
+                        self.height = h;
+                        log::info!("[mc-direct] output format: {}x{} (content)", w, h);
+                        ndk_sys::AMediaFormat_delete(fmt);
+                    }
+                    Ok(None)
+                }
+                other => Err(format!("dequeueOutputBuffer(direct): {}", other).into()),
+            }
         }
     }
 }
@@ -89,6 +400,17 @@ impl HwVideoDecoder for MediaCodecDecoder {
             VideoCodec::Hevc => "video/hevc",
             VideoCodec::H264 => "video/avc",
         };
+
+        // Direct mode: the codec renders straight into the host's video
+        // Surface (HW plane carries HDR/HDR10+/DV to the display) — no
+        // ImageReader, no GL involvement for video pixels.
+        self.direct_window = params.direct_window;
+        if self.direct_window != 0 {
+            self.width = params.width;
+            self.height = params.height;
+            self.color = params.color;
+            return self.configure_direct(&params, mime);
+        }
 
         // 32 physical NV12 surfaces ≈ 1.33 s of buffer at 24 fps.
         // Segment boundaries cause a ~1.5 s decoder stall (MediaCodec IDR
@@ -207,10 +529,9 @@ impl HwVideoDecoder for MediaCodecDecoder {
     }
 
     fn submit(&mut self, sample: &[u8], pts_us: i64) -> Result<(), DecoderError> {
-        let codec = self
-            .codec
-            .as_ref()
-            .ok_or_else(|| -> DecoderError { "submit before configure".into() })?;
+        if self.codec.is_none() && self.direct.is_none() {
+            return Err("submit before configure".into());
+        }
 
         // `sample` is length-prefixed NALU (raw mdat). Convert to Annex-B
         // (start-code prefixed) — MediaCodec expects this for HEVC/H.264.
@@ -237,6 +558,12 @@ impl HwVideoDecoder for MediaCodecDecoder {
                 {
                     let meta = hevc::parse_sei_hdr_metadata(body);
                     if let Some(hp) = meta.hdr10plus {
+                        if self.pending_hdr_meta.is_empty() && self.decoded_frame_idx == 0 {
+                            log::info!(
+                                "[mc] stream carries HDR10+ dynamic metadata (ST 2094-40) — \
+                                 direct mode forwards it to the display"
+                            );
+                        }
                         self.pending_hdr_meta.insert(
                             pts_us,
                             HdrFrameMeta {
@@ -272,6 +599,11 @@ impl HwVideoDecoder for MediaCodecDecoder {
             }
             annex_b.extend_from_slice(&n);
         }
+
+        if self.direct.is_some() {
+            return self.submit_direct(&annex_b, pts_us);
+        }
+        let codec = self.codec.as_ref().unwrap();
 
         // Retry until an input slot is free. Each wait is 5 ms; the codec
         // typically frees a slot within one frame interval (~33ms at 24fps).
@@ -314,6 +646,9 @@ impl HwVideoDecoder for MediaCodecDecoder {
     }
 
     fn try_recv(&mut self) -> Result<Option<DecodedVideoFrame>, DecoderError> {
+        if self.direct.is_some() {
+            return self.try_recv_direct();
+        }
         let codec = self
             .codec
             .as_ref()
@@ -452,9 +787,35 @@ impl HwVideoDecoder for MediaCodecDecoder {
                 .flush()
                 .map_err(|e| -> DecoderError { format!("MediaCodec::flush: {:?}", e).into() })?;
         }
+        if let Some(direct) = self.direct.as_ref() {
+            // Flush invalidates outstanding output indices; in-flight
+            // DirectVideoFrames then no-op their releases (the codec
+            // tolerates a release error, logged at trace).
+            let _l = direct.call_lock.lock().unwrap();
+            unsafe {
+                ndk_sys::AMediaCodec_flush(direct.raw);
+            }
+        }
         self.last_decoded_pts_us = -1;
         self.decoded_frame_idx = 0;
         self.pending_hdr_meta.clear();
         Ok(())
+    }
+
+    fn is_direct(&self) -> bool {
+        self.direct_window != 0
+    }
+}
+
+impl Drop for MediaCodecDecoder {
+    fn drop(&mut self) {
+        // Direct mode: stop the codec NOW (disconnects the video Surface so
+        // the next decoder can attach; invalidates in-flight frame indices,
+        // which their release handles tolerate via the stopped flag). The
+        // AMediaCodec object itself is deleted when the last Arc — possibly
+        // held by a frame still queued in the channel — drops.
+        if let Some(direct) = self.direct.take() {
+            direct.stop();
+        }
     }
 }

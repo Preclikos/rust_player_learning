@@ -248,6 +248,11 @@ pub struct Player<V: VideoSink = VideoRenderer, A: AudioSink = AudioRenderer> {
     /// `set_subtitle_track` / `clear_subtitle_track`.
     subtitle_representation: Arc<StdMutex<Option<tracks::text::TextRepresenation>>>,
 
+    /// Android direct mode: `ANativeWindow*` (as usize) of the dedicated
+    /// video plane the decoder renders into. 0 = classic renderer path.
+    /// Set once by the host before play(); consumed at pipeline build.
+    video_output_window: Arc<AtomicUsize>,
+
     video_renderer: Arc<V>,
     audio_renderer: Arc<A>,
 
@@ -288,6 +293,7 @@ impl<V: VideoSink, A: AudioSink> Clone for Player<V, A> {
             video_switch_tx: Arc::clone(&self.video_switch_tx),
             buffer_target_secs: Arc::clone(&self.buffer_target_secs),
             subtitle_representation: Arc::clone(&self.subtitle_representation),
+            video_output_window: Arc::clone(&self.video_output_window),
             video_renderer: Arc::clone(&self.video_renderer),
             audio_renderer: Arc::clone(&self.audio_renderer),
             rt: self.rt.clone(),
@@ -548,10 +554,26 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
                 }
             }
         } else {
-            // Sleep until RENDER_BUDGET_MS before the target PTS so the GPU
-            // draws the frame early. The compositor then displays it at exactly
-            // pts_ms thanks to eglPresentationTimeANDROID.
-            let target_wake_ms = pts_ms.saturating_sub(RENDER_BUDGET_MS);
+            // Sleep until shortly before the target PTS. GL path: the GPU
+            // draws the frame early and eglPresentationTimeANDROID holds it
+            // until exactly pts_ms. Direct mode: the release timestamp does
+            // the same, and a LARGER lead is the point — every released
+            // frame returns its output buffer to MediaCodec (the channel +
+            // reorder window only hold ~4), so queueing 2-3 frames ahead in
+            // SurfaceFlinger is what bridges the segment-boundary decoder
+            // warmup that the GL path bridged with its 32-image pool.
+            #[cfg(target_os = "android")]
+            let render_budget_ms = if matches!(
+                frame.native,
+                crate::decoders::PlatformFrame::MediaCodecDirect(_)
+            ) {
+                100
+            } else {
+                RENDER_BUDGET_MS
+            };
+            #[cfg(not(target_os = "android"))]
+            let render_budget_ms = RENDER_BUDGET_MS;
+            let target_wake_ms = pts_ms.saturating_sub(render_budget_ms);
             if target_wake_ms > elapsed {
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_millis(target_wake_ms - elapsed)) => {}
@@ -911,8 +933,10 @@ async fn video_decoder_task(
     // We always emit the lowest-PTS frame from the buffer. video_ready fires
     // on the first send so start_time is calibrated to when frames are
     // actually available (avoids a timing hole at startup).
-    const REORDER_DEPTH: usize = 4;
-    let mut reorder_buf: Vec<DecodedVideoFrame> = Vec::with_capacity(REORDER_DEPTH + 1);
+    // Direct mode holds codec output buffers captive in this window — keep
+    // it shallow there (see the frame-channel capacity comment in play()).
+    let reorder_depth: usize = if decoder.is_direct() { 2 } else { 4 };
+    let mut reorder_buf: Vec<DecodedVideoFrame> = Vec::with_capacity(reorder_depth + 1);
 
     while let Some(segment) = receiver.recv().await {
         if stop_flag.load(Ordering::Relaxed) {
@@ -979,7 +1003,7 @@ async fn video_decoder_task(
                                 .store(pts_ms, Ordering::Relaxed);
                         }
                         reorder_buf.push(frame);
-                        if reorder_buf.len() > REORDER_DEPTH {
+                        if reorder_buf.len() > reorder_depth {
                             let min_idx = reorder_buf.iter().enumerate()
                                 .min_by_key(|(_, f)| f.pts_us)
                                 .map(|(i, _)| i)
@@ -1316,6 +1340,8 @@ async fn run_decode(
     decoder_stop_flag: Arc<AtomicBool>,
     // `Some(..)` on an ABR swap (splice trim + timing), `None` initially.
     splice: Option<SwapSplice>,
+    // Android direct mode video window (0 = renderer path).
+    direct_window: usize,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     decoder.configure(VideoDecoderParams {
         codec: VideoCodec::Hevc,
@@ -1323,6 +1349,7 @@ async fn run_decode(
         height: pf.height,
         hvcc_nalus: pf.hvcc_nalus,
         color: pf.color,
+        direct_window,
     })?;
 
     let decoder_task = task::spawn(video_decoder_task(
@@ -1359,6 +1386,8 @@ async fn video_play(
     // supervisor can softly cap an old pipeline mid-flight without
     // discarding its already-decoded tail.
     soft_end_exclusive: Arc<AtomicUsize>,
+    // Android direct mode video window (0 = renderer path).
+    direct_window: usize,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     // Initial pipeline: nothing to overlap with, so download and decode run
     // back to back. `prime_target = MAX` → the readiness signal never fires
@@ -1376,7 +1405,17 @@ async fn video_play(
         usize::MAX,
     )
     .await?;
-    run_decode(pf, sender, video_ready, decoder, stats, stop_flag, None).await
+    run_decode(
+        pf,
+        sender,
+        video_ready,
+        decoder,
+        stats,
+        stop_flag,
+        None,
+        direct_window,
+    )
+    .await
 }
 
 async fn audio_play(
@@ -1705,6 +1744,8 @@ async fn video_supervisor(
     // Content origin (first segment's absolute presentation time). position_ms
     // is 0-based, so we add this back to locate segments on a soft swap.
     origin: Duration,
+    // Android direct mode video window (0 = renderer path).
+    direct_window: usize,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let spawn_pipeline = |repr: VideoRepresenation,
                           start_index: usize,
@@ -1728,6 +1769,7 @@ async fn video_supervisor(
             Arc::clone(&stats),
             segments_in_flight,
             soft_end.clone(),
+            direct_window,
         ));
         (handle, soft_end)
     };
@@ -2008,6 +2050,7 @@ async fn video_supervisor(
                 started: decode_t0,
                 skip_below_pts_us: splice_pts_us,
             }),
+            direct_window,
         ));
         cur_stop = new_stop;
         cur_flag = new_flag;
@@ -2127,6 +2170,7 @@ impl Player<VideoRenderer, AudioRenderer> {
             video_switch_tx: Arc::new(StdMutex::new(None)),
             buffer_target_secs: Arc::new(AtomicU32::new(DEFAULT_BUFFER_TARGET_SECS)),
             subtitle_representation: Arc::new(StdMutex::new(None)),
+            video_output_window: Arc::new(AtomicUsize::new(0)),
 
             video_renderer,
             audio_renderer,
@@ -2510,6 +2554,21 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         self.video_renderer.set_display_hdr_types(mask);
     }
 
+    /// Android direct playback mode: hand the decoder a dedicated video
+    /// `ANativeWindow*` to render into. Decoded frames then ride a HW
+    /// video plane — HDR10/HDR10+/Dolby Vision signals (incl. dynamic
+    /// metadata in the bitstream) reach the display exactly as the OS
+    /// video pipeline delivers them, and the renderer surface only
+    /// carries subtitles/UI. Takes effect at the next `play()`.
+    ///
+    /// # Safety contract
+    /// The window must stay valid (acquired) until after the player is
+    /// dropped or this is reset to null.
+    pub fn set_video_output_window(&self, window: *mut std::ffi::c_void) {
+        self.video_output_window
+            .store(window as usize, Ordering::Relaxed);
+    }
+
     /// How many seconds of media the player tries to keep buffered ahead
     /// of the renderer. Default is `DEFAULT_BUFFER_TARGET_SECS` (8s).
     /// Bumping this trades RAM for resilience against network jitter
@@ -2807,6 +2866,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         // user-driven manual switch + `set_abr_strategy(BandwidthEwma)`
         // afterwards would silently never fire any ticks again.
         let (abr_kill_tx, mut abr_kill_rx) = tokio::sync::oneshot::channel::<()>();
+        let video_output_window = Arc::clone(&self.video_output_window);
         let play = tokio::spawn(async move {
             // ABR tick runs once for the whole play() lifetime (survives
             // every seek/track-switch restart below). On Manual it's a
@@ -2936,7 +2996,16 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                 // well under Intel Arc A750's driver limit of ~21 individual
                 // decoder surfaces. hevc_d3d11va2 auto-allocates a dynamic pool;
                 // this bound prevents the pipeline from accumulating too many refs.
-                let (frame_sender, frame_receiver) = mpsc::channel::<DecodedVideoFrame>(8);
+                //
+                // Android direct mode: every queued frame PINS one of the
+                // codec's scarce output buffers (typically ~8 for HEVC) —
+                // a deep channel deadlocks the decoder outright. 2 in the
+                // channel + 2 in the reorder buffer + 1 rendering leaves
+                // the codec breathing room.
+                let direct_window = video_output_window.load(Ordering::Relaxed);
+                let frame_cap = if direct_window != 0 { 2 } else { 8 };
+                let (frame_sender, frame_receiver) =
+                    mpsc::channel::<DecodedVideoFrame>(frame_cap);
                 let (sample_sender, sample_receiver) = mpsc::channel::<DecodedAudioFrame>(256);
 
                 let video = tokio::spawn(video_supervisor(
@@ -2955,6 +3024,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                     Arc::clone(&events),
                     seg_in_flight,
                     origin,
+                    direct_window,
                 ));
 
                 let sample_rate = audio_sink.sample_rate();

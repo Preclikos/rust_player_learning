@@ -58,6 +58,13 @@ pub struct VideoDecoderParams {
     /// decoders stamp it onto every [`DecodedVideoFrame`] so the renderer
     /// keeps making the right per-frame choice across ABR SDR↔HDR swaps.
     pub color: VideoColorInfo,
+    /// Android direct mode: `ANativeWindow*` of the dedicated video plane
+    /// (as usize). When non-zero MediaCodec renders straight into it — the
+    /// HW video plane carries HDR/HDR10+/DV to the display — and frames
+    /// come back as [`PlatformFrame::MediaCodecDirect`] release handles
+    /// instead of AHardwareBuffers. 0 = classic ImageReader/GL path.
+    /// Ignored by the desktop / Apple decoders.
+    pub direct_window: usize,
 }
 
 /// Transfer function of the video signal, from the SPS VUI
@@ -154,6 +161,12 @@ pub enum PlatformFrame {
     /// Owned AHardwareBuffer produced by MediaCodec's output Surface.
     #[cfg(target_os = "android")]
     HardwareBuffer(AndroidHardwareBufferFrame),
+    /// Direct mode: a not-yet-released MediaCodec output buffer. The
+    /// renderer "renders" it by releasing it to the video Surface with a
+    /// presentation timestamp; dropping the frame unrendered (LATE drain,
+    /// teardown) releases it back to the codec without rendering.
+    #[cfg(target_os = "android")]
+    MediaCodecDirect(mediacodec::DirectVideoFrame),
     /// macOS / iOS / tvOS: native VTDecompressionSession output. The
     /// retained CVPixelBufferRef points to GPU memory (IOSurface-backed)
     /// the video renderer imports via CVMetalTextureCache zero-copy.
@@ -327,6 +340,15 @@ pub trait HwVideoDecoder: Send {
     #[allow(dead_code)]
     fn flush(&mut self) -> Result<(), DecoderError> {
         Ok(())
+    }
+
+    /// True when frames are direct-render handles (MediaCodec output
+    /// buffers awaiting a timed release) rather than copies/refs the
+    /// pipeline can hold freely. The decode pipeline then keeps far fewer
+    /// frames in flight — every queued frame pins one of the codec's
+    /// scarce output buffers and over-holding stalls the decoder.
+    fn is_direct(&self) -> bool {
+        false
     }
 }
 

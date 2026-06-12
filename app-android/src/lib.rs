@@ -28,13 +28,16 @@ use jni::sys::{jint, jlong};
 use jni::JNIEnv;
 use player::{PhysicalSize, Player};
 
-/// Player + the `ANativeWindow` ref it renders into. The window ref is acquired
-/// by `ANativeWindow_fromSurface` and must outlive the player's wgpu surface,
-/// so we keep it here and release it in `nativeDestroy` *after* the player is
-/// dropped.
+/// Player + the `ANativeWindow` refs it renders into. The window refs are
+/// acquired by `ANativeWindow_fromSurface` and must outlive the player's
+/// wgpu surface / MediaCodec output, so we keep them here and release them
+/// in `nativeDestroy` *after* the player is dropped.
 struct Handle {
     player: Player,
+    /// Overlay (wgpu/GLES) window — UI/subtitles, or video in non-direct mode.
     native_window: *mut ndk_sys::ANativeWindow,
+    /// Video plane window — MediaCodec renders into it in direct mode.
+    video_window: *mut ndk_sys::ANativeWindow,
 }
 
 /// Dedicated multi-thread Tokio runtime. The host owns the UI thread / looper,
@@ -100,7 +103,9 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_MainActivity_nativeStart(
     mut env: JNIEnv,
     _class: JClass,
     context: JObject,
+    activity: JObject,
     surface: JObject,
+    video_surface: JObject,
     width: jint,
     height: jint,
     display_hdr_types: jint,
@@ -116,6 +121,17 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_MainActivity_nativeStart(
     };
     if native_window.is_null() {
         log::error!("nativeStart: ANativeWindow_fromSurface returned null");
+        return 0;
+    }
+    let video_window = unsafe {
+        ndk_sys::ANativeWindow_fromSurface(
+            env.get_raw() as *mut _,
+            video_surface.as_raw() as *mut _,
+        )
+    };
+    if video_window.is_null() {
+        log::error!("nativeStart: video ANativeWindow_fromSurface returned null");
+        unsafe { ndk_sys::ANativeWindow_release(native_window) };
         return 0;
     }
 
@@ -150,6 +166,56 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_MainActivity_nativeStart(
         log::info!("nativeStart: HDR passthrough opt-in absent — shader tonemap path");
     }
 
+    // Direct playback mode: MediaCodec renders straight into the dedicated
+    // video Surface (HW video plane → HDR/HDR10+/DV reach the display).
+    // Opt-out for A/B testing:
+    //   echo 0 > /sdcard/Android/data/cz.preclikos.rust_player/files/direct.txt
+    let direct = std::fs::read_to_string(
+        "/storage/emulated/0/Android/data/cz.preclikos.rust_player/files/direct.txt",
+    )
+    .map(|s| s.trim() != "0")
+    .unwrap_or(true);
+    if direct {
+        player.set_video_output_window(video_window as *mut c_void);
+        log::info!("nativeStart: direct MediaCodec→Surface mode enabled");
+    } else {
+        log::info!("nativeStart: direct mode disabled by direct.txt — GL path");
+    }
+
+    // Feed content-size changes back to the Activity so it can shape the
+    // video SurfaceView to the content aspect (MediaCodec stretches to
+    // fill the surface). Uses its own JNI attachment — the events task
+    // runs on a tokio worker.
+    {
+        let vm = env.get_java_vm().expect("get_java_vm");
+        let activity_ref = env.new_global_ref(&activity).expect("global ref activity");
+        let mut events = player.events();
+        runtime().spawn(async move {
+            let mut last = (0u32, 0u32);
+            loop {
+                match events.recv().await {
+                    Ok(player::PlayerEvent::Stats {
+                        current_resolution: Some((w, h)),
+                        ..
+                    }) if (w, h) != last && w > 0 && h > 0 => {
+                        last = (w, h);
+                        if let Ok(mut env) = vm.attach_current_thread() {
+                            let _ = env.call_method(
+                                activity_ref.as_obj(),
+                                "onVideoSize",
+                                "(II)V",
+                                &[(w as jint).into(), (h as jint).into()],
+                            );
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+
     // Drive the shared smoke-test fixture: open_url → clearkey → prepare →
     // pick tracks → play(). Same stream/keys as the desktop + iOS shells.
     runtime().spawn(app_shared::run_test_playback(player.clone()));
@@ -157,6 +223,7 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_MainActivity_nativeStart(
     let handle = Box::new(Handle {
         player,
         native_window,
+        video_window,
     });
     Box::into_raw(handle) as jlong
 }
@@ -197,9 +264,13 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_MainActivity_nativeDestroy(
     let Handle {
         player,
         native_window,
+        video_window,
     } = *h;
-    // Drop the player (and its wgpu surface) first, then release the window ref
-    // we acquired in nativeStart.
+    // Drop the player (its wgpu surface AND the MediaCodec attached to the
+    // video window) first, then release the window refs from nativeStart.
     drop(player);
-    unsafe { ndk_sys::ANativeWindow_release(native_window) };
+    unsafe {
+        ndk_sys::ANativeWindow_release(native_window);
+        ndk_sys::ANativeWindow_release(video_window);
+    }
 }

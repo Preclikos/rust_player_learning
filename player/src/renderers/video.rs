@@ -1916,20 +1916,26 @@ impl VideoRenderer {
         let is_pq = matches!(color.transfer, crate::decoders::TransferFunction::Pq);
         const DISPLAY_HDR10: u32 = 1 << 1;
         if is_pq
-            && !self.android_pq_session.load(std::sync::atomic::Ordering::Relaxed)
             && self.display_hdr_types.load(std::sync::atomic::Ordering::Relaxed) & DISPLAY_HDR10
                 != 0
             && self.android_window != 0
         {
+            // Re-asserted EVERY frame, not just on session entry: the EGL
+            // wrapper re-applies its own (sRGB) dataspace on swaps after
+            // any eglSurfaceAttrib call, silently undoing a one-shot
+            // setting. The perform() hop is trivially cheap.
             let win = self.android_window as *mut ndk_sys::ANativeWindow;
             let rc = unsafe {
                 set_buffers_dataspace(win, ndk_sys::ADataSpace::ADATASPACE_BT2020_PQ.0 as i32)
             };
             if rc == 0 {
-                log::info!("[gles_oes] HDR passthrough ON — surface dataspace BT2020_PQ");
-                self.android_pq_session
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
-            } else {
+                if !self
+                    .android_pq_session
+                    .swap(true, std::sync::atomic::Ordering::Relaxed)
+                {
+                    log::info!("[gles_oes] HDR passthrough ON — surface dataspace BT2020_PQ");
+                }
+            } else if !self.android_pq_session.load(std::sync::atomic::Ordering::Relaxed) {
                 log::warn!(
                     "[gles_oes] ANativeWindow_setBuffersDataSpace(BT2020_PQ) failed ({}) — staying on shader tonemap",
                     rc

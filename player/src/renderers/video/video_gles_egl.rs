@@ -49,6 +49,29 @@ type FnGlEglImageTargetTexture2DOES = unsafe extern "system" fn(u32, *mut c_void
 type FnEglPresentationTimeANDROID =
     unsafe extern "system" fn(*mut c_void, *mut c_void, i64) -> u32;
 
+// eglSurfaceAttrib(dpy, surface, attribute, value) — used for the
+// EGL_EXT_surface_SMPTE2086_metadata / EGL_EXT_surface_CTA861_3_metadata
+// attributes that attach static HDR metadata to swapped buffers. Some
+// HWCs gate the HDMI HDR mode switch on this metadata being present.
+type FnEglSurfaceAttrib = unsafe extern "system" fn(*mut c_void, *mut c_void, i32, i32) -> u32;
+
+// EGL_EXT_surface_SMPTE2086_metadata
+const EGL_SMPTE2086_DISPLAY_PRIMARY_RX_EXT: i32 = 0x3341;
+const EGL_SMPTE2086_DISPLAY_PRIMARY_RY_EXT: i32 = 0x3342;
+const EGL_SMPTE2086_DISPLAY_PRIMARY_GX_EXT: i32 = 0x3343;
+const EGL_SMPTE2086_DISPLAY_PRIMARY_GY_EXT: i32 = 0x3344;
+const EGL_SMPTE2086_DISPLAY_PRIMARY_BX_EXT: i32 = 0x3345;
+const EGL_SMPTE2086_DISPLAY_PRIMARY_BY_EXT: i32 = 0x3346;
+const EGL_SMPTE2086_WHITE_POINT_X_EXT: i32 = 0x3347;
+const EGL_SMPTE2086_WHITE_POINT_Y_EXT: i32 = 0x3348;
+const EGL_SMPTE2086_MAX_LUMINANCE_EXT: i32 = 0x3349;
+const EGL_SMPTE2086_MIN_LUMINANCE_EXT: i32 = 0x334A;
+// EGL_EXT_surface_CTA861_3_metadata
+const EGL_CTA861_3_MAX_CONTENT_LIGHT_LEVEL_EXT: i32 = 0x3360;
+const EGL_CTA861_3_MAX_FRAME_AVERAGE_LEVEL_EXT: i32 = 0x3361;
+// Chromaticity/luminance values are scaled by EGL_METADATA_SCALING_EXT.
+const EGL_METADATA_SCALING: f32 = 50000.0;
+
 // Vertex layout: (x, y, u, v)
 //
 // OES texture Y=0 is the TOP of the AHB frame (Android convention).
@@ -640,8 +663,12 @@ pub struct GlesOesRenderer {
     fn_egl_destroy_image: usize,         // eglDestroyImageKHR
     fn_gl_egl_image_target_texture: usize, // glEGLImageTargetTexture2DOES
     fn_egl_presentation_time: usize,     // eglPresentationTimeANDROID (0 = unavailable)
+    fn_egl_surface_attrib: usize,        // eglSurfaceAttrib (core since EGL 1.1)
     // Raw EGLDisplay pointer captured at init time.
     egl_display: usize,
+    /// Static HDR metadata has been attached to the draw surface (set once
+    /// per surface on the first PassthroughPq frame).
+    hdr_metadata_set: std::sync::atomic::AtomicBool,
 }
 
 unsafe impl Send for GlesOesRenderer {}
@@ -697,6 +724,11 @@ impl GlesOesRenderer {
                     0
                 }
             }
+        };
+        // eglSurfaceAttrib is core EGL; via GetProcAddress for consistency.
+        let fn_surface_attrib: usize = {
+            let sym = concat!("eglSurfaceAttrib", "\0");
+            eglGetProcAddress(sym.as_ptr() as *const i8).map(|f| f as usize).unwrap_or(0)
         };
 
         // Capture the EGLDisplay while the context is current.
@@ -867,8 +899,49 @@ impl GlesOesRenderer {
             fn_egl_destroy_image: fn_destroy,
             fn_gl_egl_image_target_texture: fn_target,
             fn_egl_presentation_time: fn_presentation_time,
+            fn_egl_surface_attrib: fn_surface_attrib,
             egl_display: display,
+            hdr_metadata_set: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Attach static HDR metadata (SMPTE 2086 mastering display + CTA-861.3
+    /// content light level) to the current draw surface. Some HWCs only
+    /// switch the HDMI output into HDR mode when the PQ layer carries this.
+    /// BT.2020 primaries, D65 white point; luminance from the stream's SEI
+    /// when available (caller passes nits), else 1000/0.005 defaults.
+    unsafe fn set_surface_hdr_metadata(&self, max_nits: f32, max_cll: f32, max_fall: f32) {
+        if self.fn_egl_surface_attrib == 0 {
+            return;
+        }
+        let attrib: FnEglSurfaceAttrib = std::mem::transmute(self.fn_egl_surface_attrib);
+        let display = self.egl_display as *mut c_void;
+        let surface = eglGetCurrentSurface(EGL_DRAW);
+        if surface.is_null() {
+            return;
+        }
+        let s = EGL_METADATA_SCALING;
+        // BT.2020 primaries + D65 white point; every attribute value is
+        // "value × EGL_METADATA_SCALING_EXT" per the extension spec.
+        let set = |attr: i32, v: f32| {
+            attrib(display, surface, attr, v.round() as i32);
+        };
+        set(EGL_SMPTE2086_DISPLAY_PRIMARY_RX_EXT, 0.708 * s);
+        set(EGL_SMPTE2086_DISPLAY_PRIMARY_RY_EXT, 0.292 * s);
+        set(EGL_SMPTE2086_DISPLAY_PRIMARY_GX_EXT, 0.170 * s);
+        set(EGL_SMPTE2086_DISPLAY_PRIMARY_GY_EXT, 0.797 * s);
+        set(EGL_SMPTE2086_DISPLAY_PRIMARY_BX_EXT, 0.131 * s);
+        set(EGL_SMPTE2086_DISPLAY_PRIMARY_BY_EXT, 0.046 * s);
+        set(EGL_SMPTE2086_WHITE_POINT_X_EXT, 0.3127 * s);
+        set(EGL_SMPTE2086_WHITE_POINT_Y_EXT, 0.3290 * s);
+        set(EGL_SMPTE2086_MAX_LUMINANCE_EXT, max_nits * s);
+        set(EGL_SMPTE2086_MIN_LUMINANCE_EXT, 0.005 * s);
+        set(EGL_CTA861_3_MAX_CONTENT_LIGHT_LEVEL_EXT, max_cll * s);
+        set(EGL_CTA861_3_MAX_FRAME_AVERAGE_LEVEL_EXT, max_fall * s);
+        log::info!(
+            "[gles_oes] static HDR metadata attached (mastering {} nits, MaxCLL {}, MaxFALL {})",
+            max_nits, max_cll, max_fall
+        );
     }
 
     /// Render one AHardwareBuffer frame to the currently-bound DRAW framebuffer.
@@ -1062,6 +1135,19 @@ impl GlesOesRenderer {
         let gl_err = gl.get_error();
         if gl_err != glow::NO_ERROR {
             log::warn!("[gles_oes] GL error after draw_arrays: {:#x}", gl_err);
+        }
+
+        // Static HDR metadata, once per surface, on the first passthrough
+        // frame — the MTK HWC composites PQ layers into an SDR output
+        // unless the buffer carries mastering metadata.
+        if matches!(mode, OesRenderMode::PassthroughPq | OesRenderMode::SdrToPq)
+            && !self
+                .hdr_metadata_set
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            // 1000-nit mastering / CLL defaults — typical for the PQ ladder;
+            // good enough for the HDMI InfoFrame (the TV tone-maps anyway).
+            self.set_surface_hdr_metadata(1000.0, 1000.0, 400.0);
         }
 
         // Step 4: Set presentation timestamp so the compositor holds this

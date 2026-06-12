@@ -130,7 +130,25 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_MainActivity_nativeStart(
     // must run inside the runtime.
     let _guard = runtime().enter();
     let player = Player::new_from_android_surface(native_window as *mut c_void, w, h);
-    player.set_display_hdr_types(display_hdr_types as u32);
+    // HDR passthrough is opt-in for the test shell: on HDMI boxes the HWC
+    // typically refuses to switch the output to HDR for a GPU-composited
+    // layer (verified on the Google TV Streamer: layer carries BT2020_PQ +
+    // SMPTE2086/CTA861.3 metadata, output stays BT709 — SurfaceFlinger's
+    // own PQ→SDR mapping then looks worse than the player's mobius
+    // tonemap). Phone panels may behave better — flip the file to test:
+    //   echo 1 > /sdcard/Android/data/cz.preclikos.rust_player/files/hdr_passthrough.txt
+    // Real passthrough for TV boxes lands with the direct
+    // MediaCodec→Surface mode.
+    let passthrough_optin = std::fs::read_to_string(
+        "/storage/emulated/0/Android/data/cz.preclikos.rust_player/files/hdr_passthrough.txt",
+    )
+    .map(|s| s.trim() == "1")
+    .unwrap_or(false);
+    if passthrough_optin {
+        player.set_display_hdr_types(display_hdr_types as u32);
+    } else {
+        log::info!("nativeStart: HDR passthrough opt-in absent — shader tonemap path");
+    }
 
     // Drive the shared smoke-test fixture: open_url → clearkey → prepare →
     // pick tracks → play(). Same stream/keys as the desktop + iOS shells.

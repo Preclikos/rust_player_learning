@@ -62,6 +62,10 @@ pub struct MediaCodecDecoder {
     /// Static mastering-display / MaxCLL metadata (usually only on IDR
     /// SEIs) — the fallback for frames without a dynamic entry.
     static_hdr_meta: Option<HdrFrameMeta>,
+    /// Keep Dolby Vision RPU/EL NALs in the bitstream (platform DV
+    /// decoder configured — it needs them). False = strip them (plain
+    /// HEVC decoders may choke on unspecified NAL types).
+    keep_dv_nalus: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -173,7 +177,60 @@ impl MediaCodecDecoder {
             color: Default::default(),
             pending_hdr_meta: Default::default(),
             static_hdr_meta: None,
+            keep_dv_nalus: false,
         }
+    }
+
+    /// Resolve the platform decoder NAME for (mime, profile) via the Java
+    /// `MediaCodecList.findDecoderForFormat` — the NDK has no codec
+    /// enumeration, and `createDecoderByType` just takes the FIRST decoder
+    /// registered for the mime (on MTK that picks the AVC-based
+    /// `dvav.ser` for video/dolby-vision even for HEVC profiles). Returns
+    /// None on any JNI trouble; caller falls back to createDecoderByType.
+    fn find_decoder_name(mime: &str, profile: i32, width: i32, height: i32) -> Option<String> {
+        let ctx = ndk_context::android_context();
+        let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) }.ok()?;
+        let mut env = vm.attach_current_thread().ok()?;
+
+        let jmime = env.new_string(mime).ok()?;
+        let fmt = env
+            .call_static_method(
+                "android/media/MediaFormat",
+                "createVideoFormat",
+                "(Ljava/lang/String;II)Landroid/media/MediaFormat;",
+                &[(&jmime).into(), width.into(), height.into()],
+            )
+            .ok()?
+            .l()
+            .ok()?;
+        let kprofile = env.new_string("profile").ok()?;
+        env.call_method(
+            &fmt,
+            "setInteger",
+            "(Ljava/lang/String;I)V",
+            &[(&kprofile).into(), profile.into()],
+        )
+        .ok()?;
+
+        // MediaCodecList(MediaCodecList.ALL_CODECS = 1)
+        let list = env
+            .new_object("android/media/MediaCodecList", "(I)V", &[1i32.into()])
+            .ok()?;
+        let name = env
+            .call_method(
+                &list,
+                "findDecoderForFormat",
+                "(Landroid/media/MediaFormat;)Ljava/lang/String;",
+                &[(&fmt).into()],
+            )
+            .ok()?
+            .l()
+            .ok()?;
+        if name.is_null() {
+            return None;
+        }
+        let s: String = env.get_string(&jni::objects::JString::from(name)).ok()?.into();
+        Some(s)
     }
 
     /// Direct-mode configure: raw FFI codec attached to the video Surface.
@@ -181,9 +238,43 @@ impl MediaCodecDecoder {
         use std::ffi::CString;
         unsafe {
             let mime_c = CString::new(mime).unwrap();
-            let codec = ndk_sys::AMediaCodec_createDecoderByType(mime_c.as_ptr());
+            // Profile-aware decoder resolution (Java MediaCodecList) with
+            // createDecoderByType as the fallback. Essential for DV, where
+            // several profile-specific decoders register the same mime.
+            let profile_const: i32 = match params.dovi_profile {
+                Some(4) => 0x10,
+                Some(5) => 0x20,
+                Some(6) => 0x40,
+                Some(7) => 0x80,
+                Some(8) => 0x100,
+                Some(9) => 0x200,
+                _ => 0,
+            };
+            let resolved = if mime == "video/dolby-vision" && profile_const != 0 {
+                Self::find_decoder_name(
+                    mime,
+                    profile_const,
+                    params.width as i32,
+                    params.height as i32,
+                )
+            } else {
+                None
+            };
+            let codec = match &resolved {
+                Some(name) => {
+                    log::info!("MediaCodecDecoder: resolved decoder {} for {} profile {:?}",
+                        name, mime, params.dovi_profile);
+                    let name_c = CString::new(name.as_str()).unwrap();
+                    ndk_sys::AMediaCodec_createCodecByName(name_c.as_ptr())
+                }
+                None => ndk_sys::AMediaCodec_createDecoderByType(mime_c.as_ptr()),
+            };
             if codec.is_null() {
-                return Err(format!("AMediaCodec_createDecoderByType({}) failed", mime).into());
+                return Err(format!(
+                    "decoder creation failed (mime {}, resolved {:?})",
+                    mime, resolved
+                )
+                .into());
             }
 
             let format = ndk_sys::AMediaFormat_new();
@@ -193,6 +284,21 @@ impl MediaCodecDecoder {
             let key_h = CString::new("height").unwrap();
             ndk_sys::AMediaFormat_setInt32(format, key_w.as_ptr(), params.width as i32);
             ndk_sys::AMediaFormat_setInt32(format, key_h.as_ptr(), params.height as i32);
+            if mime == "video/dolby-vision" {
+                // MediaCodecInfo.CodecProfileLevel DolbyVisionProfile*
+                // constants — DV decoders key their mode off this.
+                let profile_const: i32 = match params.dovi_profile {
+                    Some(4) => 0x10,  // DvheDtr
+                    Some(5) => 0x20,  // DvheStn
+                    Some(6) => 0x40,  // DvheDth
+                    Some(7) => 0x80,  // DvheDtb
+                    Some(8) => 0x100, // DvheSt
+                    Some(9) => 0x200, // DvavSe
+                    _ => 0x100,
+                };
+                let key_profile = CString::new("profile").unwrap();
+                ndk_sys::AMediaFormat_setInt32(format, key_profile.as_ptr(), profile_const);
+            }
             if !params.hvcc_nalus.is_empty() {
                 let mut csd = Vec::new();
                 for n in &params.hvcc_nalus {
@@ -409,6 +515,36 @@ impl HwVideoDecoder for MediaCodecDecoder {
             self.width = params.width;
             self.height = params.height;
             self.color = params.color;
+            // Dolby Vision: prefer the platform DV decoder — it consumes
+            // the RPU NALs and reconstructs full DV in the OS pipeline.
+            // Falls back to the HEVC base layer (profiles 7/8 only;
+            // profile 5 has no compatible BL and must error out).
+            if let Some(p) = params.dovi_profile {
+                self.keep_dv_nalus = true;
+                match self.configure_direct(&params, "video/dolby-vision") {
+                    Ok(()) => {
+                        log::info!("MediaCodecDecoder: platform Dolby Vision decoder (profile {})", p);
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        self.keep_dv_nalus = false;
+                        if matches!(p, 7 | 8) {
+                            log::warn!(
+                                "MediaCodecDecoder: video/dolby-vision unavailable ({}) — \
+                                 falling back to the HEVC base layer",
+                                e
+                            );
+                        } else {
+                            return Err(format!(
+                                "Dolby Vision profile {} needs the platform DV decoder, \
+                                 which failed: {}",
+                                p, e
+                            )
+                            .into());
+                        }
+                    }
+                }
+            }
             return self.configure_direct(&params, mime);
         }
 
@@ -547,11 +683,14 @@ impl HwVideoDecoder for MediaCodecDecoder {
             // NALUs here carry the 4-byte start code prefix.
             let body = n.strip_prefix(&[0, 0, 0, 1][..]).unwrap_or(&n);
             let nal_type = hevc::nal_unit_type(body);
-            // Dolby Vision RPU / enhancement-layer NALs: MediaCodec's plain
-            // video/hevc decoder doesn't know them — most ignore unspecified
-            // NAL types, but some vendor decoders throw. We only play the
-            // backward-compatible base layer, so drop them at the door.
-            if matches!(nal_type, Some(hevc::NAL_DV_RPU) | Some(hevc::NAL_DV_EL)) {
+            // Dolby Vision RPU / enhancement-layer NALs: the platform
+            // video/dolby-vision decoder NEEDS them (keep_dv_nalus), but a
+            // plain video/hevc decoder doesn't know them — most ignore
+            // unspecified NAL types, some vendor decoders throw. On the
+            // base-layer fallback drop them at the door.
+            if !self.keep_dv_nalus
+                && matches!(nal_type, Some(hevc::NAL_DV_RPU) | Some(hevc::NAL_DV_EL))
+            {
                 continue;
             }
             if self.color.is_hdr() && nal_type == Some(hevc::NAL_SEI_PREFIX) {

@@ -93,43 +93,54 @@ pub async fn run_test_playback(mut player: Player) {
         }
     };
 
-    // Video: first adaptation; representation picked by `video_pref()`
-    // (default: index 5 = 720p HEVC in the preclikos.cz fixture, matching
-    // what both shells used to hardcode).
-    let video_adapt = match tracks.video.first() {
-        Some(a) => a,
-        None => {
-            log::error!("no video adaptations in manifest");
-            return;
+    // Video: representation picked by `video_pref()` (default: first
+    // adaptation, index 5 = 720p HEVC in the preclikos.cz fixture,
+    // matching what both shells used to hardcode). The hdr/dv preferences
+    // scan EVERY video adaptation set — DV reps commonly live in their
+    // own set, not the first one.
+    if tracks.video.is_empty() {
+        log::error!("no video adaptations in manifest");
+        return;
+    }
+    for (ai, a) in tracks.video.iter().enumerate() {
+        for (i, r) in a.representations.iter().enumerate() {
+            log::info!(
+                "video adapt[{}] rep[{}]: {}x{} {} {}bps hdr10={} dv={}",
+                ai, i, r.width, r.height, r.codecs, r.bandwidth, r.hdr10, r.dolby_vision
+            );
         }
-    };
-    for (i, r) in video_adapt.representations.iter().enumerate() {
-        log::info!(
-            "video rep[{}]: {}x{} {} {}bps hdr10={} dv={}",
-            i, r.width, r.height, r.codecs, r.bandwidth, r.hdr10, r.dolby_vision
-        );
     }
     let pref = video_pref();
-    let reps = &video_adapt.representations;
-    let video_repr = match pref.as_deref() {
+    let all = || {
+        tracks
+            .video
+            .iter()
+            .flat_map(|a| a.representations.iter().map(move |r| (a, r)))
+    };
+    let first_adapt = tracks.video.first().unwrap();
+    let picked = match pref.as_deref() {
         // First rep flagged HDR10; the MPD often mis-signals colorimetry,
         // so fall back to the highest-resolution 10-bit rep (the SPS VUI
         // decides the actual render path either way).
-        Some("hdr") => reps
-            .iter()
-            .find(|r| r.hdr10 && !r.dolby_vision)
+        Some("hdr") => all()
+            .find(|(_, r)| r.hdr10 && !r.dolby_vision)
             .or_else(|| {
-                reps.iter()
-                    .filter(|r| r.is_10bit() && !r.dolby_vision)
-                    .max_by_key(|r| r.height)
+                all()
+                    .filter(|(_, r)| r.is_10bit() && !r.dolby_vision)
+                    .max_by_key(|(_, r)| r.height)
             })
-            .or_else(|| reps.iter().max_by_key(|r| r.height)),
-        Some("dv") => reps.iter().find(|r| r.dolby_vision),
-        Some(s) => s.parse::<usize>().ok().and_then(|i| reps.get(i)),
-        None => reps.get(5),
+            .or_else(|| all().max_by_key(|(_, r)| r.height)),
+        Some("dv") => all()
+            .filter(|(_, r)| r.dolby_vision)
+            .max_by_key(|(_, r)| r.height),
+        Some(s) => s
+            .parse::<usize>()
+            .ok()
+            .and_then(|i| first_adapt.representations.get(i).map(|r| (first_adapt, r))),
+        None => first_adapt.representations.get(5).map(|r| (first_adapt, r)),
     };
-    let video_repr = match video_repr {
-        Some(r) => r,
+    let (video_adapt, video_repr) = match picked {
+        Some(p) => p,
         None => {
             log::error!(
                 "no video representation matches preference {:?} (and default index 5 is missing)",

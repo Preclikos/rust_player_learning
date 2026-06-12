@@ -1171,6 +1171,7 @@ struct VideoPrefetch {
     init_data: Vec<u8>,
     hvcc_nalus: Vec<Vec<u8>>,
     color: VideoColorInfo,
+    dovi_profile: Option<u8>,
     track_crypto: Option<TrackCrypto>,
     download_rx: mpsc::Receiver<DataSegment>,
     download_handle: JoinHandle<Result<(), Box<dyn Error + Send + Sync>>>,
@@ -1213,11 +1214,14 @@ async fn video_prefetch(
 
     // Dolby Vision policy: profiles 7/8 carry a decodable HEVC base layer
     // (HDR10/SDR/HLG-compatible, correctly signalled in the SPS VUI), so
-    // they play through the normal Main10 + tonemap path; the RPU NAL is
-    // dropped before MediaCodec. Profile 5 (IPTPQc2) has no compatible
-    // base layer and would render as green/purple garbage — refuse it
-    // up front with an actionable error.
-    if let Some(dovi) = crate::crypto::parse_dovi_config(&init_data) {
+    // they can always play through the normal Main10 + tonemap path with
+    // the RPU NAL dropped. On Android the decoder additionally tries the
+    // platform `video/dolby-vision` codec (full DV, RPU kept) and only
+    // falls back to the base layer. Profile 5 (IPTPQc2) has NO compatible
+    // base layer — it is only playable where a real DV decoder exists
+    // (Android direct mode); elsewhere refuse up front with an actionable
+    // error instead of rendering green/purple garbage.
+    let dovi_profile = crate::crypto::parse_dovi_config(&init_data).map(|dovi| {
         log::info!(
             "video: Dolby Vision profile {}.{} (rpu={} el={} bl={} compat_id={})",
             dovi.profile,
@@ -1227,22 +1231,21 @@ async fn video_prefetch(
             dovi.bl_present,
             dovi.bl_signal_compatibility_id
         );
-        match dovi.profile {
-            7 | 8 => {
-                if dovi.el_present {
-                    log::warn!(
-                        "video: DV enhancement layer present — ignored, playing the base layer only"
-                    );
-                }
-            }
-            p => {
-                return Err(format!(
-                    "Dolby Vision profile {} has no backward-compatible base layer \
-                     (needs RPU reshaping) — unsupported",
-                    p
-                )
-                .into());
-            }
+        if dovi.el_present {
+            log::warn!(
+                "video: DV enhancement layer present — ignored unless the platform DV decoder picks it up"
+            );
+        }
+        dovi.profile
+    });
+    if let Some(p) = dovi_profile {
+        if !matches!(p, 7 | 8) && !cfg!(target_os = "android") {
+            return Err(format!(
+                "Dolby Vision profile {} has no backward-compatible base layer \
+                 (needs a platform DV decoder) — unsupported on this target",
+                p
+            )
+            .into());
         }
     }
 
@@ -1307,6 +1310,7 @@ async fn video_prefetch(
         init_data,
         hvcc_nalus,
         color,
+        dovi_profile,
         track_crypto,
         download_rx,
         download_handle,
@@ -1350,6 +1354,7 @@ async fn run_decode(
         hvcc_nalus: pf.hvcc_nalus,
         color: pf.color,
         direct_window,
+        dovi_profile: pf.dovi_profile,
     })?;
 
     let decoder_task = task::spawn(video_decoder_task(

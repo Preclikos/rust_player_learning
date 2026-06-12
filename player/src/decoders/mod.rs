@@ -65,6 +65,12 @@ pub struct VideoDecoderParams {
     /// instead of AHardwareBuffers. 0 = classic ImageReader/GL path.
     /// Ignored by the desktop / Apple decoders.
     pub direct_window: usize,
+    /// Dolby Vision profile (5/7/8) when the representation is DV. In
+    /// direct mode the Android decoder then prefers the platform
+    /// `video/dolby-vision` codec with the RPU NALs KEPT — full DV
+    /// reconstruction in the OS pipeline — and falls back to the HEVC
+    /// base layer for profiles 7/8 when no DV decoder exists.
+    pub dovi_profile: Option<u8>,
 }
 
 /// Transfer function of the video signal, from the SPS VUI

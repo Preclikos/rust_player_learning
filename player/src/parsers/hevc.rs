@@ -340,6 +340,193 @@ fn skip_st_ref_pic_set(r: &mut BitReader, idx: u32, num_delta_pocs: &[u32]) -> O
     }
 }
 
+// ---------------------------------------------------------------------------
+// SEI parsing (HDR metadata)
+// ---------------------------------------------------------------------------
+
+/// Dynamic (per-access-unit) HDR10+ metadata from the ST 2094-40 SEI.
+/// Converted to nits; only the fields the mobius tonemap consumes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Hdr10PlusInfo {
+    /// max(maxscl[0..3]) of window 0 — the scene peak.
+    pub max_scl_nits: f32,
+    /// average_maxrgb of window 0 — the scene average of max(R,G,B).
+    pub avg_maxrgb_nits: f32,
+}
+
+/// Static HDR10 metadata from the mastering-display / content-light-level
+/// SEI messages (typically present on every IDR).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct HdrStaticInfo {
+    /// max_display_mastering_luminance (SEI 137), nits.
+    pub mastering_peak_nits: Option<f32>,
+    /// max_content_light_level (SEI 144), nits. 0 = unknown per spec.
+    pub max_cll_nits: Option<f32>,
+}
+
+/// All HDR-relevant payloads found in one SEI prefix NAL unit.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SeiHdrMetadata {
+    pub hdr10plus: Option<Hdr10PlusInfo>,
+    pub static_info: HdrStaticInfo,
+}
+
+impl SeiHdrMetadata {
+    pub fn is_empty(&self) -> bool {
+        self.hdr10plus.is_none()
+            && self.static_info.mastering_peak_nits.is_none()
+            && self.static_info.max_cll_nits.is_none()
+    }
+}
+
+const SEI_MASTERING_DISPLAY: u32 = 137;
+const SEI_CONTENT_LIGHT_LEVEL: u32 = 144;
+const SEI_USER_DATA_REGISTERED_T35: u32 = 4;
+
+/// Parse the HDR-relevant SEI payloads out of one SEI prefix NAL unit
+/// (raw NALU bytes including the 2-byte header). Unknown payloads are
+/// skipped; malformed ones abort the scan and return what was found.
+pub fn parse_sei_hdr_metadata(nalu: &[u8]) -> SeiHdrMetadata {
+    let mut out = SeiHdrMetadata::default();
+    let Some(payload) = nalu.get(2..) else {
+        return out;
+    };
+    let rbsp = unescape_rbsp(payload);
+    let mut d = &rbsp[..];
+
+    // sei_message loop: payload_type and payload_size are both coded as
+    // sequences of 0xFF (add 255) terminated by the final byte.
+    loop {
+        let mut payload_type: u32 = 0;
+        loop {
+            match d.first() {
+                Some(&b) => {
+                    d = &d[1..];
+                    payload_type += b as u32;
+                    if b != 0xFF {
+                        break;
+                    }
+                }
+                None => return out,
+            }
+        }
+        let mut payload_size: usize = 0;
+        loop {
+            match d.first() {
+                Some(&b) => {
+                    d = &d[1..];
+                    payload_size += b as usize;
+                    if b != 0xFF {
+                        break;
+                    }
+                }
+                None => return out,
+            }
+        }
+        let Some(body) = d.get(..payload_size) else {
+            return out;
+        };
+        match payload_type {
+            SEI_MASTERING_DISPLAY => {
+                // 3×(primary x,y u16) + white point (x,y u16) = 20 bytes,
+                // then max_display_mastering_luminance u32 (0.0001 nits),
+                // min u32.
+                if body.len() >= 24 {
+                    let max = u32::from_be_bytes([body[20], body[21], body[22], body[23]]);
+                    out.static_info.mastering_peak_nits = Some(max as f32 * 0.0001);
+                }
+            }
+            SEI_CONTENT_LIGHT_LEVEL => {
+                if body.len() >= 2 {
+                    let max_cll = u16::from_be_bytes([body[0], body[1]]);
+                    if max_cll > 0 {
+                        out.static_info.max_cll_nits = Some(max_cll as f32);
+                    }
+                }
+            }
+            SEI_USER_DATA_REGISTERED_T35 => {
+                if let Some(info) = parse_t35_hdr10plus(body) {
+                    out.hdr10plus = Some(info);
+                }
+            }
+            _ => {}
+        }
+        d = &d[payload_size..];
+        // rbsp_trailing_bits: 0x80 (stop bit + alignment), possibly
+        // followed by zero padding, terminates the message list. A real
+        // payload type byte can also be ≥0x80 (137/144 are), so only
+        // treat it as trailing when nothing but zeros follows.
+        if d.is_empty() || (d[0] == 0x80 && d[1..].iter().all(|&b| b == 0)) {
+            return out;
+        }
+    }
+}
+
+/// ST 2094-40 (HDR10+) dynamic metadata inside the ITU-T T.35 SEI.
+/// Returns window-0 maxscl/average in nits.
+fn parse_t35_hdr10plus(body: &[u8]) -> Option<Hdr10PlusInfo> {
+    // itu_t_t35_country_code 0xB5 (USA), terminal_provider_code 0x003C
+    // (Samsung), terminal_provider_oriented_code 0x0001,
+    // application_identifier 4 (ST 2094-40), application_version.
+    if body.len() < 7
+        || body[0] != 0xB5
+        || u16::from_be_bytes([body[1], body[2]]) != 0x003C
+        || u16::from_be_bytes([body[3], body[4]]) != 0x0001
+        || body[5] != 4
+    {
+        return None;
+    }
+    let mut r = BitReader::new(&body[7..]);
+
+    let num_windows = r.u(2)?;
+    if num_windows == 0 || num_windows > 3 {
+        return None;
+    }
+    // Window 1.. (beyond the mandatory window 0) geometry: 11 fixed fields.
+    for _ in 1..num_windows {
+        r.u(16)?; // window_upper_left_corner_x
+        r.u(16)?; // window_upper_left_corner_y
+        r.u(16)?; // window_lower_right_corner_x
+        r.u(16)?; // window_lower_right_corner_y
+        r.u(16)?; // center_of_ellipse_x
+        r.u(16)?; // center_of_ellipse_y
+        r.u(8)?;  // rotation_angle
+        r.u(16)?; // semimajor_axis_internal_ellipse
+        r.u(16)?; // semimajor_axis_external_ellipse
+        r.u(16)?; // semiminor_axis_external_ellipse
+        r.u(1)?;  // overlap_process_option
+    }
+    r.u(27)?; // targeted_system_display_maximum_luminance (0.0001 nits)
+    if r.flag()? {
+        // targeted_system_display_actual_peak_luminance: 5+5 bit dims,
+        // 4-bit entries.
+        let rows = r.u(5)?;
+        let cols = r.u(5)?;
+        for _ in 0..rows * cols {
+            r.u(4)?;
+        }
+    }
+
+    // Window 0 is the first per-window block — that's all the tonemap
+    // needs; remaining windows aren't parsed.
+    // maxscl / average_maxrgb are 17-bit, units of 0.1 nits (range
+    // 0..100000 = 10 000 nits).
+    let m0 = r.u(17)? as f32;
+    let m1 = r.u(17)? as f32;
+    let m2 = r.u(17)? as f32;
+    let avg = r.u(17)? as f32;
+
+    let max_scl_nits = m0.max(m1).max(m2) * 0.1;
+    let avg_maxrgb_nits = avg * 0.1;
+    if max_scl_nits <= 0.0 {
+        return None;
+    }
+    Some(Hdr10PlusInfo {
+        max_scl_nits,
+        avg_maxrgb_nits,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -353,6 +540,65 @@ mod tests {
         assert_eq!(r.ue(), Some(1));
         assert_eq!(r.ue(), Some(2));
         assert_eq!(r.ue(), Some(3));
+    }
+
+    fn bits_to_bytes(bits: &str) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for chunk in bits.as_bytes().chunks(8) {
+            let mut b = 0u8;
+            for (i, &c) in chunk.iter().enumerate() {
+                if c == b'1' {
+                    b |= 1 << (7 - i);
+                }
+            }
+            bytes.push(b);
+        }
+        bytes
+    }
+
+    #[test]
+    fn sei_hdr_metadata() {
+        // T35 HDR10+ payload: 7-byte header + bit fields.
+        let mut t35 = vec![0xB5, 0x00, 0x3C, 0x00, 0x01, 0x04, 0x00];
+        let mut bits = String::new();
+        bits += "01"; // num_windows = 1
+        bits += &format!("{:027b}", 4_000_000); // targeted max luminance (400 nits)
+        bits += "0"; // actual_peak_luminance_flag
+        bits += &format!("{:017b}", 10_000); // maxscl[0] = 1000 nits
+        bits += &format!("{:017b}", 8_000);  // maxscl[1]
+        bits += &format!("{:017b}", 6_000);  // maxscl[2]
+        bits += &format!("{:017b}", 2_000);  // average_maxrgb = 200 nits
+        t35.extend_from_slice(&bits_to_bytes(&bits));
+
+        // SEI NAL: header, CLL message (type 144), T35 message (type 4),
+        // trailing 0x80.
+        let mut nalu = vec![NAL_SEI_PREFIX << 1, 0x01];
+        nalu.extend_from_slice(&[144, 4, 0x03, 0xE8, 0x01, 0x90]); // MaxCLL=1000, MaxFALL=400
+        nalu.push(4);
+        nalu.push(t35.len() as u8);
+        nalu.extend_from_slice(&t35);
+        nalu.push(0x80);
+
+        let meta = parse_sei_hdr_metadata(&nalu);
+        assert_eq!(meta.static_info.max_cll_nits, Some(1000.0));
+        let hp = meta.hdr10plus.expect("hdr10plus parsed");
+        assert!((hp.max_scl_nits - 1000.0).abs() < 0.01, "{}", hp.max_scl_nits);
+        assert!((hp.avg_maxrgb_nits - 200.0).abs() < 0.01, "{}", hp.avg_maxrgb_nits);
+    }
+
+    #[test]
+    fn sei_mastering_display() {
+        let mut body = vec![0u8; 24];
+        // max_display_mastering_luminance = 10_000_000 * 0.0001 = 1000 nits
+        body[20..24].copy_from_slice(&10_000_000u32.to_be_bytes());
+        let mut nalu = vec![NAL_SEI_PREFIX << 1, 0x01];
+        nalu.push(137);
+        nalu.push(body.len() as u8);
+        nalu.extend_from_slice(&body);
+        nalu.push(0x80);
+        let meta = parse_sei_hdr_metadata(&nalu);
+        assert_eq!(meta.static_info.mastering_peak_nits, Some(1000.0));
+        assert!(meta.hdr10plus.is_none());
     }
 
     #[test]

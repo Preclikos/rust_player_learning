@@ -507,6 +507,7 @@ impl HwVideoDecoder for VideoToolboxDecoder {
             native: PlatformFrame::CvPixelBuffer(buf),
             desired_present_ns: 0,
             color: self.color,
+            hdr_meta: None,
         }))
     }
 }

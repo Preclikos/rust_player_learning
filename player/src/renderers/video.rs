@@ -1134,6 +1134,8 @@ impl VideoRenderer {
         let desired_present_ns = frame.desired_present_ns;
         #[cfg(target_os = "android")]
         let frame_color = frame.color;
+        #[cfg(target_os = "android")]
+        let frame_hdr_meta = frame.hdr_meta;
         match frame.native {
             #[cfg(any(target_os = "windows", target_os = "linux"))]
             PlatformFrame::FfmpegVideo(ffmpeg_frame) => {
@@ -1141,7 +1143,8 @@ impl VideoRenderer {
             }
             #[cfg(target_os = "android")]
             PlatformFrame::HardwareBuffer(ahb) => {
-                self.render_android(ahb, desired_present_ns, frame_color).await;
+                self.render_android(ahb, desired_present_ns, frame_color, frame_hdr_meta)
+                    .await;
             }
             #[cfg(any(target_os = "ios", target_os = "macos"))]
             PlatformFrame::CvPixelBuffer(cv_buf) => {
@@ -1615,6 +1618,7 @@ impl VideoRenderer {
         frame: crate::decoders::AndroidHardwareBufferFrame,
         desired_present_ns: i64,
         color: crate::decoders::VideoColorInfo,
+        hdr_meta: Option<crate::decoders::HdrFrameMeta>,
     ) {
         // Update tex_x_max / tex_y_max when the codec buffer is larger than
         // the visible content (e.g. PowerVR Rogue / MT8696 on Google TV
@@ -1741,22 +1745,37 @@ impl VideoRenderer {
         // so HLG falls through to the SDR program.
         let hdr = if matches!(color.transfer, crate::decoders::TransferFunction::Pq) {
             let params = **self.hdr_tonemap_params.load();
-            // Peak resolution differs from the desktop path on purpose: the
-            // wgpu pipeline seeds 100.0 (10 000 nits) and lets the per-frame
-            // detection refine it within one frame, but the GLES hook has no
-            // detection pass. A 10 000-nit assumption would render typical
-            // 1000-nit content several stops too dark for its whole runtime,
-            // so default to 10.0 (1000 nits — the common mastering peak)
-            // until stream metadata (HDR10+ / mastering display SEI)
-            // provides the real value. Explicit params.peak still wins.
-            let peak = if params.peak > 0.0 { params.peak } else { 10.0 };
+            // Peak resolution (REFERENCE_WHITE units, 1.0 = 100 nits), in
+            // priority order:
+            //   1. explicit set_hdr_tonemap peak (user/tuning override),
+            //   2. per-frame bitstream metadata (HDR10+ scene maxscl, DV
+            //      L1, or the static MaxCLL/mastering-display SEI),
+            //   3. 10.0 (1000 nits — the common mastering peak).
+            // The 1000-nit default deliberately differs from the desktop
+            // seed of 100.0: the wgpu pipeline corrects its seed via the
+            // detection passes within a frame, the GLES hook has no
+            // detection and would stay several stops too dark.
+            let peak = if params.peak > 0.0 {
+                params.peak
+            } else {
+                hdr_meta
+                    .map(|m| (m.peak_nits / 100.0).clamp(1.0, 200.0))
+                    .unwrap_or(10.0)
+            };
+            // Scene average drives the brightness slope (slope =
+            // min(1, SDR_AVG/avg) — only kicks in above 25 nits average).
+            // Without metadata use SDR_AVG itself, keeping the slope
+            // inactive exactly like the desktop detection's first-frame
+            // seed.
+            let average = hdr_meta
+                .and_then(|m| m.avg_nits)
+                .map(|a| (a / 100.0).max(1e-3))
+                .unwrap_or(0.25);
             Some(video_gles_egl::HdrFrameParams {
                 tone_param: params.tone_param,
                 desat: params.desat,
                 peak,
-                // SDR_AVG — keeps the slope compensation inactive, exactly
-                // like the desktop detection's first-frame seed.
-                average: 0.25,
+                average,
             })
         } else {
             None
@@ -1804,6 +1823,7 @@ impl VideoRenderer {
         frame: crate::decoders::AndroidHardwareBufferFrame,
         desired_present_ns: i64,
         color: crate::decoders::VideoColorInfo,
+        hdr_meta: Option<crate::decoders::HdrFrameMeta>,
     ) {
         if self.backend == wgpu::Backend::Vulkan {
             // The Vulkan AHB path has no tonemap stage — PQ content renders
@@ -1818,7 +1838,8 @@ impl VideoRenderer {
             }
             self.render_android_vulkan(frame, desired_present_ns).await;
         } else {
-            self.render_android_gles(frame, desired_present_ns, color).await;
+            self.render_android_gles(frame, desired_present_ns, color, hdr_meta)
+                .await;
         }
     }
 

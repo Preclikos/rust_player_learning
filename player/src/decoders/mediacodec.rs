@@ -29,11 +29,12 @@ use ndk::media::media_codec::{
 };
 use ndk::media::media_format::MediaFormat;
 
+use crate::parsers::hevc;
 use crate::parsers::mp4::parse_hevc_nalu;
 
 use super::{
-    AndroidHardwareBufferFrame, DecodedVideoFrame, DecoderError, HwVideoDecoder, PlatformFrame,
-    SendableAhb, VideoCodec, VideoDecoderParams,
+    AndroidHardwareBufferFrame, DecodedVideoFrame, DecoderError, HdrFrameMeta, HwVideoDecoder,
+    PlatformFrame, SendableAhb, VideoCodec, VideoDecoderParams,
 };
 
 pub struct MediaCodecDecoder {
@@ -48,6 +49,14 @@ pub struct MediaCodecDecoder {
     decoded_frame_idx: u64,
     /// Stamped onto every decoded frame (from configure params).
     color: crate::decoders::VideoColorInfo,
+    /// HDR10+ dynamic metadata parsed from the SEI of submitted samples,
+    /// keyed by the sample's pts so it can be re-attached to the decoded
+    /// frame on output (MediaCodec doesn't carry SEI through the Surface
+    /// path). Bounded — see submit().
+    pending_hdr_meta: std::collections::BTreeMap<i64, HdrFrameMeta>,
+    /// Static mastering-display / MaxCLL metadata (usually only on IDR
+    /// SEIs) — the fallback for frames without a dynamic entry.
+    static_hdr_meta: Option<HdrFrameMeta>,
 }
 
 // MediaCodec/ImageReader wrap NonNull pointers and aren't auto-Send.
@@ -64,6 +73,8 @@ impl MediaCodecDecoder {
             last_decoded_pts_us: -1,
             decoded_frame_idx: 0,
             color: Default::default(),
+            pending_hdr_meta: Default::default(),
+            static_hdr_meta: None,
         }
     }
 }
@@ -203,6 +214,50 @@ impl HwVideoDecoder for MediaCodecDecoder {
             .map_err(|e| -> DecoderError { format!("NALU parse: {}", e).into() })?;
         let mut annex_b = Vec::with_capacity(sample.len() + nalus.len() * 4);
         for n in nalus {
+            // Harvest HDR metadata from prefix SEIs on the way in —
+            // MediaCodec's Surface path doesn't surface SEI on output, so
+            // pair it with the frame by pts (one access unit per submit).
+            // Only bother for HDR streams; the parse is cheap but pointless
+            // on the SDR ladder.
+            if self.color.is_hdr() {
+                // NALUs here carry the 4-byte start code prefix.
+                let body = n.strip_prefix(&[0, 0, 0, 1][..]).unwrap_or(&n);
+                if hevc::nal_unit_type(body) == Some(hevc::NAL_SEI_PREFIX) {
+                    let meta = hevc::parse_sei_hdr_metadata(body);
+                    if let Some(hp) = meta.hdr10plus {
+                        self.pending_hdr_meta.insert(
+                            pts_us,
+                            HdrFrameMeta {
+                                peak_nits: hp.max_scl_nits,
+                                avg_nits: Some(hp.avg_maxrgb_nits),
+                            },
+                        );
+                        // Bound the map: stale entries pile up when frames
+                        // get dropped inside the codec (flush, errors).
+                        // 128 ≈ 5 s at 24 fps, far beyond codec latency.
+                        while self.pending_hdr_meta.len() > 128 {
+                            let oldest = *self.pending_hdr_meta.keys().next().unwrap();
+                            self.pending_hdr_meta.remove(&oldest);
+                        }
+                    }
+                    let peak = meta
+                        .static_info
+                        .max_cll_nits
+                        .or(meta.static_info.mastering_peak_nits);
+                    if let Some(peak_nits) = peak {
+                        let new = HdrFrameMeta { peak_nits, avg_nits: None };
+                        if self.static_hdr_meta != Some(new) {
+                            log::info!(
+                                "[mc] static HDR metadata: peak {} nits (MaxCLL {:?}, mastering {:?})",
+                                peak_nits,
+                                meta.static_info.max_cll_nits,
+                                meta.static_info.mastering_peak_nits
+                            );
+                            self.static_hdr_meta = Some(new);
+                        }
+                    }
+                }
+            }
             annex_b.extend_from_slice(&n);
         }
 
@@ -339,6 +394,13 @@ impl HwVideoDecoder for MediaCodecDecoder {
             .map_err(|e| -> DecoderError { format!("Image::hardware_buffer: {:?}", e).into() })?;
         let buffer = Arc::new(SendableAhb::new(hb_unowned.acquire(), image, Arc::clone(reader)));
 
+        // Re-attach HDR metadata harvested at submit time: the dynamic
+        // (HDR10+) entry for exactly this pts, else the static fallback.
+        let hdr_meta = self
+            .pending_hdr_meta
+            .remove(&pts_us)
+            .or(self.static_hdr_meta);
+
         Ok(Some(DecodedVideoFrame {
             pts_us,
             width: self.width,
@@ -350,6 +412,7 @@ impl HwVideoDecoder for MediaCodecDecoder {
             }),
             desired_present_ns: 0,
             color: self.color,
+            hdr_meta,
         }))
     }
 
@@ -361,6 +424,7 @@ impl HwVideoDecoder for MediaCodecDecoder {
         }
         self.last_decoded_pts_us = -1;
         self.decoded_frame_idx = 0;
+        self.pending_hdr_meta.clear();
         Ok(())
     }
 }

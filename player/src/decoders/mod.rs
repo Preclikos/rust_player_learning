@@ -126,6 +126,21 @@ pub struct DecodedVideoFrame {
     /// Per-frame (not per-renderer state) so ABR SDR↔HDR swaps stay correct
     /// for frames of the OLD representation still queued in the channel.
     pub color: VideoColorInfo,
+    /// Dynamic/static HDR metadata for this frame, parsed from the
+    /// bitstream SEI (HDR10+ per access unit; mastering display / MaxCLL
+    /// as the static fallback). None = no metadata seen — the renderer
+    /// uses its default peak.
+    pub hdr_meta: Option<HdrFrameMeta>,
+}
+
+/// Tonemap-relevant HDR metadata resolved per frame, in nits.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HdrFrameMeta {
+    /// Scene/frame peak (HDR10+ maxscl, DV L1 max, or MaxCLL/mastering).
+    pub peak_nits: f32,
+    /// Scene average of max(R,G,B) when the metadata carries one
+    /// (HDR10+ average_maxrgb, DV L1 avg).
+    pub avg_nits: Option<f32>,
 }
 
 /// Platform-native handle wrapping a decoded frame's GPU surface.

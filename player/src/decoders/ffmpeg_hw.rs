@@ -305,6 +305,9 @@ impl HwVideoDecoder for FfmpegHwDecoder {
                     native: PlatformFrame::FfmpegVideo(Arc::new(frame)),
                     desired_present_ns: 0,
                     color: self.color,
+                    // Desktop tonemap uses the wgpu detection passes; SEI
+                    // metadata isn't needed there.
+                    hdr_meta: None,
                 }))
             }
             Err(ffmpeg_next::Error::Other { errno }) if errno == ffmpeg_sys_next::EAGAIN => {

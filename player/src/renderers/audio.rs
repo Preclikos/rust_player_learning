@@ -1,6 +1,6 @@
 use std::{
     sync::{
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         Arc,
     },
     time::Duration,
@@ -35,6 +35,14 @@ pub struct AudioRenderer {
     peak_l_db: Arc<AtomicU32>,
     peak_r_db: Arc<AtomicU32>,
     peak_seen: Arc<AtomicBool>,
+    /// Samples (interleaved f32s, post-resample at the OUTPUT rate) the
+    /// cpal callback has actually consumed from the channel. The DEVICE
+    /// clock — silence emitted during pause/underrun does not advance it,
+    /// so `consumed / 2 / out_rate` is exactly how much media time the
+    /// listener has heard. Drives the A/V drift measurement in the video
+    /// sync loop (the device crystal and CLOCK_MONOTONIC disagree by
+    /// 10-100 ppm — minutes-long playback drifts audibly without it).
+    samples_consumed: Arc<AtomicU64>,
 }
 
 enum AudioRendererCommand {
@@ -120,6 +128,7 @@ impl AudioRenderer {
         // decode/sync issues.
         let volume = Arc::new(AtomicU32::new(1.0_f32.to_bits()));
 
+        let samples_consumed = Arc::new(AtomicU64::new(0));
         let (command_sender, command_receiver) = mpsc::channel(4);
         let audio_thread = AudioRenderer::start_thread(
             command_receiver,
@@ -127,6 +136,7 @@ impl AudioRenderer {
             flush_flag.clone(),
             paused_flag.clone(),
             volume.clone(),
+            samples_consumed.clone(),
         );
 
         AudioRenderer {
@@ -139,6 +149,7 @@ impl AudioRenderer {
             peak_l_db: Arc::new(AtomicU32::new(0)),
             peak_r_db: Arc::new(AtomicU32::new(0)),
             peak_seen: Arc::new(AtomicBool::new(false)),
+            samples_consumed,
         }
     }
 
@@ -165,6 +176,7 @@ impl AudioRenderer {
         self.peak_seen.store(true, Ordering::Relaxed);
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn start_audio(
         mut sample_receiver: Receiver<f32>,
         device: Device,
@@ -177,6 +189,7 @@ impl AudioRenderer {
         stop: Arc<Notify>,
         flush_flag: Arc<AtomicBool>,
         paused_flag: Arc<AtomicBool>,
+        samples_consumed: Arc<AtomicU64>,
     ) {
         // The resampler always emits packed STEREO. With a stereo stream
         // (the normal case) the callback copies 1:1; on a mono-only output it
@@ -202,19 +215,41 @@ impl AudioRenderer {
                 return;
             }
             let vol = f32::from_bits(volume.load(Ordering::Relaxed));
+            let mut consumed = 0u64;
             if out_ch >= 2 {
                 for sample in data.iter_mut() {
-                    let asample = sample_receiver.try_recv().unwrap_or(Sample::EQUILIBRIUM);
+                    let asample = match sample_receiver.try_recv() {
+                        Ok(s) => {
+                            consumed += 1;
+                            s
+                        }
+                        Err(_) => Sample::EQUILIBRIUM,
+                    };
                     *sample = asample * vol;
                 }
             } else {
                 // Mono output device: downmix the packed-stereo source (L+R)/2
                 // per output sample so playback runs at the correct speed/pitch.
                 for sample in data.iter_mut() {
-                    let l = sample_receiver.try_recv().unwrap_or(Sample::EQUILIBRIUM);
-                    let r = sample_receiver.try_recv().unwrap_or(l);
+                    let l = match sample_receiver.try_recv() {
+                        Ok(s) => {
+                            consumed += 1;
+                            s
+                        }
+                        Err(_) => Sample::EQUILIBRIUM,
+                    };
+                    let r = match sample_receiver.try_recv() {
+                        Ok(s) => {
+                            consumed += 1;
+                            s
+                        }
+                        Err(_) => l,
+                    };
                     *sample = (l + r) * 0.5 * vol;
                 }
+            }
+            if consumed > 0 {
+                samples_consumed.fetch_add(consumed, Ordering::Relaxed);
             }
         };
 
@@ -240,6 +275,7 @@ impl AudioRenderer {
         flush_flag: Arc<AtomicBool>,
         paused_flag: Arc<AtomicBool>,
         volume: Arc<AtomicU32>,
+        samples_consumed: Arc<AtomicU64>,
     ) -> (Sender<f32>, u32) {
         let (sample_sender, sample_receiver) = mpsc::channel::<f32>(192_000);
 
@@ -294,6 +330,7 @@ impl AudioRenderer {
             stop_cpal,
             flush_flag,
             paused_flag,
+            samples_consumed,
         );
         std::thread::Builder::new()
             .name("bz-audio-out".into())
@@ -386,6 +423,16 @@ impl super::AudioSink for AudioRenderer {
 
     fn sample_rate(&self) -> u32 {
         AudioRenderer::sample_rate(self)
+    }
+
+    fn played_ms(&self) -> Option<u64> {
+        if self.sample_rate == 0 {
+            return None;
+        }
+        // Interleaved stereo: 2 f32s per frame at the OUTPUT rate (the
+        // resampler preserves duration, so output time = media time).
+        let frames = self.samples_consumed.load(Ordering::Relaxed) / 2;
+        Some(frames * 1000 / self.sample_rate as u64)
     }
 
     fn flush(&self) {

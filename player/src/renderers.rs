@@ -60,6 +60,15 @@ pub trait VideoSink: Send + Sync + 'static {
 pub trait AudioSink: Send + Sync + 'static {
     fn put_samples<'a>(&'a self, samples: &'a [f32]) -> impl Future<Output = ()> + Send + 'a;
     fn sample_rate(&self) -> u32;
+    /// Media milliseconds the output device has actually PLAYED (samples
+    /// consumed by the device callback; pause/underrun silence does not
+    /// count). The device crystal is the clock the listener hears, so the
+    /// video sync loop measures A/V drift against this. `None` = the sink
+    /// can't measure (mocks, platform limitations) — drift tracking is
+    /// then disabled.
+    fn played_ms(&self) -> Option<u64> {
+        None
+    }
     fn flush(&self);
     fn stop(&self) -> impl Future<Output = ()> + Send + '_;
     /// Absolute volume in 0.0..=1.0. Implementations must clamp.

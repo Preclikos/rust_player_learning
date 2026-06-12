@@ -169,6 +169,15 @@ struct StatsState {
     /// IT hasn't received a frame for >300 ms. Video parks on its
     /// current frame instead of marching forward over silence.
     audio_starving: AtomicBool,
+    /// Measured A/V clock drift in ms: how far the video wall clock has
+    /// run ahead of the audio device clock since this pipeline started
+    /// (negative = audio ahead). Written ~1 Hz by video_sync_loop when
+    /// the sink supports `played_ms`; surfaced via PlayerEvent::Stats.
+    /// The device crystal vs CLOCK_MONOTONIC disagree by 10–100 ppm, so
+    /// multi-hour sessions are expected to show a slow linear trend —
+    /// this is the measurement that tells us when an active servo is
+    /// warranted on a given device class.
+    av_drift_ms: std::sync::atomic::AtomicI64,
 }
 
 pub struct Player<V: VideoSink = VideoRenderer, A: AudioSink = AudioRenderer> {
@@ -253,6 +262,11 @@ pub struct Player<V: VideoSink = VideoRenderer, A: AudioSink = AudioRenderer> {
     /// Set once by the host before play(); consumed at pipeline build.
     video_output_window: Arc<AtomicUsize>,
 
+    /// Set when a play() ends on exhausted pipeline retries: the position
+    /// the NEXT play() resumes from, so the consumer's manual retry
+    /// continues where playback stopped instead of starting over.
+    pending_resume: Arc<StdMutex<Option<Duration>>>,
+
     video_renderer: Arc<V>,
     audio_renderer: Arc<A>,
 
@@ -294,6 +308,7 @@ impl<V: VideoSink, A: AudioSink> Clone for Player<V, A> {
             buffer_target_secs: Arc::clone(&self.buffer_target_secs),
             subtitle_representation: Arc::clone(&self.subtitle_representation),
             video_output_window: Arc::clone(&self.video_output_window),
+            pending_resume: Arc::clone(&self.pending_resume),
             video_renderer: Arc::clone(&self.video_renderer),
             audio_renderer: Arc::clone(&self.audio_renderer),
             rt: self.rt.clone(),
@@ -379,6 +394,10 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
     let mut last_position_emit = Instant::now() - Duration::from_secs(1);
     // Stats event rate-limit: ≤ 1 Hz per PLAYER_INTEGRATION.md §4.1.
     let mut last_stats_emit = Instant::now() - Duration::from_secs(1);
+    // A/V drift measurement: (video elapsed_ms, audio played_ms) at the
+    // first stats tick — subsequent ticks compare ADVANCES from here.
+    let mut drift_baseline: Option<(u64, u64)> = None;
+    let mut last_drift_warn: Option<Instant> = None;
     let mut emitted_playing = false;
     // Starvation tracking — flips when the decoder hasn't produced a
     // frame for >300 ms (typically a network outage hitting the
@@ -661,6 +680,35 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
         // Rate-limited Stats emission (≤ 1 Hz). net_stall_ms is swap-reset
         // so consumers see "ms blocked in the last second", not cumulative.
         if last_stats_emit.elapsed() >= Duration::from_secs(1) {
+            // A/V drift bookkeeping: both clocks freeze together across
+            // pauses and starvation windows (cpal consumes nothing while
+            // paused; pause_skew stops the video timeline), so the
+            // difference of ADVANCES since the baseline isolates pure
+            // clock-rate mismatch plus any sync bug.
+            let mut drift_out: Option<i64> = None;
+            if let Some(played) = audio_sink.played_ms() {
+                match drift_baseline {
+                    None => drift_baseline = Some((render_start, played)),
+                    Some((elapsed0, played0)) => {
+                        let video_adv = render_start.saturating_sub(elapsed0) as i64;
+                        let audio_adv = played.saturating_sub(played0) as i64;
+                        let drift = video_adv - audio_adv;
+                        stats.av_drift_ms.store(drift, Ordering::Relaxed);
+                        drift_out = Some(drift);
+                        if drift.abs() > 100
+                            && last_drift_warn
+                                .map(|t| t.elapsed() > Duration::from_secs(30))
+                                .unwrap_or(true)
+                        {
+                            log::warn!(
+                                "[vsync] A/V clock drift {}ms (video wall clock vs audio device clock)",
+                                drift
+                            );
+                            last_drift_warn = Some(Instant::now());
+                        }
+                    }
+                }
+            }
             let decoder_name = stats.decoder_name.lock().unwrap().clone();
             let _ = events.send(PlayerEvent::Stats {
                 video_frames_decoded: stats.video_frames_decoded.load(Ordering::Relaxed),
@@ -670,6 +718,7 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
                 decoder_name,
                 current_resolution: Some((frame_w, frame_h)),
                 audio_peak_db: audio_sink.last_peak_db(),
+                av_drift_ms: drift_out,
             });
             last_stats_emit = Instant::now();
         }
@@ -1751,7 +1800,21 @@ async fn video_supervisor(
     origin: Duration,
     // Android direct mode video window (0 = renderer path).
     direct_window: usize,
+    // Resume slot written when retries are exhausted: the NEXT play() call
+    // starts from this position instead of zero ("continue where we
+    // stopped" semantics for the consumer's manual retry).
+    pending_resume: Arc<StdMutex<Option<Duration>>>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    // Pipeline failures (network death mid-stream, decoder errors) are
+    // retried from the current playback position with backoff. The
+    // counter resets once playback makes real progress, so a long movie
+    // surviving three separate hiccups hours apart keeps recovering, while
+    // a hard failure (dead URL, broken stream) exhausts quickly and
+    // surfaces as PlayerEvent::Error instead of a fake EndOfStream.
+    const MAX_PIPELINE_RETRIES: u32 = 3;
+    const PROGRESS_RESET_MS: u64 = 10_000;
+    let mut retry_attempt: u32 = 0;
+    let mut last_fail_pos_ms: u64 = 0;
     let spawn_pipeline = |repr: VideoRepresenation,
                           start_index: usize,
                           local_stop: Arc<Notify>,
@@ -1819,12 +1882,121 @@ async fn video_supervisor(
                     return Ok(());
                 }
                 res = &mut cur_handle => {
-                    match res {
-                        Ok(Ok(())) => log::info!("[video] supervisor: pipeline exited naturally; closing"),
-                        Ok(Err(e)) => log::error!("[video] supervisor: pipeline failed: {}", e),
-                        Err(e) => log::error!("[video] supervisor: pipeline task panicked: {}", e),
+                    let detail = match res {
+                        Ok(Ok(())) => {
+                            // Natural EOF — propagate so the keepalive
+                            // frame_sender drops, the channel closes, and
+                            // av_sync fires EndOfStream.
+                            log::info!("[video] supervisor: pipeline exited naturally; closing");
+                            return Ok(());
+                        }
+                        Ok(Err(e)) => e.to_string(),
+                        Err(e) => format!("pipeline task panicked: {}", e),
+                    };
+                    if stop_flag.load(Ordering::Relaxed) {
+                        // Teardown raced the failure — not an error.
+                        return Ok(());
                     }
-                    return Ok(());
+                    log::error!("[video] supervisor: pipeline failed: {}", detail);
+
+                    // Bounded retry-with-resume. Progress since the last
+                    // failure resets the budget.
+                    let pos_now = position_ms.load(Ordering::Relaxed);
+                    if pos_now.saturating_sub(last_fail_pos_ms) > PROGRESS_RESET_MS {
+                        retry_attempt = 0;
+                    }
+                    last_fail_pos_ms = pos_now;
+                    retry_attempt += 1;
+                    if retry_attempt > MAX_PIPELINE_RETRIES {
+                        log::error!(
+                            "[video] supervisor: {} consecutive pipeline failures — giving up at {}ms",
+                            retry_attempt - 1,
+                            pos_now
+                        );
+                        // Park the position for the consumer's next play()
+                        // ("continue where we stopped"), surface the error,
+                        // and stop WITHOUT the fake EndOfStream (av_sync
+                        // checks stop_flag before emitting EOS).
+                        *pending_resume.lock().unwrap() =
+                            Some(Duration::from_millis(pos_now));
+                        let _ = events.send(PlayerEvent::Error {
+                            kind: PlayerErrorKind::Decoder,
+                            detail,
+                        });
+                        stop_flag.store(true, Ordering::Relaxed);
+                        stop.notify_waiters();
+                        return Err("video pipeline retries exhausted".into());
+                    }
+                    log::warn!(
+                        "[video] supervisor: retrying pipeline ({}/{}) from {}ms",
+                        retry_attempt,
+                        MAX_PIPELINE_RETRIES,
+                        pos_now
+                    );
+                    // Backoff, abortable by stop. av_sync's starvation
+                    // detection keeps the consumer in Buffering meanwhile.
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_secs(retry_attempt as u64)) => {}
+                        _ = stop.notified() => return Ok(()),
+                    }
+                    if stop_flag.load(Ordering::Relaxed) {
+                        return Ok(());
+                    }
+
+                    // Respawn from the segment containing the current
+                    // position; the splice trims re-decoded frames at/below
+                    // the last rendered PTS so playback continues forward
+                    // (no rewind). The retry task includes the prefetch, so
+                    // a network failure during recovery lands back in this
+                    // arm and consumes another attempt.
+                    let pos_abs = Duration::from_millis(pos_now) + origin;
+                    let resume_idx = find_segment_index(&current_repr.segments, pos_abs);
+                    cur_stop = Arc::new(Notify::new());
+                    cur_flag = Arc::new(AtomicBool::new(false));
+                    cur_soft_end = Arc::new(AtomicUsize::new(usize::MAX));
+                    cur_handle = task::spawn({
+                        let repr = current_repr.clone();
+                        let stop = cur_stop.clone();
+                        let flag = cur_flag.clone();
+                        let soft_end = cur_soft_end.clone();
+                        let decryptor = decryptor.clone();
+                        let http = Arc::clone(&http);
+                        let stats = Arc::clone(&stats);
+                        let sender = frame_sender.clone();
+                        let video_ready = video_ready.clone();
+                        let decoder_factory = decoder_factory.clone();
+                        let splice_pts_us = pos_abs.as_micros() as i64;
+                        async move {
+                            let pf = video_prefetch(
+                                &repr,
+                                resume_idx,
+                                stop,
+                                Arc::clone(&flag),
+                                decryptor,
+                                http,
+                                Arc::clone(&stats),
+                                segments_in_flight,
+                                soft_end,
+                                usize::MAX,
+                            )
+                            .await?;
+                            run_decode(
+                                pf,
+                                sender,
+                                video_ready,
+                                decoder_factory(),
+                                stats,
+                                flag,
+                                Some(SwapSplice {
+                                    started: Instant::now(),
+                                    skip_below_pts_us: splice_pts_us,
+                                }),
+                                direct_window,
+                            )
+                            .await
+                        }
+                    });
+                    continue;
                 }
                 _ = async {
                     if stop_flag.load(Ordering::Relaxed) {
@@ -2176,6 +2348,7 @@ impl Player<VideoRenderer, AudioRenderer> {
             buffer_target_secs: Arc::new(AtomicU32::new(DEFAULT_BUFFER_TARGET_SECS)),
             subtitle_representation: Arc::new(StdMutex::new(None)),
             video_output_window: Arc::new(AtomicUsize::new(0)),
+            pending_resume: Arc::new(StdMutex::new(None)),
 
             video_renderer,
             audio_renderer,
@@ -2872,6 +3045,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         // afterwards would silently never fire any ticks again.
         let (abr_kill_tx, mut abr_kill_rx) = tokio::sync::oneshot::channel::<()>();
         let video_output_window = Arc::clone(&self.video_output_window);
+        let pending_resume = Arc::clone(&self.pending_resume);
         let play = tokio::spawn(async move {
             // ABR tick runs once for the whole play() lifetime (survives
             // every seek/track-switch restart below). On Manual it's a
@@ -2901,7 +3075,13 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                 let seek_offset = {
                     let mut target = seek_target.write().await;
                     stop_flag.store(false, Ordering::Relaxed);
-                    target.take().unwrap_or(Duration::ZERO)
+                    // Priority: explicit seek > resume position parked by an
+                    // exhausted-retries stop ("continue where we stopped" on
+                    // the consumer's next play()) > start of content.
+                    target
+                        .take()
+                        .or_else(|| pending_resume.lock().unwrap().take())
+                        .unwrap_or(Duration::ZERO)
                 };
 
                 // Hard reset the audio sink before the (re)started pipeline
@@ -3030,6 +3210,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                     seg_in_flight,
                     origin,
                     direct_window,
+                    Arc::clone(&pending_resume),
                 ));
 
                 let sample_rate = audio_sink.sample_rate();

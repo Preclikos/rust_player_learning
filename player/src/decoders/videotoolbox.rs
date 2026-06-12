@@ -203,6 +203,8 @@ pub struct VideoToolboxDecoder {
     state: Arc<SharedState>,
     format_desc: CMVideoFormatDescriptionRef,
     session: VTDecompressionSessionRef,
+    /// Stamped onto every decoded frame (from configure params).
+    color: crate::decoders::VideoColorInfo,
 }
 
 unsafe impl Send for VideoToolboxDecoder {}
@@ -215,6 +217,7 @@ impl VideoToolboxDecoder {
             }),
             format_desc: ptr::null_mut(),
             session: ptr::null_mut(),
+            color: Default::default(),
         })
     }
 }
@@ -371,6 +374,7 @@ impl HwVideoDecoder for VideoToolboxDecoder {
             return Err(format!("VTDecompressionSessionCreate: {}", st).into());
         }
         self.session = session;
+        self.color = params.color;
         Ok(())
     }
 
@@ -502,6 +506,7 @@ impl HwVideoDecoder for VideoToolboxDecoder {
             height,
             native: PlatformFrame::CvPixelBuffer(buf),
             desired_present_ns: 0,
+            color: self.color,
         }))
     }
 }

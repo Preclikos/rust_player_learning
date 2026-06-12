@@ -52,6 +52,66 @@ pub struct VideoDecoderParams {
     /// Raw NALU bytes (no length prefix, no start code) — VPS/SPS/PPS for HEVC,
     /// extracted from the hvcC box in the init segment.
     pub hvcc_nalus: Vec<Vec<u8>>,
+    /// Colour information for the representation, parsed from the SPS VUI
+    /// (authoritative — the MPD often mis-signals BT.709 on PQ content).
+    /// Drives 10-bit surface allocation and the HDR tonemap path selection;
+    /// decoders stamp it onto every [`DecodedVideoFrame`] so the renderer
+    /// keeps making the right per-frame choice across ABR SDR↔HDR swaps.
+    pub color: VideoColorInfo,
+}
+
+/// Transfer function of the video signal, from the SPS VUI
+/// `transfer_characteristics` (H.273: 16 = PQ, 18 = HLG).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum TransferFunction {
+    /// SDR (BT.709 / BT.1886 family) — also the fallback when unspecified.
+    #[default]
+    Sdr,
+    /// SMPTE ST 2084 perceptual quantizer (HDR10, Dolby Vision 8.1 BL).
+    Pq,
+    /// Hybrid log-gamma (ARIB STD-B67).
+    Hlg,
+}
+
+/// Per-representation colour description, renderer-facing.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct VideoColorInfo {
+    /// Luma bit depth (8 = SDR ladder, 10 = Main10 / HDR).
+    pub bit_depth: u8,
+    pub transfer: TransferFunction,
+    /// Primaries/matrix are BT.2020 (wide gamut).
+    pub bt2020: bool,
+    pub full_range: bool,
+}
+
+impl VideoColorInfo {
+    /// True when the HDR tonemap path must run (PQ or HLG signal).
+    pub fn is_hdr(&self) -> bool {
+        !matches!(self.transfer, TransferFunction::Sdr)
+    }
+
+    /// Build from a parsed SPS, with the hvcC bit depth as fallback.
+    pub fn from_sps(
+        sps: Option<crate::parsers::hevc::SpsColorInfo>,
+        hvcc_bit_depth: Option<u8>,
+    ) -> Self {
+        match sps {
+            Some(s) => Self {
+                bit_depth: s.bit_depth_luma,
+                transfer: match s.transfer_characteristics {
+                    16 => TransferFunction::Pq,
+                    18 => TransferFunction::Hlg,
+                    _ => TransferFunction::Sdr,
+                },
+                bt2020: s.colour_primaries == 9 || s.matrix_coeffs == 9,
+                full_range: s.full_range,
+            },
+            None => Self {
+                bit_depth: hvcc_bit_depth.unwrap_or(8),
+                ..Default::default()
+            },
+        }
+    }
 }
 
 pub struct DecodedVideoFrame {
@@ -62,6 +122,10 @@ pub struct DecodedVideoFrame {
     /// CLOCK_MONOTONIC nanoseconds when this frame should be displayed.
     /// Set by the A/V sync loop; 0 = no constraint (display ASAP).
     pub desired_present_ns: i64,
+    /// Colour description stamped by the decoder from its configure params.
+    /// Per-frame (not per-renderer state) so ABR SDR↔HDR swaps stay correct
+    /// for frames of the OLD representation still queued in the channel.
+    pub color: VideoColorInfo,
 }
 
 /// Platform-native handle wrapping a decoded frame's GPU surface.

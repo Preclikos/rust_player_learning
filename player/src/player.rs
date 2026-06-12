@@ -52,7 +52,7 @@ use crypto::{
 };
 use decoders::{
     AudioCodec, AudioDecoder, AudioDecoderParams, DecodedAudioFrame, DecodedVideoFrame,
-    HwVideoDecoder, VideoCodec, VideoDecoderParams,
+    HwVideoDecoder, VideoCodec, VideoColorInfo, VideoDecoderParams,
 };
 use parsers::mp4::aac_sampling_frequency_index_to_u32;
 use pollster::FutureExt;
@@ -1146,6 +1146,7 @@ struct VideoPrefetch {
     height: u32,
     init_data: Vec<u8>,
     hvcc_nalus: Vec<Vec<u8>>,
+    color: VideoColorInfo,
     track_crypto: Option<TrackCrypto>,
     download_rx: mpsc::Receiver<DataSegment>,
     download_handle: JoinHandle<Result<(), Box<dyn Error + Send + Sync>>>,
@@ -1185,10 +1186,21 @@ async fn video_prefetch(
 
     let hvcc_nalus = parse_hvcc_nalus(&init_data)
         .ok_or_else(|| -> Box<dyn Error + Send + Sync> { "no hvcC in init segment".into() })?;
-    if let Some(bd) = parse_hvcc_bit_depth(&init_data) {
-        if bd != 8 {
-            log::info!("video: HEVC luma bit depth = {}", bd);
-        }
+
+    // Colour info comes from the SPS VUI — the MPD is not trustworthy here
+    // (our test stream signals BT.709 on PQ representations). Fall back to
+    // the hvcC bit depth when the SPS doesn't parse.
+    let sps_color = crate::parsers::hevc::parse_sps_color_info(&hvcc_nalus);
+    let color = VideoColorInfo::from_sps(sps_color, parse_hvcc_bit_depth(&init_data));
+    if color.bit_depth != 8 || color.is_hdr() {
+        log::info!(
+            "video: {}-bit, transfer={:?}, bt2020={}, full_range={} (SPS VUI {})",
+            color.bit_depth,
+            color.transfer,
+            color.bt2020,
+            color.full_range,
+            if sps_color.is_some() { "parsed" } else { "missing — hvcC fallback" },
+        );
     }
 
     let track_crypto = setup_track_crypto(&init_data, decryptor, "video").await?;
@@ -1235,6 +1247,7 @@ async fn video_prefetch(
         height: repr.height,
         init_data,
         hvcc_nalus,
+        color,
         track_crypto,
         download_rx,
         download_handle,
@@ -1274,6 +1287,7 @@ async fn run_decode(
         width: pf.width,
         height: pf.height,
         hvcc_nalus: pf.hvcc_nalus,
+        color: pf.color,
     })?;
 
     let decoder_task = task::spawn(video_decoder_task(

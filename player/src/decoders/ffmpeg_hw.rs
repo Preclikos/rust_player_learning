@@ -20,6 +20,8 @@ pub struct FfmpegHwDecoder {
     /// across the initial decoder + every ABR-swap decoder, so a swap never
     /// recreates the GPU device. See [`SharedHwDevice`].
     shared_device: Option<Arc<SharedHwDevice>>,
+    /// Stamped onto every decoded frame (from configure params).
+    color: crate::decoders::VideoColorInfo,
 }
 
 unsafe impl Send for FfmpegHwDecoder {}
@@ -100,6 +102,7 @@ impl FfmpegHwDecoder {
             decoder: None,
             hw_device_ctx: std::ptr::null_mut(),
             shared_device: None,
+            color: Default::default(),
         }
     }
 
@@ -110,6 +113,7 @@ impl FfmpegHwDecoder {
             decoder: None,
             hw_device_ctx: std::ptr::null_mut(),
             shared_device: Some(device),
+            color: Default::default(),
         }
     }
 
@@ -236,6 +240,7 @@ impl HwVideoDecoder for FfmpegHwDecoder {
         }
 
         self.decoder = Some(decoder);
+        self.color = params.color;
         Ok(())
     }
 
@@ -299,6 +304,7 @@ impl HwVideoDecoder for FfmpegHwDecoder {
                     height,
                     native: PlatformFrame::FfmpegVideo(Arc::new(frame)),
                     desired_present_ns: 0,
+                    color: self.color,
                 }))
             }
             Err(ffmpeg_next::Error::Other { errno }) if errno == ffmpeg_sys_next::EAGAIN => {

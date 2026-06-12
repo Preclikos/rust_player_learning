@@ -45,6 +45,8 @@ pub struct MediaCodecDecoder {
     height: u32,
     last_decoded_pts_us: i64,
     decoded_frame_idx: u64,
+    /// Stamped onto every decoded frame (from configure params).
+    color: crate::decoders::VideoColorInfo,
 }
 
 // MediaCodec/ImageReader wrap NonNull pointers and aren't auto-Send.
@@ -60,6 +62,7 @@ impl MediaCodecDecoder {
             height: 0,
             last_decoded_pts_us: -1,
             decoded_frame_idx: 0,
+            color: Default::default(),
         }
     }
 }
@@ -133,6 +136,7 @@ impl HwVideoDecoder for MediaCodecDecoder {
         self.codec = Some(codec);
         self.width = params.width;
         self.height = params.height;
+        self.color = params.color;
         log::info!(
             "MediaCodecDecoder: configured {}, {}x{}, surface output",
             mime,
@@ -300,6 +304,7 @@ impl HwVideoDecoder for MediaCodecDecoder {
                 height: self.height,
             }),
             desired_present_ns: 0,
+            color: self.color,
         }))
     }
 

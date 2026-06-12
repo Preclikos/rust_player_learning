@@ -56,30 +56,36 @@ pub struct PlayerCapabilities {
 /// [`probe_capabilities`].
 pub const fn capabilities() -> PlayerCapabilities {
     PlayerCapabilities {
-        // HDR10 (HEVC Main10) is wired on the desktop targets:
+        // HDR10 (HEVC Main10) is wired on:
         //   - Windows: D3D11VA hwaccel + DX11→DX12 P010 shared import,
         //              wgpu shader_hdr (Rec.2020 + PQ → SDR tonemap).
         //   - Linux:   VAAPI hwaccel + DMA-fd Vulkan P010 import.
         //   - macOS:   VideoToolbox + Metal CVPixelBuffer P010 plane.
-        // Android (MediaCodec / AHardwareBuffer) and iOS (VTDecompression)
-        // can decode Main10 but the 10-bit render path isn't wired through
-        // them yet — keep them false until the AHB-P010 and Metal-P010
-        // paths exist.
+        //   - Android: MediaCodec 10-bit AHardwareBuffer surface + the
+        //              GLES OES PQ→SDR mobius tonemap program
+        //              (video_gles_egl.rs). Colorimetry comes from the SPS
+        //              VUI, so this works even when the MPD mis-signals.
+        // iOS (VTDecompression) can decode Main10 but the Metal-P010
+        // render path isn't wired through yet — false until it exists.
         hdr10: cfg!(any(
             target_os = "windows",
             target_os = "linux",
             target_os = "macos",
+            target_os = "android",
         )),
 
         dolby_vision: false,
 
         // Tunable only where the player's own shader does the HDR→SDR
-        // conversion. macOS / iOS hand us pre-tonemapped 8-bit NV12 from
-        // VideoToolbox — the shader knobs would do nothing there, so
-        // hide the setting in the UI.
+        // conversion (incl. the Android GLES tonemap program, which reads
+        // tone_param/desat/peak from set_hdr_tonemap per frame). macOS /
+        // iOS hand us pre-tonemapped 8-bit NV12 from VideoToolbox — the
+        // shader knobs would do nothing there, so hide the setting in
+        // the UI.
         hdr_tonemap_tunable: cfg!(any(
             target_os = "windows",
             target_os = "linux",
+            target_os = "android",
         )),
     }
 }
@@ -97,6 +103,17 @@ pub async fn probe_capabilities() -> PlayerCapabilities {
     if !caps.hdr10 {
         return caps;
     }
+
+    // Android renders HDR through the GLES OES external-texture program —
+    // the wgpu TEXTURE_FORMAT_P010 feature plays no part there, so the
+    // desktop-oriented adapter probe below would only produce a false
+    // negative. The OES path degrades gracefully at runtime anyway
+    // (SDR passthrough + warning if the HDR program fails to compile).
+    #[cfg(target_os = "android")]
+    return caps;
+
+    #[cfg(not(target_os = "android"))]
+    {
 
     // HDR10 needs the wgpu `TEXTURE_FORMAT_P010` feature on the adapter we
     // intend to use. The real renderer picks DX12 on Windows, Vulkan on
@@ -154,4 +171,5 @@ pub async fn probe_capabilities() -> PlayerCapabilities {
         caps.hdr10 = false;
     }
     caps
+    }
 }

@@ -26,6 +26,38 @@ pub fn test_clearkeys() -> HashMap<String, String> {
     keys
 }
 
+/// Test-shell video representation override. Values: `hdr` (first HDR10 /
+/// highest 10-bit rep), `dv` (first Dolby Vision rep), a numeric rep
+/// index, or unset for the historical default (index 5 = 720p SDR).
+///
+/// Desktop: `RUST_PLAYER_VIDEO` env var. Android: the app's external
+/// files dir is the only place both `adb push` (no root) and the app can
+/// touch, so a one-line `video_pref.txt` there acts as the env var:
+///   adb shell "mkdir -p /sdcard/Android/data/cz.preclikos.rust_player/files"
+///   adb shell "echo hdr > /sdcard/Android/data/cz.preclikos.rust_player/files/video_pref.txt"
+fn video_pref() -> Option<String> {
+    if let Ok(v) = std::env::var("RUST_PLAYER_VIDEO") {
+        let v = v.trim().to_string();
+        if !v.is_empty() {
+            return Some(v);
+        }
+    }
+    #[cfg(target_os = "android")]
+    for path in [
+        "/storage/emulated/0/Android/data/cz.preclikos.rust_player/files/video_pref.txt",
+        "/sdcard/Android/data/cz.preclikos.rust_player/files/video_pref.txt",
+    ] {
+        if let Ok(s) = std::fs::read_to_string(path) {
+            let s = s.trim().to_string();
+            if !s.is_empty() {
+                log::info!("video_pref: {} (from {})", s, path);
+                return Some(s);
+            }
+        }
+    }
+    None
+}
+
 /// Opens the encrypted test stream, installs ClearKey keys, prepares the
 /// pipeline, and picks a default video + audio track. Returns once the
 /// first `play()` handle has been spawned, with the play-supervisor task
@@ -61,8 +93,9 @@ pub async fn run_test_playback(mut player: Player) {
         }
     };
 
-    // Video: first adaptation, representation index 5 (720p HEVC in the
-    // preclikos.cz fixture). Matches what both shells used to hardcode.
+    // Video: first adaptation; representation picked by `video_pref()`
+    // (default: index 5 = 720p HEVC in the preclikos.cz fixture, matching
+    // what both shells used to hardcode).
     let video_adapt = match tracks.video.first() {
         Some(a) => a,
         None => {
@@ -70,17 +103,46 @@ pub async fn run_test_playback(mut player: Player) {
             return;
         }
     };
-    let video_repr = match video_adapt.representations.get(5) {
+    for (i, r) in video_adapt.representations.iter().enumerate() {
+        log::info!(
+            "video rep[{}]: {}x{} {} {}bps hdr10={} dv={}",
+            i, r.width, r.height, r.codecs, r.bandwidth, r.hdr10, r.dolby_vision
+        );
+    }
+    let pref = video_pref();
+    let reps = &video_adapt.representations;
+    let video_repr = match pref.as_deref() {
+        // First rep flagged HDR10; the MPD often mis-signals colorimetry,
+        // so fall back to the highest-resolution 10-bit rep (the SPS VUI
+        // decides the actual render path either way).
+        Some("hdr") => reps
+            .iter()
+            .find(|r| r.hdr10 && !r.dolby_vision)
+            .or_else(|| {
+                reps.iter()
+                    .filter(|r| r.is_10bit() && !r.dolby_vision)
+                    .max_by_key(|r| r.height)
+            })
+            .or_else(|| reps.iter().max_by_key(|r| r.height)),
+        Some("dv") => reps.iter().find(|r| r.dolby_vision),
+        Some(s) => s.parse::<usize>().ok().and_then(|i| reps.get(i)),
+        None => reps.get(5),
+    };
+    let video_repr = match video_repr {
         Some(r) => r,
         None => {
-            log::error!("video representation index 5 missing");
+            log::error!(
+                "no video representation matches preference {:?} (and default index 5 is missing)",
+                pref
+            );
             return;
         }
     };
     player.set_video_track(video_adapt, video_repr);
     log::info!(
-        "selected video {}x{} {}",
-        video_repr.width, video_repr.height, video_repr.codecs
+        "selected video {}x{} {} (pref={:?}, hdr10={}, dv={})",
+        video_repr.width, video_repr.height, video_repr.codecs, pref,
+        video_repr.hdr10, video_repr.dolby_vision
     );
 
     // Audio: prefer an AAC (mp4a*) representation since the Android

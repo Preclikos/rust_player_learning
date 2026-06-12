@@ -152,6 +152,12 @@ fn parse_sps(nalu: &[u8]) -> Option<SpsColorInfo> {
         r.ue()?;
     }
     let bit_depth_luma = 8 + r.ue()? as u8;
+    if !(8..=16).contains(&bit_depth_luma) {
+        // Spec range is 8..16 — out-of-range means the skip chain above
+        // desynchronised; better to fall back to the hvcC bit depth than
+        // to propagate garbage colour info.
+        return None;
+    }
     r.ue()?; // bit_depth_chroma_minus8
     let log2_max_poc_lsb_minus4 = r.ue()?;
     if log2_max_poc_lsb_minus4 > 12 {
@@ -256,11 +262,13 @@ fn parse_sps(nalu: &[u8]) -> Option<SpsColorInfo> {
 
 /// profile_tier_level(1, maxNumSubLayersMinus1) — fixed-width, skip in full.
 fn skip_profile_tier_level(r: &mut BitReader, max_sub_layers_minus1: u32) -> Option<()> {
-    // general_*: profile_space(2) tier(1) idc(5) compat(32) constraint+reserved(43) inbld(1)
+    // general_*: profile_space(2) tier(1) idc(5) = 8 bits, compat flags = 32,
+    // progressive/interlaced/non_packed/frame_only = 4, constraint+reserved
+    // = 43, inbld/reserved = 1 → 88 bits total before general_level_idc.
     r.u(8)?;
     r.u(32)?;
     r.u(32)?;
-    r.u(12)?;
+    r.u(16)?;
     r.u(8)?; // general_level_idc
 
     let mut profile_present = [false; 8];
@@ -616,7 +624,7 @@ mod tests {
         bits += "0000";                  // sps_video_parameter_set_id
         bits += "000";                   // sps_max_sub_layers_minus1 = 0
         bits += "1";                     // sps_temporal_id_nesting_flag
-        bits += &"0".repeat(8 + 32 + 32 + 12); // PTL general (88 bits, content irrelevant)
+        bits += &"0".repeat(8 + 32 + 32 + 16); // PTL general (88 bits, content irrelevant)
         bits += "00000000";              // general_level_idc
         bits += "1";                     // sps_seq_parameter_set_id ue = 0
         bits += "010";                   // chroma_format_idc ue = 1 (4:2:0)

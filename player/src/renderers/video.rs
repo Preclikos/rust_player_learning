@@ -1876,6 +1876,7 @@ impl VideoRenderer {
                 desat: params.desat,
                 peak,
                 average,
+                scene_threshold: params.scene_threshold,
             })
         } else {
             None

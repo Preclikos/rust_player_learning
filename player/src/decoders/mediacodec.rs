@@ -115,11 +115,15 @@ impl HwVideoDecoder for MediaCodecDecoder {
         //   8-bit  → YUV_420_888: defined NV12-ish layout (Y + interleaved
         //            CbCr) that both EGL and Vulkan import without
         //            VkSamplerYcbcrConversion.
-        //   10-bit → YCBCR_P010 (API 31+), falling back to PRIVATE (HAL
-        //            picks its native 10-bit layout; EGL imports it fine,
-        //            only opaque to CPU/Vulkan), falling back to
-        //            YUV_420_888 (decoder downconverts to 8-bit — PQ
-        //            tonemapping still applies, just with banding).
+        //   10-bit → PRIVATE first: the HAL picks the decoder's own native
+        //            10-bit layout, so the codec can always write it and
+        //            EGL can always import it (only opaque to CPU/Vulkan).
+        //            YCBCR_P010 second — it allocates fine on devices
+        //            whose decoder can't actually fill it (MT8696: the
+        //            codec accepted the surface and then no image ever
+        //            arrived in the reader), so it's the riskier option.
+        //            YUV_420_888 last (8-bit downconvert — PQ tonemapping
+        //            still applies, just with banding).
         // AIMAGE_FORMAT_YCBCR_P010 is missing from ndk 0.9's enum;
         // construct it through the num_enum catch-all.
         const AIMAGE_FORMAT_YCBCR_P010: i32 = 0x36;
@@ -127,8 +131,8 @@ impl HwVideoDecoder for MediaCodecDecoder {
         let mut reader: Option<ImageReader> = None;
         if params.color.bit_depth > 8 {
             for (fmt, name) in [
-                (ImageFormat::from(AIMAGE_FORMAT_YCBCR_P010), "YCBCR_P010"),
                 (ImageFormat::PRIVATE, "PRIVATE"),
+                (ImageFormat::from(AIMAGE_FORMAT_YCBCR_P010), "YCBCR_P010"),
             ] {
                 match ImageReader::new_with_usage(
                     params.width as i32,
@@ -367,6 +371,15 @@ impl HwVideoDecoder for MediaCodecDecoder {
         // leaves a frame stranded in ImageReader, and the next try_recv
         // would pair the next MediaCodec PTS with the stale image, causing
         // visible content to be displayed at the wrong timestamp.
+        //
+        // The wait is BOUNDED: on some devices a surface format that
+        // allocated fine can still never be fed by the decoder (MT8696 +
+        // YCBCR_P010: codec configures, reports the output format, and
+        // then no image ever arrives) — an unbounded spin here hangs the
+        // whole decoder task silently. 2 s is two orders of magnitude
+        // above the normal latch latency; bail with a clear error so the
+        // failure is visible in the log instead of a frozen black screen.
+        let acquire_started = std::time::Instant::now();
         let mut acquire_retries = 0u32;
         let image = loop {
             match reader
@@ -386,7 +399,16 @@ impl HwVideoDecoder for MediaCodecDecoder {
                     std::thread::yield_now();
                 }
                 AcquireResult::NoBufferAvailable => {
-                    std::thread::yield_now();
+                    if acquire_started.elapsed() > Duration::from_secs(2) {
+                        return Err(format!(
+                            "ImageReader produced no image for 2s after \
+                             release_output_buffer (pts={}ms) — surface format \
+                             unsupported by this decoder?",
+                            pts_us / 1000
+                        )
+                        .into());
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
                 }
             }
         };

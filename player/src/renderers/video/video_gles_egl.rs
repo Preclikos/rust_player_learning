@@ -177,6 +177,330 @@ void main() {
     out_color = vec4(pow(max(c, vec3(0.0)), vec3(1.0 / 2.4)), 1.0);
 }";
 
+// ---------------------------------------------------------------------------
+// Scene peak/average detection (GLES port of shader_hdr_detect.wgsl)
+// ---------------------------------------------------------------------------
+// The ES 3.0 present-hook context has no compute, so the same statistics
+// are produced with two fragment-shader reduction passes + an async PBO
+// readback:
+//   pass 1: OES frame → DETECT_W×DETECT_H grid; each fragment samples an
+//           8×8 point grid inside its cell, converts to linear BT.709
+//           maxRGB (eotf_st2084 + primaries matrix — identical math to the
+//           tonemap shader) and writes the cell's max + mean, PQ-re-encoded
+//           into RGBA8 (perceptually uniform quantisation, no float-FBO
+//           extension needed).
+//   pass 2: grid → 1×1: max of cell maxima, mean of cell means.
+//   readback: glReadPixels into a double-buffered PBO; the PREVIOUS
+//           frame's pixel is mapped (never the just-issued one) so the GPU
+//           is never stalled. One frame of latency — the same semantics as
+//           the desktop's publish-before-accumulate ordering.
+// The rolling 63-frame window + scene-change reset then runs on the CPU
+// with the same constants as shader_hdr_detect.wgsl, and the result
+// overrides the seed peak/average uniforms of the tonemap draw.
+
+const DETECT_W: i32 = 80;
+const DETECT_H: i32 = 45;
+/// Sliding window length (frames) — shader_hdr_detect.wgsl's DETECTION_FRAMES.
+const DETECT_WINDOW: usize = 63;
+const REFERENCE_WHITE: f32 = 100.0;
+
+// Fullscreen-quad vertex shader for the reduction passes (plain clip-space
+// quad, varying = the quad's 0..1 texcoord).
+const VS_DETECT_SRC: &str = "#version 300 es
+in vec2 a_pos;
+in vec2 a_tex;
+out vec2 v_tex;
+void main() {
+    gl_Position = vec4(a_pos, 0.0, 1.0);
+    v_tex = a_tex;
+}";
+
+// Pass 1: per-cell max/avg of linear BT.709 maxRGB, PQ-encoded into RG of
+// an RGBA8 target. u_tex_max crops codec padding exactly like the draw.
+const FS_DETECT_MAP_SRC: &str = "#version 300 es
+#extension GL_OES_EGL_image_external_essl3 : require
+precision highp float;
+uniform samplerExternalOES u_texture;
+uniform vec2 u_tex_max;
+in vec2 v_tex;
+out vec4 out_color;
+
+float eotf_st2084(float x) {
+    const float m1 = 0.1593017578125;
+    const float m2 = 78.84375;
+    const float c1 = 0.8359375;
+    const float c2 = 18.8515625;
+    const float c3 = 18.6875;
+    float p = pow(max(x, 0.0), 1.0 / m2);
+    float c = pow(max(p - c1, 0.0) / max(c2 - c3 * p, 1e-6), 1.0 / m1);
+    return x > 0.0 ? c * 100.0 : 0.0; // 1.0 = 100 nits
+}
+
+float oetf_st2084(float x) {
+    const float m1 = 0.1593017578125;
+    const float m2 = 78.84375;
+    const float c1 = 0.8359375;
+    const float c2 = 18.8515625;
+    const float c3 = 18.6875;
+    float p = pow(clamp(x / 100.0, 0.0, 1.0), m1); // 100.0 = 10000 nits
+    return pow((c1 + c2 * p) / (1.0 + c3 * p), m2);
+}
+
+vec3 bt2020_to_bt709(vec3 c) {
+    return vec3(
+         1.6605 * c.r - 0.5876 * c.g - 0.0728 * c.b,
+        -0.1246 * c.r + 1.1329 * c.g - 0.0083 * c.b,
+        -0.0182 * c.r - 0.1006 * c.g + 1.1187 * c.b);
+}
+
+void main() {
+    // 8x8 sample grid inside this fragment's cell of the source frame.
+    // Only the cell MEAN is kept: the filter's frame peak is the max over
+    // 16x16-WORKGROUP AVERAGES (tonemap_opencl's detect kernel atomic_max's
+    // the workgroup mean, not the pixel max) — our cells play the role of
+    // its workgroups, so the per-pixel max must NOT be propagated or the
+    // detected peak lands way above the filter's and over-compresses.
+    vec2 cell = vec2(1.0) / vec2(80.0, 45.0);
+    float sig_sum = 0.0;
+    for (int j = 0; j < 8; j++) {
+        for (int i = 0; i < 8; i++) {
+            vec2 off = (vec2(float(i), float(j)) + 0.5) / 8.0 - 0.5;
+            vec2 uv = clamp(v_tex + off * cell, vec2(0.0), vec2(1.0)) * u_tex_max;
+            vec3 pq = texture(u_texture, uv).rgb;
+            vec3 lin = vec3(eotf_st2084(pq.r), eotf_st2084(pq.g), eotf_st2084(pq.b));
+            lin = bt2020_to_bt709(lin);
+            sig_sum += max(lin.r, max(lin.g, lin.b));
+        }
+    }
+    float mean_pq = oetf_st2084(sig_sum / 64.0);
+    out_color = vec4(mean_pq, mean_pq, 0.0, 1.0);
+}";
+
+/// CPU side of the scene detection: rolling window + PBO bookkeeping.
+struct DetectState {
+    /// (frame_peak, frame_avg) in REFERENCE_WHITE units, newest at the back.
+    window: std::collections::VecDeque<(f32, f32)>,
+    /// Which of the two PBOs the NEXT readback should be issued into.
+    pbo_idx: usize,
+    /// Whether each PBO currently holds an issued, not-yet-mapped readback.
+    pbo_pending: [bool; 2],
+    /// Published values (None until the first readback lands).
+    out_peak_avg: Option<(f32, f32)>,
+    /// Readbacks processed (diagnostic log rate limiting).
+    frames: u64,
+}
+
+/// GL objects for the detection pass. The grid (14 KB) is read back whole
+/// through the PBOs and reduced on the CPU — a second GPU reduction pass
+/// proved unreliable on PowerVR (the 1×1 draw read bogus values) and a
+/// 3 600-texel loop is nothing on the CPU anyway.
+struct HdrDetectGl {
+    map_program: glow::Program,
+    map_tex_max_loc: Option<glow::UniformLocation>,
+    /// Pass target (DETECT_W×DETECT_H RGBA8).
+    grid_fbo: glow::Framebuffer,
+    _grid_tex: glow::Texture,
+    pbos: [glow::Buffer; 2],
+    state: std::sync::Mutex<DetectState>,
+}
+
+const GRID_BYTES: i32 = DETECT_W * DETECT_H * 4;
+
+impl HdrDetectGl {
+    /// Build the reduction programs, FBOs and PBOs. Must be called with
+    /// the EGL context current. Any failure is non-fatal for playback —
+    /// the caller degrades to seed-only tonemapping.
+    unsafe fn new(gl: &glow::Context) -> Result<Self, String> {
+        let vs = compile_shader(gl, glow::VERTEX_SHADER, VS_DETECT_SRC)?;
+        let fs_map = compile_shader(gl, glow::FRAGMENT_SHADER, FS_DETECT_MAP_SRC)?;
+        let map_program = link_program(gl, vs, fs_map)?;
+        gl.delete_shader(fs_map);
+        gl.delete_shader(vs);
+
+        gl.use_program(Some(map_program));
+        if let Some(loc) = gl.get_uniform_location(map_program, "u_texture") {
+            gl.uniform_1_i32(Some(&loc), 0);
+        }
+        let map_tex_max_loc = gl.get_uniform_location(map_program, "u_tex_max");
+        gl.use_program(None);
+
+        let make_target = |w: i32, h: i32, label: &str| -> Result<(glow::Framebuffer, glow::Texture), String> {
+            let tex = gl.create_texture().map_err(|e| e.to_string())?;
+            gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+            gl.tex_storage_2d(glow::TEXTURE_2D, 1, glow::RGBA8, w, h);
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::NEAREST as i32);
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::NEAREST as i32);
+            let fbo = gl.create_framebuffer().map_err(|e| e.to_string())?;
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+            gl.framebuffer_texture_2d(
+                glow::FRAMEBUFFER,
+                glow::COLOR_ATTACHMENT0,
+                glow::TEXTURE_2D,
+                Some(tex),
+                0,
+            );
+            let status = gl.check_framebuffer_status(glow::FRAMEBUFFER);
+            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            gl.bind_texture(glow::TEXTURE_2D, None);
+            if status != glow::FRAMEBUFFER_COMPLETE {
+                return Err(format!("{} FBO incomplete: {:#x}", label, status));
+            }
+            Ok((fbo, tex))
+        };
+        let (grid_fbo, grid_tex) = make_target(DETECT_W, DETECT_H, "detect grid")?;
+
+        let mut make_pbo = || -> Result<glow::Buffer, String> {
+            let b = gl.create_buffer().map_err(|e| e.to_string())?;
+            gl.bind_buffer(glow::PIXEL_PACK_BUFFER, Some(b));
+            gl.buffer_data_size(glow::PIXEL_PACK_BUFFER, GRID_BYTES, glow::STREAM_READ);
+            Ok(b)
+        };
+        let pbos = [make_pbo()?, make_pbo()?];
+        gl.bind_buffer(glow::PIXEL_PACK_BUFFER, None);
+
+        Ok(Self {
+            map_program,
+            map_tex_max_loc,
+            grid_fbo,
+            _grid_tex: grid_tex,
+            pbos,
+            state: std::sync::Mutex::new(DetectState {
+                window: std::collections::VecDeque::with_capacity(DETECT_WINDOW + 1),
+                pbo_idx: 0,
+                pbo_pending: [false; 2],
+                out_peak_avg: None,
+                frames: 0,
+            }),
+        })
+    }
+
+    /// CPU mirror of the shader's PQ OETF/EOTF pair (for the RGBA8 codes).
+    fn pq_decode(code: u8) -> f32 {
+        let x = code as f32 / 255.0;
+        let m1 = 0.159_301_76_f32;
+        let m2 = 78.84375_f32;
+        let c1 = 0.8359375_f32;
+        let c2 = 18.8515625_f32;
+        let c3 = 18.6875_f32;
+        let p = x.max(0.0).powf(1.0 / m2);
+        let c = ((p - c1).max(0.0) / (c2 - c3 * p).max(1e-6)).powf(1.0 / m1);
+        // Fraction of 10 000 nits → REFERENCE_WHITE units (1.0 = 100 nits).
+        c * 10_000.0 / REFERENCE_WHITE
+    }
+
+    /// Run both reduction passes for the frame currently bound on the OES
+    /// texture unit 0, map the PREVIOUS frame's readback into the rolling
+    /// window, and return the published (peak, average) once available.
+    /// Caller restores draw state afterwards (program, viewport, FBO 0 are
+    /// all clobbered here).
+    unsafe fn run(
+        &self,
+        gl: &glow::Context,
+        vao: glow::VertexArray,
+        tex_x_max: f32,
+        tex_y_max: f32,
+        scene_threshold: f32,
+    ) -> Option<(f32, f32)> {
+        let mut st = self.state.lock().unwrap();
+
+        // 1. Map the oldest pending PBO (the readback issued LAST frame —
+        //    the GPU has long finished it, so this never stalls) and reduce
+        //    the grid of PQ-encoded cell means on the CPU.
+        let map_idx = st.pbo_idx;
+        if st.pbo_pending[map_idx] {
+            gl.bind_buffer(glow::PIXEL_PACK_BUFFER, Some(self.pbos[map_idx]));
+            let ptr = gl.map_buffer_range(
+                glow::PIXEL_PACK_BUFFER,
+                0,
+                GRID_BYTES,
+                glow::MAP_READ_BIT,
+            );
+            if !ptr.is_null() {
+                let grid = std::slice::from_raw_parts(ptr, GRID_BYTES as usize);
+                // 256-entry LUT: PQ code byte → linear. pq_decode already
+                // yields REFERENCE_WHITE units (1.0 = 100 nits).
+                let lut: Vec<f32> = (0..256u32)
+                    .map(|c| Self::pq_decode(c as u8))
+                    .collect();
+                let mut peak = 0.0f32;
+                let mut sum = 0.0f32;
+                let cells = (DETECT_W * DETECT_H) as usize;
+                for cell in 0..cells {
+                    let v = lut[grid[cell * 4] as usize];
+                    peak = peak.max(v);
+                    sum += v;
+                }
+                let avg = sum / cells as f32;
+                gl.unmap_buffer(glow::PIXEL_PACK_BUFFER);
+
+                // Scene-change reset — same rule as shader_hdr_detect.wgsl:
+                // |frame avg − window mean| > threshold (REFERENCE_WHITE
+                // units) drops the whole window.
+                if scene_threshold > 0.0 && !st.window.is_empty() {
+                    let mean: f32 = st.window.iter().map(|(_, a)| a).sum::<f32>()
+                        / st.window.len() as f32;
+                    if (avg - mean).abs() > scene_threshold {
+                        st.window.clear();
+                    }
+                }
+                st.window.push_back((peak, avg));
+                while st.window.len() > DETECT_WINDOW {
+                    st.window.pop_front();
+                }
+                let n = st.window.len() as f32;
+                let peak_out =
+                    (st.window.iter().map(|(p, _)| p).sum::<f32>() / n).max(1.0);
+                let avg_out =
+                    (st.window.iter().map(|(_, a)| a).sum::<f32>() / n).max(1e-3);
+                st.out_peak_avg = Some((peak_out, avg_out));
+                st.frames += 1;
+                if st.frames % 120 == 1 {
+                    log::debug!(
+                        "[gles_oes] detect: frame peak={:.3} avg={:.3} → window({}) peak={:.3} avg={:.3}",
+                        peak, avg, st.window.len(), peak_out, avg_out
+                    );
+                }
+            }
+            gl.bind_buffer(glow::PIXEL_PACK_BUFFER, None);
+            st.pbo_pending[map_idx] = false;
+        }
+
+        // 2. Pass 1: OES frame → grid. The OES texture is already bound on
+        //    unit 0 by the caller.
+        gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(self.grid_fbo));
+        gl.viewport(0, 0, DETECT_W, DETECT_H);
+        gl.use_program(Some(self.map_program));
+        if let Some(ref loc) = self.map_tex_max_loc {
+            gl.uniform_2_f32(Some(loc), tex_x_max, tex_y_max);
+        }
+        gl.bind_vertex_array(Some(vao));
+        gl.draw_arrays(glow::TRIANGLES, 0, 6);
+
+        gl.bind_vertex_array(None);
+
+        // 3. Issue the async grid readback for THIS frame into the current
+        //    PBO (mapped two frames from now).
+        let issue_idx = st.pbo_idx;
+        gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(self.grid_fbo));
+        gl.bind_buffer(glow::PIXEL_PACK_BUFFER, Some(self.pbos[issue_idx]));
+        gl.read_pixels(
+            0,
+            0,
+            DETECT_W,
+            DETECT_H,
+            glow::RGBA,
+            glow::UNSIGNED_BYTE,
+            glow::PixelPackData::BufferOffset(0),
+        );
+        gl.bind_buffer(glow::PIXEL_PACK_BUFFER, None);
+        gl.bind_framebuffer(glow::READ_FRAMEBUFFER, None);
+        st.pbo_pending[issue_idx] = true;
+        st.pbo_idx = (issue_idx + 1) % 2;
+
+        st.out_peak_avg
+    }
+}
+
 // libEGL.so is always present on Android.
 // eglGetProcAddress loads EGL/GL extension entry points at runtime.
 // eglGetCurrentDisplay/eglGetCurrentSurface return the EGL display/surface for
@@ -216,13 +540,19 @@ pub struct GlesOesPendingFrame {
 
 /// Per-frame mobius tonemap inputs for the HDR fragment shader.
 /// Peak/average are in REFERENCE_WHITE units (1.0 = 100 nits) — the same
-/// scale the wgpu detection buffer publishes on desktop.
+/// scale the wgpu detection buffer publishes on desktop. `peak`/`average`
+/// act as the SEED: once the GL scene detection has a window, its values
+/// take over (exactly like the desktop detection supersedes the uniform
+/// seed from the second frame on).
 #[derive(Clone, Copy, Debug)]
 pub struct HdrFrameParams {
     pub tone_param: f32,
     pub desat: f32,
     pub peak: f32,
     pub average: f32,
+    /// Scene-change reset threshold in REFERENCE_WHITE units (filter
+    /// `threshold`, default 0.2 = 20 nits average jump).
+    pub scene_threshold: f32,
 }
 
 /// Renders AHardwareBuffer frames directly to FBO 0 (window surface) via GL_TEXTURE_EXTERNAL_OES.
@@ -242,6 +572,9 @@ pub struct GlesOesRenderer {
     /// at init — HDR frames then render through the SDR program (washed
     /// out, but alive) with a one-time warning.
     hdr: Option<HdrProgram>,
+    /// Scene peak/average detection (GL reduction + PBO readback). None →
+    /// the tonemap runs on the seed peak/average alone.
+    hdr_detect: Option<HdrDetectGl>,
     // EGL extension function pointers stored as usize (makes the struct Send + Sync).
     fn_get_native_client_buffer: usize,  // eglGetNativeClientBufferANDROID
     fn_egl_create_image: usize,          // eglCreateImageKHR
@@ -406,6 +739,22 @@ impl GlesOesRenderer {
             }
         };
 
+        // Scene detection — optional refinement; seed-only tonemap without it.
+        let hdr_detect = if hdr.is_some() {
+            match HdrDetectGl::new(gl) {
+                Ok(d) => {
+                    log::info!("[gles_oes] HDR scene detection ready ({}x{} grid)", DETECT_W, DETECT_H);
+                    Some(d)
+                }
+                Err(e) => {
+                    log::warn!("[gles_oes] HDR scene detection unavailable: {} — using static peak", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Ok(GlesOesRenderer {
             program,
             vao,
@@ -416,6 +765,7 @@ impl GlesOesRenderer {
             tex_x_max_loc,
             tex_y_max_loc,
             hdr,
+            hdr_detect,
             fn_get_native_client_buffer: fn_get_client,
             fn_egl_create_image: fn_create,
             fn_egl_destroy_image: fn_destroy,
@@ -507,9 +857,28 @@ impl GlesOesRenderer {
             log::warn!("[gles_oes] GL error after glEGLImageTargetTexture2DOES: {:#x}", gl_err);
         }
 
+        // Scene peak/average detection — HDR frames only. Consumes the OES
+        // texture bound above; clobbers FBO/viewport/program, so it runs
+        // before the main draw's state setup and FBO 0 is restored here.
+        let detected = if hdr.is_some() && self.hdr.is_some() {
+            let threshold = hdr.map(|p| p.scene_threshold).unwrap_or(0.2);
+            let r = self
+                .hdr_detect
+                .as_ref()
+                .and_then(|d| d.run(gl, self.vao, tex_x_max, tex_y_max, threshold));
+            gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, None);
+            r
+        } else {
+            None
+        };
+
         gl.viewport(0, 0, viewport_width, viewport_height);
         match (hdr, &self.hdr) {
             (Some(p), Some(h)) => {
+                // Detection (rolling-window scene statistics) supersedes
+                // the seed once it has data — same takeover the desktop
+                // detection performs after its first frame.
+                let (peak, average) = detected.unwrap_or((p.peak, p.average));
                 gl.use_program(Some(h.program));
                 if let Some(ref loc) = h.scale_x_loc {
                     gl.uniform_1_f32(Some(loc), scale_x);
@@ -530,10 +899,10 @@ impl GlesOesRenderer {
                     gl.uniform_1_f32(Some(loc), p.desat);
                 }
                 if let Some(ref loc) = h.peak_loc {
-                    gl.uniform_1_f32(Some(loc), p.peak);
+                    gl.uniform_1_f32(Some(loc), peak);
                 }
                 if let Some(ref loc) = h.average_loc {
-                    gl.uniform_1_f32(Some(loc), p.average);
+                    gl.uniform_1_f32(Some(loc), average);
                 }
             }
             (hdr_wanted, _) => {

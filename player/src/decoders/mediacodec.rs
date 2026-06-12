@@ -229,8 +229,8 @@ impl HwVideoDecoder for MediaCodecDecoder {
             if matches!(nal_type, Some(hevc::NAL_DV_RPU) | Some(hevc::NAL_DV_EL)) {
                 continue;
             }
-            if self.color.is_hdr() {
-                if nal_type == Some(hevc::NAL_SEI_PREFIX) {
+            if self.color.is_hdr() && nal_type == Some(hevc::NAL_SEI_PREFIX) {
+                {
                     let meta = hevc::parse_sei_hdr_metadata(body);
                     if let Some(hp) = meta.hdr10plus {
                         self.pending_hdr_meta.insert(

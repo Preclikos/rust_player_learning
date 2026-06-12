@@ -104,7 +104,7 @@ pub const fn capabilities() -> PlayerCapabilities {
 /// before the real player builds its own. Don't poll this — cache the
 /// result for the lifetime of the host.
 pub async fn probe_capabilities() -> PlayerCapabilities {
-    let mut caps = capabilities();
+    let caps = capabilities();
     if !caps.hdr10 {
         return caps;
     }
@@ -119,6 +119,7 @@ pub async fn probe_capabilities() -> PlayerCapabilities {
 
     #[cfg(not(target_os = "android"))]
     {
+    let mut caps = caps;
 
     // HDR10 needs the wgpu `TEXTURE_FORMAT_P010` feature on the adapter we
     // intend to use. The real renderer picks DX12 on Windows, Vulkan on

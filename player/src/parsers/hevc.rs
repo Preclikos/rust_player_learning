@@ -40,11 +40,8 @@ impl<'a> BitReader<'a> {
     /// Unsigned Exp-Golomb (ue(v)).
     pub fn ue(&mut self) -> Option<u32> {
         let mut leading_zeros = 0u32;
-        loop {
-            match self.u(1)? {
-                0 => leading_zeros += 1,
-                _ => break,
-            }
+        while self.u(1)? == 0 {
+            leading_zeros += 1;
             // Defensive cap — a valid ue(v) in SPS never needs more.
             if leading_zeros > 31 {
                 return None;
@@ -373,14 +370,6 @@ pub struct HdrStaticInfo {
 pub struct SeiHdrMetadata {
     pub hdr10plus: Option<Hdr10PlusInfo>,
     pub static_info: HdrStaticInfo,
-}
-
-impl SeiHdrMetadata {
-    pub fn is_empty(&self) -> bool {
-        self.hdr10plus.is_none()
-            && self.static_info.mastering_peak_nits.is_none()
-            && self.static_info.max_cll_nits.is_none()
-    }
 }
 
 const SEI_MASTERING_DISPLAY: u32 = 137;

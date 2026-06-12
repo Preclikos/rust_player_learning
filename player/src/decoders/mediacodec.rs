@@ -22,6 +22,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use ndk::hardware_buffer::HardwareBufferUsage;
 use ndk::media::image_reader::{AcquireResult, ImageFormat, ImageReader};
 use ndk::media::media_codec::{
     DequeuedInputBufferResult, DequeuedOutputBufferInfoResult, MediaCodec, MediaCodecDirection,
@@ -88,20 +89,64 @@ impl HwVideoDecoder for MediaCodecDecoder {
         // 64 caused a device-level SIGABRT on the MT8696 (PowerVR driver
         // has a hard limit on AImageReader max_images for YUV_420_888).
         // Memory cost: 32 × ~1.4 MB (720p NV12) ≈ 45 MB.
-        let max_images = 32;
+        // 10-bit P010 is 2× that per pixel; above 1440p the 32-deep pool
+        // would cost >0.5 GB of gralloc memory, so cap it at 16 there
+        // (4K stalls recover via the LATE drain instead of the deep pool).
+        let max_images = if params.color.bit_depth > 8
+            && params.width as u64 * params.height as u64 > 2560 * 1440
+        {
+            16
+        } else {
+            32
+        };
 
-        // YUV_420_888 gives us an AHardwareBuffer with a defined NV12-ish
-        // layout (Y plane + interleaved CbCr plane) that Vulkan can
-        // import via VK_FORMAT_G8_B8R8_2PLANE_420_UNORM without needing
-        // VkSamplerYcbcrConversion. On devices that refuse it we'd fall
-        // back to ImageFormat::PRIVATE + VkExternalFormatANDROID.
-        let reader = ImageReader::new(
-            params.width as i32,
-            params.height as i32,
-            ImageFormat::YUV_420_888,
-            max_images,
-        )
-        .map_err(|e| -> DecoderError { format!("ImageReader::new: {:?}", e).into() })?;
+        // Surface pixel format:
+        //   8-bit  → YUV_420_888: defined NV12-ish layout (Y + interleaved
+        //            CbCr) that both EGL and Vulkan import without
+        //            VkSamplerYcbcrConversion.
+        //   10-bit → YCBCR_P010 (API 31+), falling back to PRIVATE (HAL
+        //            picks its native 10-bit layout; EGL imports it fine,
+        //            only opaque to CPU/Vulkan), falling back to
+        //            YUV_420_888 (decoder downconverts to 8-bit — PQ
+        //            tonemapping still applies, just with banding).
+        // AIMAGE_FORMAT_YCBCR_P010 is missing from ndk 0.9's enum;
+        // construct it through the num_enum catch-all.
+        const AIMAGE_FORMAT_YCBCR_P010: i32 = 0x36;
+        let gpu_only = HardwareBufferUsage::GPU_SAMPLED_IMAGE | HardwareBufferUsage::CPU_READ_NEVER;
+        let mut reader: Option<ImageReader> = None;
+        if params.color.bit_depth > 8 {
+            for (fmt, name) in [
+                (ImageFormat::from(AIMAGE_FORMAT_YCBCR_P010), "YCBCR_P010"),
+                (ImageFormat::PRIVATE, "PRIVATE"),
+            ] {
+                match ImageReader::new_with_usage(
+                    params.width as i32,
+                    params.height as i32,
+                    fmt,
+                    gpu_only,
+                    max_images,
+                ) {
+                    Ok(r) => {
+                        log::info!("MediaCodecDecoder: 10-bit surface pool = {}", name);
+                        reader = Some(r);
+                        break;
+                    }
+                    Err(e) => {
+                        log::warn!("MediaCodecDecoder: {} ImageReader failed ({:?})", name, e);
+                    }
+                }
+            }
+        }
+        let reader = match reader {
+            Some(r) => r,
+            None => ImageReader::new(
+                params.width as i32,
+                params.height as i32,
+                ImageFormat::YUV_420_888,
+                max_images,
+            )
+            .map_err(|e| -> DecoderError { format!("ImageReader::new: {:?}", e).into() })?,
+        };
 
         let window = reader
             .window()

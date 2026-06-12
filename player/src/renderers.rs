@@ -45,6 +45,14 @@ pub trait VideoSink: Send + Sync + 'static {
     /// Implementations that own the HDR shader (wgpu on Win/Linux) write
     /// the values into their per-frame uniform buffer.
     fn set_hdr_tonemap_params(&self, _params: crate::HdrTonemapParams) {}
+
+    /// Bitmask of HDR formats the active display can present natively
+    /// (bit 0 = Dolby Vision, 1 = HDR10, 2 = HLG, 3 = HDR10+ — the
+    /// Android `Display.HdrCapabilities` order). Sinks that can hand the
+    /// signal through to such a display (Android GLES: BT2020_PQ surface
+    /// dataspace) use it to prefer passthrough over in-shader
+    /// tonemapping. Default: ignored (tonemap-only sinks).
+    fn set_display_hdr_types(&self, _mask: u32) {}
 }
 
 /// Receives decoded PCM audio and feeds it to the output device.

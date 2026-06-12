@@ -4,7 +4,9 @@ import android.app.Activity
 import android.content.Context
 import android.graphics.Color
 import android.graphics.drawable.ColorDrawable
+import android.os.Build
 import android.os.Bundle
+import android.view.Display
 import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.SurfaceView
@@ -49,10 +51,36 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
         if (handle == 0L) {
-            handle = nativeStart(applicationContext, holder.surface, width, height)
+            handle = nativeStart(applicationContext, holder.surface, width, height, displayHdrTypes())
         } else {
             nativeSetSize(handle, width, height)
         }
+    }
+
+    /**
+     * Bitmask of HDR formats the current display can render natively
+     * (bit 0 = Dolby Vision, 1 = HDR10, 2 = HLG, 3 = HDR10+), passed to the
+     * native player so it can choose PQ passthrough over shader tonemapping.
+     * 0 = SDR-only display (or caps unavailable).
+     */
+    private fun displayHdrTypes(): Int {
+        val display: Display? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            display
+        } else {
+            @Suppress("DEPRECATION")
+            windowManager.defaultDisplay
+        }
+        val caps = display?.hdrCapabilities ?: return 0
+        var mask = 0
+        for (t in caps.supportedHdrTypes) {
+            when (t) {
+                Display.HdrCapabilities.HDR_TYPE_DOLBY_VISION -> mask = mask or (1 shl 0)
+                Display.HdrCapabilities.HDR_TYPE_HDR10 -> mask = mask or (1 shl 1)
+                Display.HdrCapabilities.HDR_TYPE_HLG -> mask = mask or (1 shl 2)
+                Display.HdrCapabilities.HDR_TYPE_HDR10_PLUS -> mask = mask or (1 shl 3)
+            }
+        }
+        return mask
     }
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
@@ -81,6 +109,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             surface: Surface,
             width: Int,
             height: Int,
+            displayHdrTypes: Int,
         ): Long
 
         @JvmStatic

@@ -131,6 +131,48 @@ impl Vertex {
     }
 }
 
+/// `ANativeWindow_setBuffersDataSpace`, resolved at runtime. The symbol
+/// lives in `libnativewindow.so` (API 28+), which ndk-sys does NOT link —
+/// a build-time extern made dlopen of the whole app .so fail with
+/// UnsatisfiedLinkError on the 32-bit Google TV Streamer. dlsym degrades
+/// to a no-op (returns non-zero) on devices without the symbol.
+///
+/// # Safety
+/// `win` must be a valid acquired ANativeWindow.
+#[cfg(target_os = "android")]
+unsafe fn set_buffers_dataspace(win: *mut ndk_sys::ANativeWindow, dataspace: i32) -> i32 {
+    use std::sync::OnceLock;
+    type SetDataspaceFn =
+        unsafe extern "C" fn(*mut ndk_sys::ANativeWindow, i32) -> i32;
+    static SYM: OnceLock<Option<SetDataspaceFn>> = OnceLock::new();
+    let f = SYM.get_or_init(|| {
+        let name = b"ANativeWindow_setBuffersDataSpace\0";
+        // The symbol is usually already in the process (libEGL pulls
+        // libnativewindow in); RTLD_DEFAULT finds it without bumping any
+        // library refcounts. Fall back to an explicit dlopen.
+        let mut sym = libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr() as *const _);
+        if sym.is_null() {
+            let lib = libc::dlopen(
+                b"libnativewindow.so\0".as_ptr() as *const _,
+                libc::RTLD_NOW | libc::RTLD_GLOBAL,
+            );
+            if !lib.is_null() {
+                sym = libc::dlsym(lib, name.as_ptr() as *const _);
+            }
+        }
+        if sym.is_null() {
+            log::warn!("[gles_oes] ANativeWindow_setBuffersDataSpace unavailable on this device");
+            None
+        } else {
+            Some(std::mem::transmute::<*mut libc::c_void, SetDataspaceFn>(sym))
+        }
+    });
+    match f {
+        Some(f) => f(win, dataspace),
+        None => -1,
+    }
+}
+
 // tex_y_max: normally 1.0; set to (content_height - 1) / buffer_height (<1.0)
 // when the codec produces a taller buffer than the visible frame (e.g. 736 for
 // 720p HEVC on Exynos) so we don't sample codec-alignment padding rows. The
@@ -275,6 +317,22 @@ pub struct VideoRenderer {
     /// is fallible).
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     metal_cache: Option<Arc<MetalTextureCache>>,
+    /// Bitmask of display-native HDR formats (Display.HdrCapabilities
+    /// order: bit 0 = DV, 1 = HDR10, 2 = HLG, 3 = HDR10+) from the host.
+    /// 0 = SDR display → tonemap in-shader.
+    #[cfg(target_os = "android")]
+    display_hdr_types: std::sync::atomic::AtomicU32,
+    /// `ANativeWindow*` of the host surface (embed model) for
+    /// `ANativeWindow_setBuffersDataSpace`. 0 when unavailable (winit
+    /// path) — passthrough then stays off.
+    #[cfg(target_os = "android")]
+    android_window: usize,
+    /// Sticky: the surface dataspace has been switched to BT2020_PQ.
+    /// Never un-set while the renderer lives — flapping the dataspace
+    /// makes TVs re-negotiate their HDR mode (black flash) on every ABR
+    /// SDR↔HDR transition; SDR frames are up-converted to PQ instead.
+    #[cfg(target_os = "android")]
+    android_pq_session: std::sync::atomic::AtomicBool,
 }
 
 /// Size of the HDR tonemap uniform (TonemapUniforms in shader_hdr.wgsl /
@@ -362,14 +420,19 @@ impl VideoRenderer {
             std::ptr::NonNull::new(native_window).expect("null ANativeWindow"),
         ));
         let display = RawDisplayHandle::Android(AndroidDisplayHandle::new());
-        Self::new_with_surface(
+        let mut renderer = Self::new_with_surface(
             size,
             SurfaceSource::RawHandle {
                 window,
                 display: Some(display),
             },
         )
-        .await
+        .await;
+        // Keep the raw window for ANativeWindow_setBuffersDataSpace (HDR
+        // passthrough). The host owns the acquired reference and releases
+        // it only after the renderer is dropped.
+        renderer.android_window = native_window as usize;
+        renderer
     }
 
     /// Shared constructor body. Differs from the old `new` only in how the
@@ -895,7 +958,7 @@ impl VideoRenderer {
                                     f.tex_x_max,
                                     f.tex_y_max,
                                     f.desired_present_ns,
-                                    f.hdr,
+                                    f.mode,
                                 )
                             } {
                                 log::warn!("[gles_oes] hook render failed: {}", e);
@@ -958,6 +1021,12 @@ impl VideoRenderer {
             ahb_keepalive,
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             metal_cache,
+            #[cfg(target_os = "android")]
+            display_hdr_types: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(target_os = "android")]
+            android_window: 0,
+            #[cfg(target_os = "android")]
+            android_pq_session: std::sync::atomic::AtomicBool::new(false),
         };
 
         renderer.spawn_command_thread(command_receiver);
@@ -1839,11 +1908,55 @@ impl VideoRenderer {
             (1.0_f32, 1.0_f32)
         };
 
-        // Resolve the HDR tonemap inputs for this frame. PQ only — the
-        // tonemap shader hardcodes eotf_st2084 (HLG would need the
-        // inverse_oetf_hlg variant, same as the desktop shader's TODO),
-        // so HLG falls through to the SDR program.
-        let hdr = if matches!(color.transfer, crate::decoders::TransferFunction::Pq) {
+        // HDR passthrough: when the display can present HDR10 natively,
+        // switch the surface dataspace to BT2020_PQ on the first PQ frame
+        // and hand the signal through untouched — the shader tonemap is
+        // the fallback for SDR displays. The session is sticky (see the
+        // android_pq_session field doc).
+        let is_pq = matches!(color.transfer, crate::decoders::TransferFunction::Pq);
+        const DISPLAY_HDR10: u32 = 1 << 1;
+        if is_pq
+            && !self.android_pq_session.load(std::sync::atomic::Ordering::Relaxed)
+            && self.display_hdr_types.load(std::sync::atomic::Ordering::Relaxed) & DISPLAY_HDR10
+                != 0
+            && self.android_window != 0
+        {
+            let win = self.android_window as *mut ndk_sys::ANativeWindow;
+            let rc = unsafe {
+                set_buffers_dataspace(win, ndk_sys::ADataSpace::ADATASPACE_BT2020_PQ.0 as i32)
+            };
+            if rc == 0 {
+                log::info!("[gles_oes] HDR passthrough ON — surface dataspace BT2020_PQ");
+                self.android_pq_session
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                log::warn!(
+                    "[gles_oes] ANativeWindow_setBuffersDataSpace(BT2020_PQ) failed ({}) — staying on shader tonemap",
+                    rc
+                );
+                // Make the failure terminal for this renderer so we don't
+                // retry (and re-log) every frame.
+                self.display_hdr_types
+                    .store(0, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let pq_session = self
+            .android_pq_session
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        // Resolve the render mode for this frame. PQ-transfer detection
+        // only — the tonemap shader hardcodes eotf_st2084 (HLG would need
+        // the inverse_oetf_hlg variant, same as the desktop shader's TODO),
+        // so HLG falls through to the SDR/up-convert program.
+        let mode = if pq_session {
+            if is_pq {
+                video_gles_egl::OesRenderMode::PassthroughPq
+            } else {
+                // ABR dropped to an SDR rep mid-session: up-convert so the
+                // surface dataspace doesn't have to flap.
+                video_gles_egl::OesRenderMode::SdrToPq
+            }
+        } else if is_pq {
             let params = **self.hdr_tonemap_params.load();
             // Peak resolution (REFERENCE_WHITE units, 1.0 = 100 nits), in
             // priority order:
@@ -1871,7 +1984,7 @@ impl VideoRenderer {
                 .and_then(|m| m.avg_nits)
                 .map(|a| (a / 100.0).max(1e-3))
                 .unwrap_or(0.25);
-            Some(video_gles_egl::HdrFrameParams {
+            video_gles_egl::OesRenderMode::TonemapHdr(video_gles_egl::HdrFrameParams {
                 tone_param: params.tone_param,
                 desat: params.desat,
                 peak,
@@ -1879,7 +1992,7 @@ impl VideoRenderer {
                 scene_threshold: params.scene_threshold,
             })
         } else {
-            None
+            video_gles_egl::OesRenderMode::Sdr
         };
 
         // Publish frame data for the present hook to consume.
@@ -1892,7 +2005,7 @@ impl VideoRenderer {
                 tex_x_max,
                 tex_y_max,
                 desired_present_ns,
-                hdr,
+                mode,
             });
         }
 
@@ -2238,5 +2351,12 @@ impl super::VideoSink for VideoRenderer {
         // the uniform exists but the HDR pipeline is never bound — the
         // value is functionally a no-op there.
         self.hdr_tonemap_params.store(Arc::new(params));
+    }
+
+    #[cfg(target_os = "android")]
+    fn set_display_hdr_types(&self, mask: u32) {
+        log::info!("[renderer] display HDR types mask = {:#06b}", mask);
+        self.display_hdr_types
+            .store(mask, std::sync::atomic::Ordering::Relaxed);
     }
 }

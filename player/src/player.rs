@@ -2500,6 +2500,16 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         self.video_renderer.set_hdr_tonemap_params(params.sanitised());
     }
 
+    /// Tell the renderer which HDR formats the active display can present
+    /// natively (bitmask in `Display.HdrCapabilities` order: bit 0 = Dolby
+    /// Vision, 1 = HDR10, 2 = HLG, 3 = HDR10+). On Android the GLES sink
+    /// then passes PQ streams through to the display (BT2020_PQ surface
+    /// dataspace, no tonemap) instead of tonemapping to SDR. 0 (default) =
+    /// SDR display, tonemap in-shader.
+    pub fn set_display_hdr_types(&self, mask: u32) {
+        self.video_renderer.set_display_hdr_types(mask);
+    }
+
     /// How many seconds of media the player tries to keep buffered ahead
     /// of the renderer. Default is `DEFAULT_BUFFER_TARGET_SECS` (8s).
     /// Bumping this trades RAM for resilience against network jitter

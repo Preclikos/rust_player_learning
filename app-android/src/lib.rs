@@ -103,6 +103,7 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_MainActivity_nativeStart(
     surface: JObject,
     width: jint,
     height: jint,
+    display_hdr_types: jint,
 ) -> jlong {
     init_logging();
     init_ndk_context(&mut env, &context);
@@ -120,12 +121,16 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_MainActivity_nativeStart(
 
     let w = width.max(1) as u32;
     let h = height.max(1) as u32;
-    log::info!("nativeStart: {}x{}", w, h);
+    log::info!(
+        "nativeStart: {}x{} display_hdr_types={:#06b}",
+        w, h, display_hdr_types
+    );
 
     // Building the renderer block_on's and spawns Tokio tasks internally, so it
     // must run inside the runtime.
     let _guard = runtime().enter();
     let player = Player::new_from_android_surface(native_window as *mut c_void, w, h);
+    player.set_display_hdr_types(display_hdr_types as u32);
 
     // Drive the shared smoke-test fixture: open_url → clearkey → prepare →
     // pick tracks → play(). Same stream/keys as the desktop + iOS shells.

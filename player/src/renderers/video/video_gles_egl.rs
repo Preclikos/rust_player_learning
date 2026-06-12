@@ -276,6 +276,43 @@ void main() {
     out_color = vec4(mean_pq, mean_pq, 0.0, 1.0);
 }";
 
+// SDR (BT.709, display gamma) → PQ BT.2020 up-conversion, for SDR frames
+// rendered while the surface is locked to the BT2020_PQ dataspace (ABR
+// switched to an SDR rep mid-HDR-session). BT.2408: SDR reference white
+// maps to 203 nits; linearisation is the BT.1886 2.4 power (the inverse of
+// what the tonemap path emits).
+const FS_SDR_TO_PQ_SRC: &str = "#version 300 es
+#extension GL_OES_EGL_image_external_essl3 : require
+precision highp float;
+uniform samplerExternalOES u_texture;
+in vec2 v_tex;
+out vec4 out_color;
+
+vec3 bt709_to_bt2020(vec3 c) {
+    return vec3(
+        0.6274 * c.r + 0.3293 * c.g + 0.0433 * c.b,
+        0.0691 * c.r + 0.9195 * c.g + 0.0114 * c.b,
+        0.0164 * c.r + 0.0880 * c.g + 0.8956 * c.b);
+}
+
+// PQ OETF, input = fraction of 10 000 nits.
+float oetf_pq(float x) {
+    const float m1 = 0.1593017578125;
+    const float m2 = 78.84375;
+    const float c1 = 0.8359375;
+    const float c2 = 18.8515625;
+    const float c3 = 18.6875;
+    float p = pow(clamp(x, 0.0, 1.0), m1);
+    return pow((c1 + c2 * p) / (1.0 + c3 * p), m2);
+}
+
+void main() {
+    vec3 c = texture(u_texture, v_tex).rgb; // BT.709 display-gamma R'G'B'
+    vec3 lin = pow(max(c, vec3(0.0)), vec3(2.4)) * (203.0 / 10000.0);
+    lin = bt709_to_bt2020(lin);
+    out_color = vec4(oetf_pq(lin.r), oetf_pq(lin.g), oetf_pq(lin.b), 1.0);
+}";
+
 /// CPU side of the scene detection: rolling window + PBO bookkeeping.
 struct DetectState {
     /// (frame_peak, frame_avg) in REFERENCE_WHITE units, newest at the back.
@@ -532,10 +569,28 @@ pub struct GlesOesPendingFrame {
     /// CLOCK_MONOTONIC nanoseconds when this frame should appear on screen.
     /// Passed to eglPresentationTimeANDROID; 0 = no constraint.
     pub desired_present_ns: i64,
-    /// HDR tonemap parameters for this frame; `None` = SDR (plain OES
-    /// passthrough shader). Resolved per frame in render_android_gles so
-    /// ABR SDR↔HDR swaps switch shaders on exactly the right frame.
-    pub hdr: Option<HdrFrameParams>,
+    /// How this frame's signal maps onto the surface — resolved per frame
+    /// in render_android_gles so ABR SDR↔HDR swaps switch programs on
+    /// exactly the right frame.
+    pub mode: OesRenderMode,
+}
+
+/// Per-frame program selection for the OES draw.
+#[derive(Clone, Copy, Debug)]
+pub enum OesRenderMode {
+    /// SDR content on an SDR-dataspace surface — plain OES passthrough.
+    Sdr,
+    /// PQ content tonemapped to SDR in-shader (SDR display fallback).
+    TonemapHdr(HdrFrameParams),
+    /// PQ content handed through untouched — the surface dataspace is
+    /// BT2020_PQ and the display presents HDR natively. Uses the same
+    /// plain program as Sdr (the OES sampler already yields PQ BT.2020
+    /// R'G'B'; there is nothing to convert).
+    PassthroughPq,
+    /// SDR (BT.709) content up-converted to PQ BT.2020 because the
+    /// surface is locked to the BT2020_PQ dataspace (sticky passthrough
+    /// session) — SDR white maps to 203 nits per BT.2408.
+    SdrToPq,
 }
 
 /// Per-frame mobius tonemap inputs for the HDR fragment shader.
@@ -575,6 +630,10 @@ pub struct GlesOesRenderer {
     /// Scene peak/average detection (GL reduction + PBO readback). None →
     /// the tonemap runs on the seed peak/average alone.
     hdr_detect: Option<HdrDetectGl>,
+    /// SDR→PQ up-conversion program for SDR frames inside a sticky
+    /// BT2020_PQ passthrough session. None → SDR frames render through
+    /// the plain program (washed out on an HDR surface, but alive).
+    sdr_to_pq: Option<BasicProgram>,
     // EGL extension function pointers stored as usize (makes the struct Send + Sync).
     fn_get_native_client_buffer: usize,  // eglGetNativeClientBufferANDROID
     fn_egl_create_image: usize,          // eglCreateImageKHR
@@ -587,6 +646,15 @@ pub struct GlesOesRenderer {
 
 unsafe impl Send for GlesOesRenderer {}
 unsafe impl Sync for GlesOesRenderer {}
+
+/// A program with just the geometry/crop uniforms (SDR→PQ up-convert).
+struct BasicProgram {
+    program: glow::Program,
+    scale_x_loc: Option<glow::UniformLocation>,
+    scale_y_loc: Option<glow::UniformLocation>,
+    tex_x_max_loc: Option<glow::UniformLocation>,
+    tex_y_max_loc: Option<glow::UniformLocation>,
+}
 
 /// The HDR program and its uniform locations.
 struct HdrProgram {
@@ -755,6 +823,33 @@ impl GlesOesRenderer {
             None
         };
 
+        // SDR→PQ up-convert program (passthrough sessions only).
+        let sdr_to_pq = (|| -> Result<BasicProgram, String> {
+            let vs = compile_shader(gl, glow::VERTEX_SHADER, VS_SRC)?;
+            let fs = compile_shader(gl, glow::FRAGMENT_SHADER, FS_SDR_TO_PQ_SRC)?;
+            let program = link_program(gl, vs, fs)?;
+            gl.delete_shader(vs);
+            gl.delete_shader(fs);
+            gl.use_program(Some(program));
+            if let Some(loc) = gl.get_uniform_location(program, "u_texture") {
+                gl.uniform_1_i32(Some(&loc), 0);
+            }
+            let p = BasicProgram {
+                scale_x_loc: gl.get_uniform_location(program, "u_scale_x"),
+                scale_y_loc: gl.get_uniform_location(program, "u_scale_y"),
+                tex_x_max_loc: gl.get_uniform_location(program, "u_tex_x_max"),
+                tex_y_max_loc: gl.get_uniform_location(program, "u_tex_y_max"),
+                program,
+            };
+            gl.use_program(None);
+            Ok(p)
+        })()
+        .map_err(|e| {
+            log::warn!("[gles_oes] SDR→PQ program unavailable: {}", e);
+            e
+        })
+        .ok();
+
         Ok(GlesOesRenderer {
             program,
             vao,
@@ -766,6 +861,7 @@ impl GlesOesRenderer {
             tex_y_max_loc,
             hdr,
             hdr_detect,
+            sdr_to_pq,
             fn_get_native_client_buffer: fn_get_client,
             fn_egl_create_image: fn_create,
             fn_egl_destroy_image: fn_destroy,
@@ -792,7 +888,7 @@ impl GlesOesRenderer {
         tex_x_max: f32,
         tex_y_max: f32,
         desired_present_ns: i64,     // CLOCK_MONOTONIC ns for this frame; 0 = unconstrained
-        hdr: Option<HdrFrameParams>, // Some = run the PQ→SDR tonemap program
+        mode: OesRenderMode,
     ) -> Result<(), String> {
         let get_client: FnEglGetNativeClientBufferANDROID =
             std::mem::transmute(self.fn_get_native_client_buffer);
@@ -857,11 +953,15 @@ impl GlesOesRenderer {
             log::warn!("[gles_oes] GL error after glEGLImageTargetTexture2DOES: {:#x}", gl_err);
         }
 
-        // Scene peak/average detection — HDR frames only. Consumes the OES
-        // texture bound above; clobbers FBO/viewport/program, so it runs
-        // before the main draw's state setup and FBO 0 is restored here.
-        let detected = if hdr.is_some() && self.hdr.is_some() {
-            let threshold = hdr.map(|p| p.scene_threshold).unwrap_or(0.2);
+        // Scene peak/average detection — tonemapped HDR frames only (a
+        // passthrough display does its own). Consumes the OES texture
+        // bound above; clobbers FBO/viewport/program, so it runs before
+        // the main draw's state setup and FBO 0 is restored here.
+        let detected = if matches!(mode, OesRenderMode::TonemapHdr(_)) && self.hdr.is_some() {
+            let threshold = match mode {
+                OesRenderMode::TonemapHdr(p) => p.scene_threshold,
+                _ => 0.2,
+            };
             let r = self
                 .hdr_detect
                 .as_ref()
@@ -873,8 +973,8 @@ impl GlesOesRenderer {
         };
 
         gl.viewport(0, 0, viewport_width, viewport_height);
-        match (hdr, &self.hdr) {
-            (Some(p), Some(h)) => {
+        match (mode, &self.hdr, &self.sdr_to_pq) {
+            (OesRenderMode::TonemapHdr(p), Some(h), _) => {
                 // Detection (rolling-window scene statistics) supersedes
                 // the seed once it has data — same takeover the desktop
                 // detection performs after its first frame.
@@ -905,12 +1005,39 @@ impl GlesOesRenderer {
                     gl.uniform_1_f32(Some(loc), average);
                 }
             }
-            (hdr_wanted, _) => {
-                if hdr_wanted.is_some() {
-                    static WARN_ONCE: std::sync::Once = std::sync::Once::new();
-                    WARN_ONCE.call_once(|| {
-                        log::warn!("[gles_oes] HDR frame but no HDR program — SDR passthrough");
-                    });
+            (OesRenderMode::SdrToPq, _, Some(s)) => {
+                gl.use_program(Some(s.program));
+                if let Some(ref loc) = s.scale_x_loc {
+                    gl.uniform_1_f32(Some(loc), scale_x);
+                }
+                if let Some(ref loc) = s.scale_y_loc {
+                    gl.uniform_1_f32(Some(loc), scale_y);
+                }
+                if let Some(ref loc) = s.tex_x_max_loc {
+                    gl.uniform_1_f32(Some(loc), tex_x_max);
+                }
+                if let Some(ref loc) = s.tex_y_max_loc {
+                    gl.uniform_1_f32(Some(loc), tex_y_max);
+                }
+            }
+            (m, _, _) => {
+                // Sdr and PassthroughPq both sample-and-emit unchanged;
+                // also the degraded fallbacks (TonemapHdr without the HDR
+                // program, SdrToPq without the up-convert program).
+                match m {
+                    OesRenderMode::TonemapHdr(_) => {
+                        static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+                        WARN_ONCE.call_once(|| {
+                            log::warn!("[gles_oes] HDR frame but no HDR program — SDR passthrough");
+                        });
+                    }
+                    OesRenderMode::SdrToPq => {
+                        static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+                        WARN_ONCE.call_once(|| {
+                            log::warn!("[gles_oes] SDR frame in PQ session but no up-convert program — plain draw");
+                        });
+                    }
+                    _ => {}
                 }
                 gl.use_program(Some(self.program));
                 if let Some(ref loc) = self.scale_x_loc {

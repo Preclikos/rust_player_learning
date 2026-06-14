@@ -358,6 +358,12 @@ impl MediaCodecDecoder {
 
     /// Direct-mode submit: same Annex-B conversion, raw FFI input queue.
     fn submit_direct(&mut self, annex_b: &[u8], pts_us: i64) -> Result<(), DecoderError> {
+        // Frames the codec has emitted so far this session. Frozen during the
+        // dequeue_input spin (try_recv runs on the same task), so logging it at
+        // a stall tells us whether the codec ever produced output: 0 after a
+        // seek/start-at-offset == the codec accepts input but emits nothing
+        // (lifecycle/Surface issue), vs >0 == it flowed then backed up.
+        let produced = self.decoded_frame_idx;
         let direct = self.direct.as_ref().unwrap();
         unsafe {
             let idx = {
@@ -377,9 +383,10 @@ impl MediaCodecDecoder {
                     retries += 1;
                     if retries % 200 == 0 {
                         log::warn!(
-                            "[mc-direct] dequeue_input stall {}x5ms pts={}",
+                            "[mc-direct] dequeue_input stall {}x5ms pts={} produced={} (produced=0 => codec emits no output after this seek/start)",
                             retries,
-                            pts_us / 1000
+                            pts_us / 1000,
+                            produced
                         );
                     }
                     std::thread::yield_now();

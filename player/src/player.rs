@@ -925,8 +925,26 @@ async fn av_sync_handler<V: VideoSink, A: AudioSink>(
     // start_time. This ensures A/V sync is established from a common wall-clock
     // origin. The audio channel is sized large enough (256 frames) that
     // the audio decoder task won't block even if video download is slow.
+    // Video MUST produce its first frame: the sync loop needs it to anchor the
+    // clock base, and in direct mode the sync loop is also what releases the
+    // codec's output buffers back to it.
     tokio::select! {
-        _ = async { tokio::join!(video_ready.notified(), audio_ready.notified()); } => {}
+        _ = video_ready.notified() => {}
+        _ = stop.notified() => {
+            stop.notify_waiters();
+            return;
+        }
+    }
+    // Audio readiness is BOUNDED, not a hard gate: if it gated the sync loop's
+    // start, a slow audio decoder after a seek/start-at-offset would keep the
+    // loop from running — and in direct mode that means the video codec's
+    // output buffers never get released, so it backpressure-stalls on
+    // dequeue_input forever. A/V sync self-aligns once audio starts flowing.
+    tokio::select! {
+        _ = audio_ready.notified() => {}
+        _ = tokio::time::sleep(Duration::from_secs(3)) => {
+            log::warn!("[vsync] audio not ready after 3s — starting playback without waiting (guards the direct-mode video codec against a backpressure stall)");
+        }
         _ = stop.notified() => {
             stop.notify_waiters();
             return;

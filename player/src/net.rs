@@ -145,10 +145,38 @@ pub struct HttpClient {
     callback_timeout: ArcSwap<Duration>,
 }
 
+/// Build the reqwest client. On native-tls targets (Win/Linux) this is the
+/// default client (system Schannel/OpenSSL). On rustls targets
+/// (macOS/iOS/Android) we hand reqwest a preconfigured rustls config backed by
+/// bundled webpki roots, so TLS stays self-contained — see the rustls dep note
+/// in Cargo.toml for why we don't use reqwest 0.13's platform-verifier default.
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "android"))]
+fn build_client() -> Client {
+    // Pin the rustls crypto provider explicitly: both aws-lc-rs and ring are in
+    // the dependency tree, and ClientConfig::builder() PANICS at runtime if the
+    // process-default provider is ambiguous. install_default returns Err if one
+    // is already set — fine, we just need a deterministic default.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let tls = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Client::builder()
+        .use_preconfigured_tls(tls)
+        .build()
+        .expect("reqwest client (rustls + webpki-roots)")
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "android")))]
+fn build_client() -> Client {
+    Client::new()
+}
+
 impl HttpClient {
     pub fn new() -> Self {
         Self {
-            client: Client::new(),
+            client: build_client(),
             interceptor: ArcSwap::from_pointee(
                 Box::new(NoopInterceptor) as Box<dyn RequestInterceptor>
             ),

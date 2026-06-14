@@ -9,7 +9,7 @@ path = "src/player.rs"
 
 [dependencies]
 # TLS backend is target-specific (see [target.cfg.dependencies] below).
-reqwest = { version = "0.12.12", default-features = false, features = ["blocking", "http2", "charset"] }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "http2", "charset"] }
 quick-xml = {version ="0.40", features = [ "serialize" ] }
 serde = { version = "1.0", features = ["derive"] }
 iso8601-duration = { version = "0.2" }
@@ -79,11 +79,13 @@ ffmpeg-sys-next = { version = "8.1" }
 
 # Win/Linux: native-tls (system OpenSSL/Schannel). macOS prefers rustls
 # so we don't drag native-tls + OpenSSL into the build.
+# NOTE: reqwest 0.13 redefined `default-tls` to mean rustls (it was native-tls
+# in 0.12), so we now name `native-tls` explicitly to keep Schannel/OpenSSL.
 [target.'cfg(any(target_os = "windows", target_os = "linux"))'.dependencies]
-reqwest = { version = "0.12.12", default-features = false, features = ["default-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["native-tls"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-reqwest = { version = "0.12.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 
 # Apple zero-copy interop, shared by macOS (FFmpeg VideoToolbox) and iOS
 # (native VTDecompressionSession). Both pull a CVPixelBuffer through
@@ -115,7 +117,7 @@ jni = "0.22"
 # platform APIs (MediaCodecList decoder resolution; NDK has no codec list).
 ndk-context = "0.1"
 libc = "0.2"
-reqwest = { version = "0.12.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 glow = "0.17"
 
 # iOS: rustls-tls so reqwest doesn't try to use native-tls (which has no
@@ -124,7 +126,19 @@ glow = "0.17"
 # native VideoToolbox; audio is FFmpeg (see the ffmpeg-next target block above
 # — iOS is included there).
 [target.'cfg(target_os = "ios")'.dependencies]
-reqwest = { version = "0.12.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+
+# rustls targets (macOS/iOS/Android): keep TLS self-contained with bundled
+# Mozilla roots, exactly as reqwest 0.12's `rustls-tls` did. reqwest 0.13's
+# `rustls` feature switched the default verifier to rustls-platform-verifier,
+# which on Android needs the Android Context AND the verifier's Java classes on
+# the app classpath — a runtime footgun for embedders. We sidestep it by handing
+# reqwest a preconfigured rustls ClientConfig built from webpki-roots (net.rs).
+# rustls tracks the same 0.23 line reqwest links so use_preconfigured_tls's
+# Any-downcast unifies; default features give the aws-lc-rs provider.
+[target.'cfg(any(target_os = "macos", target_os = "ios", target_os = "android"))'.dependencies]
+rustls = "0.23"
+webpki-roots = "1"
 
 [dev-dependencies]
 # Shader validation tests parse the WGSL with the same naga revision the

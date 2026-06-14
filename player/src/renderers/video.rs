@@ -322,6 +322,10 @@ pub struct VideoRenderer {
     /// 0 = SDR display → tonemap in-shader.
     #[cfg(target_os = "android")]
     display_hdr_types: std::sync::atomic::AtomicU32,
+    /// Bottom safe-area inset (device px) the host reported via
+    /// `Player::set_subtitle_safe_insets`, threaded into the subtitle quad's
+    /// anchor. 0 = unset → renderers fall back to a 10% TV title-safe margin.
+    subtitle_safe_bottom_px: std::sync::atomic::AtomicU32,
     /// `ANativeWindow*` of the host surface (embed model) for
     /// `ANativeWindow_setBuffersDataSpace`. 0 when unavailable (winit
     /// path) — passthrough then stays off.
@@ -965,6 +969,7 @@ impl VideoRenderer {
                                     f.desired_present_ns,
                                     f.mode,
                                     f.subtitle,
+                                    f.subtitle_bottom_inset_px,
                                 )
                             } {
                                 log::warn!("[gles_oes] hook render failed: {}", e);
@@ -1029,6 +1034,7 @@ impl VideoRenderer {
             metal_cache,
             #[cfg(target_os = "android")]
             display_hdr_types: std::sync::atomic::AtomicU32::new(0),
+            subtitle_safe_bottom_px: std::sync::atomic::AtomicU32::new(0),
             #[cfg(target_os = "android")]
             android_window: 0,
             #[cfg(target_os = "android")]
@@ -1086,6 +1092,9 @@ impl VideoRenderer {
                 desired_present_ns: 0,
                 mode: video_gles_egl::OesRenderMode::Sdr,
                 subtitle,
+                subtitle_bottom_inset_px: self
+                    .subtitle_safe_bottom_px
+                    .load(std::sync::atomic::Ordering::Relaxed),
             });
         }
         self.queue.submit([]);
@@ -1592,7 +1601,13 @@ impl VideoRenderer {
                 render_pass.draw(0..6, 0..1);
 
                 if let Some(overlay) = overlay_snapshot {
-                    overlay.draw_into(&mut render_pass, surface_w, surface_h);
+                    overlay.draw_into(
+                    &mut render_pass,
+                    surface_w,
+                    surface_h,
+                    self.subtitle_safe_bottom_px
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                );
                 }
             }
 
@@ -1808,7 +1823,13 @@ impl VideoRenderer {
             render_pass.draw(0..6, 0..1);
 
             if let Some(overlay) = overlay_snapshot {
-                overlay.draw_into(&mut render_pass, surface_w, surface_h);
+                overlay.draw_into(
+                    &mut render_pass,
+                    surface_w,
+                    surface_h,
+                    self.subtitle_safe_bottom_px
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                );
             }
         }
 
@@ -2087,6 +2108,9 @@ impl VideoRenderer {
                 desired_present_ns,
                 mode,
                 subtitle,
+                subtitle_bottom_inset_px: self
+                    .subtitle_safe_bottom_px
+                    .load(std::sync::atomic::Ordering::Relaxed),
             });
         }
 
@@ -2439,5 +2463,11 @@ impl super::VideoSink for VideoRenderer {
         log::info!("[renderer] display HDR types mask = {:#06b}", mask);
         self.display_hdr_types
             .store(mask, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn set_subtitle_safe_bottom_px(&self, px: u32) {
+        log::info!("[renderer] subtitle bottom safe inset = {} px", px);
+        self.subtitle_safe_bottom_px
+            .store(px, std::sync::atomic::Ordering::Relaxed);
     }
 }

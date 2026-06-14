@@ -367,6 +367,7 @@ impl SubtitleOverlay {
         render_pass: &mut wgpu::RenderPass<'_>,
         target_w: u32,
         target_h: u32,
+        bottom_inset_px: u32,
     ) {
         let mut inner = self.inner.lock().unwrap();
         let pts = inner.current_pts_ms;
@@ -451,9 +452,11 @@ impl SubtitleOverlay {
             None => return,
         };
 
-        // Position: bottom-center with a 9% safe area from the bottom,
-        // proportional to bitmap aspect. Kept in parity with the GLES path,
-        // where 9% was needed to clear TV overscan (7% got clipped).
+        // Position: bottom-center, anchored to the host-reported bottom safe
+        // area (real screen geometry via WindowInsets; on a TV the host maxes
+        // it with the title-safe margin so invisible HDMI overscan is still
+        // cleared). bottom_inset_px == 0 → 10% TV title-safe fallback. Kept in
+        // parity with the GLES path.
         let bmp_w = cached.bitmap_w as f32;
         let bmp_h = cached.bitmap_h as f32;
         let tw = target_w as f32;
@@ -462,7 +465,12 @@ impl SubtitleOverlay {
         let half_w = bmp_w / tw;
         let half_h = bmp_h / th;
         let center_x = 0.0; // horizontal center
-        let center_y = -1.0 + half_h + (th * 0.09) / (th * 0.5); // 9% safe area
+        let safe_frac = if bottom_inset_px > 0 {
+            (bottom_inset_px as f32 / th).clamp(0.0, 0.45)
+        } else {
+            0.10
+        };
+        let center_y = -1.0 + half_h + 2.0 * safe_frac;
 
         let uniform = QuadUniform {
             transform: [center_x, center_y, half_w, half_h],

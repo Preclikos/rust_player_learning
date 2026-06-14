@@ -606,6 +606,12 @@ pub struct GlesOesPendingFrame {
     pub ahb_ptr: usize,
     /// Rasterized cue to draw over the frame; None = no active cue.
     pub subtitle: Option<std::sync::Arc<crate::renderers::subtitle::SubtitleBitmap>>,
+    /// Bottom safe-area inset (device px) the host reported for this surface;
+    /// the subtitle quad anchors its bottom edge here so cues clear TV
+    /// overscan / system bars. 0 = host provided none → 10% TV title-safe
+    /// fallback. Sourced from the host's WindowInsets (see
+    /// Player::set_subtitle_safe_insets).
+    pub subtitle_bottom_inset_px: u32,
     pub scale_x: f32,
     pub scale_y: f32,
     /// (content_width - 1) / buffer_width — crops the right-edge codec
@@ -1036,6 +1042,7 @@ impl GlesOesRenderer {
         desired_present_ns: i64,     // CLOCK_MONOTONIC ns for this frame; 0 = unconstrained
         mode: OesRenderMode,
         subtitle: Option<std::sync::Arc<crate::renderers::subtitle::SubtitleBitmap>>,
+        subtitle_bottom_inset_px: u32,
     ) -> Result<(), String> {
         let get_client: FnEglGetNativeClientBufferANDROID =
             std::mem::transmute(self.fn_get_native_client_buffer);
@@ -1108,7 +1115,13 @@ impl GlesOesRenderer {
 
         if overlay_only {
             gl.viewport(0, 0, viewport_width, viewport_height);
-            self.draw_subtitle(gl, subtitle.as_deref(), viewport_width, viewport_height);
+            self.draw_subtitle(
+                gl,
+                subtitle.as_deref(),
+                viewport_width,
+                viewport_height,
+                subtitle_bottom_inset_px,
+            );
             return Ok(());
         }
 
@@ -1234,7 +1247,13 @@ impl GlesOesRenderer {
 
         // Subtitle quad over the video (non-direct GLES path; in direct
         // mode the overlay-only branch above handles it).
-        self.draw_subtitle(gl, subtitle.as_deref(), viewport_width, viewport_height);
+        self.draw_subtitle(
+            gl,
+            subtitle.as_deref(),
+            viewport_width,
+            viewport_height,
+            subtitle_bottom_inset_px,
+        );
 
         // Static HDR metadata, once per surface, on the first passthrough
         // frame — the MTK HWC composites PQ layers into an SDR output
@@ -1277,6 +1296,7 @@ impl GlesOesRenderer {
         bitmap: Option<&crate::renderers::subtitle::SubtitleBitmap>,
         viewport_width: i32,
         viewport_height: i32,
+        bottom_inset_px: u32,
     ) {
         let (Some(bmp), Some(sub)) = (bitmap, &self.subtitle) else {
             return;
@@ -1315,12 +1335,19 @@ impl GlesOesRenderer {
         // it stays fully on-screen — clamp guards against a very tall cue.
         let half_w = bmp.width as f32 / viewport_width as f32;
         let half_h = bmp.height as f32 / viewport_height as f32;
-        // 9% of full height up from the bottom. 7% (NDC 0.14) was clipped by
-        // TV overscan on the Google TV Streamer (panels eat ~5-8% off the
-        // bottom); 11% started intruding onto the picture, so 9% is the
-        // measured sweet spot. Clamp so a tall multi-line cue can't run off
-        // the top edge.
-        let center_y = (-1.0 + half_h + 0.18).min(1.0 - half_h);
+        // Anchor the cue's bottom edge to the host-reported bottom safe area
+        // (real screen geometry — WindowInsets, which on a TV the host maxes
+        // with the title-safe margin so HDMI overscan that the OS can't see is
+        // still cleared). bottom_inset_px == 0 means the host gave none, so we
+        // fall back to a 10% TV title-safe margin (the Streamer clips ~7%, so
+        // a smaller default would be eaten). Clamp so a tall multi-line cue
+        // can't run off the top edge.
+        let safe_frac = if bottom_inset_px > 0 {
+            (bottom_inset_px as f32 / viewport_height as f32).clamp(0.0, 0.45)
+        } else {
+            0.10
+        };
+        let center_y = (-1.0 + 2.0 * safe_frac + half_h).min(1.0 - half_h);
         if let Some(ref loc) = sub.rect_loc {
             gl.uniform_4_f32(Some(loc), 0.0, center_y, half_w, half_h);
         }

@@ -2866,6 +2866,25 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         self.video_renderer.set_display_hdr_types(mask);
     }
 
+    /// Bottom safe-area inset, in **device pixels of the overlay surface**,
+    /// that subtitles must stay above. The cue's bottom edge is anchored here
+    /// instead of at the surface's physical bottom — this is how subtitles
+    /// clear TV overscan and system bars without the player guessing a
+    /// per-device margin.
+    ///
+    /// The host should pass the real bottom inset from `WindowInsets`
+    /// (system bars / display cutout / reported overscan). On Android TV,
+    /// where HDMI overscan is usually invisible to the app, the host should
+    /// pass `max(windowInsets.bottom, 0.10 * surfaceHeight)` so the
+    /// title-safe margin still applies. 0 (default, host never called this)
+    /// makes the renderers fall back to a 10% title-safe margin.
+    ///
+    /// Takes effect on the next presented frame. Re-call it on every
+    /// inset/size change.
+    pub fn set_subtitle_safe_insets(&self, bottom_px: u32) {
+        self.video_renderer.set_subtitle_safe_bottom_px(bottom_px);
+    }
+
     /// Android direct playback mode: hand the decoder a dedicated video
     /// `ANativeWindow*` to render into. Decoded frames then ride a HW
     /// video plane — HDR10/HDR10+/Dolby Vision signals (incl. dynamic

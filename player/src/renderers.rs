@@ -53,6 +53,13 @@ pub trait VideoSink: Send + Sync + 'static {
     /// dataspace) use it to prefer passthrough over in-shader
     /// tonemapping. Default: ignored (tonemap-only sinks).
     fn set_display_hdr_types(&self, _mask: u32) {}
+
+    /// Bottom safe-area inset (device px of the render surface) that
+    /// subtitles must stay above — sourced from the host's `WindowInsets`
+    /// (see `Player::set_subtitle_safe_insets`). The subtitle quad anchors
+    /// its bottom edge here so cues clear TV overscan / system bars. Default:
+    /// ignored (0 → renderer falls back to a 10% TV title-safe margin).
+    fn set_subtitle_safe_bottom_px(&self, _px: u32) {}
 }
 
 /// Receives decoded PCM audio and feeds it to the output device.

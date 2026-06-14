@@ -1517,50 +1517,85 @@ async fn video_prefetch(
 /// avoids both a backward rewind AND a future-PTS frame that av_sync would
 /// sit and wait for (the multi-second freeze seen on a 1080→4K upswitch, where
 /// NEW used to start a whole segment ahead). `started` is for the timing log.
-/// Hint the video plane's content frame rate to the OS so it can switch the
-/// display to a matching refresh rate (adaptive frame rate). Wraps
-/// `ANativeWindow_setFrameRate` (API 30+), resolved at runtime via dlsym — the
-/// symbol lives in `libnativewindow.so`, which ndk-sys doesn't link, and a
-/// build-time extern made the whole .so fail to load on the 32-bit Streamer
-/// (same lesson as `ANativeWindow_setBuffersDataSpace`). No-op below API 30.
+/// Switch the video plane's display refresh rate to match the content fps
+/// (adaptive frame rate). Prefers `ANativeWindow_setFrameRateWithChangeStrategy`
+/// (API 31) with the ALWAYS strategy so the panel *actually* changes mode
+/// (e.g. 60 -> 24 Hz) — plain `ANativeWindow_setFrameRate` is seamless-only,
+/// and on most TVs a 60->24 switch is NOT a seamless transition, so it would
+/// silently never change. ALWAYS costs a brief blink at start/stop, which is
+/// the expected "match content frame rate" behaviour. Falls back to the
+/// seamless `setFrameRate` on API 30. Both symbols live in libnativewindow.so
+/// and are dlsym'd (ndk-sys doesn't link it; a build-time extern broke the
+/// 32-bit Streamer .so load — same lesson as `ANativeWindow_setBuffersDataSpace`).
+/// No-op below API 30.
 #[cfg(target_os = "android")]
 fn set_window_frame_rate(window: usize, fps: f32) {
     use std::sync::OnceLock;
     if window == 0 || !(fps > 0.0) {
         return;
     }
-    // int32_t ANativeWindow_setFrameRate(ANativeWindow*, float, int8_t)
-    type SetFrameRateFn = unsafe extern "C" fn(*mut std::ffi::c_void, f32, i8) -> i32;
-    static SYM: OnceLock<Option<SetFrameRateFn>> = OnceLock::new();
-    let f = SYM.get_or_init(|| unsafe {
-        let name = b"ANativeWindow_setFrameRate\0";
-        let mut sym = libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr() as *const _);
-        if sym.is_null() {
+    unsafe fn resolve(name: &[u8]) -> *mut libc::c_void {
+        // libEGL usually pulled libnativewindow into the process already, so
+        // RTLD_DEFAULT finds the symbol without bumping refcounts; else dlopen.
+        let mut s = libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr() as *const _);
+        if s.is_null() {
             let lib = libc::dlopen(
                 b"libnativewindow.so\0".as_ptr() as *const _,
                 libc::RTLD_NOW | libc::RTLD_GLOBAL,
             );
             if !lib.is_null() {
-                sym = libc::dlsym(lib, name.as_ptr() as *const _);
+                s = libc::dlsym(lib, name.as_ptr() as *const _);
             }
         }
-        if sym.is_null() {
-            log::warn!("[afr] ANativeWindow_setFrameRate unavailable (API < 30) — adaptive frame rate off");
+        s
+    }
+    // int32_t (ANativeWindow*, float rate, int8_t compatibility, int8_t strategy)
+    type WithStrategyFn = unsafe extern "C" fn(*mut std::ffi::c_void, f32, i8, i8) -> i32;
+    // int32_t (ANativeWindow*, float rate, int8_t compatibility)
+    type BasicFn = unsafe extern "C" fn(*mut std::ffi::c_void, f32, i8) -> i32;
+    enum FrameRateFn {
+        WithStrategy(WithStrategyFn),
+        Basic(BasicFn),
+    }
+    static SYM: OnceLock<Option<FrameRateFn>> = OnceLock::new();
+    let f = SYM.get_or_init(|| unsafe {
+        let with_strategy = resolve(b"ANativeWindow_setFrameRateWithChangeStrategy\0");
+        if !with_strategy.is_null() {
+            return Some(FrameRateFn::WithStrategy(
+                std::mem::transmute::<*mut libc::c_void, WithStrategyFn>(with_strategy),
+            ));
+        }
+        let basic = resolve(b"ANativeWindow_setFrameRate\0");
+        if basic.is_null() {
+            log::warn!("[afr] ANativeWindow_setFrameRate* unavailable (API < 30) — adaptive frame rate off");
             None
         } else {
-            Some(std::mem::transmute::<*mut libc::c_void, SetFrameRateFn>(sym))
+            Some(FrameRateFn::Basic(
+                std::mem::transmute::<*mut libc::c_void, BasicFn>(basic),
+            ))
         }
     });
-    if let Some(f) = f {
-        // compatibility = 1 (ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE):
-        // the source has a fixed inherent rate, so the system should prefer an
-        // exact match (e.g. 23.976 -> 24/48/120 Hz) over the current mode.
-        let rc = unsafe { f(window as *mut std::ffi::c_void, fps, 1) };
-        if rc == 0 {
-            log::info!("[afr] hinted display frame rate {:.3} fps (fixed-source)", fps);
-        } else {
-            log::warn!("[afr] ANativeWindow_setFrameRate({:.3}) returned {}", fps, rc);
+    // compatibility = 1 (FIXED_SOURCE): the source has a fixed inherent rate.
+    // strategy = 1 (ALWAYS): switch even when not seamless.
+    let win = window as *mut std::ffi::c_void;
+    match f {
+        Some(FrameRateFn::WithStrategy(f)) => {
+            let rc = unsafe { f(win, fps, 1, 1) };
+            if rc == 0 {
+                log::info!("[afr] switching display to {:.3} fps (fixed-source, always)", fps);
+            } else {
+                log::warn!("[afr] setFrameRateWithChangeStrategy({:.3}) returned {}", fps, rc);
+            }
         }
+        Some(FrameRateFn::Basic(f)) => {
+            let rc = unsafe { f(win, fps, 1) };
+            if rc == 0 {
+                log::info!("[afr] hinted {:.3} fps (seamless-only, API 30)", fps);
+            } else {
+                log::warn!("[afr] setFrameRate({:.3}) returned {}", fps, rc);
+            }
+        }
+        None => {}
     }
 }
 

@@ -451,8 +451,9 @@ impl SubtitleOverlay {
             None => return,
         };
 
-        // Position: bottom-center with 7% safe area from the bottom and
-        // proportional to bitmap aspect.
+        // Position: bottom-center with a 9% safe area from the bottom,
+        // proportional to bitmap aspect. Kept in parity with the GLES path,
+        // where 9% was needed to clear TV overscan (7% got clipped).
         let bmp_w = cached.bitmap_w as f32;
         let bmp_h = cached.bitmap_h as f32;
         let tw = target_w as f32;
@@ -461,7 +462,7 @@ impl SubtitleOverlay {
         let half_w = bmp_w / tw;
         let half_h = bmp_h / th;
         let center_x = 0.0; // horizontal center
-        let center_y = -1.0 + half_h + (th * 0.07) / (th * 0.5); // 7% safe area
+        let center_y = -1.0 + half_h + (th * 0.09) / (th * 0.5); // 9% safe area
 
         let uniform = QuadUniform {
             transform: [center_x, center_y, half_w, half_h],

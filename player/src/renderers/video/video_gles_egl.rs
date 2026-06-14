@@ -1315,9 +1315,12 @@ impl GlesOesRenderer {
         // it stays fully on-screen — clamp guards against a very tall cue.
         let half_w = bmp.width as f32 / viewport_width as f32;
         let half_h = bmp.height as f32 / viewport_height as f32;
-        // 7% of full height up from the bottom, but never let the top edge
-        // leave the screen (tall multi-line cue).
-        let center_y = (-1.0 + half_h + 0.14).min(1.0 - half_h);
+        // 9% of full height up from the bottom. 7% (NDC 0.14) was clipped by
+        // TV overscan on the Google TV Streamer (panels eat ~5-8% off the
+        // bottom); 11% started intruding onto the picture, so 9% is the
+        // measured sweet spot. Clamp so a tall multi-line cue can't run off
+        // the top edge.
+        let center_y = (-1.0 + half_h + 0.18).min(1.0 - half_h);
         if let Some(ref loc) = sub.rect_loc {
             gl.uniform_4_f32(Some(loc), 0.0, center_y, half_w, half_h);
         }

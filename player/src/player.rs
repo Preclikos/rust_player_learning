@@ -398,6 +398,9 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
     // first stats tick — subsequent ticks compare ADVANCES from here.
     let mut drift_baseline: Option<(u64, u64)> = None;
     let mut last_drift_warn: Option<Instant> = None;
+    // Min A/V drift over the current 1Hz stats window (least-stale read of
+    // the chunky audio-played counter ≈ the true offset).
+    let mut drift_min_window = i64::MAX;
     let mut emitted_playing = false;
     // Starvation tracking — flips when the decoder hasn't produced a
     // frame for >300 ms (typically a network outage hitting the
@@ -517,9 +520,21 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
             }
         };
         let raw_pts_ms = (frame.pts_us / 1000) as u64;
+        // Audio output latency (device buffer + DAC): the sink consumes a
+        // sample this many ms before it's audible. Subtract it from the
+        // video clock so a frame reaches the screen exactly when its audio
+        // reaches the speaker — without it video leads audio by the output
+        // latency at every (re)start, which surfaces as "audio delayed"
+        // after seeks/track-switches. Re-read each iteration: it's ~0 until
+        // the first callback, then stabilises, so it applies as a one-time
+        // hold early in playback. `pts_ms` itself stays the frame's true
+        // media time, so subtitles (keyed off pts_ms) and the picture move
+        // together against this same audio-anchored clock.
+        let audio_latency = Duration::from_millis(audio_sink.output_latency_ms());
         let elapsed = start_time
             .elapsed()
             .saturating_sub(pause_skew)
+            .saturating_sub(audio_latency)
             .as_millis() as u64;
 
         let base = *pts_base.get_or_insert(raw_pts_ms.saturating_sub(elapsed));
@@ -617,6 +632,7 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
         let elapsed_us = start_time
             .elapsed()
             .saturating_sub(pause_skew)
+            .saturating_sub(audio_latency)
             .as_micros() as i64;
         let pts_to_go_ns = (pts_us_rel - elapsed_us).max(0) * 1_000;
         frame.desired_present_ns = clock_monotonic_ns() + pts_to_go_ns;
@@ -625,6 +641,20 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
             .elapsed()
             .saturating_sub(pause_skew)
             .as_millis() as u64;
+        // Per-frame A/V drift, min-accumulated over the 1Hz stats window.
+        // Sampling the chunky audio-played counter gives a noisy sawtooth;
+        // the per-window MIN is the least-stale read = the true video-ahead
+        // offset (see the stats emit below).
+        if let Some(played) = audio_sink.played_ms() {
+            match drift_baseline {
+                None => drift_baseline = Some((render_start, played)),
+                Some((e0, p0)) => {
+                    let d = render_start.saturating_sub(e0) as i64
+                        - played.saturating_sub(p0) as i64;
+                    drift_min_window = drift_min_window.min(d);
+                }
+            }
+        }
         let interval_ms = if last_render_elapsed > 0 { render_start - last_render_elapsed } else { 0 };
         let delta_pts = pts_ms.saturating_sub(last_pts_ms);
 
@@ -685,30 +715,29 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
             // paused; pause_skew stops the video timeline), so the
             // difference of ADVANCES since the baseline isolates pure
             // clock-rate mismatch plus any sync bug.
+            // A/V drift = the MIN video-ahead offset over the window. The
+            // 1Hz-sampled raw drift beats against the chunky audio-played
+            // counter (a ±100ms sampling sawtooth); the per-window minimum
+            // is the least-stale read and tracks the true offset. Both
+            // clocks freeze together across pause/starvation, so this
+            // isolates genuine desync. Warn past 150ms.
             let mut drift_out: Option<i64> = None;
-            if let Some(played) = audio_sink.played_ms() {
-                match drift_baseline {
-                    None => drift_baseline = Some((render_start, played)),
-                    Some((elapsed0, played0)) => {
-                        let video_adv = render_start.saturating_sub(elapsed0) as i64;
-                        let audio_adv = played.saturating_sub(played0) as i64;
-                        let drift = video_adv - audio_adv;
-                        stats.av_drift_ms.store(drift, Ordering::Relaxed);
-                        drift_out = Some(drift);
-                        if drift.abs() > 100
-                            && last_drift_warn
-                                .map(|t| t.elapsed() > Duration::from_secs(30))
-                                .unwrap_or(true)
-                        {
-                            log::warn!(
-                                "[vsync] A/V clock drift {}ms (video wall clock vs audio device clock)",
-                                drift
-                            );
-                            last_drift_warn = Some(Instant::now());
-                        }
-                    }
+            if drift_min_window != i64::MAX {
+                stats.av_drift_ms.store(drift_min_window, Ordering::Relaxed);
+                drift_out = Some(drift_min_window);
+                if drift_min_window.abs() > 150
+                    && last_drift_warn
+                        .map(|t| t.elapsed() > Duration::from_secs(20))
+                        .unwrap_or(true)
+                {
+                    log::warn!(
+                        "[vsync] A/V drift {}ms (+ = audio behind video)",
+                        drift_min_window
+                    );
+                    last_drift_warn = Some(Instant::now());
                 }
             }
+            drift_min_window = i64::MAX;
             let decoder_name = stats.decoder_name.lock().unwrap().clone();
             let _ = events.send(PlayerEvent::Stats {
                 video_frames_decoded: stats.video_frames_decoded.load(Ordering::Relaxed),
@@ -895,17 +924,42 @@ async fn av_sync_handler<V: VideoSink, A: AudioSink>(
             return;
         }
     }
-    let now = Instant::now();
-    let start_time = Arc::new(now.checked_sub(seek_offset).unwrap_or(now));
-    // Unpause the audio device in lock-step with the wall-clock origin.
-    // AudioRenderer starts paused at construction (cpal would otherwise
-    // pull from an empty mpsc and play silence while the audio decoder
-    // warmed up, then "catch up" once real samples arrived — perceived
-    // as audio leading or lagging by an unpredictable amount). seek()
-    // re-pauses + flushes; this restores playback for the new pipeline.
+    // Unpause the audio device. AudioRenderer starts paused at construction
+    // (cpal would otherwise pull from an empty mpsc and play silence while
+    // the audio decoder warmed up, then "catch up" once real samples
+    // arrived). seek() re-pauses + flushes; this restores playback.
     if !paused.load(Ordering::Relaxed) {
         audio_sink.set_paused(false);
     }
+    // Universal start alignment (no per-device constants): anchor the video
+    // clock to the instant audio ACTUALLY starts flowing — i.e. when the
+    // output device's played-sample position first advances — not to the
+    // earlier "first frame decoded" instant. Otherwise video starts at the
+    // wall clock while the audio output buffer is still filling, so video
+    // leads audio at every (re)start; the LATE-drain then yanks video back
+    // with a visible skip. Because seek() and track/ABR switches rebuild
+    // the pipeline through here, that transient recurred on every switch —
+    // the "audio delayed after switching" the user reported. Bounded so a
+    // sink that never reports a position (mocks) or genuine leading silence
+    // still starts. Skipped while paused.
+    if !paused.load(Ordering::Relaxed) && audio_sink.played_ms().is_some() {
+        let gate = Instant::now();
+        while audio_sink.played_ms().unwrap_or(1) == 0 {
+            if gate.elapsed() > Duration::from_millis(500) {
+                log::debug!("[vsync] audio-start gate timed out; anchoring anyway");
+                break;
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(4)) => {}
+                _ = stop.notified() => {
+                    stop.notify_waiters();
+                    return;
+                }
+            }
+        }
+    }
+    let now = Instant::now();
+    let start_time = Arc::new(now.checked_sub(seek_offset).unwrap_or(now));
     let stats_audio = Arc::clone(&stats);
     let events_audio = Arc::clone(&events);
     let paused_audio = Arc::clone(&paused);

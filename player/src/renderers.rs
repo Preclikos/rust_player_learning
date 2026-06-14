@@ -69,6 +69,15 @@ pub trait AudioSink: Send + Sync + 'static {
     fn played_ms(&self) -> Option<u64> {
         None
     }
+    /// Output-path latency in ms (device output buffer + DAC) — how long
+    /// after the sink consumes a sample it becomes audible. The video
+    /// sync loop subtracts this from its wall clock so a frame reaches the
+    /// screen at the same instant its audio reaches the speaker. 0 = the
+    /// sink can't report it (then video is paced to the bare wall clock,
+    /// the previous behaviour).
+    fn output_latency_ms(&self) -> u64 {
+        0
+    }
     fn flush(&self);
     fn stop(&self) -> impl Future<Output = ()> + Send + '_;
     /// Absolute volume in 0.0..=1.0. Implementations must clamp.

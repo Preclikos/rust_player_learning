@@ -43,6 +43,13 @@ pub struct AudioRenderer {
     /// sync loop (the device crystal and CLOCK_MONOTONIC disagree by
     /// 10-100 ppm — minutes-long playback drifts audibly without it).
     samples_consumed: Arc<AtomicU64>,
+    /// Output-path latency in ms (device buffer + DAC), from the cpal
+    /// callback timestamp. 0 until the first callback / when the backend
+    /// can't report it. The video sync loop subtracts this from its wall
+    /// clock so video reaches the screen when the matching audio reaches
+    /// the speaker — otherwise video leads by this much at every
+    /// (re)start, the "audio delayed after a seek/switch" symptom.
+    output_latency_ms: Arc<AtomicU64>,
 }
 
 enum AudioRendererCommand {
@@ -129,6 +136,12 @@ impl AudioRenderer {
         let volume = Arc::new(AtomicU32::new(1.0_f32.to_bits()));
 
         let samples_consumed = Arc::new(AtomicU64::new(0));
+        // Populated by the cpal callback from the backend's playback
+        // timestamp where the platform reports it (desktop / iOS CoreAudio);
+        // stays 0 on backends that don't (Android oboe), where the video
+        // sync loop instead anchors its clock to when audio actually starts
+        // playing — both universal, no per-device constants.
+        let output_latency_ms = Arc::new(AtomicU64::new(0));
         let (command_sender, command_receiver) = mpsc::channel(4);
         let audio_thread = AudioRenderer::start_thread(
             command_receiver,
@@ -137,6 +150,7 @@ impl AudioRenderer {
             paused_flag.clone(),
             volume.clone(),
             samples_consumed.clone(),
+            output_latency_ms.clone(),
         );
 
         AudioRenderer {
@@ -150,6 +164,7 @@ impl AudioRenderer {
             peak_r_db: Arc::new(AtomicU32::new(0)),
             peak_seen: Arc::new(AtomicBool::new(false)),
             samples_consumed,
+            output_latency_ms,
         }
     }
 
@@ -190,6 +205,7 @@ impl AudioRenderer {
         flush_flag: Arc<AtomicBool>,
         paused_flag: Arc<AtomicBool>,
         samples_consumed: Arc<AtomicU64>,
+        output_latency_ms: Arc<AtomicU64>,
     ) {
         // The resampler always emits packed STEREO. With a stereo stream
         // (the normal case) the callback copies 1:1; on a mono-only output it
@@ -202,7 +218,21 @@ impl AudioRenderer {
             buffer_size: cpal::BufferSize::Default,
         };
 
-        let callback = move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+        let callback = move |data: &mut [f32], info: &cpal::OutputCallbackInfo| {
+            // Output latency = (when this buffer's first sample is AUDIBLE)
+            // − (now). The device buffer + DAC delay everything the callback
+            // hands over by this much, so video paced to the wall clock
+            // would lead audio by it. Captured here (stable per stream),
+            // consumed by the video sync loop to delay video into alignment.
+            // Backend may not support the timestamp (returns None / 0) — then
+            // it stays 0 and behaviour is unchanged.
+            let ts = info.timestamp();
+            if let Some(latency) = ts.playback.duration_since(&ts.callback) {
+                let ms = latency.as_millis() as u64;
+                if ms <= 1000 {
+                    output_latency_ms.store(ms, Ordering::Relaxed);
+                }
+            }
             if flush_flag.swap(false, Ordering::Relaxed) {
                 while sample_receiver.try_recv().is_ok() {}
             }
@@ -276,6 +306,7 @@ impl AudioRenderer {
         paused_flag: Arc<AtomicBool>,
         volume: Arc<AtomicU32>,
         samples_consumed: Arc<AtomicU64>,
+        output_latency_ms: Arc<AtomicU64>,
     ) -> (Sender<f32>, u32) {
         let (sample_sender, sample_receiver) = mpsc::channel::<f32>(192_000);
 
@@ -331,6 +362,7 @@ impl AudioRenderer {
             flush_flag,
             paused_flag,
             samples_consumed,
+            output_latency_ms,
         );
         std::thread::Builder::new()
             .name("bz-audio-out".into())
@@ -388,6 +420,12 @@ impl AudioRenderer {
         self.sample_rate
     }
 
+    /// Output-path latency in ms (device buffer + DAC) reported by the cpal
+    /// backend; 0 until the first callback or when unsupported.
+    pub fn output_latency_ms(&self) -> u64 {
+        self.output_latency_ms.load(Ordering::Relaxed)
+    }
+
     pub async fn stop(&self) {
         _ = self.command_sender.send(AudioRendererCommand::Stop).await;
     }
@@ -433,6 +471,10 @@ impl super::AudioSink for AudioRenderer {
         // resampler preserves duration, so output time = media time).
         let frames = self.samples_consumed.load(Ordering::Relaxed) / 2;
         Some(frames * 1000 / self.sample_rate as u64)
+    }
+
+    fn output_latency_ms(&self) -> u64 {
+        AudioRenderer::output_latency_ms(self)
     }
 
     fn flush(&self) {

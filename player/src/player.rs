@@ -262,6 +262,13 @@ pub struct Player<V: VideoSink = VideoRenderer, A: AudioSink = AudioRenderer> {
     /// Set once by the host before play(); consumed at pipeline build.
     video_output_window: Arc<AtomicUsize>,
 
+    /// Adaptive frame rate (Android direct mode): when set, the player hints
+    /// the video plane's content fps to the OS via `ANativeWindow_setFrameRate`
+    /// so the display can switch to a matching refresh rate (24 -> 24/48/120
+    /// Hz) and avoid judder. Default on; the host can disable it via
+    /// `set_adaptive_frame_rate(false)` to own display-mode policy itself.
+    adaptive_frame_rate: Arc<std::sync::atomic::AtomicBool>,
+
     /// Set when a play() ends on exhausted pipeline retries: the position
     /// the NEXT play() resumes from, so the consumer's manual retry
     /// continues where playback stopped instead of starting over.
@@ -308,6 +315,7 @@ impl<V: VideoSink, A: AudioSink> Clone for Player<V, A> {
             buffer_target_secs: Arc::clone(&self.buffer_target_secs),
             subtitle_representation: Arc::clone(&self.subtitle_representation),
             video_output_window: Arc::clone(&self.video_output_window),
+            adaptive_frame_rate: Arc::clone(&self.adaptive_frame_rate),
             pending_resume: Arc::clone(&self.pending_resume),
             video_renderer: Arc::clone(&self.video_renderer),
             audio_renderer: Arc::clone(&self.audio_renderer),
@@ -1509,6 +1517,53 @@ async fn video_prefetch(
 /// avoids both a backward rewind AND a future-PTS frame that av_sync would
 /// sit and wait for (the multi-second freeze seen on a 1080→4K upswitch, where
 /// NEW used to start a whole segment ahead). `started` is for the timing log.
+/// Hint the video plane's content frame rate to the OS so it can switch the
+/// display to a matching refresh rate (adaptive frame rate). Wraps
+/// `ANativeWindow_setFrameRate` (API 30+), resolved at runtime via dlsym — the
+/// symbol lives in `libnativewindow.so`, which ndk-sys doesn't link, and a
+/// build-time extern made the whole .so fail to load on the 32-bit Streamer
+/// (same lesson as `ANativeWindow_setBuffersDataSpace`). No-op below API 30.
+#[cfg(target_os = "android")]
+fn set_window_frame_rate(window: usize, fps: f32) {
+    use std::sync::OnceLock;
+    if window == 0 || !(fps > 0.0) {
+        return;
+    }
+    // int32_t ANativeWindow_setFrameRate(ANativeWindow*, float, int8_t)
+    type SetFrameRateFn = unsafe extern "C" fn(*mut std::ffi::c_void, f32, i8) -> i32;
+    static SYM: OnceLock<Option<SetFrameRateFn>> = OnceLock::new();
+    let f = SYM.get_or_init(|| unsafe {
+        let name = b"ANativeWindow_setFrameRate\0";
+        let mut sym = libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr() as *const _);
+        if sym.is_null() {
+            let lib = libc::dlopen(
+                b"libnativewindow.so\0".as_ptr() as *const _,
+                libc::RTLD_NOW | libc::RTLD_GLOBAL,
+            );
+            if !lib.is_null() {
+                sym = libc::dlsym(lib, name.as_ptr() as *const _);
+            }
+        }
+        if sym.is_null() {
+            log::warn!("[afr] ANativeWindow_setFrameRate unavailable (API < 30) — adaptive frame rate off");
+            None
+        } else {
+            Some(std::mem::transmute::<*mut libc::c_void, SetFrameRateFn>(sym))
+        }
+    });
+    if let Some(f) = f {
+        // compatibility = 1 (ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE):
+        // the source has a fixed inherent rate, so the system should prefer an
+        // exact match (e.g. 23.976 -> 24/48/120 Hz) over the current mode.
+        let rc = unsafe { f(window as *mut std::ffi::c_void, fps, 1) };
+        if rc == 0 {
+            log::info!("[afr] hinted display frame rate {:.3} fps (fixed-source)", fps);
+        } else {
+            log::warn!("[afr] ANativeWindow_setFrameRate({:.3}) returned {}", fps, rc);
+        }
+    }
+}
+
 struct SwapSplice {
     started: Instant,
     skip_below_pts_us: i64,
@@ -2482,6 +2537,7 @@ impl Player<VideoRenderer, AudioRenderer> {
             buffer_target_secs: Arc::new(AtomicU32::new(DEFAULT_BUFFER_TARGET_SECS)),
             subtitle_representation: Arc::new(StdMutex::new(None)),
             video_output_window: Arc::new(AtomicUsize::new(0)),
+            adaptive_frame_rate: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             pending_resume: Arc::new(StdMutex::new(None)),
 
             video_renderer,
@@ -2900,6 +2956,20 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             .store(window as usize, Ordering::Relaxed);
     }
 
+    /// Adaptive frame rate (Android direct mode). When enabled (the default),
+    /// the player hints the content's frame rate to the OS via
+    /// `ANativeWindow_setFrameRate` on the video plane at each pipeline build,
+    /// so the display can switch to a matching refresh rate (e.g. 24 ->
+    /// 24/48/120 Hz) and play judder-free. It's a per-surface *hint*, not a
+    /// forced mode switch — the system chooses. Requires API 30+ (no-op
+    /// below). Disable it if the host wants to drive display-mode policy
+    /// itself (`Surface.setFrameRate` / `preferredDisplayModeId`). Takes
+    /// effect at the next `play()`.
+    pub fn set_adaptive_frame_rate(&self, enabled: bool) {
+        self.adaptive_frame_rate
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// How many seconds of media the player tries to keep buffered ahead
     /// of the renderer. Default is `DEFAULT_BUFFER_TARGET_SECS` (8s).
     /// Bumping this trades RAM for resilience against network jitter
@@ -3198,6 +3268,18 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         // afterwards would silently never fire any ticks again.
         let (abr_kill_tx, mut abr_kill_rx) = tokio::sync::oneshot::channel::<()>();
         let video_output_window = Arc::clone(&self.video_output_window);
+        // Adaptive-frame-rate inputs (Android direct mode only): the toggle and
+        // the content fps (MPD @frameRate on the selected adaptation, captured
+        // once per play() — ABR swaps keep the same content fps).
+        #[cfg(target_os = "android")]
+        let adaptive_frame_rate = Arc::clone(&self.adaptive_frame_rate);
+        #[cfg(target_os = "android")]
+        let video_fps = self
+            .video_adaptation
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|a| a.fps());
         let pending_resume = Arc::clone(&self.pending_resume);
         let play = tokio::spawn(async move {
             // ABR tick runs once for the whole play() lifetime (survives
@@ -3341,6 +3423,17 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                 // channel + 2 in the reorder buffer + 1 rendering leaves
                 // the codec breathing room.
                 let direct_window = video_output_window.load(Ordering::Relaxed);
+                // Adaptive frame rate: hint the content fps to the video plane
+                // so the display can match its refresh rate. Idempotent — fine
+                // to re-assert on every (re)build (seek / ABR swap).
+                #[cfg(target_os = "android")]
+                if direct_window != 0
+                    && adaptive_frame_rate.load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    if let Some(fps) = video_fps {
+                        set_window_frame_rate(direct_window, fps.as_f32());
+                    }
+                }
                 let frame_cap = if direct_window != 0 { 2 } else { 8 };
                 let (frame_sender, frame_receiver) =
                     mpsc::channel::<DecodedVideoFrame>(frame_cap);

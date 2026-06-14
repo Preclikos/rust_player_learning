@@ -3247,6 +3247,34 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         if Some(picked.id) == current_id {
             return;
         }
+
+        // Buffer gate for UP-switches. A higher rung means a heavier segment +
+        // a codec reconfigure (e.g. 1080p -> 4K); at the cold start or right
+        // after a (re)build the buffer is near-empty, so the make-before-break
+        // swap starves -> a visible buffering hitch + a LATE cascade (the rough
+        // start, no seek involved). Defer until a cushion exists. Down-switches
+        // are NOT gated — dropping a rung is how we AVOID starvation when
+        // bandwidth falls, so it must fire even on a thin buffer.
+        let cur_bw = self
+            .video_representation
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|r| r.bandwidth)
+            .unwrap_or(0);
+        if picked.bandwidth > cur_bw {
+            const MIN_UPSWITCH_BUFFER_MS: i64 = 4_000;
+            let pos = self.position_ms.load(Ordering::Relaxed) as i64;
+            let decoded = self.stats.last_decoded_pts_ms.load(Ordering::Relaxed);
+            let buffered_ahead_ms = (decoded - pos).max(0);
+            if buffered_ahead_ms < MIN_UPSWITCH_BUFFER_MS {
+                log::debug!(
+                    "[abr] up-switch to {} deferred: buffer {}ms < {}ms",
+                    picked.id, buffered_ahead_ms, MIN_UPSWITCH_BUFFER_MS
+                );
+                return;
+            }
+        }
         log::info!(
             "[abr] switch repr {:?} -> {} (ewma={}bps safety={} profile={:?})",
             current_id, picked.id, ewma_bps, safety, profile

@@ -269,6 +269,14 @@ pub struct Player<V: VideoSink = VideoRenderer, A: AudioSink = AudioRenderer> {
     /// `set_adaptive_frame_rate(false)` to own display-mode policy itself.
     adaptive_frame_rate: Arc<std::sync::atomic::AtomicBool>,
 
+    /// True once the current pipeline has produced its first frame (set in
+    /// av_sync_handler after video_ready, reset to false on every pipeline
+    /// (re)build). The ABR tick consults it so the FIRST auto-switch can't
+    /// fire into a just-started / resuming pipeline — that rebuild-on-top-of-a-
+    /// rebuild is what collided with resume and could stall the direct-mode
+    /// MediaCodec. An event-based gate (first frame landed), not a timer.
+    pipeline_live: Arc<std::sync::atomic::AtomicBool>,
+
     /// Set when a play() ends on exhausted pipeline retries: the position
     /// the NEXT play() resumes from, so the consumer's manual retry
     /// continues where playback stopped instead of starting over.
@@ -316,6 +324,7 @@ impl<V: VideoSink, A: AudioSink> Clone for Player<V, A> {
             subtitle_representation: Arc::clone(&self.subtitle_representation),
             video_output_window: Arc::clone(&self.video_output_window),
             adaptive_frame_rate: Arc::clone(&self.adaptive_frame_rate),
+            pipeline_live: Arc::clone(&self.pipeline_live),
             pending_resume: Arc::clone(&self.pending_resume),
             video_renderer: Arc::clone(&self.video_renderer),
             audio_renderer: Arc::clone(&self.audio_renderer),
@@ -914,6 +923,7 @@ async fn av_sync_handler<V: VideoSink, A: AudioSink>(
     paused: Arc<AtomicBool>,
     pause_notify: Arc<Notify>,
     stats: Arc<StatsState>,
+    pipeline_live: Arc<AtomicBool>,
 ) {
     // Emit Buffering{Initial} immediately so the consumer can show "buffering"
     // while the first segments download.
@@ -935,6 +945,10 @@ async fn av_sync_handler<V: VideoSink, A: AudioSink>(
             return;
         }
     }
+    // First frame is out: the pipeline is live. Lets the ABR tick resume —
+    // any switch from here rebuilds a pipeline that's actually producing,
+    // not a half-started one.
+    pipeline_live.store(true, Ordering::Relaxed);
     // Audio readiness is BOUNDED, not a hard gate: if it gated the sync loop's
     // start, a slow audio decoder after a seek/start-at-offset would keep the
     // loop from running — and in direct mode that means the video codec's
@@ -2591,6 +2605,7 @@ impl Player<VideoRenderer, AudioRenderer> {
             subtitle_representation: Arc::new(StdMutex::new(None)),
             video_output_window: Arc::new(AtomicUsize::new(0)),
             adaptive_frame_rate: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            pipeline_live: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pending_resume: Arc::new(StdMutex::new(None)),
 
             video_renderer,
@@ -3023,6 +3038,21 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             .store(enabled, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Initial playback position for the next `play()` (resume). Unlike
+    /// `seek()` — which is fire-and-forget and races `play()`'s read of the
+    /// seek target — this stores the position **synchronously**, so a
+    /// consumer can just `set_start_position(Some(pos)); play();` and the
+    /// pipeline deterministically starts there (priority over the start of
+    /// content, below an explicit pending `seek()`). One-shot: `play()`
+    /// consumes it. `None` clears it (start from the beginning).
+    ///
+    /// The initial ABR auto-switch is held until the pipeline produces its
+    /// first frame, so it can't collide with this resume start — consumers
+    /// no longer need to defer ABR or seek-after-Playing to resume safely.
+    pub fn set_start_position(&self, pos: Option<Duration>) {
+        *self.pending_resume.lock().unwrap() = pos;
+    }
+
     /// How many seconds of media the player tries to keep buffered ahead
     /// of the renderer. Default is `DEFAULT_BUFFER_TARGET_SECS` (8s).
     /// Bumping this trades RAM for resilience against network jitter
@@ -3119,6 +3149,17 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             AbrStrategy::Manual => return,
             AbrStrategy::BandwidthEwma { safety_factor } => safety_factor,
         };
+
+        // Don't switch until the current pipeline has produced its first frame.
+        // Otherwise the first auto-switch (~1s in, once a bandwidth sample
+        // exists) can fire into a just-started or resuming pipeline — a codec
+        // rebuild on top of a rebuild that collided with resume and could stall
+        // the direct-mode MediaCodec. Reset on every (re)build; set after the
+        // first frame. This is the safe, event-based replacement for consumers
+        // deferring ABR by a fixed delay after a resume seek.
+        if !self.pipeline_live.load(Ordering::Relaxed) {
+            return;
+        }
 
         let adaptation = match self.video_adaptation.lock().unwrap().clone() {
             Some(a) => a,
@@ -3334,6 +3375,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             .as_ref()
             .and_then(|a| a.fps());
         let pending_resume = Arc::clone(&self.pending_resume);
+        let pipeline_live = Arc::clone(&self.pipeline_live);
         let play = tokio::spawn(async move {
             // ABR tick runs once for the whole play() lifetime (survives
             // every seek/track-switch restart below). On Manual it's a
@@ -3528,6 +3570,9 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                     seg_in_flight,
                 ));
 
+                // New pipeline: not "live" until it produces its first frame.
+                // Gates the ABR tick off this fragile startup window.
+                pipeline_live.store(false, Ordering::Relaxed);
                 av_sync_handler(
                     snapped_seek_offset,
                     video_ready.clone(),
@@ -3544,6 +3589,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                     paused.clone(),
                     pause_notify.clone(),
                     Arc::clone(&stats),
+                    Arc::clone(&pipeline_live),
                 )
                 .await;
 

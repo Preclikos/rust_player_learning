@@ -1307,10 +1307,17 @@ impl GlesOesRenderer {
         gl.enable(glow::BLEND);
         gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
         gl.use_program(Some(sub.program));
-        // Bottom-center with a 7% safe area — mirrors SubtitleOverlay::draw_into.
+        // Bottom-center of the FULL surface with a 7% safe area. We always
+        // aspect-FIT (never crop), so the surface's bottom is at or below
+        // the video's bottom: on a letterboxed clip the subtitle sits in
+        // the lower black bar (unobstructed picture); when the video
+        // reaches the bottom edge it sits over the video bottom. Either way
+        // it stays fully on-screen — clamp guards against a very tall cue.
         let half_w = bmp.width as f32 / viewport_width as f32;
         let half_h = bmp.height as f32 / viewport_height as f32;
-        let center_y = -1.0 + half_h + 0.14; // 7% of full height in NDC
+        // 7% of full height up from the bottom, but never let the top edge
+        // leave the screen (tall multi-line cue).
+        let center_y = (-1.0 + half_h + 0.14).min(1.0 - half_h);
         if let Some(ref loc) = sub.rect_loc {
             gl.uniform_4_f32(Some(loc), 0.0, center_y, half_w, half_h);
         }

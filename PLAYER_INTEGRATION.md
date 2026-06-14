@@ -124,9 +124,16 @@ second surface.
 
 Host responsibilities in direct mode:
 
-- **Aspect ratio**: MediaCodec stretches to fill the surface. Listen to
-  `PlayerEvent::Stats { current_resolution }` and resize the video
-  SurfaceView to the content aspect (see `MainActivity.onVideoSize`).
+- **Aspect ratio + centering**: MediaCodec stretches to fill the surface.
+  Listen to `PlayerEvent::Stats { current_resolution }` and resize the
+  video SurfaceView to the content aspect — **and center it** (e.g.
+  `Gravity.CENTER`; see `MainActivity.onVideoSize`). The overlay surface
+  the player draws subtitles on is full-screen and has no way to know
+  where you placed the video plane, so it anchors cues at the *full
+  surface's* bottom-center. If the resized video plane is not centered
+  (a `FrameLayout` defaults to top-left), letter-/pillar-boxed video and
+  the subtitles drift apart and cues land off the picture / half into the
+  black bar.
 - **Display HDR caps**: pass `Display.getHdrCapabilities` types as a
   bitmask (bit 0 = Dolby Vision, 1 = HDR10, 2 = HLG, 3 = HDR10+).
 - **Window lifetime**: both `ANativeWindow` refs must outlive the

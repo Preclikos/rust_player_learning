@@ -435,6 +435,40 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
     // on the first frame as (raw_pts - elapsed), making frame 0 render immediately
     // and all subsequent frames at their correct relative positions.
     let mut pts_base: Option<u64> = None;
+    // Audio-master clock anchor: (last observed played_ms, wall instant then).
+    // Video paces to the audio device's playback position so the two CANNOT
+    // drift (crystal mismatch, underruns) the way a free-running wall clock
+    // does — the recurring "A/V out of sync mid-playback, fixed by a seek".
+    // played_ms advances at the device rate and freezes on pause/starvation
+    // (verified in AudioRenderer), so it also subsumes the pause_skew dance.
+    let mut audio_anchor: Option<(u64, Instant)> = None;
+    // Current 0-based media clock in µs, mastered by audio when the sink
+    // reports a position, else the wall clock. played_ms updates only ~once
+    // per audio callback, so interpolate with wall time between updates for
+    // smooth frame pacing; if it hasn't ticked for >80ms the audio is
+    // paused/starving, so freeze (don't let video outrun a stalled clock).
+    // Returns None only when the sink has no clock at all (mocks) → wall
+    // fallback. `output_latency_ms` folds in so the picture lands when its
+    // audio is audible, not when it's merely consumed.
+    let audio_clock_us = |anchor: &mut Option<(u64, Instant)>| -> Option<i64> {
+        let played = audio_sink.played_ms()?;
+        let lat_us = audio_sink.output_latency_ms() as i64 * 1_000;
+        let now = Instant::now();
+        let (p0, w0) = match *anchor {
+            Some((p0, w0)) if played <= p0 => (p0, w0),
+            _ => {
+                *anchor = Some((played, now));
+                (played, now)
+            }
+        };
+        let since = now.duration_since(w0);
+        let pos_us = if since < Duration::from_millis(80) {
+            p0 as i64 * 1_000 + since.as_micros() as i64
+        } else {
+            p0 as i64 * 1_000
+        };
+        Some((pos_us - lat_us).max(0))
+    };
     loop {
         if stop_flag.load(Ordering::Relaxed) {
             break;
@@ -548,11 +582,16 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
         // media time, so subtitles (keyed off pts_ms) and the picture move
         // together against this same audio-anchored clock.
         let audio_latency = Duration::from_millis(audio_sink.output_latency_ms());
-        let elapsed = start_time
-            .elapsed()
-            .saturating_sub(pause_skew)
-            .saturating_sub(audio_latency)
-            .as_millis() as u64;
+        // Audio-master clock (falls back to the wall clock for sinks with no
+        // playback position). See `audio_clock_us` above.
+        let elapsed = match audio_clock_us(&mut audio_anchor) {
+            Some(us) => (us / 1_000) as u64,
+            None => start_time
+                .elapsed()
+                .saturating_sub(pause_skew)
+                .saturating_sub(audio_latency)
+                .as_millis() as u64,
+        };
 
         let base = *pts_base.get_or_insert(raw_pts_ms.saturating_sub(elapsed));
         let mut pts_ms = raw_pts_ms.saturating_sub(base);
@@ -646,11 +685,13 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
         let raw_pts_us = frame.pts_us;
         let base_us = base as i64 * 1_000;
         let pts_us_rel = (raw_pts_us - base_us).max(0);
-        let elapsed_us = start_time
-            .elapsed()
-            .saturating_sub(pause_skew)
-            .saturating_sub(audio_latency)
-            .as_micros() as i64;
+        let elapsed_us = audio_clock_us(&mut audio_anchor).unwrap_or_else(|| {
+            start_time
+                .elapsed()
+                .saturating_sub(pause_skew)
+                .saturating_sub(audio_latency)
+                .as_micros() as i64
+        });
         let pts_to_go_ns = (pts_us_rel - elapsed_us).max(0) * 1_000;
         frame.desired_present_ns = clock_monotonic_ns() + pts_to_go_ns;
 

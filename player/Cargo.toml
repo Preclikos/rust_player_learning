@@ -23,7 +23,14 @@ async-trait = "0.1"
 arc-swap = "1.7"
 bytes = "1"
 rand = "0.8"
-cpal ={ version =  "0.17" }
+# 0.18 AAudio: requests PERFORMANCE_MODE_LOW_LATENCY under the `realtime`
+# feature (collapses Android output latency to ~one burst — fixes video
+# leading audio with no per-device tuning; degrades gracefully to normal
+# mode, emitting RealtimeDenied via the error callback, if not granted).
+# 0.18 also folds hardware latency into the CoreAudio/WASAPI playback
+# timestamps, so the renderer's output-latency compensation is accurate
+# on desktop + Apple too.
+cpal = { version = "0.18", features = ["realtime"] }
 bytemuck ={ version =  "1.13.1" }
 pollster = "0.4.0"
 wgpu = { git = "https://github.com/Preclikos/wgpu.git" }

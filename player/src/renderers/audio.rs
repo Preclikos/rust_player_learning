@@ -227,11 +227,15 @@ impl AudioRenderer {
             // Backend may not support the timestamp (returns None / 0) — then
             // it stays 0 and behaviour is unchanged.
             let ts = info.timestamp();
-            if let Some(latency) = ts.playback.duration_since(&ts.callback) {
-                let ms = latency.as_millis() as u64;
-                if ms <= 1000 {
-                    output_latency_ms.store(ms, Ordering::Relaxed);
-                }
+            // cpal 0.18: duration_since takes StreamInstant by value and
+            // saturates to a Duration. playback − callback = how long until
+            // this buffer is audible (CoreAudio/WASAPI now fold in hardware
+            // latency). Only adopt a real (nonzero, sane) reading — backends
+            // that don't implement the playback timestamp give 0, which must
+            // not clobber an earlier good value.
+            let ms = ts.playback.duration_since(ts.callback).as_millis() as u64;
+            if ms > 0 && ms <= 1000 {
+                output_latency_ms.store(ms, Ordering::Relaxed);
             }
             if flush_flag.swap(false, Ordering::Relaxed) {
                 while sample_receiver.try_recv().is_ok() {}
@@ -283,11 +287,20 @@ impl AudioRenderer {
             }
         };
 
-        let err_fn = |err| log::error!("audio stream error: {}", err);
+        // RealtimeDenied (AAudio couldn't grant the low-latency/realtime
+        // path) is informational, not fatal — the stream falls back to the
+        // normal mode and keeps playing. Log it quieter than real errors.
+        let err_fn = |err: cpal::Error| {
+            if err.to_string().contains("Realtime") {
+                log::info!("audio: realtime/low-latency not granted, using normal mode");
+            } else {
+                log::error!("audio stream error: {}", err);
+            }
+        };
 
         let stream = device
             .build_output_stream(
-                &stream_config,
+                stream_config,
                 callback,
                 err_fn,
                 Some(Duration::from_secs(20)),

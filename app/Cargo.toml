@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 player = { path = "../player" }
 app-shared = { path = "../app-shared" }
-tokio = { version = "1.43.0", features = ["full"] }
+tokio = { version = "1.52", features = ["full"] }
 winit = "0.30.9"
 pollster = "0.4.0"
 env_logger = "0.11.6"

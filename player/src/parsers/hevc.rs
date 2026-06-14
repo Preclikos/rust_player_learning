@@ -429,11 +429,13 @@ pub fn parse_sei_hdr_metadata(nalu: &[u8]) -> SeiHdrMetadata {
         };
         match payload_type {
             SEI_MASTERING_DISPLAY => {
-                // 3×(primary x,y u16) + white point (x,y u16) = 20 bytes,
-                // then max_display_mastering_luminance u32 (0.0001 nits),
-                // min u32.
-                if body.len() >= 24 {
-                    let max = u32::from_be_bytes([body[20], body[21], body[22], body[23]]);
+                // SMPTE 2086: 3×(primary x,y u16)=12B + white point (x,y u16)=4B
+                // = 16 bytes, THEN max_display_mastering_luminance u32 (0.0001
+                // nits) at 16..20, then min u32 at 20..24. (The old code read
+                // 20..24 = the MIN — that surfaced as a bogus 0.005-nit "peak"
+                // flip-flopping against MaxCLL on real streams.)
+                if body.len() >= 20 {
+                    let max = u32::from_be_bytes([body[16], body[17], body[18], body[19]]);
                     out.static_info.mastering_peak_nits = Some(max as f32 * 0.0001);
                 }
             }
@@ -590,8 +592,11 @@ mod tests {
     #[test]
     fn sei_mastering_display() {
         let mut body = vec![0u8; 24];
-        // max_display_mastering_luminance = 10_000_000 * 0.0001 = 1000 nits
-        body[20..24].copy_from_slice(&10_000_000u32.to_be_bytes());
+        // max_display_mastering_luminance (offset 16, per SMPTE 2086) =
+        // 10_000_000 * 0.0001 = 1000 nits. Offset 20 is the MIN — put a
+        // distinct small value there to catch a regression that reads it.
+        body[16..20].copy_from_slice(&10_000_000u32.to_be_bytes());
+        body[20..24].copy_from_slice(&50u32.to_be_bytes()); // min = 0.005 nits
         let mut nalu = vec![NAL_SEI_PREFIX << 1, 0x01];
         nalu.push(137);
         nalu.push(body.len() as u8);

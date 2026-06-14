@@ -62,6 +62,12 @@ pub struct MediaCodecDecoder {
     /// Static mastering-display / MaxCLL metadata (usually only on IDR
     /// SEIs) — the fallback for frames without a dynamic entry.
     static_hdr_meta: Option<HdrFrameMeta>,
+    /// Last MaxCLL (content light level) seen, persisted across frames. Some
+    /// streams carry MaxCLL and the mastering-display SEI on ALTERNATING
+    /// frames, so recomputing peak = MaxCLL.or(mastering) per frame made it
+    /// flip-flop (and re-log). Once MaxCLL is seen we keep it — it's the
+    /// tonemap-relevant peak — and only fall back to mastering until then.
+    seen_max_cll_nits: Option<f32>,
     /// Keep Dolby Vision RPU/EL NALs in the bitstream (platform DV
     /// decoder configured — it needs them). False = strip them (plain
     /// HEVC decoders may choke on unspecified NAL types).
@@ -177,6 +183,7 @@ impl MediaCodecDecoder {
             color: Default::default(),
             pending_hdr_meta: Default::default(),
             static_hdr_meta: None,
+            seen_max_cll_nits: None,
             keep_dv_nalus: false,
         }
     }
@@ -734,9 +741,13 @@ impl HwVideoDecoder for MediaCodecDecoder {
                             self.pending_hdr_meta.remove(&oldest);
                         }
                     }
-                    let peak = meta
-                        .static_info
-                        .max_cll_nits
+                    if let Some(cll) = meta.static_info.max_cll_nits {
+                        self.seen_max_cll_nits = Some(cll);
+                    }
+                    // MaxCLL once seen, else the mastering-display peak. Sticky
+                    // so alternating-SEI streams don't flip the peak each frame.
+                    let peak = self
+                        .seen_max_cll_nits
                         .or(meta.static_info.mastering_peak_nits);
                     if let Some(peak_nits) = peak {
                         let new = HdrFrameMeta { peak_nits, avg_nits: None };

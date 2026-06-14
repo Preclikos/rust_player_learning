@@ -52,7 +52,7 @@ use crypto::{
 };
 use decoders::{
     AudioCodec, AudioDecoder, AudioDecoderParams, DecodedAudioFrame, DecodedVideoFrame,
-    HwVideoDecoder, VideoCodec, VideoDecoderParams,
+    HwVideoDecoder, VideoCodec, VideoColorInfo, VideoDecoderParams,
 };
 use parsers::mp4::aac_sampling_frequency_index_to_u32;
 use pollster::FutureExt;
@@ -169,6 +169,15 @@ struct StatsState {
     /// IT hasn't received a frame for >300 ms. Video parks on its
     /// current frame instead of marching forward over silence.
     audio_starving: AtomicBool,
+    /// Measured A/V clock drift in ms: how far the video wall clock has
+    /// run ahead of the audio device clock since this pipeline started
+    /// (negative = audio ahead). Written ~1 Hz by video_sync_loop when
+    /// the sink supports `played_ms`; surfaced via PlayerEvent::Stats.
+    /// The device crystal vs CLOCK_MONOTONIC disagree by 10–100 ppm, so
+    /// multi-hour sessions are expected to show a slow linear trend —
+    /// this is the measurement that tells us when an active servo is
+    /// warranted on a given device class.
+    av_drift_ms: std::sync::atomic::AtomicI64,
 }
 
 pub struct Player<V: VideoSink = VideoRenderer, A: AudioSink = AudioRenderer> {
@@ -248,6 +257,23 @@ pub struct Player<V: VideoSink = VideoRenderer, A: AudioSink = AudioRenderer> {
     /// `set_subtitle_track` / `clear_subtitle_track`.
     subtitle_representation: Arc<StdMutex<Option<tracks::text::TextRepresenation>>>,
 
+    /// Android direct mode: `ANativeWindow*` (as usize) of the dedicated
+    /// video plane the decoder renders into. 0 = classic renderer path.
+    /// Set once by the host before play(); consumed at pipeline build.
+    video_output_window: Arc<AtomicUsize>,
+
+    /// Adaptive frame rate (Android direct mode): when set, the player hints
+    /// the video plane's content fps to the OS via `ANativeWindow_setFrameRate`
+    /// so the display can switch to a matching refresh rate (24 -> 24/48/120
+    /// Hz) and avoid judder. Default on; the host can disable it via
+    /// `set_adaptive_frame_rate(false)` to own display-mode policy itself.
+    adaptive_frame_rate: Arc<std::sync::atomic::AtomicBool>,
+
+    /// Set when a play() ends on exhausted pipeline retries: the position
+    /// the NEXT play() resumes from, so the consumer's manual retry
+    /// continues where playback stopped instead of starting over.
+    pending_resume: Arc<StdMutex<Option<Duration>>>,
+
     video_renderer: Arc<V>,
     audio_renderer: Arc<A>,
 
@@ -288,6 +314,9 @@ impl<V: VideoSink, A: AudioSink> Clone for Player<V, A> {
             video_switch_tx: Arc::clone(&self.video_switch_tx),
             buffer_target_secs: Arc::clone(&self.buffer_target_secs),
             subtitle_representation: Arc::clone(&self.subtitle_representation),
+            video_output_window: Arc::clone(&self.video_output_window),
+            adaptive_frame_rate: Arc::clone(&self.adaptive_frame_rate),
+            pending_resume: Arc::clone(&self.pending_resume),
             video_renderer: Arc::clone(&self.video_renderer),
             audio_renderer: Arc::clone(&self.audio_renderer),
             rt: self.rt.clone(),
@@ -373,6 +402,13 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
     let mut last_position_emit = Instant::now() - Duration::from_secs(1);
     // Stats event rate-limit: ≤ 1 Hz per PLAYER_INTEGRATION.md §4.1.
     let mut last_stats_emit = Instant::now() - Duration::from_secs(1);
+    // A/V drift measurement: (video elapsed_ms, audio played_ms) at the
+    // first stats tick — subsequent ticks compare ADVANCES from here.
+    let mut drift_baseline: Option<(u64, u64)> = None;
+    let mut last_drift_warn: Option<Instant> = None;
+    // Min A/V drift over the current 1Hz stats window (least-stale read of
+    // the chunky audio-played counter ≈ the true offset).
+    let mut drift_min_window = i64::MAX;
     let mut emitted_playing = false;
     // Starvation tracking — flips when the decoder hasn't produced a
     // frame for >300 ms (typically a network outage hitting the
@@ -492,9 +528,21 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
             }
         };
         let raw_pts_ms = (frame.pts_us / 1000) as u64;
+        // Audio output latency (device buffer + DAC): the sink consumes a
+        // sample this many ms before it's audible. Subtract it from the
+        // video clock so a frame reaches the screen exactly when its audio
+        // reaches the speaker — without it video leads audio by the output
+        // latency at every (re)start, which surfaces as "audio delayed"
+        // after seeks/track-switches. Re-read each iteration: it's ~0 until
+        // the first callback, then stabilises, so it applies as a one-time
+        // hold early in playback. `pts_ms` itself stays the frame's true
+        // media time, so subtitles (keyed off pts_ms) and the picture move
+        // together against this same audio-anchored clock.
+        let audio_latency = Duration::from_millis(audio_sink.output_latency_ms());
         let elapsed = start_time
             .elapsed()
             .saturating_sub(pause_skew)
+            .saturating_sub(audio_latency)
             .as_millis() as u64;
 
         let base = *pts_base.get_or_insert(raw_pts_ms.saturating_sub(elapsed));
@@ -548,10 +596,26 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
                 }
             }
         } else {
-            // Sleep until RENDER_BUDGET_MS before the target PTS so the GPU
-            // draws the frame early. The compositor then displays it at exactly
-            // pts_ms thanks to eglPresentationTimeANDROID.
-            let target_wake_ms = pts_ms.saturating_sub(RENDER_BUDGET_MS);
+            // Sleep until shortly before the target PTS. GL path: the GPU
+            // draws the frame early and eglPresentationTimeANDROID holds it
+            // until exactly pts_ms. Direct mode: the release timestamp does
+            // the same, and a LARGER lead is the point — every released
+            // frame returns its output buffer to MediaCodec (the channel +
+            // reorder window only hold ~4), so queueing 2-3 frames ahead in
+            // SurfaceFlinger is what bridges the segment-boundary decoder
+            // warmup that the GL path bridged with its 32-image pool.
+            #[cfg(target_os = "android")]
+            let render_budget_ms = if matches!(
+                frame.native,
+                crate::decoders::PlatformFrame::MediaCodecDirect(_)
+            ) {
+                100
+            } else {
+                RENDER_BUDGET_MS
+            };
+            #[cfg(not(target_os = "android"))]
+            let render_budget_ms = RENDER_BUDGET_MS;
+            let target_wake_ms = pts_ms.saturating_sub(render_budget_ms);
             if target_wake_ms > elapsed {
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_millis(target_wake_ms - elapsed)) => {}
@@ -576,6 +640,7 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
         let elapsed_us = start_time
             .elapsed()
             .saturating_sub(pause_skew)
+            .saturating_sub(audio_latency)
             .as_micros() as i64;
         let pts_to_go_ns = (pts_us_rel - elapsed_us).max(0) * 1_000;
         frame.desired_present_ns = clock_monotonic_ns() + pts_to_go_ns;
@@ -584,6 +649,20 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
             .elapsed()
             .saturating_sub(pause_skew)
             .as_millis() as u64;
+        // Per-frame A/V drift, min-accumulated over the 1Hz stats window.
+        // Sampling the chunky audio-played counter gives a noisy sawtooth;
+        // the per-window MIN is the least-stale read = the true video-ahead
+        // offset (see the stats emit below).
+        if let Some(played) = audio_sink.played_ms() {
+            match drift_baseline {
+                None => drift_baseline = Some((render_start, played)),
+                Some((e0, p0)) => {
+                    let d = render_start.saturating_sub(e0) as i64
+                        - played.saturating_sub(p0) as i64;
+                    drift_min_window = drift_min_window.min(d);
+                }
+            }
+        }
         let interval_ms = if last_render_elapsed > 0 { render_start - last_render_elapsed } else { 0 };
         let delta_pts = pts_ms.saturating_sub(last_pts_ms);
 
@@ -639,6 +718,34 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
         // Rate-limited Stats emission (≤ 1 Hz). net_stall_ms is swap-reset
         // so consumers see "ms blocked in the last second", not cumulative.
         if last_stats_emit.elapsed() >= Duration::from_secs(1) {
+            // A/V drift bookkeeping: both clocks freeze together across
+            // pauses and starvation windows (cpal consumes nothing while
+            // paused; pause_skew stops the video timeline), so the
+            // difference of ADVANCES since the baseline isolates pure
+            // clock-rate mismatch plus any sync bug.
+            // A/V drift = the MIN video-ahead offset over the window. The
+            // 1Hz-sampled raw drift beats against the chunky audio-played
+            // counter (a ±100ms sampling sawtooth); the per-window minimum
+            // is the least-stale read and tracks the true offset. Both
+            // clocks freeze together across pause/starvation, so this
+            // isolates genuine desync. Warn past 150ms.
+            let mut drift_out: Option<i64> = None;
+            if drift_min_window != i64::MAX {
+                stats.av_drift_ms.store(drift_min_window, Ordering::Relaxed);
+                drift_out = Some(drift_min_window);
+                if drift_min_window.abs() > 150
+                    && last_drift_warn
+                        .map(|t| t.elapsed() > Duration::from_secs(20))
+                        .unwrap_or(true)
+                {
+                    log::warn!(
+                        "[vsync] A/V drift {}ms (+ = audio behind video)",
+                        drift_min_window
+                    );
+                    last_drift_warn = Some(Instant::now());
+                }
+            }
+            drift_min_window = i64::MAX;
             let decoder_name = stats.decoder_name.lock().unwrap().clone();
             let _ = events.send(PlayerEvent::Stats {
                 video_frames_decoded: stats.video_frames_decoded.load(Ordering::Relaxed),
@@ -648,6 +755,7 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
                 decoder_name,
                 current_resolution: Some((frame_w, frame_h)),
                 audio_peak_db: audio_sink.last_peak_db(),
+                av_drift_ms: drift_out,
             });
             last_stats_emit = Instant::now();
         }
@@ -824,17 +932,42 @@ async fn av_sync_handler<V: VideoSink, A: AudioSink>(
             return;
         }
     }
-    let now = Instant::now();
-    let start_time = Arc::new(now.checked_sub(seek_offset).unwrap_or(now));
-    // Unpause the audio device in lock-step with the wall-clock origin.
-    // AudioRenderer starts paused at construction (cpal would otherwise
-    // pull from an empty mpsc and play silence while the audio decoder
-    // warmed up, then "catch up" once real samples arrived — perceived
-    // as audio leading or lagging by an unpredictable amount). seek()
-    // re-pauses + flushes; this restores playback for the new pipeline.
+    // Unpause the audio device. AudioRenderer starts paused at construction
+    // (cpal would otherwise pull from an empty mpsc and play silence while
+    // the audio decoder warmed up, then "catch up" once real samples
+    // arrived). seek() re-pauses + flushes; this restores playback.
     if !paused.load(Ordering::Relaxed) {
         audio_sink.set_paused(false);
     }
+    // Universal start alignment (no per-device constants): anchor the video
+    // clock to the instant audio ACTUALLY starts flowing — i.e. when the
+    // output device's played-sample position first advances — not to the
+    // earlier "first frame decoded" instant. Otherwise video starts at the
+    // wall clock while the audio output buffer is still filling, so video
+    // leads audio at every (re)start; the LATE-drain then yanks video back
+    // with a visible skip. Because seek() and track/ABR switches rebuild
+    // the pipeline through here, that transient recurred on every switch —
+    // the "audio delayed after switching" the user reported. Bounded so a
+    // sink that never reports a position (mocks) or genuine leading silence
+    // still starts. Skipped while paused.
+    if !paused.load(Ordering::Relaxed) && audio_sink.played_ms().is_some() {
+        let gate = Instant::now();
+        while audio_sink.played_ms().unwrap_or(1) == 0 {
+            if gate.elapsed() > Duration::from_millis(500) {
+                log::debug!("[vsync] audio-start gate timed out; anchoring anyway");
+                break;
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(4)) => {}
+                _ = stop.notified() => {
+                    stop.notify_waiters();
+                    return;
+                }
+            }
+        }
+    }
+    let now = Instant::now();
+    let start_time = Arc::new(now.checked_sub(seek_offset).unwrap_or(now));
     let stats_audio = Arc::clone(&stats);
     let events_audio = Arc::clone(&events);
     let paused_audio = Arc::clone(&paused);
@@ -911,33 +1044,115 @@ async fn video_decoder_task(
     // We always emit the lowest-PTS frame from the buffer. video_ready fires
     // on the first send so start_time is calibrated to when frames are
     // actually available (avoids a timing hole at startup).
-    const REORDER_DEPTH: usize = 4;
-    let mut reorder_buf: Vec<DecodedVideoFrame> = Vec::with_capacity(REORDER_DEPTH + 1);
+    // Direct mode holds codec output buffers captive in this window — keep
+    // it shallow there (see the frame-channel capacity comment in play()).
+    let reorder_depth: usize = if decoder.is_direct() { 2 } else { 4 };
+    let mut reorder_buf: Vec<DecodedVideoFrame> = Vec::with_capacity(reorder_depth + 1);
 
-    while let Some(segment) = receiver.recv().await {
+    // Segment preparation (init concat + CENC decrypt + mp4 parse) runs on
+    // a BLOCKING thread, overlapped with feeding the previous segment.
+    // Software AES on 32-bit devices costs ~0.5 s per 4K segment — done
+    // inline (the old shape) that was a guaranteed codec starvation +
+    // LATE drain at every segment boundary; overlapped it disappears into
+    // the ~6 s feed window of the segment before it.
+    struct PreparedSegment {
+        id: usize,
+        data_vec: Vec<u8>,
+        sample_info: Vec<(usize, usize, i64, u64)>,
+    }
+    let init_data = Arc::new(init_data);
+    let prepare = {
+        let init_data = Arc::clone(&init_data);
+        let crypto = track_crypto.clone();
+        move |segment: DataSegment| {
+            let init_data = Arc::clone(&init_data);
+            let crypto = crypto.clone();
+            tokio::task::spawn_blocking(
+                move || -> Result<PreparedSegment, Box<dyn Error + Send + Sync>> {
+                    let mut data_vec =
+                        Vec::with_capacity(init_data.len() + segment.data.len());
+                    data_vec.extend_from_slice(&init_data);
+                    data_vec.extend_from_slice(&segment.data[..]);
+                    decrypt_segment_in_place(&mut data_vec, crypto.as_ref())?;
+                    let sample_info: Vec<(usize, usize, i64, u64)> = {
+                        let mp4 = Mp4::read_bytes(&data_vec).map_err(
+                            |e| -> Box<dyn Error + Send + Sync> { format!("mp4: {}", e).into() },
+                        )?;
+                        let (_id, track) = mp4.tracks().first_key_value().ok_or_else(
+                            || -> Box<dyn Error + Send + Sync> { "no track".into() },
+                        )?;
+                        track
+                            .samples
+                            .iter()
+                            .map(|s| {
+                                (
+                                    s.offset as usize,
+                                    s.size as usize,
+                                    s.composition_timestamp,
+                                    s.timescale,
+                                )
+                            })
+                            .collect()
+                    };
+                    Ok(PreparedSegment {
+                        id: segment.id,
+                        data_vec,
+                        sample_info,
+                    })
+                },
+            )
+        }
+    };
+
+    let mut pending_prepare: Option<
+        tokio::task::JoinHandle<Result<PreparedSegment, Box<dyn Error + Send + Sync>>>,
+    > = None;
+    loop {
+        let boundary_t0 = Instant::now();
+        let prepared = match pending_prepare.take() {
+            // Steady state: the next segment was prepared while the
+            // previous one fed — this await is ~0.
+            Some(handle) => handle
+                .await
+                .map_err(|e| -> Box<dyn Error + Send + Sync> {
+                    format!("prepare task: {}", e).into()
+                })??,
+            // Startup / buffer-dry case: wait for a download, prepare it
+            // (nothing to overlap with).
+            None => {
+                let Some(segment) = receiver.recv().await else {
+                    break;
+                };
+                if stop_flag.load(Ordering::Relaxed) {
+                    log::debug!("[dec] stop signal received between segments; aborting drain");
+                    break;
+                }
+                prepare(segment)
+                    .await
+                    .map_err(|e| -> Box<dyn Error + Send + Sync> {
+                        format!("prepare task: {}", e).into()
+                    })??
+            }
+        };
         if stop_flag.load(Ordering::Relaxed) {
-            log::debug!("[dec] stop signal received between segments; aborting drain");
             break;
         }
-        log::debug!("[dec] consuming video segment: {}", segment.id);
-
-        let mut data_vec = init_data.clone();
-        data_vec.extend_from_slice(&segment.data[..]);
-        decrypt_segment_in_place(&mut data_vec, track_crypto.as_ref())?;
-
-        let sample_info: Vec<(usize, usize, i64, u64)> = {
-            let mp4 = Mp4::read_bytes(&data_vec)
-                .map_err(|e| -> Box<dyn Error + Send + Sync> { format!("mp4: {}", e).into() })?;
-            let (_id, track) = mp4
-                .tracks()
-                .first_key_value()
-                .ok_or_else(|| -> Box<dyn Error + Send + Sync> { "no track".into() })?;
-            track
-                .samples
-                .iter()
-                .map(|s| (s.offset as usize, s.size as usize, s.composition_timestamp, s.timescale))
-                .collect()
-        };
+        // Kick off the NEXT segment's preparation before feeding this one
+        // — downloads run ~4 segments ahead, so it's normally buffered.
+        if let Ok(next) = receiver.try_recv() {
+            pending_prepare = Some(prepare(next));
+        }
+        let boundary_ms = boundary_t0.elapsed().as_millis();
+        if boundary_ms > 50 {
+            log::info!(
+                "[dec] segment {} boundary stall {}ms ({} samples, {} KiB)",
+                prepared.id, boundary_ms,
+                prepared.sample_info.len(), prepared.data_vec.len() / 1024
+            );
+        }
+        log::debug!("[dec] consuming video segment: {}", prepared.id);
+        let data_vec = prepared.data_vec;
+        let sample_info = prepared.sample_info;
 
         let mut first_pts_us: Option<i64> = None;
         let mut last_pts_us: i64 = 0;
@@ -979,7 +1194,7 @@ async fn video_decoder_task(
                                 .store(pts_ms, Ordering::Relaxed);
                         }
                         reorder_buf.push(frame);
-                        if reorder_buf.len() > REORDER_DEPTH {
+                        if reorder_buf.len() > reorder_depth {
                             let min_idx = reorder_buf.iter().enumerate()
                                 .min_by_key(|(_, f)| f.pts_us)
                                 .map(|(i, _)| i)
@@ -1146,6 +1361,8 @@ struct VideoPrefetch {
     height: u32,
     init_data: Vec<u8>,
     hvcc_nalus: Vec<Vec<u8>>,
+    color: VideoColorInfo,
+    dovi_profile: Option<u8>,
     track_crypto: Option<TrackCrypto>,
     download_rx: mpsc::Receiver<DataSegment>,
     download_handle: JoinHandle<Result<(), Box<dyn Error + Send + Sync>>>,
@@ -1185,10 +1402,58 @@ async fn video_prefetch(
 
     let hvcc_nalus = parse_hvcc_nalus(&init_data)
         .ok_or_else(|| -> Box<dyn Error + Send + Sync> { "no hvcC in init segment".into() })?;
-    if let Some(bd) = parse_hvcc_bit_depth(&init_data) {
-        if bd != 8 {
-            log::info!("video: HEVC luma bit depth = {}", bd);
+
+    // Dolby Vision policy: profiles 7/8 carry a decodable HEVC base layer
+    // (HDR10/SDR/HLG-compatible, correctly signalled in the SPS VUI), so
+    // they can always play through the normal Main10 + tonemap path with
+    // the RPU NAL dropped. On Android the decoder additionally tries the
+    // platform `video/dolby-vision` codec (full DV, RPU kept) and only
+    // falls back to the base layer. Profile 5 (IPTPQc2) has NO compatible
+    // base layer — it is only playable where a real DV decoder exists
+    // (Android direct mode); elsewhere refuse up front with an actionable
+    // error instead of rendering green/purple garbage.
+    let dovi_profile = crate::crypto::parse_dovi_config(&init_data).map(|dovi| {
+        log::info!(
+            "video: Dolby Vision profile {}.{} (rpu={} el={} bl={} compat_id={})",
+            dovi.profile,
+            dovi.level,
+            dovi.rpu_present,
+            dovi.el_present,
+            dovi.bl_present,
+            dovi.bl_signal_compatibility_id
+        );
+        if dovi.el_present {
+            log::warn!(
+                "video: DV enhancement layer present — ignored unless the platform DV decoder picks it up"
+            );
         }
+        dovi.profile
+    });
+    if let Some(p) = dovi_profile {
+        if !matches!(p, 7 | 8) && !cfg!(target_os = "android") {
+            return Err(format!(
+                "Dolby Vision profile {} has no backward-compatible base layer \
+                 (needs a platform DV decoder) — unsupported on this target",
+                p
+            )
+            .into());
+        }
+    }
+
+    // Colour info comes from the SPS VUI — the MPD is not trustworthy here
+    // (our test stream signals BT.709 on PQ representations). Fall back to
+    // the hvcC bit depth when the SPS doesn't parse.
+    let sps_color = crate::parsers::hevc::parse_sps_color_info(&hvcc_nalus);
+    let color = VideoColorInfo::from_sps(sps_color, parse_hvcc_bit_depth(&init_data));
+    if color.bit_depth != 8 || color.is_hdr() {
+        log::info!(
+            "video: {}-bit, transfer={:?}, bt2020={}, full_range={} (SPS VUI {})",
+            color.bit_depth,
+            color.transfer,
+            color.bt2020,
+            color.full_range,
+            if sps_color.is_some() { "parsed" } else { "missing — hvcC fallback" },
+        );
     }
 
     let track_crypto = setup_track_crypto(&init_data, decryptor, "video").await?;
@@ -1235,6 +1500,8 @@ async fn video_prefetch(
         height: repr.height,
         init_data,
         hvcc_nalus,
+        color,
+        dovi_profile,
         track_crypto,
         download_rx,
         download_handle,
@@ -1250,6 +1517,53 @@ async fn video_prefetch(
 /// avoids both a backward rewind AND a future-PTS frame that av_sync would
 /// sit and wait for (the multi-second freeze seen on a 1080→4K upswitch, where
 /// NEW used to start a whole segment ahead). `started` is for the timing log.
+/// Hint the video plane's content frame rate to the OS so it can switch the
+/// display to a matching refresh rate (adaptive frame rate). Wraps
+/// `ANativeWindow_setFrameRate` (API 30+), resolved at runtime via dlsym — the
+/// symbol lives in `libnativewindow.so`, which ndk-sys doesn't link, and a
+/// build-time extern made the whole .so fail to load on the 32-bit Streamer
+/// (same lesson as `ANativeWindow_setBuffersDataSpace`). No-op below API 30.
+#[cfg(target_os = "android")]
+fn set_window_frame_rate(window: usize, fps: f32) {
+    use std::sync::OnceLock;
+    if window == 0 || !(fps > 0.0) {
+        return;
+    }
+    // int32_t ANativeWindow_setFrameRate(ANativeWindow*, float, int8_t)
+    type SetFrameRateFn = unsafe extern "C" fn(*mut std::ffi::c_void, f32, i8) -> i32;
+    static SYM: OnceLock<Option<SetFrameRateFn>> = OnceLock::new();
+    let f = SYM.get_or_init(|| unsafe {
+        let name = b"ANativeWindow_setFrameRate\0";
+        let mut sym = libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr() as *const _);
+        if sym.is_null() {
+            let lib = libc::dlopen(
+                b"libnativewindow.so\0".as_ptr() as *const _,
+                libc::RTLD_NOW | libc::RTLD_GLOBAL,
+            );
+            if !lib.is_null() {
+                sym = libc::dlsym(lib, name.as_ptr() as *const _);
+            }
+        }
+        if sym.is_null() {
+            log::warn!("[afr] ANativeWindow_setFrameRate unavailable (API < 30) — adaptive frame rate off");
+            None
+        } else {
+            Some(std::mem::transmute::<*mut libc::c_void, SetFrameRateFn>(sym))
+        }
+    });
+    if let Some(f) = f {
+        // compatibility = 1 (ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE):
+        // the source has a fixed inherent rate, so the system should prefer an
+        // exact match (e.g. 23.976 -> 24/48/120 Hz) over the current mode.
+        let rc = unsafe { f(window as *mut std::ffi::c_void, fps, 1) };
+        if rc == 0 {
+            log::info!("[afr] hinted display frame rate {:.3} fps (fixed-source)", fps);
+        } else {
+            log::warn!("[afr] ANativeWindow_setFrameRate({:.3}) returned {}", fps, rc);
+        }
+    }
+}
+
 struct SwapSplice {
     started: Instant,
     skip_below_pts_us: i64,
@@ -1268,12 +1582,17 @@ async fn run_decode(
     decoder_stop_flag: Arc<AtomicBool>,
     // `Some(..)` on an ABR swap (splice trim + timing), `None` initially.
     splice: Option<SwapSplice>,
+    // Android direct mode video window (0 = renderer path).
+    direct_window: usize,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     decoder.configure(VideoDecoderParams {
         codec: VideoCodec::Hevc,
         width: pf.width,
         height: pf.height,
         hvcc_nalus: pf.hvcc_nalus,
+        color: pf.color,
+        direct_window,
+        dovi_profile: pf.dovi_profile,
     })?;
 
     let decoder_task = task::spawn(video_decoder_task(
@@ -1310,6 +1629,8 @@ async fn video_play(
     // supervisor can softly cap an old pipeline mid-flight without
     // discarding its already-decoded tail.
     soft_end_exclusive: Arc<AtomicUsize>,
+    // Android direct mode video window (0 = renderer path).
+    direct_window: usize,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     // Initial pipeline: nothing to overlap with, so download and decode run
     // back to back. `prime_target = MAX` → the readiness signal never fires
@@ -1327,7 +1648,17 @@ async fn video_play(
         usize::MAX,
     )
     .await?;
-    run_decode(pf, sender, video_ready, decoder, stats, stop_flag, None).await
+    run_decode(
+        pf,
+        sender,
+        video_ready,
+        decoder,
+        stats,
+        stop_flag,
+        None,
+        direct_window,
+    )
+    .await
 }
 
 async fn audio_play(
@@ -1656,7 +1987,23 @@ async fn video_supervisor(
     // Content origin (first segment's absolute presentation time). position_ms
     // is 0-based, so we add this back to locate segments on a soft swap.
     origin: Duration,
+    // Android direct mode video window (0 = renderer path).
+    direct_window: usize,
+    // Resume slot written when retries are exhausted: the NEXT play() call
+    // starts from this position instead of zero ("continue where we
+    // stopped" semantics for the consumer's manual retry).
+    pending_resume: Arc<StdMutex<Option<Duration>>>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    // Pipeline failures (network death mid-stream, decoder errors) are
+    // retried from the current playback position with backoff. The
+    // counter resets once playback makes real progress, so a long movie
+    // surviving three separate hiccups hours apart keeps recovering, while
+    // a hard failure (dead URL, broken stream) exhausts quickly and
+    // surfaces as PlayerEvent::Error instead of a fake EndOfStream.
+    const MAX_PIPELINE_RETRIES: u32 = 3;
+    const PROGRESS_RESET_MS: u64 = 10_000;
+    let mut retry_attempt: u32 = 0;
+    let mut last_fail_pos_ms: u64 = 0;
     let spawn_pipeline = |repr: VideoRepresenation,
                           start_index: usize,
                           local_stop: Arc<Notify>,
@@ -1679,6 +2026,7 @@ async fn video_supervisor(
             Arc::clone(&stats),
             segments_in_flight,
             soft_end.clone(),
+            direct_window,
         ));
         (handle, soft_end)
     };
@@ -1723,12 +2071,121 @@ async fn video_supervisor(
                     return Ok(());
                 }
                 res = &mut cur_handle => {
-                    match res {
-                        Ok(Ok(())) => log::info!("[video] supervisor: pipeline exited naturally; closing"),
-                        Ok(Err(e)) => log::error!("[video] supervisor: pipeline failed: {}", e),
-                        Err(e) => log::error!("[video] supervisor: pipeline task panicked: {}", e),
+                    let detail = match res {
+                        Ok(Ok(())) => {
+                            // Natural EOF — propagate so the keepalive
+                            // frame_sender drops, the channel closes, and
+                            // av_sync fires EndOfStream.
+                            log::info!("[video] supervisor: pipeline exited naturally; closing");
+                            return Ok(());
+                        }
+                        Ok(Err(e)) => e.to_string(),
+                        Err(e) => format!("pipeline task panicked: {}", e),
+                    };
+                    if stop_flag.load(Ordering::Relaxed) {
+                        // Teardown raced the failure — not an error.
+                        return Ok(());
                     }
-                    return Ok(());
+                    log::error!("[video] supervisor: pipeline failed: {}", detail);
+
+                    // Bounded retry-with-resume. Progress since the last
+                    // failure resets the budget.
+                    let pos_now = position_ms.load(Ordering::Relaxed);
+                    if pos_now.saturating_sub(last_fail_pos_ms) > PROGRESS_RESET_MS {
+                        retry_attempt = 0;
+                    }
+                    last_fail_pos_ms = pos_now;
+                    retry_attempt += 1;
+                    if retry_attempt > MAX_PIPELINE_RETRIES {
+                        log::error!(
+                            "[video] supervisor: {} consecutive pipeline failures — giving up at {}ms",
+                            retry_attempt - 1,
+                            pos_now
+                        );
+                        // Park the position for the consumer's next play()
+                        // ("continue where we stopped"), surface the error,
+                        // and stop WITHOUT the fake EndOfStream (av_sync
+                        // checks stop_flag before emitting EOS).
+                        *pending_resume.lock().unwrap() =
+                            Some(Duration::from_millis(pos_now));
+                        let _ = events.send(PlayerEvent::Error {
+                            kind: PlayerErrorKind::Decoder,
+                            detail,
+                        });
+                        stop_flag.store(true, Ordering::Relaxed);
+                        stop.notify_waiters();
+                        return Err("video pipeline retries exhausted".into());
+                    }
+                    log::warn!(
+                        "[video] supervisor: retrying pipeline ({}/{}) from {}ms",
+                        retry_attempt,
+                        MAX_PIPELINE_RETRIES,
+                        pos_now
+                    );
+                    // Backoff, abortable by stop. av_sync's starvation
+                    // detection keeps the consumer in Buffering meanwhile.
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_secs(retry_attempt as u64)) => {}
+                        _ = stop.notified() => return Ok(()),
+                    }
+                    if stop_flag.load(Ordering::Relaxed) {
+                        return Ok(());
+                    }
+
+                    // Respawn from the segment containing the current
+                    // position; the splice trims re-decoded frames at/below
+                    // the last rendered PTS so playback continues forward
+                    // (no rewind). The retry task includes the prefetch, so
+                    // a network failure during recovery lands back in this
+                    // arm and consumes another attempt.
+                    let pos_abs = Duration::from_millis(pos_now) + origin;
+                    let resume_idx = find_segment_index(&current_repr.segments, pos_abs);
+                    cur_stop = Arc::new(Notify::new());
+                    cur_flag = Arc::new(AtomicBool::new(false));
+                    cur_soft_end = Arc::new(AtomicUsize::new(usize::MAX));
+                    cur_handle = task::spawn({
+                        let repr = current_repr.clone();
+                        let stop = cur_stop.clone();
+                        let flag = cur_flag.clone();
+                        let soft_end = cur_soft_end.clone();
+                        let decryptor = decryptor.clone();
+                        let http = Arc::clone(&http);
+                        let stats = Arc::clone(&stats);
+                        let sender = frame_sender.clone();
+                        let video_ready = video_ready.clone();
+                        let decoder_factory = decoder_factory.clone();
+                        let splice_pts_us = pos_abs.as_micros() as i64;
+                        async move {
+                            let pf = video_prefetch(
+                                &repr,
+                                resume_idx,
+                                stop,
+                                Arc::clone(&flag),
+                                decryptor,
+                                http,
+                                Arc::clone(&stats),
+                                segments_in_flight,
+                                soft_end,
+                                usize::MAX,
+                            )
+                            .await?;
+                            run_decode(
+                                pf,
+                                sender,
+                                video_ready,
+                                decoder_factory(),
+                                stats,
+                                flag,
+                                Some(SwapSplice {
+                                    started: Instant::now(),
+                                    skip_below_pts_us: splice_pts_us,
+                                }),
+                                direct_window,
+                            )
+                            .await
+                        }
+                    });
+                    continue;
                 }
                 _ = async {
                     if stop_flag.load(Ordering::Relaxed) {
@@ -1959,6 +2416,7 @@ async fn video_supervisor(
                 started: decode_t0,
                 skip_below_pts_us: splice_pts_us,
             }),
+            direct_window,
         ));
         cur_stop = new_stop;
         cur_flag = new_flag;
@@ -2078,6 +2536,9 @@ impl Player<VideoRenderer, AudioRenderer> {
             video_switch_tx: Arc::new(StdMutex::new(None)),
             buffer_target_secs: Arc::new(AtomicU32::new(DEFAULT_BUFFER_TARGET_SECS)),
             subtitle_representation: Arc::new(StdMutex::new(None)),
+            video_output_window: Arc::new(AtomicUsize::new(0)),
+            adaptive_frame_rate: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            pending_resume: Arc::new(StdMutex::new(None)),
 
             video_renderer,
             audio_renderer,
@@ -2451,6 +2912,64 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         self.video_renderer.set_hdr_tonemap_params(params.sanitised());
     }
 
+    /// Tell the renderer which HDR formats the active display can present
+    /// natively (bitmask in `Display.HdrCapabilities` order: bit 0 = Dolby
+    /// Vision, 1 = HDR10, 2 = HLG, 3 = HDR10+). On Android the GLES sink
+    /// then passes PQ streams through to the display (BT2020_PQ surface
+    /// dataspace, no tonemap) instead of tonemapping to SDR. 0 (default) =
+    /// SDR display, tonemap in-shader.
+    pub fn set_display_hdr_types(&self, mask: u32) {
+        self.video_renderer.set_display_hdr_types(mask);
+    }
+
+    /// Bottom safe-area inset, in **device pixels of the overlay surface**,
+    /// that subtitles must stay above. The cue's bottom edge is anchored here
+    /// instead of at the surface's physical bottom — this is how subtitles
+    /// clear TV overscan and system bars without the player guessing a
+    /// per-device margin.
+    ///
+    /// The host should pass the real bottom inset from `WindowInsets`
+    /// (system bars / display cutout / reported overscan). On Android TV,
+    /// where HDMI overscan is usually invisible to the app, the host should
+    /// pass `max(windowInsets.bottom, 0.10 * surfaceHeight)` so the
+    /// title-safe margin still applies. 0 (default, host never called this)
+    /// makes the renderers fall back to a 10% title-safe margin.
+    ///
+    /// Takes effect on the next presented frame. Re-call it on every
+    /// inset/size change.
+    pub fn set_subtitle_safe_insets(&self, bottom_px: u32) {
+        self.video_renderer.set_subtitle_safe_bottom_px(bottom_px);
+    }
+
+    /// Android direct playback mode: hand the decoder a dedicated video
+    /// `ANativeWindow*` to render into. Decoded frames then ride a HW
+    /// video plane — HDR10/HDR10+/Dolby Vision signals (incl. dynamic
+    /// metadata in the bitstream) reach the display exactly as the OS
+    /// video pipeline delivers them, and the renderer surface only
+    /// carries subtitles/UI. Takes effect at the next `play()`.
+    ///
+    /// # Safety contract
+    /// The window must stay valid (acquired) until after the player is
+    /// dropped or this is reset to null.
+    pub fn set_video_output_window(&self, window: *mut std::ffi::c_void) {
+        self.video_output_window
+            .store(window as usize, Ordering::Relaxed);
+    }
+
+    /// Adaptive frame rate (Android direct mode). When enabled (the default),
+    /// the player hints the content's frame rate to the OS via
+    /// `ANativeWindow_setFrameRate` on the video plane at each pipeline build,
+    /// so the display can switch to a matching refresh rate (e.g. 24 ->
+    /// 24/48/120 Hz) and play judder-free. It's a per-surface *hint*, not a
+    /// forced mode switch — the system chooses. Requires API 30+ (no-op
+    /// below). Disable it if the host wants to drive display-mode policy
+    /// itself (`Surface.setFrameRate` / `preferredDisplayModeId`). Takes
+    /// effect at the next `play()`.
+    pub fn set_adaptive_frame_rate(&self, enabled: bool) {
+        self.adaptive_frame_rate
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// How many seconds of media the player tries to keep buffered ahead
     /// of the renderer. Default is `DEFAULT_BUFFER_TARGET_SECS` (8s).
     /// Bumping this trades RAM for resilience against network jitter
@@ -2748,6 +3267,20 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         // user-driven manual switch + `set_abr_strategy(BandwidthEwma)`
         // afterwards would silently never fire any ticks again.
         let (abr_kill_tx, mut abr_kill_rx) = tokio::sync::oneshot::channel::<()>();
+        let video_output_window = Arc::clone(&self.video_output_window);
+        // Adaptive-frame-rate inputs (Android direct mode only): the toggle and
+        // the content fps (MPD @frameRate on the selected adaptation, captured
+        // once per play() — ABR swaps keep the same content fps).
+        #[cfg(target_os = "android")]
+        let adaptive_frame_rate = Arc::clone(&self.adaptive_frame_rate);
+        #[cfg(target_os = "android")]
+        let video_fps = self
+            .video_adaptation
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|a| a.fps());
+        let pending_resume = Arc::clone(&self.pending_resume);
         let play = tokio::spawn(async move {
             // ABR tick runs once for the whole play() lifetime (survives
             // every seek/track-switch restart below). On Manual it's a
@@ -2777,7 +3310,13 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                 let seek_offset = {
                     let mut target = seek_target.write().await;
                     stop_flag.store(false, Ordering::Relaxed);
-                    target.take().unwrap_or(Duration::ZERO)
+                    // Priority: explicit seek > resume position parked by an
+                    // exhausted-retries stop ("continue where we stopped" on
+                    // the consumer's next play()) > start of content.
+                    target
+                        .take()
+                        .or_else(|| pending_resume.lock().unwrap().take())
+                        .unwrap_or(Duration::ZERO)
                 };
 
                 // Hard reset the audio sink before the (re)started pipeline
@@ -2877,7 +3416,27 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                 // well under Intel Arc A750's driver limit of ~21 individual
                 // decoder surfaces. hevc_d3d11va2 auto-allocates a dynamic pool;
                 // this bound prevents the pipeline from accumulating too many refs.
-                let (frame_sender, frame_receiver) = mpsc::channel::<DecodedVideoFrame>(8);
+                //
+                // Android direct mode: every queued frame PINS one of the
+                // codec's scarce output buffers (typically ~8 for HEVC) —
+                // a deep channel deadlocks the decoder outright. 2 in the
+                // channel + 2 in the reorder buffer + 1 rendering leaves
+                // the codec breathing room.
+                let direct_window = video_output_window.load(Ordering::Relaxed);
+                // Adaptive frame rate: hint the content fps to the video plane
+                // so the display can match its refresh rate. Idempotent — fine
+                // to re-assert on every (re)build (seek / ABR swap).
+                #[cfg(target_os = "android")]
+                if direct_window != 0
+                    && adaptive_frame_rate.load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    if let Some(fps) = video_fps {
+                        set_window_frame_rate(direct_window, fps.as_f32());
+                    }
+                }
+                let frame_cap = if direct_window != 0 { 2 } else { 8 };
+                let (frame_sender, frame_receiver) =
+                    mpsc::channel::<DecodedVideoFrame>(frame_cap);
                 let (sample_sender, sample_receiver) = mpsc::channel::<DecodedAudioFrame>(256);
 
                 let video = tokio::spawn(video_supervisor(
@@ -2896,6 +3455,8 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                     Arc::clone(&events),
                     seg_in_flight,
                     origin,
+                    direct_window,
+                    Arc::clone(&pending_resume),
                 ));
 
                 let sample_rate = audio_sink.sample_rate();

@@ -90,6 +90,34 @@ impl VideoRepresenation {
         c.starts_with("hvc1.2") || c.starts_with("hev1.2") || self.dolby_vision
     }
 
+    /// Dolby Vision profile from the codec string (`dvh1.08.06` → 8).
+    /// None when the rep isn't DV or the string is malformed.
+    pub fn dv_profile(&self) -> Option<u8> {
+        let c = self.codecs.as_str();
+        if !(c.starts_with("dvh1") || c.starts_with("dvhe") || c.starts_with("dvav")) {
+            return None;
+        }
+        c.split('.').nth(1)?.parse::<u8>().ok()
+    }
+
+    /// DV profiles whose base layer is a self-contained, correctly-signalled
+    /// HEVC stream the player can decode and tonemap without RPU processing:
+    /// profile 8 (single-layer BL+RPU, cross-compatible by definition) and
+    /// profile 7 (BL+EL — ignoring the enhancement layer still yields the
+    /// HDR10 base). Profile 5 (IPTPQc2) has no compatible base layer — it
+    /// needs the RPU reshaping math and renders as green/purple garbage
+    /// without it.
+    pub fn dv_base_layer_playable(&self) -> bool {
+        match self.dv_profile() {
+            Some(7) | Some(8) => true,
+            Some(_) => false,
+            // DV flagged via manifest properties only (codec string isn't
+            // dv*, i.e. a malformed manifest with a plain hvc1/hev1
+            // codec) — the BL is decodable.
+            None => self.dolby_vision,
+        }
+    }
+
     /// Pre-formatted single-line summary, e.g. "1080p HEVC 10-bit · 8.5 Mbps".
     pub fn label(&self) -> String {
         let resolution = match self.height {

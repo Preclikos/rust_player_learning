@@ -56,30 +56,41 @@ pub struct PlayerCapabilities {
 /// [`probe_capabilities`].
 pub const fn capabilities() -> PlayerCapabilities {
     PlayerCapabilities {
-        // HDR10 (HEVC Main10) is wired on the desktop targets:
+        // HDR10 (HEVC Main10) is wired on:
         //   - Windows: D3D11VA hwaccel + DX11→DX12 P010 shared import,
         //              wgpu shader_hdr (Rec.2020 + PQ → SDR tonemap).
         //   - Linux:   VAAPI hwaccel + DMA-fd Vulkan P010 import.
-        //   - macOS:   VideoToolbox + Metal CVPixelBuffer P010 plane.
-        // Android (MediaCodec / AHardwareBuffer) and iOS (VTDecompression)
-        // can decode Main10 but the 10-bit render path isn't wired through
-        // them yet — keep them false until the AHB-P010 and Metal-P010
-        // paths exist.
+        //   - macOS / iOS: VTDecompressionSession with a 10-bit ('x420')
+        //              destination, imported as R16/RG16 plane textures
+        //              through CVMetalTextureCache into the same
+        //              shader_hdr pipeline + detection passes as desktop.
+        //              Falls back to VT-internal 8-bit conversion when the
+        //              10-bit destination is refused.
+        //   - Android: MediaCodec 10-bit AHardwareBuffer surface + the
+        //              GLES OES PQ→SDR mobius tonemap program
+        //              (video_gles_egl.rs). Colorimetry comes from the SPS
+        //              VUI, so this works even when the MPD mis-signals.
         hdr10: cfg!(any(
             target_os = "windows",
             target_os = "linux",
             target_os = "macos",
+            target_os = "ios",
+            target_os = "android",
         )),
 
         dolby_vision: false,
 
-        // Tunable only where the player's own shader does the HDR→SDR
-        // conversion. macOS / iOS hand us pre-tonemapped 8-bit NV12 from
-        // VideoToolbox — the shader knobs would do nothing there, so
-        // hide the setting in the UI.
+        // Tunable everywhere the player's own shader does the HDR→SDR
+        // conversion: the wgpu shader_hdr path (desktop + Apple 10-bit
+        // destination) and the Android GLES tonemap program all read
+        // tone_param/desat/peak from set_hdr_tonemap per frame. Only the
+        // Apple 8-bit fallback (VT-internal conversion) ignores them.
         hdr_tonemap_tunable: cfg!(any(
             target_os = "windows",
             target_os = "linux",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android",
         )),
     }
 }
@@ -93,10 +104,22 @@ pub const fn capabilities() -> PlayerCapabilities {
 /// before the real player builds its own. Don't poll this — cache the
 /// result for the lifetime of the host.
 pub async fn probe_capabilities() -> PlayerCapabilities {
-    let mut caps = capabilities();
+    let caps = capabilities();
     if !caps.hdr10 {
         return caps;
     }
+
+    // Android renders HDR through the GLES OES external-texture program —
+    // the wgpu TEXTURE_FORMAT_P010 feature plays no part there, so the
+    // desktop-oriented adapter probe below would only produce a false
+    // negative. The OES path degrades gracefully at runtime anyway
+    // (SDR passthrough + warning if the HDR program fails to compile).
+    #[cfg(target_os = "android")]
+    return caps;
+
+    #[cfg(not(target_os = "android"))]
+    {
+    let mut caps = caps;
 
     // HDR10 needs the wgpu `TEXTURE_FORMAT_P010` feature on the adapter we
     // intend to use. The real renderer picks DX12 on Windows, Vulkan on
@@ -128,19 +151,19 @@ pub async fn probe_capabilities() -> PlayerCapabilities {
         })
         .await;
 
-    // On macOS the Metal backend always supports the P010 path (we sample
-    // it as two separate single-plane MTLTextures, not as a wgpu P010
-    // texture), so the adapter probe only needs to confirm an adapter
-    // exists at all. On Windows/Linux we additionally require the
-    // `TEXTURE_FORMAT_P010` feature for the wgpu plane-view import path.
+    // On Apple Metal (macOS + iOS) the P010 path samples two separate
+    // single-plane MTLTextures, not a wgpu P010 texture, so the adapter
+    // probe only needs to confirm an adapter exists at all. On
+    // Windows/Linux we additionally require the `TEXTURE_FORMAT_P010`
+    // feature for the wgpu plane-view import path.
     let p010_ok = match adapter {
         Ok(adapter) => {
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             {
                 let _ = adapter;
                 true
             }
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
             {
                 adapter
                     .features()
@@ -154,4 +177,5 @@ pub async fn probe_capabilities() -> PlayerCapabilities {
         caps.hdr10 = false;
     }
     caps
+    }
 }

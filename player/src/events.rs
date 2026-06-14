@@ -63,6 +63,12 @@ pub enum PlayerEvent {
         /// Last-frame L/R peak in dB (range typically -60..=0).
         /// `None` until at least one audio frame has been mixed.
         audio_peak_db: Option<[f32; 2]>,
+        /// Measured A/V clock drift since pipeline start, in ms: video
+        /// wall clock minus the audio device clock (negative = audio
+        /// ahead). `None` while unmeasured (first second, or sinks that
+        /// can't report playback position). Expect a slow linear trend
+        /// from crystal mismatch; jumps indicate sync bugs.
+        av_drift_ms: Option<i64>,
     },
     /// End of media reached.
     EndOfStream,

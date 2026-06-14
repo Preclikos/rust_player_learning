@@ -45,6 +45,21 @@ pub trait VideoSink: Send + Sync + 'static {
     /// Implementations that own the HDR shader (wgpu on Win/Linux) write
     /// the values into their per-frame uniform buffer.
     fn set_hdr_tonemap_params(&self, _params: crate::HdrTonemapParams) {}
+
+    /// Bitmask of HDR formats the active display can present natively
+    /// (bit 0 = Dolby Vision, 1 = HDR10, 2 = HLG, 3 = HDR10+ — the
+    /// Android `Display.HdrCapabilities` order). Sinks that can hand the
+    /// signal through to such a display (Android GLES: BT2020_PQ surface
+    /// dataspace) use it to prefer passthrough over in-shader
+    /// tonemapping. Default: ignored (tonemap-only sinks).
+    fn set_display_hdr_types(&self, _mask: u32) {}
+
+    /// Bottom safe-area inset (device px of the render surface) that
+    /// subtitles must stay above — sourced from the host's `WindowInsets`
+    /// (see `Player::set_subtitle_safe_insets`). The subtitle quad anchors
+    /// its bottom edge here so cues clear TV overscan / system bars. Default:
+    /// ignored (0 → renderer falls back to a 10% TV title-safe margin).
+    fn set_subtitle_safe_bottom_px(&self, _px: u32) {}
 }
 
 /// Receives decoded PCM audio and feeds it to the output device.
@@ -52,6 +67,24 @@ pub trait VideoSink: Send + Sync + 'static {
 pub trait AudioSink: Send + Sync + 'static {
     fn put_samples<'a>(&'a self, samples: &'a [f32]) -> impl Future<Output = ()> + Send + 'a;
     fn sample_rate(&self) -> u32;
+    /// Media milliseconds the output device has actually PLAYED (samples
+    /// consumed by the device callback; pause/underrun silence does not
+    /// count). The device crystal is the clock the listener hears, so the
+    /// video sync loop measures A/V drift against this. `None` = the sink
+    /// can't measure (mocks, platform limitations) — drift tracking is
+    /// then disabled.
+    fn played_ms(&self) -> Option<u64> {
+        None
+    }
+    /// Output-path latency in ms (device output buffer + DAC) — how long
+    /// after the sink consumes a sample it becomes audible. The video
+    /// sync loop subtracts this from its wall clock so a frame reaches the
+    /// screen at the same instant its audio reaches the speaker. 0 = the
+    /// sink can't report it (then video is paced to the bare wall clock,
+    /// the previous behaviour).
+    fn output_latency_ms(&self) -> u64 {
+        0
+    }
     fn flush(&self);
     fn stop(&self) -> impl Future<Output = ()> + Send + '_;
     /// Absolute volume in 0.0..=1.0. Implementations must clamp.

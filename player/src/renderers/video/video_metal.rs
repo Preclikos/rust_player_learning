@@ -44,6 +44,13 @@ type MTLPixelFormat = u64;
 // Subset of MTLPixelFormat values we use.
 const MTL_PIXEL_FORMAT_R8_UNORM: MTLPixelFormat = 10;
 const MTL_PIXEL_FORMAT_RG8_UNORM: MTLPixelFormat = 30;
+const MTL_PIXEL_FORMAT_R16_UNORM: MTLPixelFormat = 23;
+const MTL_PIXEL_FORMAT_RG16_UNORM: MTLPixelFormat = 60;
+
+// CVPixelBuffer 10-bit biplanar formats (P010 layout: 10-bit codes in the
+// high bits of 16-bit containers). 'x420' video range / 'xf20' full range.
+const K_CV_PIXEL_FORMAT_420_YPCBCR10_BIPLANAR_VIDEO_RANGE: u32 = 0x78343230;
+const K_CV_PIXEL_FORMAT_420_YPCBCR10_BIPLANAR_FULL_RANGE: u32 = 0x78663230;
 
 #[link(name = "CoreVideo", kind = "framework")]
 #[link(name = "CoreFoundation", kind = "framework")]
@@ -74,6 +81,7 @@ extern "C" {
 
     fn CVPixelBufferGetWidthOfPlane(pixel_buffer: CFTypeRef, plane_index: usize) -> usize;
     fn CVPixelBufferGetHeightOfPlane(pixel_buffer: CFTypeRef, plane_index: usize) -> usize;
+    fn CVPixelBufferGetPixelFormatType(pixel_buffer: CFTypeRef) -> u32;
 
     fn CFRelease(cf: CFTypeRef);
 }
@@ -191,14 +199,36 @@ impl MetalNV12Frame {
         let uv_w = unsafe { CVPixelBufferGetWidthOfPlane(pixel_buffer, 1) };
         let uv_h = unsafe { CVPixelBufferGetHeightOfPlane(pixel_buffer, 1) };
 
+        // 10-bit ('x420'/'xf20', P010 layout) imports as 16-bit-unorm plane
+        // textures; the R16Unorm Y plane is also what tells the render path
+        // to use the HDR tonemap pipeline. 8-bit NV12 stays R8/RG8.
+        let pixel_format = unsafe { CVPixelBufferGetPixelFormatType(pixel_buffer) };
+        let is_10bit = pixel_format == K_CV_PIXEL_FORMAT_420_YPCBCR10_BIPLANAR_VIDEO_RANGE
+            || pixel_format == K_CV_PIXEL_FORMAT_420_YPCBCR10_BIPLANAR_FULL_RANGE;
+        let (y_mtl, y_wgpu, uv_mtl, uv_wgpu) = if is_10bit {
+            (
+                MTL_PIXEL_FORMAT_R16_UNORM,
+                wgpu::TextureFormat::R16Unorm,
+                MTL_PIXEL_FORMAT_RG16_UNORM,
+                wgpu::TextureFormat::Rg16Unorm,
+            )
+        } else {
+            (
+                MTL_PIXEL_FORMAT_R8_UNORM,
+                wgpu::TextureFormat::R8Unorm,
+                MTL_PIXEL_FORMAT_RG8_UNORM,
+                wgpu::TextureFormat::Rg8Unorm,
+            )
+        };
+
         // Build the Y plane wgpu::Texture.
         let (cv_y, y_texture) = build_plane_texture(
             cache,
             device,
             pixel_buffer,
             0,
-            MTL_PIXEL_FORMAT_R8_UNORM,
-            wgpu::TextureFormat::R8Unorm,
+            y_mtl,
+            y_wgpu,
             y_w as u32,
             y_h as u32,
         )?;
@@ -209,8 +239,8 @@ impl MetalNV12Frame {
             device,
             pixel_buffer,
             1,
-            MTL_PIXEL_FORMAT_RG8_UNORM,
-            wgpu::TextureFormat::Rg8Unorm,
+            uv_mtl,
+            uv_wgpu,
             uv_w as u32,
             uv_h as u32,
         ) {

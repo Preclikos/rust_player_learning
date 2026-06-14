@@ -3,10 +3,19 @@
 Cross-platform encrypted DASH video player in Rust.
 Targets: Windows, Linux, macOS, Android, iOS.
 
-For workspace layout, source map, decoder pipeline and the full
-`Player` API see [`ONBOARDING.md`](ONBOARDING.md). For embedding the
-player crate from a downstream consumer see
-[`PLAYER_INTEGRATION.md`](PLAYER_INTEGRATION.md).
+Hardware decode on every platform, ClearKey CENC, bandwidth-EWMA ABR
+with make-before-break switches, WebVTT subtitles, and a full HDR
+stack: HDR10 / HDR10+ / Dolby Vision play **natively** on Android via
+the direct MediaCodec→Surface mode (dynamic metadata reaches the
+display), and tonemap faithfully to SDR everywhere else via an exact
+port of FFmpeg's `tonemap_opencl` mobius pipeline.
+
+For workspace layout, source map, decoder pipeline, device quirks and
+the `Player` API sketch see [`ONBOARDING.md`](ONBOARDING.md). For the
+host-integration contract (embedding, events, error/retry semantics,
+HDR controls) see [`PLAYER_INTEGRATION.md`](PLAYER_INTEGRATION.md).
+For the tonemap specifically see
+[`player/HDR_TONEMAP.md`](player/HDR_TONEMAP.md).
 
 ---
 
@@ -185,13 +194,15 @@ threshold. No-op stub on iOS / Android (no ffmpeg-sys-next there).
 
 ## Mobile builds
 
-iOS and Android don't link FFmpeg. Audio + video both go through
-platform-native decoders (`AVFoundation`/`VTDecompressionSession` +
-`AudioToolbox` on Apple, `MediaCodec` via the NDK on Android), so
-`ffmpeg-sys-next` isn't a dep on those targets and you can skip the
-local FFmpeg build entirely.
+Android doesn't link FFmpeg at all — video and audio both go through
+NDK `MediaCodec`, so you can skip the local FFmpeg build entirely for
+Android work. iOS decodes **video** natively (`VTDecompressionSession`)
+but uses FFmpeg for **audio** (AudioToolbox's AAC decoder mishandles
+packetised access units), so iOS builds need the FFmpeg setup like
+macOS does.
 
-- Android: `app-android/android/README.md` for the gradle + cargo-ndk flow
+- Android: `ONBOARDING.md` → "Android build" (quick) or
+  `app-android/android/README.md` (gradle details)
 - iOS: `app-ios/ios/build_sim.sh` for the simulator xcframework build
 
 ---

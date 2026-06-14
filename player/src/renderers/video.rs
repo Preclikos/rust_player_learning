@@ -131,6 +131,48 @@ impl Vertex {
     }
 }
 
+/// `ANativeWindow_setBuffersDataSpace`, resolved at runtime. The symbol
+/// lives in `libnativewindow.so` (API 28+), which ndk-sys does NOT link —
+/// a build-time extern made dlopen of the whole app .so fail with
+/// UnsatisfiedLinkError on the 32-bit Google TV Streamer. dlsym degrades
+/// to a no-op (returns non-zero) on devices without the symbol.
+///
+/// # Safety
+/// `win` must be a valid acquired ANativeWindow.
+#[cfg(target_os = "android")]
+unsafe fn set_buffers_dataspace(win: *mut ndk_sys::ANativeWindow, dataspace: i32) -> i32 {
+    use std::sync::OnceLock;
+    type SetDataspaceFn =
+        unsafe extern "C" fn(*mut ndk_sys::ANativeWindow, i32) -> i32;
+    static SYM: OnceLock<Option<SetDataspaceFn>> = OnceLock::new();
+    let f = SYM.get_or_init(|| {
+        let name = b"ANativeWindow_setBuffersDataSpace\0";
+        // The symbol is usually already in the process (libEGL pulls
+        // libnativewindow in); RTLD_DEFAULT finds it without bumping any
+        // library refcounts. Fall back to an explicit dlopen.
+        let mut sym = libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr() as *const _);
+        if sym.is_null() {
+            let lib = libc::dlopen(
+                b"libnativewindow.so\0".as_ptr() as *const _,
+                libc::RTLD_NOW | libc::RTLD_GLOBAL,
+            );
+            if !lib.is_null() {
+                sym = libc::dlsym(lib, name.as_ptr() as *const _);
+            }
+        }
+        if sym.is_null() {
+            log::warn!("[gles_oes] ANativeWindow_setBuffersDataSpace unavailable on this device");
+            None
+        } else {
+            Some(std::mem::transmute::<*mut libc::c_void, SetDataspaceFn>(sym))
+        }
+    });
+    match f {
+        Some(f) => f(win, dataspace),
+        None => -1,
+    }
+}
+
 // tex_y_max: normally 1.0; set to (content_height - 1) / buffer_height (<1.0)
 // when the codec produces a taller buffer than the visible frame (e.g. 736 for
 // 720p HEVC on Exynos) so we don't sample codec-alignment padding rows. The
@@ -275,6 +317,31 @@ pub struct VideoRenderer {
     /// is fallible).
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     metal_cache: Option<Arc<MetalTextureCache>>,
+    /// Bitmask of display-native HDR formats (Display.HdrCapabilities
+    /// order: bit 0 = DV, 1 = HDR10, 2 = HLG, 3 = HDR10+) from the host.
+    /// 0 = SDR display → tonemap in-shader.
+    #[cfg(target_os = "android")]
+    display_hdr_types: std::sync::atomic::AtomicU32,
+    /// Bottom safe-area inset (device px) the host reported via
+    /// `Player::set_subtitle_safe_insets`, threaded into the subtitle quad's
+    /// anchor. 0 = unset → renderers fall back to a 10% TV title-safe margin.
+    subtitle_safe_bottom_px: std::sync::atomic::AtomicU32,
+    /// `ANativeWindow*` of the host surface (embed model) for
+    /// `ANativeWindow_setBuffersDataSpace`. 0 when unavailable (winit
+    /// path) — passthrough then stays off.
+    #[cfg(target_os = "android")]
+    android_window: usize,
+    /// Sticky: the surface dataspace has been switched to BT2020_PQ.
+    /// Never un-set while the renderer lives — flapping the dataspace
+    /// makes TVs re-negotiate their HDR mode (black flash) on every ABR
+    /// SDR↔HDR transition; SDR frames are up-converted to PQ instead.
+    #[cfg(target_os = "android")]
+    android_pq_session: std::sync::atomic::AtomicBool,
+    /// Subtitle generation last presented on the overlay surface in
+    /// direct mode (0 = nothing). The overlay only re-presents when this
+    /// changes — the GL surface stays untouched during cue-less playback.
+    #[cfg(target_os = "android")]
+    overlay_presented_gen: std::sync::atomic::AtomicU64,
 }
 
 /// Size of the HDR tonemap uniform (TonemapUniforms in shader_hdr.wgsl /
@@ -362,14 +429,19 @@ impl VideoRenderer {
             std::ptr::NonNull::new(native_window).expect("null ANativeWindow"),
         ));
         let display = RawDisplayHandle::Android(AndroidDisplayHandle::new());
-        Self::new_with_surface(
+        let mut renderer = Self::new_with_surface(
             size,
             SurfaceSource::RawHandle {
                 window,
                 display: Some(display),
             },
         )
-        .await
+        .await;
+        // Keep the raw window for ANativeWindow_setBuffersDataSpace (HDR
+        // passthrough). The host owns the acquired reference and releases
+        // it only after the renderer is dropped.
+        renderer.android_window = native_window as usize;
+        renderer
     }
 
     /// Shared constructor body. Differs from the old `new` only in how the
@@ -463,6 +535,12 @@ impl VideoRenderer {
                 | wgpu::Features::TEXTURE_FORMAT_P010
                 | wgpu::Features::TEXTURE_FORMAT_16BIT_NORM;
             adapter.features() & desired
+        } else if backend == wgpu::Backend::Metal {
+            // Metal imports CVPixelBuffer planes as separate textures, so it
+            // needs neither NV12 nor P010 — but the 10-bit ('x420') planes
+            // are R16Unorm/Rg16Unorm, which wgpu gates behind
+            // TEXTURE_FORMAT_16BIT_NORM (Metal hardware always has it).
+            adapter.features() & wgpu::Features::TEXTURE_FORMAT_16BIT_NORM
         } else {
             wgpu::Features::empty()
         };
@@ -889,6 +967,9 @@ impl VideoRenderer {
                                     f.tex_x_max,
                                     f.tex_y_max,
                                     f.desired_present_ns,
+                                    f.mode,
+                                    f.subtitle,
+                                    f.subtitle_bottom_inset_px,
                                 )
                             } {
                                 log::warn!("[gles_oes] hook render failed: {}", e);
@@ -951,11 +1032,74 @@ impl VideoRenderer {
             ahb_keepalive,
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             metal_cache,
+            #[cfg(target_os = "android")]
+            display_hdr_types: std::sync::atomic::AtomicU32::new(0),
+            subtitle_safe_bottom_px: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(target_os = "android")]
+            android_window: 0,
+            #[cfg(target_os = "android")]
+            android_pq_session: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(target_os = "android")]
+            overlay_presented_gen: std::sync::atomic::AtomicU64::new(0),
         };
 
         renderer.spawn_command_thread(command_receiver);
 
         renderer
+    }
+
+    /// Direct mode: present the overlay surface when (and only when) the
+    /// active subtitle changed — appearing, changing text, or clearing.
+    /// Video rides its own surface plane, so the GL surface stays
+    /// completely idle during cue-less playback.
+    #[cfg(target_os = "android")]
+    async fn present_subtitle_overlay(&self) {
+        if self.gles_oes_renderer.is_none() {
+            return;
+        }
+        let size = self.inner_size();
+        let subtitle = {
+            let overlay = self.subtitle_overlay.lock().unwrap().clone();
+            overlay.and_then(|o| o.active_bitmap(size.width, size.height))
+        };
+        let gen = subtitle.as_ref().map(|b| b.generation).unwrap_or(0);
+        if self
+            .overlay_presented_gen
+            .swap(gen, std::sync::atomic::Ordering::Relaxed)
+            == gen
+        {
+            return;
+        }
+        log::debug!("[subs] presenting overlay gen={} (subtitle={})", gen, subtitle.is_some());
+
+        let surface = self.surface.lock().await;
+        let surface_texture = match surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(t)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
+            other => {
+                log::warn!("[gles_oes] overlay surface not available: {:?}", other);
+                return;
+            }
+        };
+        {
+            let mut pending = self.gles_oes_pending.lock().unwrap();
+            *pending = Some(video_gles_egl::GlesOesPendingFrame {
+                ahb_ptr: 0,
+                scale_x: 1.0,
+                scale_y: 1.0,
+                tex_x_max: 1.0,
+                tex_y_max: 1.0,
+                desired_present_ns: 0,
+                mode: video_gles_egl::OesRenderMode::Sdr,
+                subtitle,
+                subtitle_bottom_inset_px: self
+                    .subtitle_safe_bottom_px
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            });
+        }
+        self.queue.submit([]);
+        self.pre_present_notify();
+        self.queue.present(surface_texture);
     }
 
     /// Last known drawable size (device pixels), kept current by the host via
@@ -1131,6 +1275,10 @@ impl VideoRenderer {
         // offset (commonly several seconds in real DASH streams).
         #[cfg(target_os = "android")]
         let desired_present_ns = frame.desired_present_ns;
+        #[cfg(target_os = "android")]
+        let frame_color = frame.color;
+        #[cfg(target_os = "android")]
+        let frame_hdr_meta = frame.hdr_meta;
         match frame.native {
             #[cfg(any(target_os = "windows", target_os = "linux"))]
             PlatformFrame::FfmpegVideo(ffmpeg_frame) => {
@@ -1138,7 +1286,17 @@ impl VideoRenderer {
             }
             #[cfg(target_os = "android")]
             PlatformFrame::HardwareBuffer(ahb) => {
-                self.render_android(ahb, desired_present_ns).await;
+                self.render_android(ahb, desired_present_ns, frame_color, frame_hdr_meta)
+                    .await;
+            }
+            #[cfg(target_os = "android")]
+            PlatformFrame::MediaCodecDirect(direct) => {
+                // Direct mode: "rendering" = queueing the codec output
+                // buffer to the video Surface for the target vsync. The
+                // OS video pipeline owns scaling, colour and HDR from
+                // here; the wgpu surface only carries subtitles/UI.
+                direct.render_at(desired_present_ns.max(1));
+                self.present_subtitle_overlay().await;
             }
             #[cfg(any(target_os = "ios", target_os = "macos"))]
             PlatformFrame::CvPixelBuffer(cv_buf) => {
@@ -1443,7 +1601,13 @@ impl VideoRenderer {
                 render_pass.draw(0..6, 0..1);
 
                 if let Some(overlay) = overlay_snapshot {
-                    overlay.draw_into(&mut render_pass, surface_w, surface_h);
+                    overlay.draw_into(
+                    &mut render_pass,
+                    surface_w,
+                    surface_h,
+                    self.subtitle_safe_bottom_px
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                );
                 }
             }
 
@@ -1476,16 +1640,48 @@ impl VideoRenderer {
         let y_plane_view = metal_frame.y_texture.create_view(&Default::default());
         let uv_plane_view = metal_frame.uv_texture.create_view(&Default::default());
 
+        // 16-bit planes = a 10-bit P010-layout CVPixelBuffer ('x420') from
+        // VideoToolbox — PQ signal that goes through the HDR tonemap
+        // pipeline + detection passes, mirroring the desktop P010 path.
+        // 8-bit planes stay on the SDR pipeline (incl. HDR content VT
+        // already converted internally when the 10-bit destination was
+        // refused).
+        let is_hdr = metal_frame.y_texture.format() == TextureFormat::R16Unorm;
+        let (frame_w, frame_h) = (
+            metal_frame.y_texture.width(),
+            metal_frame.y_texture.height(),
+        );
+        let (uv_w, uv_h) = (frame_w.div_ceil(2), frame_h.div_ceil(2));
+        let (wg_x, wg_y) = (uv_w.div_ceil(16), uv_h.div_ceil(16));
+
         let layout = self.texture_bind_group_layout.as_ref().expect("no bind group layout");
-        // Apple Metal renders SDR-only (VideoToolbox tonemaps HDR internally
-        // before handing us NV12), but the shared layout still includes the
-        // tonemap uniform binding so the bind group has the same shape as
-        // Win/Linux. The SDR shader doesn't reference binding 3 — the
-        // uniform sits there unused. No per-frame write needed.
+        // The shared layout includes the tonemap uniform binding so the
+        // bind group has the same shape as Win/Linux. The SDR shader
+        // doesn't reference binding 3; for HDR frames the uniform is
+        // written per frame exactly like the desktop p010_render.
         let tonemap_uniform = self
             .hdr_tonemap_uniform
             .as_ref()
             .expect("no HDR tonemap uniform");
+        if is_hdr {
+            let params = **self.hdr_tonemap_params.load();
+            let peak_seed = if params.peak > 0.0 { params.peak } else { 100.0 };
+            self.queue.write_buffer(
+                tonemap_uniform,
+                0,
+                bytemuck::cast_slice(&[
+                    params.tone_param,
+                    params.desat,
+                    peak_seed,
+                    params.scene_threshold,
+                ]),
+            );
+            self.queue.write_buffer(
+                tonemap_uniform,
+                16,
+                bytemuck::cast_slice(&[wg_x * wg_y, frame_w, frame_h, 0u32]),
+            );
+        }
         let texture_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             layout,
             entries: &[
@@ -1509,10 +1705,47 @@ impl VideoRenderer {
             label: Some("metal_nv12_bind_group"),
         });
 
+        // HDR-only: per-frame bind group for the detection compute passes
+        // (same layout/dispatch as the desktop p010_render).
+        let detect_bind_group = if is_hdr && frame_w > 0 && frame_h > 0 {
+            self.hdr_detect.as_ref().map(|det| {
+                self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    layout: &det.compute_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(&y_plane_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(&uv_plane_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: tonemap_uniform.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: det.buffer.as_entire_binding(),
+                        },
+                    ],
+                    label: Some("hdr_detect_bind_group (metal)"),
+                })
+            })
+        } else {
+            None
+        };
+
         let surface = self.surface.lock().await;
         let vb_arc = self.vertex_buffer.as_ref().expect("no vertex buffer");
         let vertex_buffer = vb_arc.read().await;
-        let render_pipeline = self.render_pipeline.as_ref().expect("no render pipeline");
+        let render_pipeline = if is_hdr {
+            self.render_pipeline_hdr
+                .as_ref()
+                .expect("no HDR render pipeline")
+        } else {
+            self.render_pipeline.as_ref().expect("no render pipeline")
+        };
 
         let surface_texture = match surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t) => t,
@@ -1541,6 +1774,24 @@ impl VideoRenderer {
         };
 
         let mut encoder = self.device.create_command_encoder(&Default::default());
+
+        // Frame peak/average detection — HDR frames only, publish first so
+        // this draw maps with previous-frames statistics (see p010_render).
+        if let Some(detect_group) = detect_bind_group.as_ref() {
+            let det = self
+                .hdr_detect
+                .as_ref()
+                .expect("detect bind group exists without resources");
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+            cpass.set_pipeline(&det.publish);
+            cpass.set_bind_group(0, detect_group, &[]);
+            cpass.dispatch_workgroups(1, 1, 1);
+            cpass.set_pipeline(&det.accumulate);
+            cpass.dispatch_workgroups(wg_x, wg_y, 1);
+            cpass.set_pipeline(&det.finalize);
+            cpass.dispatch_workgroups(1, 1, 1);
+        }
+
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
@@ -1561,11 +1812,24 @@ impl VideoRenderer {
 
             render_pass.set_pipeline(render_pipeline);
             render_pass.set_bind_group(0, &texture_bind_group, &[]);
+            // The HDR pipeline's group 1 = detection result (read-only
+            // storage). The SDR pipeline has no group 1.
+            if is_hdr {
+                if let Some(det) = self.hdr_detect.as_ref() {
+                    render_pass.set_bind_group(1, &det.frag_bind_group, &[]);
+                }
+            }
             render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
             render_pass.draw(0..6, 0..1);
 
             if let Some(overlay) = overlay_snapshot {
-                overlay.draw_into(&mut render_pass, surface_w, surface_h);
+                overlay.draw_into(
+                    &mut render_pass,
+                    surface_w,
+                    surface_h,
+                    self.subtitle_safe_bottom_px
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                );
             }
         }
 
@@ -1607,7 +1871,13 @@ impl VideoRenderer {
     /// directly to FBO 0, then eglSwapBuffers presents it.
     /// Falls back to a blue-screen clear when the OES renderer is unavailable.
     #[cfg(target_os = "android")]
-    async fn render_android_gles(&self, frame: crate::decoders::AndroidHardwareBufferFrame, desired_present_ns: i64) {
+    async fn render_android_gles(
+        &self,
+        frame: crate::decoders::AndroidHardwareBufferFrame,
+        desired_present_ns: i64,
+        color: crate::decoders::VideoColorInfo,
+        hdr_meta: Option<crate::decoders::HdrFrameMeta>,
+    ) {
         // Update tex_x_max / tex_y_max when the codec buffer is larger than
         // the visible content (e.g. PowerVR Rogue / MT8696 on Google TV
         // Streamer: 1920×1088 buffer for 1280×720 content). Only fire when
@@ -1727,6 +1997,105 @@ impl VideoRenderer {
             (1.0_f32, 1.0_f32)
         };
 
+        // HDR passthrough: when the display can present HDR10 natively,
+        // switch the surface dataspace to BT2020_PQ on the first PQ frame
+        // and hand the signal through untouched — the shader tonemap is
+        // the fallback for SDR displays. The session is sticky (see the
+        // android_pq_session field doc).
+        let is_pq = matches!(color.transfer, crate::decoders::TransferFunction::Pq);
+        const DISPLAY_HDR10: u32 = 1 << 1;
+        if is_pq
+            && self.display_hdr_types.load(std::sync::atomic::Ordering::Relaxed) & DISPLAY_HDR10
+                != 0
+            && self.android_window != 0
+        {
+            // Re-asserted EVERY frame, not just on session entry: the EGL
+            // wrapper re-applies its own (sRGB) dataspace on swaps after
+            // any eglSurfaceAttrib call, silently undoing a one-shot
+            // setting. The perform() hop is trivially cheap.
+            let win = self.android_window as *mut ndk_sys::ANativeWindow;
+            let rc = unsafe {
+                set_buffers_dataspace(win, ndk_sys::ADataSpace::ADATASPACE_BT2020_PQ.0 as i32)
+            };
+            if rc == 0 {
+                if !self
+                    .android_pq_session
+                    .swap(true, std::sync::atomic::Ordering::Relaxed)
+                {
+                    log::info!("[gles_oes] HDR passthrough ON — surface dataspace BT2020_PQ");
+                }
+            } else if !self.android_pq_session.load(std::sync::atomic::Ordering::Relaxed) {
+                log::warn!(
+                    "[gles_oes] ANativeWindow_setBuffersDataSpace(BT2020_PQ) failed ({}) — staying on shader tonemap",
+                    rc
+                );
+                // Make the failure terminal for this renderer so we don't
+                // retry (and re-log) every frame.
+                self.display_hdr_types
+                    .store(0, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let pq_session = self
+            .android_pq_session
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        // Resolve the render mode for this frame. PQ-transfer detection
+        // only — the tonemap shader hardcodes eotf_st2084 (HLG would need
+        // the inverse_oetf_hlg variant, same as the desktop shader's TODO),
+        // so HLG falls through to the SDR/up-convert program.
+        let mode = if pq_session {
+            if is_pq {
+                video_gles_egl::OesRenderMode::PassthroughPq
+            } else {
+                // ABR dropped to an SDR rep mid-session: up-convert so the
+                // surface dataspace doesn't have to flap.
+                video_gles_egl::OesRenderMode::SdrToPq
+            }
+        } else if is_pq {
+            let params = **self.hdr_tonemap_params.load();
+            // Peak resolution (REFERENCE_WHITE units, 1.0 = 100 nits), in
+            // priority order:
+            //   1. explicit set_hdr_tonemap peak (user/tuning override),
+            //   2. per-frame bitstream metadata (HDR10+ scene maxscl, DV
+            //      L1, or the static MaxCLL/mastering-display SEI),
+            //   3. 10.0 (1000 nits — the common mastering peak).
+            // The 1000-nit default deliberately differs from the desktop
+            // seed of 100.0: the wgpu pipeline corrects its seed via the
+            // detection passes within a frame, the GLES hook has no
+            // detection and would stay several stops too dark.
+            let peak = if params.peak > 0.0 {
+                params.peak
+            } else {
+                hdr_meta
+                    .map(|m| (m.peak_nits / 100.0).clamp(1.0, 200.0))
+                    .unwrap_or(10.0)
+            };
+            // Scene average drives the brightness slope (slope =
+            // min(1, SDR_AVG/avg) — only kicks in above 25 nits average).
+            // Without metadata use SDR_AVG itself, keeping the slope
+            // inactive exactly like the desktop detection's first-frame
+            // seed.
+            let average = hdr_meta
+                .and_then(|m| m.avg_nits)
+                .map(|a| (a / 100.0).max(1e-3))
+                .unwrap_or(0.25);
+            video_gles_egl::OesRenderMode::TonemapHdr(video_gles_egl::HdrFrameParams {
+                tone_param: params.tone_param,
+                desat: params.desat,
+                peak,
+                average,
+                scene_threshold: params.scene_threshold,
+            })
+        } else {
+            video_gles_egl::OesRenderMode::Sdr
+        };
+
+        // Active subtitle cue for this frame (None = no cue / no track).
+        let subtitle = {
+            let overlay = self.subtitle_overlay.lock().unwrap().clone();
+            overlay.and_then(|o| o.active_bitmap(window_size.width, window_size.height))
+        };
+
         // Publish frame data for the present hook to consume.
         {
             let mut pending = self.gles_oes_pending.lock().unwrap();
@@ -1737,6 +2106,11 @@ impl VideoRenderer {
                 tex_x_max,
                 tex_y_max,
                 desired_present_ns,
+                mode,
+                subtitle,
+                subtitle_bottom_inset_px: self
+                    .subtitle_safe_bottom_px
+                    .load(std::sync::atomic::Ordering::Relaxed),
             });
         }
 
@@ -1763,11 +2137,28 @@ impl VideoRenderer {
     }
 
     #[cfg(target_os = "android")]
-    pub async fn render_android(&self, frame: crate::decoders::AndroidHardwareBufferFrame, desired_present_ns: i64) {
+    pub async fn render_android(
+        &self,
+        frame: crate::decoders::AndroidHardwareBufferFrame,
+        desired_present_ns: i64,
+        color: crate::decoders::VideoColorInfo,
+        hdr_meta: Option<crate::decoders::HdrFrameMeta>,
+    ) {
         if self.backend == wgpu::Backend::Vulkan {
+            // The Vulkan AHB path has no tonemap stage — PQ content renders
+            // through the NV12 pipeline washed out. All current Android
+            // targets run the GLES path; warn so a Vulkan+HDR combination
+            // is visible in the log if it ever materialises.
+            if color.is_hdr() {
+                static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+                WARN_ONCE.call_once(|| {
+                    log::warn!("[android_vk] HDR stream on the Vulkan path — no tonemap wired, colours will be washed out");
+                });
+            }
             self.render_android_vulkan(frame, desired_present_ns).await;
         } else {
-            self.render_android_gles(frame, desired_present_ns).await;
+            self.render_android_gles(frame, desired_present_ns, color, hdr_meta)
+                .await;
         }
     }
 
@@ -2065,5 +2456,18 @@ impl super::VideoSink for VideoRenderer {
         // the uniform exists but the HDR pipeline is never bound — the
         // value is functionally a no-op there.
         self.hdr_tonemap_params.store(Arc::new(params));
+    }
+
+    #[cfg(target_os = "android")]
+    fn set_display_hdr_types(&self, mask: u32) {
+        log::info!("[renderer] display HDR types mask = {:#06b}", mask);
+        self.display_hdr_types
+            .store(mask, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn set_subtitle_safe_bottom_px(&self, px: u32) {
+        log::info!("[renderer] subtitle bottom safe inset = {} px", px);
+        self.subtitle_safe_bottom_px
+            .store(px, std::sync::atomic::Ordering::Relaxed);
     }
 }

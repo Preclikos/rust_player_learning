@@ -1,7 +1,12 @@
 # rust_player_learning — Onboarding Guide
 
 A cross-platform encrypted DASH video player written in Rust.
-Targets: Windows, Linux, Android (armeabi-v7a + arm64-v8a + x86_64), iOS (stub).
+Targets: Windows, Linux, macOS, Android (armeabi-v7a + arm64-v8a + x86_64), iOS.
+
+Feature highlights: ClearKey CENC, hardware decode everywhere, ABR with
+make-before-break representation swaps, HDR10 / HDR10+ / Dolby Vision
+(native passthrough on Android direct mode, faithful tonemap elsewhere),
+WebVTT subtitles, pipeline retry-with-resume, A/V drift measurement.
 
 ---
 
@@ -9,10 +14,12 @@ Targets: Windows, Linux, Android (armeabi-v7a + arm64-v8a + x86_64), iOS (stub).
 
 | Crate | Path | Role |
 |---|---|---|
-| **player** | `player/` | Core library: DASH/MPD, decoders, renderers, DRM |
-| **app** | `app/` | Desktop entry point (Windows / Linux) |
-| **app-android** | `app-android/` | Android NativeActivity entry point |
-| **app-ios** | `app-ios/` | iOS entry point (stub — VideoToolbox not wired) |
+| **player** | `player/` | Core library: DASH/MPD, decoders, renderers, DRM, events |
+| **app** | `app/` | Desktop shell (Windows / Linux / macOS) + stdin console (`abr on/off`, track switching) |
+| **app-shared** | `app-shared/` | Test fixture shared by all shells (stream URL, keys, track pick) |
+| **app-android** | `app-android/` | Android embed shell: host Activity + two SurfaceViews + JNI |
+| **app-ios** | `app-ios/` | iOS shell (UIView + CAMetalLayer; simulator build script) |
+| **app-web** | `app-web/` | experimental |
 
 ---
 
@@ -20,112 +27,148 @@ Targets: Windows, Linux, Android (armeabi-v7a + arm64-v8a + x86_64), iOS (stub).
 
 ```
 player/src/
-  player.rs              Main Player struct + public API
-  crypto.rs              AES-128-CTR ClearKey DRM decryption
+  player.rs              Player struct + public API + A/V sync loops + pipeline supervisor
+  events.rs              PlayerEvent / PlayerErrorKind / TrackInfo / Fps
+  capabilities.rs        Static + probed PlayerCapabilities (hdr10, dolby_vision, tunable)
+  abr.rs                 AbrStrategy (bandwidth EWMA) + AbrVideoProfile filters
+  crypto.rs              AES-128-CTR ClearKey CENC + hvcC/dvcC/senc/tenc box parsing
+  hdr_tonemap.rs         HdrTonemapParams (tonemap_opencl mobius mirror)
   manifest.rs            DASH MPD download + quick-xml parsing
-  networking.rs          HTTP client (reqwest), bandwidth measurement
-  parsers/mp4.rs         ISO BMFF box parsing (ftyp/moov/sidx)
-  tracks.rs              Tracks struct, VideoAdaptation, AudioAdaptation
-  tracks/segment.rs      Segment (URL, byte range, PTS, duration)
-  utils/time.rs          ISO 8601 duration → std::time::Duration
+  net.rs                 HttpClient, RequestInterceptor, LicenseResolver, RetryPolicy
+  parsers/mp4.rs         ISO BMFF helpers + length-prefixed NALU → Annex-B
+  parsers/hevc.rs        HEVC bitstream: SPS/VUI colour info, HDR SEI (mastering, CLL, HDR10+ ST 2094-40)
+  parsers/vtt.rs         WebVTT cues (single-file + segmented)
+  tracks.rs (+ tracks/)  Tracks, Video/Audio/Text adaptations, segment indexing, HDR/DV detection
   decoders/
-    mod.rs               HwVideoDecoder trait + DecodedVideoFrame types
-    ffmpeg_hw.rs         Desktop: FFmpeg D3D11VA / VAAPI
-    ffmpeg_audio.rs      Desktop: FFmpeg AAC
-    mediacodec.rs        Android: NDK MediaCodec video
-    mediacodec_audio.rs  Android: NDK MediaCodec AAC
-    videotoolbox.rs      iOS: VideoToolbox (stub)
+    mod.rs               HwVideoDecoder/AudioDecoder traits, VideoColorInfo, HdrFrameMeta, frame types
+    ffmpeg_hw.rs         Desktop video: FFmpeg D3D11VA / VAAPI (shared hw-device across ABR swaps)
+    ffmpeg_audio.rs      Desktop + Apple audio: FFmpeg AAC/AC-3/EAC-3
+    mediacodec.rs        Android video: ImageReader path + DIRECT-to-Surface path (incl. video/dolby-vision)
+    mediacodec_audio.rs  Android audio: MediaCodec AAC
+    videotoolbox.rs      Apple video: VTDecompressionSession (NV12 or 10-bit x420 destination)
   renderers/
-    audio.rs             cpal audio output pipeline
-    video.rs             VideoRenderer — selects backend, dispatches frames
-    video/video_directx.rs    Windows D3D11 (AHB import)
-    video/video_vulkan.rs     Vulkan AHB → VkImage (Android Vulkan path)
-    video/video_mediacodec.rs Android AHB → VkImage helper
-    video/video_vaapi.rs      Linux VAAPI
-    video/video_gles_egl.rs   Android GLES: EGLImageKHR + GL_TEXTURE_EXTERNAL_OES
-    video/video_frame.rs      Desktop VideoFrame (CPU → GPU upload)
-    video/shader.wgsl         NV12 / P010 → RGB wgpu shader
+    audio.rs             cpal output + resampler + played-samples clock (A/V drift reference)
+    subtitle.rs          Cue store + fontdue rasterizer; wgpu overlay pass + CPU bitmaps for GLES
+    video.rs             VideoRenderer: backend pick, wgpu pipelines, HDR detection, Android dispatch
+    video/video_directx.rs    Windows D3D11→DX12 shared-handle import
+    video/video_vaapi.rs      Linux VAAPI DMA-BUF import
+    video/video_vulkan.rs     Vulkan image→wgpu wrap (AHB path, currently not default)
+    video/video_mediacodec.rs Android AHB→VkImage helper (Vulkan path)
+    video/video_gles_egl.rs   Android GLES present hook: OES video, HDR tonemap + GL scene
+                              detection, SDR→PQ, subtitle quad, HDR metadata, dataspace
+    video/video_metal.rs      Apple CVPixelBuffer→Metal plane import (8-bit + 10-bit)
+    video/video_frame.rs      Desktop frame wrapper (native import / upload)
+  renderers/shader.wgsl           SDR NV12 → RGB (exact limited-range BT.709)
+  renderers/shader_hdr.wgsl       HDR10 P010 → SDR (tonemap_opencl mobius port)
+  renderers/shader_hdr_detect.wgsl  Scene peak/average compute passes (desktop/Apple)
 ```
 
 ---
 
 ## Public API (player::Player)
 
+See `PLAYER_INTEGRATION.md` for the full integration contract. Sketch:
+
 ```rust
-Player::new(window: Arc<Window>) -> Self
-player.open_url(url: &str) -> Result<()>          // fetch + parse MPD
-player.set_clearkey(keys: HashMap<String,String>)  // register DRM keys
-player.prepare() -> Result<()>                     // fetch init segments
-player.get_tracks() -> Result<Tracks>
-player.set_video_track(adaptation, repr)
-player.set_audio_track(adaptation, repr)
-player.play() -> Result<JoinHandle<()>>            // starts background loop
-player.seek(target: Duration)
-player.seek_relative(delta_ms: i64)
-player.position() -> Duration
-player.resize(size: PhysicalSize<u32>)
-player.stop()
-player.volume(diff: f32)
+// constructors (per platform)
+Player::new_from_raw_handle(window, display, w, h)     // desktop
+Player::new_from_android_surface(native_window, w, h)  // Android overlay surface
+Player::new_from_metal_layer(layer, w, h)              // iOS/macOS
+
+// lifecycle
+open_url(url).await / prepare().await / get_tracks()
+set_video_track / set_audio_track / set_subtitle_track / clear_subtitle_track
+play() -> JoinHandle / seek / seek_relative / pause / resume / stop
+events() -> broadcast::Receiver<PlayerEvent> / position()
+
+// injection + policy
+set_request_interceptor / set_license_resolver / set_clearkey
+set_retry_policy / set_callback_timeout
+set_abr_strategy / set_abr_video_profile
+
+// rendering / platform
+resize / volume / set_volume
+set_subtitle_font(ttf_bytes)
+set_hdr_tonemap(HdrTonemapParams)          // see player/HDR_TONEMAP.md
+set_display_hdr_types(mask)                // Android: Display.getHdrCapabilities bitmask
+set_video_output_window(ptr)               // Android: enable DIRECT mode (HW video plane)
+capabilities() / probe_capabilities()
 ```
 
 ---
 
 ## Decoder pipeline
 
-### Desktop (Windows / Linux / macOS)
-- **Video**: FFmpeg `ffmpeg-next 7.1` → D3D11VA (Windows) / VAAPI (Linux) → `VideoFrame` → wgpu NV12 texture → `shader.wgsl`. macOS skips FFmpeg for video and runs VTDecompressionSession directly.
-- **Audio**: FFmpeg → PCM → cpal. macOS also takes the FFmpeg path because AudioToolbox's AAC decoder mis-handles packetized AUs.
+Segments download ahead (default 8 s target), get CENC-decrypted and
+mp4-parsed on a blocking thread **overlapped with the previous segment's
+feed** (software AES on 32-bit Android costs ~0.5 s per 4K segment —
+inline it starved the codec at every boundary), then feed the platform
+decoder sample-by-sample. Decoded frames flow through a small reorder
+window into the vsync loop, which paces them against the wall clock and
+drops late frames proportionally. ABR swaps are make-before-break (new
+representation prefetches while the old decoder keeps playing, then
+splices forward at the last rendered PTS). Pipeline failures retry from
+the current position with backoff before surfacing an error.
 
-See [`README.md`](README.md) for how to build a known-good FFmpeg locally and run the smoke tests.
+### Desktop (Windows / Linux / macOS)
+- **Video**: FFmpeg `ffmpeg-next 8.1` → D3D11VA (Windows) / VAAPI (Linux);
+  macOS decodes via native VTDecompressionSession instead.
+- **Audio**: FFmpeg → PCM → cpal (all desktop + Apple targets — AudioToolbox's
+  AAC decoder mishandles packetised access units).
+
+See [`README.md`](README.md) for the vendored FFmpeg build + smoke tests.
 
 ### Android
-- **Video**: NDK `MediaCodec` → `AHardwareBuffer` → one of two render paths (see below)
-- **Audio**: NDK `MediaCodec` (mp4a-latm AAC) → PCM → cpal/AAudio
+- **Video, direct mode (production for TV)**: NDK `AMediaCodec` renders
+  straight into the host's video `Surface` — frames ride a HW video
+  plane, HDR10/HDR10+/DV reach the display natively. Frame pacing via
+  `releaseOutputBufferAtTime` ~100 ms ahead (the queue bridges segment
+  boundaries). DV uses the platform `video/dolby-vision` decoder
+  (resolved by NAME via Java `MediaCodecList` over JNI — by-type lookup
+  returns the wrong profile's codec) with RPU NALs kept.
+- **Video, GL path (SDR displays / single-surface hosts)**: MediaCodec →
+  ImageReader → AHardwareBuffer → EGLImage → `GL_TEXTURE_EXTERNAL_OES`,
+  drawn in a wgpu present hook directly to FBO 0. 10-bit streams use a
+  PRIVATE-format ImageReader. HDR tonemaps in GLSL (see
+  `player/HDR_TONEMAP.md`); HDR-capable panels can take BT2020_PQ
+  passthrough.
+- **Audio**: NDK MediaCodec (AAC) → PCM → cpal/AAudio.
+
+### iOS / macOS
+- **Video**: VTDecompressionSession → CVPixelBuffer → CVMetalTextureCache →
+  wgpu Metal textures (R8/RG8 for NV12, R16/RG16 for the 10-bit HDR path).
 
 ---
 
-## Android render paths
+## Device quirk encyclopedia (hard-won)
 
-### Path A — Vulkan + NV12 (Samsung Galaxy S etc.)
-Chosen when adapter exposes `TEXTURE_FORMAT_NV12`.
+**Google TV Streamer (kirkwood / MT8696, 32-bit userspace, PowerVR GE9215):**
+- Vulkan driver aborts in `BILParseStream` → GL-only backend.
+- wgpu renderbuffer presents are silently discarded → all GL drawing
+  happens in a present hook directly on FBO 0 (custom wgpu fork hook).
+- `YCBCR_P010` ImageReader allocates but never delivers images →
+  10-bit pool order is PRIVATE → P010 → YUV; the acquire spin is
+  time-boxed so a bad combo errors instead of hanging.
+- HWC refuses HDMI HDR for GPU-composited layers (even with BT2020_PQ
+  dataspace + SMPTE 2086 metadata) — video-plane (direct mode) only.
+- Runs the **armeabi-v7a** build → software AES (~20 MB/s); see the
+  overlapped segment prep above.
+- HEVC decoder pads aggressively (e.g. 2560×1440 content in a
+  4096×1472 buffer) — content size must come from the `crop` rect
+  (`AMediaFormat_getRect`, the Java-style `crop-left` int keys don't
+  exist at the NDK level), and GL-path crops inset by 1 texel
+  (AOSP SurfaceTexture rule) or bilinear bleeds green padding.
+- Codec quirk: `AMediaCodec_createDecoderByType("video/dolby-vision")`
+  returns the AVC-based `dvav.ser` decoder — silent black for HEVC DV.
+- max AImageReader images = 32 (64 SIGABRTs).
 
-```
-AHardwareBuffer
-  → vkImportAndroidHardwareBufferANDROID (video_mediacodec.rs)
-  → VkImage (NV12)
-  → wgpu Texture (NV12)
-  → shader.wgsl (Y+UV planes → RGB)
-  → wgpu surface present
-```
+**Samsung Galaxy S21 (Mali-G78):** GL path default; AImage lifetime
+matters — hold the AImage (not just the AHB ref) until the frame leaves
+the renderer, or MediaCodec overwrites queued frames (scene-cut
+flicker).
 
-### Path B — GLES + OES (Google TV MT8696, emulator, any non-Vulkan device)
-Chosen when Vulkan is unavailable or broken. **Zero-copy**: no CPU read-back.
-
-```
-AHardwareBuffer
-  → eglGetNativeClientBufferANDROID()  → EGLClientBuffer
-  → eglCreateImageKHR(EGL_NATIVE_BUFFER_ANDROID) → EGLImageKHR
-  → glEGLImageTargetTexture2DOES(GL_TEXTURE_EXTERNAL_OES)
-  → OES sampler (hardware YCbCr→RGB)
-  → wgpu swapchain renderbuffer (via temporary FBO)
-  → wgpu present() blits renderbuffer → EGL window surface
-```
-
-Implemented in `video_gles_egl.rs`. The OES renderer is initialised once in
-`VideoRenderer::new()` by locking the EGL context (`AdapterContext::lock()`).
-
----
-
-## MT8696 (Google TV Chromecast HD) quirks
-
-Device: `kirkwood`, SoC `MT8696`, ABI `armeabi-v7a` (32-bit), GPU `PowerVR Rogue`.
-
-**Vulkan driver** (`vulkan.mt8696.so`) calls `abort()` in `BILParseStream` on ANY
-Vulkan API call. Detection: check `/vendor/lib/hw/vulkan.mt8696.so` on disk before
-touching any Vulkan API. If found → `Backends::GL` only → GLES path.
-
-**wgpu limits**: PowerVR Rogue max texture dimension = 4096, not 8192.
-Fix: `max_texture_dimension_2d: adapter_limits.max_texture_dimension_2d`.
+**Android emulator:** `vulkan.ranchu` rejects `vkCreateInstance` →
+GLES; ES 3.0 only (no compute).
 
 ---
 
@@ -133,17 +176,17 @@ Fix: `max_texture_dimension_2d: adapter_limits.max_texture_dimension_2d`.
 
 | Crate | Version | Note |
 |---|---|---|
-| `wgpu` | git fork | `https://github.com/Preclikos/wgpu.git` (custom patches) |
-| `winit` | 0.30.9 | window + event loop |
-| `ffmpeg-next` | 8.1.0 | desktop only |
-| `ndk` | 0.9 | Android MediaCodec, API 29+ |
-| `glow` | 0.17 | Android only — raw GLES calls for OES path |
-| `ash` | 0.38 | Vulkan bindings |
-| `cpal` | 0.17 | audio output |
-| `reqwest` | 0.12 | HTTP (native-tls on desktop, rustls on Android) |
-| `quick-xml` | 0.37 | DASH MPD parsing |
-| `re_mp4` | 0.3 | MP4 box parsing |
-| `aes` + `ctr` | 0.8 / 0.9 | AES-128-CTR ClearKey |
+| `wgpu` | git fork `Preclikos/wgpu` | adds the GLES present hook (FBO 0 drawing) + P010 |
+| `ffmpeg-next` | 8.1 | desktop video + desktop/Apple audio; workspace-patched for 8.1.1+ headers |
+| `ndk` / `ndk-sys` | 0.9 / 0.6 | MediaCodec, ImageReader, ANativeWindow (API 29 features) |
+| `ndk-context` | 0.1 | JavaVM handle for the few Java-only APIs (MediaCodecList) |
+| `jni` | 0.21 | Android Java interop |
+| `glow` | 0.17 | raw GLES for the OES present hook |
+| `cpal` | 0.17 | audio output (+ played-samples clock) |
+| `fontdue` | — | subtitle rasterization |
+| `reqwest` | 0.12 | HTTP (rustls on Android/iOS) |
+| `quick-xml` / `re_mp4` | 0.37 / 0.3 | MPD + MP4 parsing |
+| `aes` + `ctr` | — | ClearKey CENC (`opt-level = 3` even in dev — see Cargo.toml) |
 
 ---
 
@@ -151,51 +194,33 @@ Fix: `max_texture_dimension_2d: adapter_limits.max_texture_dimension_2d`.
 
 ### Prerequisites
 - Rust targets: `aarch64-linux-android`, `armv7-linux-androideabi`, `x86_64-linux-android`
-- `cargo-ndk`
-- Android NDK 29 (`ndkVersion = "29.0.13113456"` in build.gradle)
-- JDK 22 (`JAVA_HOME = C:/Java/jdk-22.0.2` on dev machine)
-- `ANDROID_SDK_ROOT` / `ANDROID_NDK_HOME` set
+- `cargo-ndk`; Android NDK per `ndkVersion` in `app-android/android/app/build.gradle`
+- JDK 17+ (`JAVA_HOME = C:\Program Files\Android\Android Studio\jbr` works)
 
-### Build commands (PowerShell)
+### Build + install (PowerShell)
 ```powershell
-# Rust: build all three ABIs
-$env:JAVA_HOME = "C:/Java/jdk-22.0.2"
-cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 build -p app-android
+# one-shot helper: build → install → launch → filtered logcat
+.\test_android.ps1            # add -Release for release profile
 
-# Android: assemble APK (runs cargo ndk internally via Gradle tasks)
-cd app-android\android
-.\gradlew assembleDebug
+# or manually:
+cargo ndk -t arm64-v8a -o app-android\android\app\src\main\jniLibs build -p app-android
+cd app-android\android; .\gradlew.bat assembleDebug   # builds ALL ABIs via cargo-ndk
+adb install -r app\build\outputs\apk\debug\app-debug.apk
 ```
 
-APK output: `app-android/android/app/build/outputs/apk/debug/app-debug.apk`
-
-Gradle tasks `buildRustDebug` / `buildRustRelease` invoke cargo-ndk and copy
-`libapp_android.so` + `libc++_shared.so` into `src/main/jniLibs/<abi>/`.
-
-### Install + logcat
+### Useful logcat filter
 ```powershell
-adb install -r app-debug.apk
-adb logcat -s RustStdoutStderr:V player:V gles_oes:V
+adb logcat | Select-String 'app_android|app_shared|player::|stall|LATE|BACKWARD'
 ```
+Tags are Rust module paths (truncated to 23 chars): `player::decoders::med..`,
+`player::renderers::vi..`, `player  ` (player.rs), `app_shared`, `app_android`.
 
-Key logcat tags: `RustStdoutStderr` (all `log::*` output from Rust).
-
-### SSH / git with PPK key
-```powershell
-$env:GIT_SSH_COMMAND = '"C:\Program Files\PuTTY\plink.exe" -batch -i "C:\Users\husak\Documents\GitKeys\private.ppk"'
-git fetch origin
-git pull
-```
-
----
-
-## Git branches
-
-| Branch | Purpose |
-|---|---|
-| `master` | main / stable |
-| `feature/renderer_split` | current — renderer refactor + GLES OES path |
-| `audio` | audio pipeline work |
+### Test-shell knobs (files in `/sdcard/Android/data/cz.preclikos.rust_player/files/`)
+| File | Values | Meaning |
+|---|---|---|
+| `video_pref.txt` | `hdr` / `dv` / rep index | representation pick (default: index 5 = 720p SDR) |
+| `direct.txt` | `0` | disable direct mode (default ON) |
+| `hdr_passthrough.txt` | `1` | enable GL-path HDR passthrough experiment |
 
 ---
 
@@ -206,18 +231,22 @@ Encrypted DASH stream used for development:
 https://preclikos.cz/examples/encrypted/manifest.mpd
 ```
 
-ClearKey DRM keys (hardcoded in both `app/src/main.rs` and `app-android/src/lib.rs`):
-```
-0fd37dac41c0e987e68d43b801b1210c → fd8d9f408c2bd702970afcd3b219e791
-519af81ab2d284f52aa8257d96b5e4bd → 627ef72b42d98770dec20ecab46cd1f4
-```
-
-Default track selection: video index 5 (720p HEVC), first `mp4a` audio track.
+ClearKey keys live in `app-shared/src/lib.rs` (single source for all
+shells). Adaptation set 0 = HEVC ladder (480p–4K; ≤1080p truly SDR,
+1440p/4K are PQ **despite the MPD claiming BT.709** — the player trusts
+the SPS VUI, not the manifest). Adaptation set 1 = Dolby Vision profile
+8 (`dvh1.08`, 1440p + 4K). One forced-English WebVTT subtitle track.
 
 ---
 
-## Known issues / TODO
+## Known gaps / next steps
 
-- **iOS**: `app-ios` entry point doesn't construct `Player` yet — VideoToolbox decoder is a stub
-- **Google TV MT8696**: GLES OES path initialised; rendering in progress (black screen being diagnosed — `video_gles_egl.rs`)
-- **Android emulator**: Vulkan `vulkan.ranchu` rejects `vkCreateInstance` → falls back to GLES path automatically
+- Audio pipeline has no internal retry (video does) — audio death parks
+  playback in `Buffering { Stall }`.
+- A/V drift is measured (`Stats::av_drift_ms`) but not yet servo-corrected.
+- HLG renders through the SDR shader (washed) on tonemap paths.
+- GL surface is RGBA8888 — GL-path HDR passthrough would band; 1010102
+  needs a wgpu-fork surface-config change (moot once direct mode is used).
+- tvOS direct-mode analog (`AVSampleBufferDisplayLayer`) not implemented.
+- Apple targets not compile-verified from the Windows dev machine (ring
+  can't cross-build) — first Mac build will tell.

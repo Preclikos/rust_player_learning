@@ -17,8 +17,8 @@ url = { version = "2.5.4" }
 tokio = { version = "1.52", features = ["full"] }
 re_mp4 = { version = "0.3.0" }
 hex = { version = "0.4" }
-aes = { version = "0.8" }
-ctr = { version = "0.9" }
+aes = { version = "0.9" }
+ctr = { version = "0.10" }
 async-trait = "0.1"
 arc-swap = "1.7"
 bytes = "1"

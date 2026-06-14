@@ -110,7 +110,7 @@ objc2-metal = { version = "0.3.2", default-features = false, features = [
 [target.'cfg(target_os = "android")'.dependencies]
 ndk = { version = "0.9", features = ["media", "api-level-29"] }
 ndk-sys = "0.6"
-jni = "0.21"
+jni = "0.22"
 # JavaVM/context handle seeded by the host shell — used for the few Java-only
 # platform APIs (MediaCodecList decoder resolution; NDK has no codec list).
 ndk-context = "0.1"

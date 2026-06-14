@@ -189,48 +189,57 @@ impl MediaCodecDecoder {
     /// None on any JNI trouble; caller falls back to createDecoderByType.
     fn find_decoder_name(mime: &str, profile: i32, width: i32, height: i32) -> Option<String> {
         let ctx = ndk_context::android_context();
-        let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) }.ok()?;
-        let mut env = vm.attach_current_thread().ok()?;
+        let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) };
+        // jni 0.22 dropped the AttachGuard-returning attach in favour of a
+        // scoped callback handed a `&mut Env`. All the calls below return
+        // jni::errors::Error, so we `?` inside and collapse the
+        // Result<Option<_>> back to an Option for the caller (any JNI trouble
+        // → None → caller falls back to createDecoderByType).
+        // jni 0.22 also requires class/method names and signatures to be
+        // null-terminated JNIStr/MethodSignature (built at compile time by the
+        // jni_str!/jni_sig! macros) instead of plain &str, and JObject ->
+        // JString goes through env.cast_local rather than a From impl.
+        vm.attach_current_thread(|env| -> Result<Option<String>, jni::errors::Error> {
+            let jmime = env.new_string(mime)?;
+            let fmt = env
+                .call_static_method(
+                    jni::jni_str!("android/media/MediaFormat"),
+                    jni::jni_str!("createVideoFormat"),
+                    jni::jni_sig!("(Ljava/lang/String;II)Landroid/media/MediaFormat;"),
+                    &[(&jmime).into(), width.into(), height.into()],
+                )?
+                .l()?;
+            let kprofile = env.new_string("profile")?;
+            env.call_method(
+                &fmt,
+                jni::jni_str!("setInteger"),
+                jni::jni_sig!("(Ljava/lang/String;I)V"),
+                &[(&kprofile).into(), profile.into()],
+            )?;
 
-        let jmime = env.new_string(mime).ok()?;
-        let fmt = env
-            .call_static_method(
-                "android/media/MediaFormat",
-                "createVideoFormat",
-                "(Ljava/lang/String;II)Landroid/media/MediaFormat;",
-                &[(&jmime).into(), width.into(), height.into()],
-            )
-            .ok()?
-            .l()
-            .ok()?;
-        let kprofile = env.new_string("profile").ok()?;
-        env.call_method(
-            &fmt,
-            "setInteger",
-            "(Ljava/lang/String;I)V",
-            &[(&kprofile).into(), profile.into()],
-        )
-        .ok()?;
-
-        // MediaCodecList(MediaCodecList.ALL_CODECS = 1)
-        let list = env
-            .new_object("android/media/MediaCodecList", "(I)V", &[1i32.into()])
-            .ok()?;
-        let name = env
-            .call_method(
-                &list,
-                "findDecoderForFormat",
-                "(Landroid/media/MediaFormat;)Ljava/lang/String;",
-                &[(&fmt).into()],
-            )
-            .ok()?
-            .l()
-            .ok()?;
-        if name.is_null() {
-            return None;
-        }
-        let s: String = env.get_string(&jni::objects::JString::from(name)).ok()?.into();
-        Some(s)
+            // MediaCodecList(MediaCodecList.ALL_CODECS = 1)
+            let list = env.new_object(
+                jni::jni_str!("android/media/MediaCodecList"),
+                jni::jni_sig!("(I)V"),
+                &[1i32.into()],
+            )?;
+            let name = env
+                .call_method(
+                    &list,
+                    jni::jni_str!("findDecoderForFormat"),
+                    jni::jni_sig!("(Landroid/media/MediaFormat;)Ljava/lang/String;"),
+                    &[(&fmt).into()],
+                )?
+                .l()?;
+            if name.is_null() {
+                return Ok(None);
+            }
+            let jstr = env.cast_local::<jni::objects::JString>(name)?;
+            let s: String = env.get_string(&jstr)?.into();
+            Ok(Some(s))
+        })
+        .ok()
+        .flatten()
     }
 
     /// Direct-mode configure: raw FFI codec attached to the video Surface.

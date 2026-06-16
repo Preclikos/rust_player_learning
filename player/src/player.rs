@@ -713,6 +713,17 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
         let pts_to_go_ns = (pts_us_rel - elapsed_us).max(0) * 1_000;
         frame.desired_present_ns = clock_monotonic_ns() + pts_to_go_ns;
 
+        // DIAG (#23): first few frames' pacing — tells us whether the direct
+        // pipeline renders promptly (releasing codec buffers) or schedules
+        // present far in the future (buffers stay captive → dequeue_input stall).
+        if frame_idx < 3 {
+            log::info!(
+                "[vsync] frame #{} pts_ms={} elapsed_ms={} pts_rel_ms={} pts_to_go_ms={} base={}",
+                frame_idx, pts_ms, elapsed_us / 1000, pts_us_rel / 1000,
+                pts_to_go_ns / 1_000_000, base
+            );
+        }
+
         let render_start = start_time
             .elapsed()
             .saturating_sub(pause_skew)
@@ -1004,6 +1015,7 @@ async fn av_sync_handler<V: VideoSink, A: AudioSink>(
             return;
         }
     }
+    log::info!("[av_sync] video_ready passed (seek_offset={}ms)", seek_offset.as_millis()); // DIAG #23
     // First frame is out: the pipeline is live. Lets the ABR tick resume —
     // any switch from here rebuilds a pipeline that's actually producing,
     // not a half-started one.
@@ -1063,6 +1075,7 @@ async fn av_sync_handler<V: VideoSink, A: AudioSink>(
     // the video sync loop can rebase played_ms onto this pipeline's 0-based
     // media timeline (position = seek_offset + (played - audio_base)).
     let audio_base_ms = audio_sink.played_ms().unwrap_or(0);
+    log::info!("[av_sync] spawning sync loops (audio_base={}ms)", audio_base_ms); // DIAG #23
     let stats_audio = Arc::clone(&stats);
     let events_audio = Arc::clone(&events);
     let paused_audio = Arc::clone(&paused);
@@ -1726,6 +1739,10 @@ async fn run_decode(
         direct_window,
         dovi_profile: pf.dovi_profile,
     })?;
+    // Direct mode: let the input-buffer spin observe teardown so a seek /
+    // track-switch can't strand the decode task in the spin (see [B] in
+    // mediacodec submit_direct).
+    decoder.set_stop_signal(decoder_stop_flag.clone());
 
     let decoder_task = task::spawn(video_decoder_task(
         pf.download_rx,

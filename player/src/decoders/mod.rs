@@ -356,6 +356,12 @@ pub trait HwVideoDecoder: Send {
     fn is_direct(&self) -> bool {
         false
     }
+
+    /// Hand the decoder the pipeline's stop signal so a blocking decode call
+    /// (e.g. MediaCodec direct mode's input-buffer spin) can bail promptly on
+    /// teardown instead of wedging the rebuild. Default: ignored — only the
+    /// direct MediaCodec path needs it.
+    fn set_stop_signal(&mut self, _stop: std::sync::Arc<std::sync::atomic::AtomicBool>) {}
 }
 
 pub trait AudioDecoder: Send {

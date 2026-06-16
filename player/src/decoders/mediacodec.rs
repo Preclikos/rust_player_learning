@@ -72,6 +72,10 @@ pub struct MediaCodecDecoder {
     /// decoder configured — it needs them). False = strip them (plain
     /// HEVC decoders may choke on unspecified NAL types).
     keep_dv_nalus: bool,
+    /// Pipeline stop signal (direct mode). The `submit_direct` input-buffer
+    /// spin checks it so a teardown (seek/track-switch) doesn't leave the
+    /// decode task wedged in the spin when the codec is being torn down.
+    stop_signal: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -79,6 +83,16 @@ pub struct MediaCodecDecoder {
 // Raw ndk_sys FFI — the safe `ndk` wrapper hides the output-buffer index,
 // which is exactly what the deferred timed release needs.
 // ---------------------------------------------------------------------------
+
+/// [C2] Serializes direct codecs on the shared video Surface: only ONE codec
+/// may own the `ANativeWindow` producer connection at a time. A new codec must
+/// wait until the previous one's `AMediaCodec_delete` (in
+/// `SharedDirectCodec::drop`) has released the connection — otherwise it
+/// configures into a half-released Surface and emits NO output (`produced=0`),
+/// which stalls forever (`video_ready` never fires → av_sync blocks). Held for
+/// the codec's whole lifetime; released in Drop.
+static DIRECT_WINDOW_BUSY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// The codec shared between the decoder (input/dequeue side) and in-flight
 /// frames (release side). AMediaCodec is not documented thread-safe, so
@@ -135,6 +149,9 @@ impl Drop for SharedDirectCodec {
         unsafe {
             ndk_sys::AMediaCodec_delete(self.raw);
         }
+        // [C2] The Surface producer connection is now released (delete is
+        // synchronous) — let the next direct codec configure onto it.
+        DIRECT_WINDOW_BUSY.store(false, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -185,6 +202,7 @@ impl MediaCodecDecoder {
             static_hdr_meta: None,
             seen_max_cll_nits: None,
             keep_dv_nalus: false,
+            stop_signal: None,
         }
     }
 
@@ -330,6 +348,31 @@ impl MediaCodecDecoder {
                 );
             }
 
+            // [C2] Claim the shared Surface before connecting our producer to
+            // it (AMediaCodec_configure binds the codec to the window). Wait
+            // for any prior direct codec to finish its AMediaCodec_delete
+            // (which clears the flag in Drop) so we never configure into a
+            // half-released Surface. Bounded — a leaked frame ref can't wedge
+            // configure forever; the produced=0 watchdog then recovers.
+            {
+                use std::sync::atomic::Ordering;
+                let mut waited = 0u32;
+                while DIRECT_WINDOW_BUSY
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    if waited >= 500 {
+                        log::warn!(
+                            "[mc-direct] prior codec still owns the Surface after ~1s; configuring anyway"
+                        );
+                        DIRECT_WINDOW_BUSY.store(true, Ordering::Release);
+                        break;
+                    }
+                    waited += 1;
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }
+
             let st = ndk_sys::AMediaCodec_configure(
                 codec,
                 format,
@@ -340,11 +383,14 @@ impl MediaCodecDecoder {
             ndk_sys::AMediaFormat_delete(format);
             if st != ndk_sys::media_status_t::AMEDIA_OK {
                 ndk_sys::AMediaCodec_delete(codec);
+                // No SharedDirectCodec will be created to release the gate.
+                DIRECT_WINDOW_BUSY.store(false, std::sync::atomic::Ordering::Release);
                 return Err(format!("AMediaCodec_configure(direct): {:?}", st).into());
             }
             let st = ndk_sys::AMediaCodec_start(codec);
             if st != ndk_sys::media_status_t::AMEDIA_OK {
                 ndk_sys::AMediaCodec_delete(codec);
+                DIRECT_WINDOW_BUSY.store(false, std::sync::atomic::Ordering::Release);
                 return Err(format!("AMediaCodec_start(direct): {:?}", st).into());
             }
 
@@ -376,6 +422,16 @@ impl MediaCodecDecoder {
             let idx = {
                 let mut retries = 0u32;
                 loop {
+                    // [B] Bail promptly on teardown (seek/track-switch) instead
+                    // of spinning a codec that's being torn down — otherwise
+                    // this blocking spin strands the decode task and the
+                    // pipeline rebuild can't join it. The supervisor treats an
+                    // error while stop_flag is set as a clean teardown.
+                    if let Some(stop) = &self.stop_signal {
+                        if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                            return Err("submit_direct: stop signalled".into());
+                        }
+                    }
                     let idx = {
                         let _l = direct.call_lock.lock().unwrap();
                         ndk_sys::AMediaCodec_dequeueInputBuffer(direct.raw, 5_000)
@@ -388,6 +444,20 @@ impl MediaCodecDecoder {
                         return Err(format!("dequeueInputBuffer(direct): {}", idx).into());
                     }
                     retries += 1;
+                    // [A] produced==0 watchdog: a freshly (re)configured codec
+                    // that accepts no more input AND has never emitted output is
+                    // wedged (the lifecycle/Surface race — produced=0). Bail
+                    // (~2s) so the supervisor rebuilds the pipeline rather than
+                    // spinning forever. produced>0 is ordinary backpressure (it
+                    // recovers once the renderer drains output buffers) → keep
+                    // waiting; don't false-trip on it.
+                    if produced == 0 && retries >= 400 {
+                        return Err(format!(
+                            "submit_direct: codec produced no output {}ms after configure (wedged Surface)",
+                            retries * 5
+                        )
+                        .into());
+                    }
                     if retries % 200 == 0 {
                         log::warn!(
                             "[mc-direct] dequeue_input stall {}x5ms pts={} produced={} (produced=0 => codec emits no output after this seek/start)",
@@ -970,6 +1040,10 @@ impl HwVideoDecoder for MediaCodecDecoder {
 
     fn is_direct(&self) -> bool {
         self.direct_window != 0
+    }
+
+    fn set_stop_signal(&mut self, stop: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        self.stop_signal = Some(stop);
     }
 }
 

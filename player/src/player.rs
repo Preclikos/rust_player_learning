@@ -1287,74 +1287,54 @@ async fn video_decoder_task(
             if first_pts_us.is_none() { first_pts_us = Some(pts_us); }
             last_pts_us = pts_us;
 
-            decoder.submit(sample_data, pts_us)?;
-
-            loop {
-                match decoder.try_recv()? {
-                    Some(frame) => {
-                        // Track the high-water-mark of decoded PTS so the
-                        // av_sync loop can publish `buffered_ahead_secs`.
-                        // Includes frames still in the reorder buffer — they
-                        // are already decoded and will be rendered shortly.
-                        let pts_ms = frame.pts_us / 1000;
-                        let prev = stats.last_decoded_pts_ms.load(Ordering::Relaxed);
-                        if pts_ms > prev {
-                            stats
-                                .last_decoded_pts_ms
-                                .store(pts_ms, Ordering::Relaxed);
-                        }
-                        reorder_buf.push(frame);
-                        if reorder_buf.len() > reorder_depth {
-                            let min_idx = reorder_buf.iter().enumerate()
-                                .min_by_key(|(_, f)| f.pts_us)
-                                .map(|(i, _)| i)
-                                .unwrap();
-                            let to_send = reorder_buf.swap_remove(min_idx);
-                            // ABR splice trim: drop NEW frames at/below the PTS
-                            // OLD last rendered so NEW joins forward-contiguous
-                            // — no rewind, and no future-PTS frame av_sync would
-                            // sit waiting for (the 1080→4K freeze).
-                            if let Some(sp) = &splice {
-                                if to_send.pts_us <= sp.skip_below_pts_us {
-                                    continue;
-                                }
-                            }
-                            if !first_frame_signaled {
-                                video_ready.notify_one();
-                                first_frame_signaled = true;
-                                if let Some(sp) = &splice {
-                                    log::info!(
-                                        "[abr] NEW first frame {}ms after OLD teardown (pts={}ms)",
-                                        sp.started.elapsed().as_millis(),
-                                        to_send.pts_us / 1000
-                                    );
-                                }
-                            }
-                            // Stop-aware send: without this, the `await` on
-                            // a full frame_sender (capacity 8) parks the
-                            // decoder for ~333 ms before re-checking
-                            // stop_flag. Selecting against stop_flag's
-                            // associated Notify cuts that latency to
-                            // ~zero so the supervisor's await on vp_handle
-                            // returns promptly after the swap signal.
-                            if sender.send(to_send).await.is_err() {
-                                return Ok(());
-                            }
-                            if stop_flag.load(Ordering::Relaxed) {
-                                log::debug!(
-                                    "[dec] stop signal received after send; aborting"
-                                );
-                                return Ok(());
-                            }
-                        }
-                    }
-                    None => break,
-                }
+            // Drain the frames the codec ALREADY has ready BEFORE feeding it
+            // more input. A direct MediaCodec whose output buffers are all
+            // dequeued-but-undrained refuses new input — submit() then spins on
+            // a full codec while the very frames that would free it sit waiting
+            // to be pulled, so the old feed-then-drain order deadlocked once the
+            // pool filled (#23 backpressure variant: produced>0, dequeue_input
+            // stall forever, video starves). Draining first keeps the codec's
+            // output pool flowing so submit doesn't wedge.
+            if !drain_video_decoder(
+                &mut decoder,
+                &mut reorder_buf,
+                reorder_depth,
+                &splice,
+                &mut first_frame_signaled,
+                &video_ready,
+                &stats,
+                &sender,
+                &stop_flag,
+            )
+            .await?
+            {
+                return Ok(());
             }
+
+            decoder.submit(sample_data, pts_us)?;
         }
         if let Some(first) = first_pts_us {
             log::info!("[dec] seg done: pts {}..{}ms", first / 1000, last_pts_us / 1000);
         }
+    }
+
+    // Final drain: with drain-before-submit, the last submitted sample's output
+    // is still inside the codec — pull it before the reorder flush so the tail
+    // frames aren't lost.
+    if !drain_video_decoder(
+        &mut decoder,
+        &mut reorder_buf,
+        reorder_depth,
+        &splice,
+        &mut first_frame_signaled,
+        &video_ready,
+        &stats,
+        &sender,
+        &stop_flag,
+    )
+    .await?
+    {
+        return Ok(());
     }
 
     // Flush remaining frames in PTS order.
@@ -1375,6 +1355,77 @@ async fn video_decoder_task(
     }
 
     Ok(())
+}
+
+/// Pull every frame the video decoder currently has ready into the reorder
+/// buffer and forward the lowest-PTS ones downstream. MUST run before each
+/// `submit()` in the decode loop (direct mode): a MediaCodec whose output
+/// buffers are all dequeued-but-undrained refuses new input, so feeding before
+/// draining deadlocks. Returns `false` when the pipeline should stop (the
+/// frame channel closed, or a teardown was signalled mid-send).
+async fn drain_video_decoder(
+    decoder: &mut Box<dyn HwVideoDecoder>,
+    reorder_buf: &mut Vec<DecodedVideoFrame>,
+    reorder_depth: usize,
+    splice: &Option<SwapSplice>,
+    first_frame_signaled: &mut bool,
+    video_ready: &Arc<Notify>,
+    stats: &Arc<StatsState>,
+    sender: &Sender<DecodedVideoFrame>,
+    stop_flag: &Arc<AtomicBool>,
+) -> Result<bool, Box<dyn Error + Send + Sync>> {
+    loop {
+        match decoder.try_recv()? {
+            Some(frame) => {
+                // Track the high-water-mark of decoded PTS so av_sync can
+                // publish `buffered_ahead_secs` (reorder-buffered frames are
+                // already decoded and render shortly).
+                let pts_ms = frame.pts_us / 1000;
+                let prev = stats.last_decoded_pts_ms.load(Ordering::Relaxed);
+                if pts_ms > prev {
+                    stats.last_decoded_pts_ms.store(pts_ms, Ordering::Relaxed);
+                }
+                reorder_buf.push(frame);
+                if reorder_buf.len() > reorder_depth {
+                    let min_idx = reorder_buf
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, f)| f.pts_us)
+                        .map(|(i, _)| i)
+                        .unwrap();
+                    let to_send = reorder_buf.swap_remove(min_idx);
+                    // ABR splice trim: drop NEW frames at/below the PTS OLD last
+                    // rendered so NEW joins forward-contiguous (no rewind, no
+                    // future-PTS frame av_sync would sit waiting for).
+                    if let Some(sp) = splice {
+                        if to_send.pts_us <= sp.skip_below_pts_us {
+                            continue;
+                        }
+                    }
+                    if !*first_frame_signaled {
+                        video_ready.notify_one();
+                        *first_frame_signaled = true;
+                        if let Some(sp) = splice {
+                            log::info!(
+                                "[abr] NEW first frame {}ms after OLD teardown (pts={}ms)",
+                                sp.started.elapsed().as_millis(),
+                                to_send.pts_us / 1000
+                            );
+                        }
+                    }
+                    if sender.send(to_send).await.is_err() {
+                        return Ok(false);
+                    }
+                    if stop_flag.load(Ordering::Relaxed) {
+                        log::debug!("[dec] stop signal received after send; aborting");
+                        return Ok(false);
+                    }
+                }
+            }
+            None => break,
+        }
+    }
+    Ok(true)
 }
 
 async fn audio_decoder_task(

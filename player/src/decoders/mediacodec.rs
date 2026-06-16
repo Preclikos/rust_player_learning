@@ -458,6 +458,20 @@ impl MediaCodecDecoder {
                         )
                         .into());
                     }
+                    // [Fix2] Catch-all: an input-buffer stall this long with
+                    // output already flowing (produced>0) is a backpressure
+                    // deadlock the renderer isn't clearing (codec output pool
+                    // exhausted, e.g. buffers stuck awaiting present). Bail (~3s,
+                    // before the 5s input-ANR) so the supervisor rebuilds onto a
+                    // fresh codec + pool instead of spinning forever.
+                    if retries >= 600 {
+                        return Err(format!(
+                            "submit_direct: input-buffer stall {}ms (backpressure deadlock, produced={})",
+                            retries * 5,
+                            produced
+                        )
+                        .into());
+                    }
                     if retries % 200 == 0 {
                         log::warn!(
                             "[mc-direct] dequeue_input stall {}x5ms pts={} produced={} (produced=0 => codec emits no output after this seek/start)",

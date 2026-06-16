@@ -381,18 +381,24 @@ fn clock_monotonic_ns() -> i64 { 0 }
 
 async fn video_sync_loop<V: VideoSink, A: AudioSink>(
     start_time: Arc<Instant>,
-    // 0-based media position the pipeline (re)started at (seek/resume target,
-    // segment-snapped). The audio-master clock (`audio_clock_us`) is rebased by
-    // this so `position_ms` reports the ABSOLUTE stream position, not the audio
-    // device's free-running played_ms. Without it, position collapses to
-    // play-time-since-(seek/resume) — breaking the seekbar, relative seeks, and
-    // the ABR soft-switch's restart-segment pick (it reads `position_ms`).
+    // 0-based media position playback starts at (the requested seek/resume
+    // TARGET, NOT segment-snapped). The audio-master clock (`audio_clock_us`)
+    // is rebased by this so `position_ms` reports the ABSOLUTE stream position,
+    // not the audio device's free-running played_ms. Without it, position
+    // collapses to play-time-since-(seek/resume) — breaking the seekbar,
+    // relative seeks, and the ABR soft-switch's restart-segment pick.
     seek_offset: Duration,
     // Snapshot of the audio sink's cumulative `played_ms` at this pipeline's
     // anchor instant. `samples_consumed` is NOT reset on flush(), so played_ms
     // is session-cumulative; subtracting this baseline yields the per-pipeline
     // elapsed, to which `seek_offset` is added → absolute media time.
     audio_base_ms: u64,
+    // Frame-accurate seek: the decoder feeds from the segment-start keyframe,
+    // which can be up to a segment before the target. Frames whose absolute
+    // pts_us is below this threshold are dropped (codec buffer released) WITHOUT
+    // pacing/rendering, so playback begins exactly at the target instead of the
+    // segment boundary. 0 = no discard (start of content / segment-aligned).
+    discard_below_us: i64,
     mut input_rx: mpsc::Receiver<DecodedVideoFrame>,
     renderer: Arc<V>,
     audio_sink: Arc<A>,
@@ -411,6 +417,10 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
     // playback time", so resuming after a 10s pause doesn't make every
     // frame look "10s late" and trigger the drain-to-catch-up path.
     let mut pause_skew = Duration::ZERO;
+    // Frame-accurate-seek discard gate: false until the first frame at/after
+    // the target is seen; pre-target frames are dropped (see `discard_below_us`).
+    let mut reached_target = discard_below_us <= 0;
+    let mut discarded = 0u32;
     // Start rendering this many ms before the target PTS so the GPU has time
     // to finish before the VSync deadline. The compositor (via
     // eglPresentationTimeANDROID) then holds the frame until the exact VSync.
@@ -588,6 +598,22 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
                 _ = stop.notified() => return,
             }
         };
+        // Frame-accurate seek: drop frames decoded from the segment-start
+        // keyframe that fall before the requested target. Dropping `frame`
+        // releases its codec output buffer (direct mode), keeping the decoder
+        // flowing; we neither pace nor render until the first at/after-target
+        // frame, which then anchors the clock exactly at the target.
+        if !reached_target {
+            if frame.pts_us < discard_below_us {
+                discarded += 1;
+                continue;
+            }
+            log::debug!(
+                "[vsync] seek target reached: pts={}ms (dropped {} pre-target frames)",
+                frame.pts_us / 1000, discarded
+            );
+            reached_target = true;
+        }
         let raw_pts_ms = (frame.pts_us / 1000) as u64;
         // Audio output latency (device buffer + DAC): the sink consumes a
         // sample this many ms before it's audible. Subtract it from the
@@ -979,6 +1005,9 @@ async fn audio_sync_loop<A: AudioSink>(
 
 async fn av_sync_handler<V: VideoSink, A: AudioSink>(
     seek_offset: Duration,
+    // Absolute pts_us below which video frames are discarded (frame-accurate
+    // seek: decode from the segment keyframe, render from the target). 0 = none.
+    video_discard_below_us: i64,
     video_ready: Arc<Notify>,
     video_rx: mpsc::Receiver<DecodedVideoFrame>,
     video_sink: Arc<V>,
@@ -1084,6 +1113,7 @@ async fn av_sync_handler<V: VideoSink, A: AudioSink>(
             start_time.clone(),
             seek_offset,
             audio_base_ms,
+            video_discard_below_us,
             video_rx,
             video_sink,
             audio_sink.clone(),
@@ -3639,31 +3669,49 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                 let audio_start_index =
                     find_segment_index(&audio_representation.segments, abs_offset);
 
-                // 0-based snapped position (absolute segment start - origin).
-                // Feeding this to av_sync (start_time = now - snapped) keeps the
-                // video_sync_loop's `base` anchored to the origin, so position
-                // and pts_ms come out 0-based.
-                let snapped_abs = video_representation
-                    .segments
-                    .get(video_start_index)
+                // Frame-accurate seek: decode entry is the segment START (a
+                // keyframe — CMAF segments are independently decodable), but we
+                // RENDER from the requested target. Video discards frames below
+                // the target (`discard_below_us`, absolute pts) and audio trims
+                // to it, so playback lands exactly where the user aimed instead
+                // of snapping back to the segment boundary.
+                let entry_seg = video_representation.segments.get(video_start_index);
+                let seg_start = entry_seg
                     .map(|s| s.start_time())
-                    .unwrap_or(abs_offset);
-                let snapped_seek_offset = snapped_abs.saturating_sub(origin);
-                // Where this (re)started pipeline actually begins: the 0-based
-                // offset, the segment it snapped to, and the segment count.
+                    .unwrap_or(abs_offset)
+                    .saturating_sub(origin);
+                // Discard ceiling = the entry segment's END (absolute pts). The
+                // target is always within this segment (find_segment_index), so
+                // clamping here guarantees the discard terminates inside the
+                // segment we decode from — fps-independent, no frame-count
+                // guess. Worst case (a bad target past the segment) renders from
+                // the next segment boundary instead of spinning forever.
+                // Only discard when the target is genuinely PAST the segment
+                // start — at a segment-aligned start (cold start / resume on a
+                // boundary) there's nothing to trim, and trimming there risks
+                // dropping the first displayable frame if its composition pts
+                // dips just under the segment start (B-frame reorder).
+                let seg_end = entry_seg.map(|s| s.end_time()).unwrap_or(abs_offset);
+                let discard_below_us = if seek_offset > seg_start {
+                    abs_offset.min(seg_end).as_micros() as i64
+                } else {
+                    0
+                };
                 log::debug!(
-                    "[play] start: seek_offset={}ms origin={}ms abs_offset={}ms vidx={} aidx={} snapped={}ms segs={}",
-                    seek_offset.as_millis(), origin.as_millis(), abs_offset.as_millis(),
-                    video_start_index, audio_start_index, snapped_seek_offset.as_millis(),
+                    "[play] start: target={}ms seg_start={}ms discard_below={}ms vidx={} aidx={} segs={}",
+                    seek_offset.as_millis(), seg_start.as_millis(), discard_below_us / 1000,
+                    video_start_index, audio_start_index,
                     video_representation.segments.len()
                 );
-                position_ms.store(snapped_seek_offset.as_millis() as u64, Ordering::Relaxed);
+                // Anchor position/clock to the TARGET (video discards to it,
+                // audio trims to it) — not the segment start.
+                position_ms.store(seek_offset.as_millis() as u64, Ordering::Relaxed);
                 stats
                     .last_decoded_pts_ms
-                    .store(snapped_seek_offset.as_millis() as i64, Ordering::Relaxed);
+                    .store(seek_offset.as_millis() as i64, Ordering::Relaxed);
                 stats
                     .audio_last_decoded_pts_ms
-                    .store(snapped_seek_offset.as_millis() as i64, Ordering::Relaxed);
+                    .store(seek_offset.as_millis() as i64, Ordering::Relaxed);
                 // Clear stale starvation state so the fresh pipeline can emit
                 // its initial Playing event.
                 stats.video_starving.store(false, Ordering::Relaxed);
@@ -3761,7 +3809,8 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                 // Gates the ABR tick off this fragile startup window.
                 pipeline_live.store(false, Ordering::Relaxed);
                 av_sync_handler(
-                    snapped_seek_offset,
+                    seek_offset,
+                    discard_below_us,
                     video_ready.clone(),
                     frame_receiver,
                     video_sink.clone(),

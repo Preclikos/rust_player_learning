@@ -381,6 +381,18 @@ fn clock_monotonic_ns() -> i64 { 0 }
 
 async fn video_sync_loop<V: VideoSink, A: AudioSink>(
     start_time: Arc<Instant>,
+    // 0-based media position the pipeline (re)started at (seek/resume target,
+    // segment-snapped). The audio-master clock (`audio_clock_us`) is rebased by
+    // this so `position_ms` reports the ABSOLUTE stream position, not the audio
+    // device's free-running played_ms. Without it, position collapses to
+    // play-time-since-(seek/resume) — breaking the seekbar, relative seeks, and
+    // the ABR soft-switch's restart-segment pick (it reads `position_ms`).
+    seek_offset: Duration,
+    // Snapshot of the audio sink's cumulative `played_ms` at this pipeline's
+    // anchor instant. `samples_consumed` is NOT reset on flush(), so played_ms
+    // is session-cumulative; subtracting this baseline yields the per-pipeline
+    // elapsed, to which `seek_offset` is added → absolute media time.
+    audio_base_ms: u64,
     mut input_rx: mpsc::Receiver<DecodedVideoFrame>,
     renderer: Arc<V>,
     audio_sink: Arc<A>,
@@ -450,6 +462,12 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
     // Returns None only when the sink has no clock at all (mocks) → wall
     // fallback. `output_latency_ms` folds in so the picture lands when its
     // audio is audible, not when it's merely consumed.
+    // Rebase the cumulative audio clock onto the 0-based media timeline of THIS
+    // pipeline: media = seek_offset + (played_ms - audio_base_ms). Constant per
+    // pipeline; cancels out of the frame-pacing delta (it shifts both pts_base
+    // and the live clock equally), so pacing is unchanged — only the reported
+    // position becomes absolute.
+    let clock_rebase_us = seek_offset.as_micros() as i64 - audio_base_ms as i64 * 1_000;
     let audio_clock_us = |anchor: &mut Option<(u64, Instant)>| -> Option<i64> {
         let played = audio_sink.played_ms()?;
         let lat_us = audio_sink.output_latency_ms() as i64 * 1_000;
@@ -467,7 +485,7 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
         } else {
             p0 as i64 * 1_000
         };
-        Some((pos_us - lat_us).max(0))
+        Some((pos_us + clock_rebase_us - lat_us).max(0))
     };
     loop {
         if stop_flag.load(Ordering::Relaxed) {
@@ -1041,12 +1059,18 @@ async fn av_sync_handler<V: VideoSink, A: AudioSink>(
     }
     let now = Instant::now();
     let start_time = Arc::new(now.checked_sub(seek_offset).unwrap_or(now));
+    // Baseline the cumulative audio clock at the SAME instant as start_time so
+    // the video sync loop can rebase played_ms onto this pipeline's 0-based
+    // media timeline (position = seek_offset + (played - audio_base)).
+    let audio_base_ms = audio_sink.played_ms().unwrap_or(0);
     let stats_audio = Arc::clone(&stats);
     let events_audio = Arc::clone(&events);
     let paused_audio = Arc::clone(&paused);
     let (_, _) = tokio::join!(
         tokio::spawn(video_sync_loop(
             start_time.clone(),
+            seek_offset,
+            audio_base_ms,
             video_rx,
             video_sink,
             audio_sink.clone(),
@@ -2922,8 +2946,13 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             info: video_track_info(representation),
         });
         // Hard restart — seek() flips stop_flag, the user-level play()
-        // loop respawns with the freshly-stored representation.
-        self.seek(self.position());
+        // loop respawns with the freshly-stored representation. Gated on
+        // pipeline_live for the same reason as change_audio_track: a seek
+        // before the first frame would clobber a parked start position
+        // (pending_resume); the play() loop re-reads this cell on start.
+        if self.pipeline_live.load(Ordering::Relaxed) {
+            self.seek(self.position());
+        }
     }
 
     /// Trigger a soft (ABR-style) video representation swap directly,
@@ -3289,7 +3318,20 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
     ) {
         *self.audio_adaptation.lock().unwrap() = Some(adaptation.clone());
         *self.audio_representation.lock().unwrap() = Some(representation.clone());
-        self.seek(self.position());
+        // Only an already-running pipeline needs a seek to restart at the
+        // current position with the new track. BEFORE the pipeline goes live,
+        // a seek here is destructive: position() is still 0 and seek(0) parks
+        // seek_target=Some(0), which the play() loop takes ahead of (shadows)
+        // a parked start position — set_start_position's `pending_resume` —
+        // via `take().or_else(pending_resume)`, silently killing resume. The
+        // play() loop re-reads the representation cells on (re)start, so the
+        // new track is honored at startup WITHOUT a seek. This fires in the
+        // wild because consumers apply a saved audio-language preference right
+        // after prepare() (e.g. BlackZone's applyLanguagePreference), i.e.
+        // exactly between set_start_position() and the pipeline's first frame.
+        if self.pipeline_live.load(Ordering::Relaxed) {
+            self.seek(self.position());
+        }
     }
 
     /// Start playback. Creates platform-specific decoders and feeds them into
@@ -3539,6 +3581,14 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                     .map(|s| s.start_time())
                     .unwrap_or(abs_offset);
                 let snapped_seek_offset = snapped_abs.saturating_sub(origin);
+                // Where this (re)started pipeline actually begins: the 0-based
+                // offset, the segment it snapped to, and the segment count.
+                log::info!(
+                    "[play] start: seek_offset={}ms origin={}ms abs_offset={}ms vidx={} aidx={} snapped={}ms segs={}",
+                    seek_offset.as_millis(), origin.as_millis(), abs_offset.as_millis(),
+                    video_start_index, audio_start_index, snapped_seek_offset.as_millis(),
+                    video_representation.segments.len()
+                );
                 position_ms.store(snapped_seek_offset.as_millis() as u64, Ordering::Relaxed);
                 stats
                     .last_decoded_pts_ms

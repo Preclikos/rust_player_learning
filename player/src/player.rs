@@ -268,6 +268,13 @@ pub struct Player<V: VideoSink = VideoRenderer, A: AudioSink = AudioRenderer> {
     /// Hz) and avoid judder. Default on; the host can disable it via
     /// `set_adaptive_frame_rate(false)` to own display-mode policy itself.
     adaptive_frame_rate: Arc<std::sync::atomic::AtomicBool>,
+    /// Audio passthrough (bitstream): when enabled AND the platform output
+    /// supports it AND the selected track is a passthrough codec (E-AC-3 /
+    /// AC-3 / DTS), the compressed audio is sent to the device's audio sink
+    /// untouched (HDMI → AVR/soundbar decodes it) instead of being decoded to
+    /// PCM. Default OFF — the host opts in via `set_audio_passthrough(true)`,
+    /// and it transparently falls back to PCM decode when unsupported.
+    audio_passthrough: Arc<std::sync::atomic::AtomicBool>,
 
     /// True once the current pipeline has produced its first frame (set in
     /// av_sync_handler after video_ready, reset to false on every pipeline
@@ -324,6 +331,7 @@ impl<V: VideoSink, A: AudioSink> Clone for Player<V, A> {
             subtitle_representation: Arc::clone(&self.subtitle_representation),
             video_output_window: Arc::clone(&self.video_output_window),
             adaptive_frame_rate: Arc::clone(&self.adaptive_frame_rate),
+            audio_passthrough: Arc::clone(&self.audio_passthrough),
             pipeline_live: Arc::clone(&self.pipeline_live),
             pending_resume: Arc::clone(&self.pending_resume),
             video_renderer: Arc::clone(&self.video_renderer),
@@ -2806,6 +2814,7 @@ impl Player<VideoRenderer, AudioRenderer> {
             subtitle_representation: Arc::new(StdMutex::new(None)),
             video_output_window: Arc::new(AtomicUsize::new(0)),
             adaptive_frame_rate: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            audio_passthrough: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pipeline_live: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pending_resume: Arc::new(StdMutex::new(None)),
 
@@ -3241,6 +3250,19 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
     /// effect at the next `play()`.
     pub fn set_adaptive_frame_rate(&self, enabled: bool) {
         self.adaptive_frame_rate
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Opt into audio passthrough (bitstream): when enabled, a passthrough
+    /// codec track (E-AC-3 / AC-3 / DTS) is sent to the audio output untouched
+    /// for an HDMI AVR/soundbar to decode, instead of being decoded to PCM
+    /// here. Default OFF. It self-gates: passthrough only engages if the
+    /// platform sink reports support for the codec AND a passthrough track is
+    /// selected; otherwise it transparently falls back to PCM decode. Takes
+    /// effect at the next `play()`. NB: E-AC-3 needs HDMI — optical (S/PDIF)
+    /// carries only AC-3/DTS core.
+    pub fn set_audio_passthrough(&self, enabled: bool) {
+        self.audio_passthrough
             .store(enabled, std::sync::atomic::Ordering::Relaxed);
     }
 

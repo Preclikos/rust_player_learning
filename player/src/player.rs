@@ -1498,7 +1498,22 @@ async fn drain_video_decoder(
                     stats.last_decoded_pts_ms.store(pts_ms, Ordering::Relaxed);
                 }
                 reorder_buf.push(frame);
-                if reorder_buf.len() > reorder_depth {
+                // Startup fast-path: emit the very first frame as soon as it
+                // is decoded instead of waiting for the reorder buffer to fill
+                // (reorder_depth + 1 frames). At a cold start / post-seek the
+                // first decoded frame is the segment-start IDR keyframe — the
+                // lowest PTS in its GOP — so emitting it early can't reorder
+                // ahead of an earlier frame. This is exactly the wait that
+                // gates time-to-first-frame (video_ready → av_sync). Restricted
+                // to `splice.is_none()`: an ABR swap mid-play needs the full
+                // reorder discipline (its first kept frame is mid-GOP, not an
+                // IDR) and doesn't show startup latency anyway.
+                let ready = if !*first_frame_signaled && splice.is_none() {
+                    !reorder_buf.is_empty()
+                } else {
+                    reorder_buf.len() > reorder_depth
+                };
+                if ready {
                     let min_idx = reorder_buf
                         .iter()
                         .enumerate()

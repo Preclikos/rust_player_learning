@@ -9,6 +9,7 @@ mod manifest;
 mod net;
 mod parsers;
 mod renderers;
+mod subtitle_style;
 mod tracks;
 mod utils;
 
@@ -22,6 +23,7 @@ pub use events::{
 };
 pub use ffmpeg_log::{set_log_level, LogLevel};
 pub use hdr_tonemap::HdrTonemapParams;
+pub use subtitle_style::SubtitleStyle;
 pub use net::{
     BoxError, HttpClient, LicenseResolver, NoopInterceptor, PreparedRequest,
     RequestInterceptor, RequestKind, RetryPolicy,
@@ -817,6 +819,17 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
         let interval_ms = if last_render_elapsed > 0 { render_start - last_render_elapsed } else { 0 };
         let delta_pts = pts_ms.saturating_sub(last_pts_ms);
 
+        // DIAG: per-frame pacing. interval_ms = wall ms between renders (~41 at
+        // 24fps; jitter here = judder), elapsed = master clock, pts_to_go = the
+        // scheduled lead. Reveals clock-jitter judder that doesn't trip LATE.
+        if frame_idx % 60 == 0 {
+            log::info!(
+                "[vsync] f#{} pts={}ms elapsed={}ms interval={}ms dpts={}ms pts_to_go={}ms",
+                frame_idx, pts_ms, elapsed_us / 1000, interval_ms, delta_pts,
+                pts_to_go_ns / 1_000_000
+            );
+        }
+
         last_pts_ms = pts_ms;
         last_render_elapsed = render_start;
         frame_idx += 1;
@@ -1149,7 +1162,16 @@ async fn av_sync_handler<V: VideoSink, A: AudioSink>(
     // Baseline the cumulative audio clock at the SAME instant as start_time so
     // the video sync loop can rebase played_ms onto this pipeline's 0-based
     // media timeline (position = seek_offset + (played - audio_base)).
-    let audio_base_ms = audio_sink.played_ms().unwrap_or(0);
+    // Passthrough's AudioTrack played_ms is ALREADY 0-based from this
+    // pipeline's start (fresh track playing seek_offset content from 0), and
+    // it has typically been playing for the video-startup duration by now — so
+    // its base is 0, not the (late, non-zero) anchor snapshot, which would make
+    // the clock lag by that pre-anchor playback (audio running seconds ahead).
+    let audio_base_ms = if audio_sink.is_passthrough() {
+        0
+    } else {
+        audio_sink.played_ms().unwrap_or(0)
+    };
     log::debug!("[av_sync] spawning sync loops (audio_base={}ms)", audio_base_ms);
     let stats_audio = Arc::clone(&stats);
     let events_audio = Arc::clone(&events);
@@ -2047,6 +2069,171 @@ async fn audio_play(
     let (dl_res, dec_res) = join!(download_task, decoder_task);
     log_task_result("audio download_task", dl_res);
     log_task_result("audio decoder_task", dec_res);
+    Ok(())
+}
+
+/// Audio passthrough feed: download + decrypt the audio segments, slice the
+/// compressed access units out of the mp4 samples and write them straight to
+/// the bitstream sink (no decode, no PCM channel). Mirrors `audio_play`'s
+/// download path; the decoder + `audio_sync_loop` are bypassed. Pre-target AUs
+/// are dropped so audio begins at the seek target, matching video's
+/// frame-accurate discard, so A/V line up under the passthrough clock.
+#[cfg(target_os = "android")]
+async fn audio_passthrough_play(
+    audio_representation: AudioRepresentation,
+    start_index: usize,
+    sink: Arc<dyn crate::renderers::AudioPassthrough>,
+    audio_ready: Arc<Notify>,
+    stop: Arc<Notify>,
+    stop_flag: Arc<AtomicBool>,
+    decryptor: Option<Arc<dyn Decryptor>>,
+    http: Arc<HttpClient>,
+    stats: Arc<StatsState>,
+    segments_in_flight: usize,
+    discard_below_us: i64,
+    pipeline_live: Arc<AtomicBool>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let (download_tx, download_rx) = mpsc::channel::<DataSegment>(segments_in_flight);
+
+    let init_dl = audio_representation
+        .segment_init
+        .download(&http, RequestKind::InitSegment)
+        .await
+        .map_err(|e| -> Box<dyn Error + Send + Sync> {
+            format!("audio init download: {}", e).into()
+        })?;
+    let init_data = init_dl.data;
+    let track_crypto = setup_track_crypto(&init_data, decryptor, "audio").await?;
+
+    let segments = audio_representation.segments.clone();
+    let download = task::spawn(download_task(
+        segments,
+        start_index,
+        download_tx,
+        stop,
+        stop_flag.clone(),
+        http,
+        Some(Arc::clone(&stats)),
+        None,
+        Arc::new(AtomicUsize::new(usize::MAX)),
+    ));
+    let feed = task::spawn(audio_passthrough_task(
+        download_rx,
+        sink,
+        init_data,
+        audio_ready,
+        track_crypto,
+        stop_flag,
+        discard_below_us,
+        pipeline_live,
+    ));
+    let (dl_res, feed_res) = join!(download, feed);
+    log_task_result("audio download_task (passthrough)", dl_res);
+    log_task_result("audio passthrough_task", feed_res);
+    Ok(())
+}
+
+#[cfg(target_os = "android")]
+async fn audio_passthrough_task(
+    mut receiver: Receiver<DataSegment>,
+    sink: Arc<dyn crate::renderers::AudioPassthrough>,
+    init_data: Vec<u8>,
+    audio_ready: Arc<Notify>,
+    track_crypto: Option<TrackCrypto>,
+    stop_flag: Arc<AtomicBool>,
+    discard_below_us: i64,
+    pipeline_live: Arc<AtomicBool>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let mut first_au_written = false;
+    let mut au_count = 0u64;
+    let mut base_pts_ms: i64 = 0;
+    while let Some(segment) = receiver.recv().await {
+        if stop_flag.load(Ordering::Relaxed) {
+            break;
+        }
+        let mut data_vec = init_data.clone();
+        data_vec.extend_from_slice(&segment.data[..]);
+        decrypt_segment_in_place(&mut data_vec, track_crypto.as_ref())?;
+
+        let sample_info: Vec<(usize, usize, i64, u64)> = {
+            let mp4 = Mp4::read_bytes(&data_vec)
+                .map_err(|e| -> Box<dyn Error + Send + Sync> { format!("mp4: {}", e).into() })?;
+            let (_id, track) = mp4
+                .tracks()
+                .first_key_value()
+                .ok_or_else(|| -> Box<dyn Error + Send + Sync> { "no track".into() })?;
+            track
+                .samples
+                .iter()
+                .map(|s| (s.offset as usize, s.size as usize, s.composition_timestamp, s.timescale))
+                .collect()
+        };
+
+        for (offset, size, ts, ts_scale) in sample_info {
+            if stop_flag.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            if offset + size > data_vec.len() {
+                continue;
+            }
+            let pts_us = if ts_scale > 0 { ts * 1_000_000 / ts_scale as i64 } else { 0 };
+            // Frame-accurate seek: drop AUs before the target.
+            if pts_us < discard_below_us {
+                continue;
+            }
+            let au_ms = pts_us / 1000;
+            if !first_au_written {
+                // Start audio only once video is live (pipeline_live), so the
+                // two begin together. Otherwise the feed plays the first AU
+                // immediately while video is still ~1-2s from its first frame,
+                // and audio runs that far ahead for the whole pipeline.
+                while !pipeline_live.load(Ordering::Relaxed) {
+                    if stop_flag.load(Ordering::Relaxed) {
+                        return Ok(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                base_pts_ms = au_ms;
+            }
+            // Pace the feed to the PLAYBACK HEAD: keep the write at most AHEAD_MS
+            // of media ahead of what's actually playing. AudioTrack.write does
+            // NOT back-pressure (HDMI swallows the bitstream faster than
+            // realtime). Pacing on wall time instead buffered the whole
+            // video-startup gap (~2s, while the track sat paused) ahead of
+            // playback — exactly the offset we measured (write_ahead≈1970ms).
+            // Head-pacing bounds it to AHEAD_MS. Safe from the earlier deadlock
+            // now that the track only starts at the av_sync anchor, so `played`
+            // reliably advances once playback begins (during the pre-anchor
+            // prime, played==0 and we fill just AHEAD_MS, then wait for play()).
+            const AHEAD_MS: i64 = 200;
+            loop {
+                if stop_flag.load(Ordering::Relaxed) {
+                    return Ok(());
+                }
+                let played = sink.played_ms().unwrap_or(0) as i64;
+                if au_ms - (base_pts_ms + played) <= AHEAD_MS {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            // `block_in_place`: hand this worker's other tasks (the video decode
+            // pipeline!) to a sibling worker while the JNI write runs.
+            let au = &data_vec[offset..offset + size];
+            tokio::task::block_in_place(|| sink.write(au));
+            au_count += 1;
+            if !first_au_written {
+                audio_ready.notify_one();
+                first_au_written = true;
+            }
+            if au_count % 48 == 0 {
+                let head = base_pts_ms + sink.played_ms().unwrap_or(0) as i64;
+                log::info!(
+                    "[audio-pt] au={}ms head={}ms write_ahead={}ms",
+                    au_ms, head, au_ms - head
+                );
+            }
+        }
+    }
     Ok(())
 }
 
@@ -3310,6 +3497,20 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         Ok(())
     }
 
+    /// Set the subtitle overlay's visual style — text/outline colour and a
+    /// size multiplier (see [`SubtitleStyle`]). Values are sanitised into
+    /// the safe rendering range before being applied, and the change takes
+    /// effect on the next cue draw (any cached rasterization is dropped).
+    ///
+    /// Like `set_hdr_tonemap`, the player does **not** persist this across
+    /// runs; the host round-trips the user's choice through its own
+    /// settings and calls this on every init. No-op on sinks that don't
+    /// own subtitle rendering. A future libass backend will read the same
+    /// struct, so styling set here survives that migration.
+    pub fn set_subtitle_style(&self, style: SubtitleStyle) {
+        self.video_renderer.set_subtitle_style(style.sanitised());
+    }
+
     /// Select a subtitle track. Spawns the text_play pipeline
     /// immediately — works regardless of whether `play()` is currently
     /// running, has finished, or hasn't been called yet. Single-file
@@ -3645,6 +3846,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             .and_then(|a| a.fps());
         let pending_resume = Arc::clone(&self.pending_resume);
         let pipeline_live = Arc::clone(&self.pipeline_live);
+        let audio_passthrough = Arc::clone(&self.audio_passthrough);
         let play = tokio::spawn(async move {
             // ABR tick runs once for the whole play() lifetime (survives
             // every seek/track-switch restart below). On Manual it's a
@@ -3682,6 +3884,15 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                         .or_else(|| pending_resume.lock().unwrap().take())
                         .unwrap_or(Duration::ZERO)
                 };
+
+                // Release any passthrough sink from the previous pipeline
+                // BEFORE this iteration creates a new one — only one compressed
+                // AudioTrack may own the HDMI output at a time, so creating the
+                // next while the old is alive conflicts (the seek crash). The
+                // previous audio task has already joined (join! below), so this
+                // drops the last ref → old AudioTrack stop+release. Also
+                // un-pauses the cpal path for a possible PCM track this round.
+                audio_sink.set_passthrough(None);
 
                 // Hard reset the audio sink before the (re)started pipeline
                 // pumps samples — drops the previous pipeline's residual
@@ -3850,20 +4061,85 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                 ));
 
                 let sample_rate = audio_sink.sample_rate();
-                let audio = tokio::spawn(audio_play(
-                    audio_representation,
-                    audio_start_index,
-                    audio_ready.clone(),
-                    sample_sender,
-                    sample_rate,
-                    stop.clone(),
-                    stop_flag.clone(),
-                    decryptor_snapshot,
-                    audio_decoder,
-                    Arc::clone(&http),
-                    Arc::clone(&stats),
-                    seg_in_flight,
-                ));
+                // Audio passthrough decision: host opted in AND the selected
+                // track is a passthrough codec. The sink create self-gates
+                // (None on unsupported → PCM). When engaged, feed raw AUs to
+                // the bitstream sink and let av_sync's audio_sync_loop no-op
+                // (its sample channel is dropped → recv None → returns).
+                let want_passthrough = audio_passthrough.load(Ordering::Relaxed)
+                    && matches!(audio_representation.codecs.as_str(), "ec-3" | "ac-3");
+                let audio;
+                #[cfg(target_os = "android")]
+                {
+                    let pt_sink: Option<Arc<dyn crate::renderers::AudioPassthrough>> =
+                        if want_passthrough {
+                            let enc = if audio_representation.codecs == "ac-3" {
+                                renderers::audio_passthrough::ENCODING_AC3
+                            } else {
+                                renderers::audio_passthrough::ENCODING_E_AC3
+                            };
+                            renderers::audio_passthrough::AudioTrackSink::new(
+                                enc,
+                                audio_representation.audio_sampling_rate,
+                                audio_representation.channels.unwrap_or(6) as u16,
+                            )
+                            .map(|s| Arc::new(s) as Arc<dyn crate::renderers::AudioPassthrough>)
+                        } else {
+                            None
+                        };
+                    audio_sink.set_passthrough(pt_sink.clone());
+                    audio = if let Some(sink) = pt_sink {
+                        drop(sample_sender);
+                        log::info!("[audio] passthrough engaged ({})", audio_representation.codecs);
+                        tokio::spawn(audio_passthrough_play(
+                            audio_representation,
+                            audio_start_index,
+                            sink,
+                            audio_ready.clone(),
+                            stop.clone(),
+                            stop_flag.clone(),
+                            decryptor_snapshot,
+                            Arc::clone(&http),
+                            Arc::clone(&stats),
+                            seg_in_flight,
+                            discard_below_us,
+                            Arc::clone(&pipeline_live),
+                        ))
+                    } else {
+                        tokio::spawn(audio_play(
+                            audio_representation,
+                            audio_start_index,
+                            audio_ready.clone(),
+                            sample_sender,
+                            sample_rate,
+                            stop.clone(),
+                            stop_flag.clone(),
+                            decryptor_snapshot,
+                            audio_decoder,
+                            Arc::clone(&http),
+                            Arc::clone(&stats),
+                            seg_in_flight,
+                        ))
+                    };
+                }
+                #[cfg(not(target_os = "android"))]
+                {
+                    let _ = want_passthrough;
+                    audio = tokio::spawn(audio_play(
+                        audio_representation,
+                        audio_start_index,
+                        audio_ready.clone(),
+                        sample_sender,
+                        sample_rate,
+                        stop.clone(),
+                        stop_flag.clone(),
+                        decryptor_snapshot,
+                        audio_decoder,
+                        Arc::clone(&http),
+                        Arc::clone(&stats),
+                        seg_in_flight,
+                    ));
+                }
 
                 // New pipeline: not "live" until it produces its first frame.
                 // Gates the ABR tick off this fragile startup window.

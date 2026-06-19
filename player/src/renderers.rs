@@ -23,6 +23,12 @@ pub trait VideoSink: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Apply subtitle styling (text/outline colour, size multiplier).
+    /// Default no-op so sinks that don't render subtitles keep compiling.
+    /// Sinks that own the overlay store it and invalidate any cached
+    /// rasterization. Mirrors `set_hdr_tonemap_params`.
+    fn set_subtitle_style(&self, _style: crate::SubtitleStyle) {}
+
     /// Queue parsed cues for rendering. The sink keeps an internal list
     /// and picks the one active at the current playback PTS. Called by
     /// the text_play pipeline as cues arrive.
@@ -62,6 +68,25 @@ pub trait VideoSink: Send + Sync + 'static {
     /// its bottom edge here so cues clear TV overscan / system bars. Default:
     /// ignored (0 → renderer falls back to a 10% TV title-safe margin).
     fn set_subtitle_safe_bottom_px(&self, _px: u32) {}
+}
+
+/// A compressed-bitstream audio output (audio passthrough): the audio pipeline
+/// writes raw access units, the device decodes them (HDMI → AVR/soundbar). When
+/// one is installed on an [`AudioSink`] via [`AudioSink::set_passthrough`], the
+/// sink delegates its clock/lifecycle here so the rest of the player drives it
+/// through the same interface without knowing it's a bitstream. Object-safe so
+/// the platform impl (Android `AudioTrackSink`) reaches the generic pipeline.
+pub trait AudioPassthrough: Send + Sync {
+    /// Write one compressed access unit (blocking — back-pressures the feed to
+    /// the receiver's consumption rate, which makes the playback head a clock).
+    fn write(&self, au: &[u8]);
+    /// Playback-head position in media ms (the passthrough clock source).
+    fn played_ms(&self) -> Option<u64>;
+    fn output_latency_ms(&self) -> u64 {
+        0
+    }
+    fn flush(&self);
+    fn set_paused(&self, paused: bool);
 }
 
 /// Receives decoded PCM audio and feeds it to the output device.
@@ -105,6 +130,20 @@ pub trait AudioSink: Send + Sync + 'static {
     /// `Player::pause()` calls this so the cpal stream halts and we don't
     /// burn through whatever was already queued.
     fn set_paused(&self, paused: bool);
+
+    /// Install (or clear) a passthrough output. While set, the sink's PCM path
+    /// is dormant and `played_ms`/`output_latency_ms`/`flush`/`set_paused`
+    /// delegate to the passthrough, so `MediaClock` paces to the AVR's real
+    /// output. Default: ignored (sinks without passthrough support).
+    fn set_passthrough(&self, _pt: Option<std::sync::Arc<dyn AudioPassthrough>>) {}
+
+    /// True while a passthrough output is engaged. The clock rebase differs:
+    /// a passthrough sink's `played_ms` is already 0-based from THIS pipeline's
+    /// start (a fresh AudioTrack per play), so its base is 0 — unlike the cpal
+    /// counter, which is session-cumulative and must be baselined at the anchor.
+    fn is_passthrough(&self) -> bool {
+        false
+    }
 
     /// Latest L/R peak in dB (range roughly -120..=0). `None` before the
     /// first audio frame has been pushed. Surfaced via `PlayerEvent::Stats`

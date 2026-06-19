@@ -50,6 +50,12 @@ pub struct AudioRenderer {
     /// the speaker — otherwise video leads by this much at every
     /// (re)start, the "audio delayed after a seek/switch" symptom.
     output_latency_ms: Arc<AtomicU64>,
+    /// When set (audio passthrough engaged), the cpal PCM path is dormant and
+    /// this bitstream output is the real output + clock source: `played_ms` /
+    /// `output_latency_ms` / `flush` / `set_paused` delegate to it, so
+    /// `MediaClock` and the rest of the player drive it through the same
+    /// `AudioSink` interface without knowing it's a compressed bitstream.
+    passthrough: std::sync::Mutex<Option<Arc<dyn super::AudioPassthrough>>>,
 }
 
 enum AudioRendererCommand {
@@ -165,6 +171,7 @@ impl AudioRenderer {
             peak_seen: Arc::new(AtomicBool::new(false)),
             samples_consumed,
             output_latency_ms,
+            passthrough: std::sync::Mutex::new(None),
         }
     }
 
@@ -477,6 +484,10 @@ impl super::AudioSink for AudioRenderer {
     }
 
     fn played_ms(&self) -> Option<u64> {
+        // Passthrough: the bitstream output's playback head is the clock source.
+        if let Some(pt) = self.passthrough.lock().unwrap().as_ref() {
+            return pt.played_ms();
+        }
         if self.sample_rate == 0 {
             return None;
         }
@@ -487,11 +498,31 @@ impl super::AudioSink for AudioRenderer {
     }
 
     fn output_latency_ms(&self) -> u64 {
+        if let Some(pt) = self.passthrough.lock().unwrap().as_ref() {
+            return pt.output_latency_ms();
+        }
         AudioRenderer::output_latency_ms(self)
     }
 
     fn flush(&self) {
+        if let Some(pt) = self.passthrough.lock().unwrap().as_ref() {
+            pt.flush();
+            return;
+        }
         AudioRenderer::flush(self)
+    }
+
+    fn is_passthrough(&self) -> bool {
+        self.passthrough.lock().unwrap().is_some()
+    }
+
+    fn set_passthrough(&self, pt: Option<Arc<dyn super::AudioPassthrough>>) {
+        // Engaging passthrough silences the cpal PCM path so it doesn't fight
+        // the compressed AudioTrack for the HDMI output (concurrent PCM
+        // disconnects the bitstream stream — the EPIPE / underrun spam).
+        let engaging = pt.is_some();
+        *self.passthrough.lock().unwrap() = pt;
+        self.paused_flag.store(engaging, Ordering::Relaxed);
     }
 
     fn stop(&self) -> impl std::future::Future<Output = ()> + Send + '_ {
@@ -511,6 +542,10 @@ impl super::AudioSink for AudioRenderer {
     }
 
     fn set_paused(&self, paused: bool) {
+        if let Some(pt) = self.passthrough.lock().unwrap().as_ref() {
+            pt.set_paused(paused);
+            return;
+        }
         AudioRenderer::set_paused(self, paused)
     }
 

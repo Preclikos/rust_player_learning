@@ -2430,6 +2430,11 @@ impl super::VideoSink for VideoRenderer {
         overlay.set_font(bytes)
     }
 
+    fn set_subtitle_style(&self, style: crate::SubtitleStyle) {
+        let overlay = self.ensure_subtitle_overlay();
+        overlay.set_style(style);
+    }
+
     fn queue_subtitle_cues(&self, cues: Vec<crate::parsers::vtt::VttCue>) {
         if cues.is_empty() {
             return;

@@ -33,10 +33,29 @@ fn android_vm() -> jni::JavaVM {
     unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) }
 }
 
+/// CLOCK_MONOTONIC now, in ns — the timebase of `AudioTimestamp.nanoTime`
+/// (TIMEBASE_MONOTONIC, the default), so we can interpolate the timestamp's
+/// frame position to the current instant.
+fn clock_monotonic_ns() -> i64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    ts.tv_sec as i64 * 1_000_000_000 + ts.tv_nsec as i64
+}
+
 /// A compressed-bitstream `AudioTrack`. The clock source for passthrough.
 pub struct AudioTrackSink {
     track: GlobalRef<JObject<'static>>,
     sample_rate: u32,
+    /// Set in Drop before stop/release; write/played_ms/lifecycle become no-ops
+    /// so a feed or the clock touching the track mid-teardown can't hit a
+    /// stopped/released native object (the seek-time crash).
+    stopped: std::sync::atomic::AtomicBool,
+    /// False until the first AU is written, at which point we lazily `play()`.
+    /// We must NOT `play()` an empty direct track nor call `getTimestamp` before
+    /// it's playing — the framework reports "dead IAudioTrack" and recreates it
+    /// in a loop (no audio). The feed gates the first write on video readiness,
+    /// so playback begins with the first real audio, in step with video.
+    started: std::sync::atomic::AtomicBool,
 }
 
 // The GlobalRef + VM handle are thread-safe to use from the audio task.
@@ -179,16 +198,25 @@ impl AudioTrackSink {
             if state != STATE_INITIALIZED {
                 return Err(jni::errors::Error::JavaException);
             }
-            env.call_method(&track, jni::jni_str!("play"), jni::jni_sig!("()V"), &[])?;
+            // Do NOT play() here. av_sync starts the track (via set_paused
+            // (false)) at the SAME instant it renders the first video frame, so
+            // audio can't race seconds ahead during the video-decode startup
+            // (the "audio way ahead" bug). The feed primes the buffer meanwhile
+            // (write blocks on the full stopped-track buffer until play()).
             env.new_global_ref(&track)
         });
         match res {
             Ok(track) => {
                 log::info!(
-                    "[audio-pt] AudioTrack passthrough started: encoding={} {}Hz {}ch",
+                    "[audio-pt] AudioTrack passthrough configured (paused): encoding={} {}Hz {}ch",
                     encoding, sample_rate, channels
                 );
-                Some(Self { track, sample_rate })
+                Some(Self {
+                    track,
+                    sample_rate,
+                    stopped: std::sync::atomic::AtomicBool::new(false),
+                    started: std::sync::atomic::AtomicBool::new(false),
+                })
             }
             Err(e) => {
                 log::warn!("[audio-pt] AudioTrack passthrough init failed: {}", e);
@@ -201,6 +229,9 @@ impl AudioTrackSink {
     /// the receiver's consumption rate, which is what makes the playback head a
     /// usable clock).
     pub fn write(&self, au: &[u8]) {
+        if self.stopped.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
         let vm = android_vm();
         let _ = vm.attach_current_thread(|env| -> Result<(), jni::errors::Error> {
             let arr = env.byte_array_from_slice(au)?;
@@ -213,31 +244,82 @@ impl AudioTrackSink {
             )?;
             Ok(())
         });
+        // Lazily start playback on the first AU: the track now has real data, so
+        // play() begins output with actual audio (no silent pre-roll counted by
+        // the clock, no "dead IAudioTrack" from getTimestamp on an idle track).
+        if !self.started.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            self.call_void(jni::jni_str!("play"));
+        }
     }
 
-    /// Frames played, as milliseconds — the passthrough clock source.
+    /// Presented-frame position as milliseconds — the passthrough clock source.
+    ///
+    /// Uses `AudioTrack.getTimestamp()` (precise presentation `framePosition`),
+    /// which gives a smooth, accurate position regardless of how coarsely the
+    /// playback head updates — `getPlaybackHeadPosition` alone is bursty for
+    /// compressed passthrough, so MediaClock's interpolation froze between
+    /// updates and video stuttered. Falls back to the head before the first
+    /// timestamp is available.
     pub fn played_ms(&self) -> Option<u64> {
-        if self.sample_rate == 0 {
+        // Before the first AU (track not playing) getTimestamp churns the track
+        // ("dead IAudioTrack"); report no clock so MediaClock uses its wall
+        // fallback until audio actually starts.
+        if self.sample_rate == 0
+            || !self.started.load(std::sync::atomic::Ordering::Acquire)
+            || self.stopped.load(std::sync::atomic::Ordering::Acquire)
+        {
             return None;
         }
         let vm = android_vm();
-        let res = vm.attach_current_thread(|env| -> Result<i32, jni::errors::Error> {
-            Ok(env
+        let res = vm.attach_current_thread(|env| -> Result<i64, jni::errors::Error> {
+            let ts = env.new_object(
+                jni::jni_str!("android/media/AudioTimestamp"),
+                jni::jni_sig!("()V"),
+                &[],
+            )?;
+            let have_ts = env
                 .call_method(
                     self.track.as_obj(),
-                    jni::jni_str!("getPlaybackHeadPosition"),
-                    jni::jni_sig!("()I"),
-                    &[],
+                    jni::jni_str!("getTimestamp"),
+                    jni::jni_sig!("(Landroid/media/AudioTimestamp;)Z"),
+                    &[(&ts).into()],
                 )?
-                .i()?)
+                .z()?;
+            if have_ts {
+                // AudioTimestamp public fields (long): the presented frame at
+                // CLOCK_MONOTONIC instant `nanoTime`. Interpolate to NOW —
+                // returning the stale framePosition jitters the clock by the
+                // (now − nanoTime) staleness, which judders the video.
+                let frame_pos = env
+                    .get_field(&ts, jni::jni_str!("framePosition"), jni::jni_sig!("J"))?
+                    .j()?;
+                let nano_time = env
+                    .get_field(&ts, jni::jni_str!("nanoTime"), jni::jni_sig!("J"))?
+                    .j()?;
+                let dt_ns = clock_monotonic_ns() - nano_time;
+                Ok(frame_pos + dt_ns * self.sample_rate as i64 / 1_000_000_000)
+            } else {
+                let head = env
+                    .call_method(
+                        self.track.as_obj(),
+                        jni::jni_str!("getPlaybackHeadPosition"),
+                        jni::jni_sig!("()I"),
+                        &[],
+                    )?
+                    .i()?;
+                Ok(head as u32 as i64)
+            }
         });
         match res {
-            Ok(frames) => Some((frames as u32 as u64) * 1000 / self.sample_rate as u64),
+            Ok(frames) => Some((frames.max(0) as u64) * 1000 / self.sample_rate as u64),
             Err(_) => None,
         }
     }
 
     fn call_void(&self, method: &'static jni::strings::JNIStr) {
+        if self.stopped.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
         let vm = android_vm();
         let _ = vm.attach_current_thread(|env| -> Result<(), jni::errors::Error> {
             env.call_method(self.track.as_obj(), method, jni::jni_sig!("()V"), &[])?;
@@ -256,9 +338,40 @@ impl AudioTrackSink {
     }
 }
 
+impl crate::renderers::AudioPassthrough for AudioTrackSink {
+    fn write(&self, au: &[u8]) {
+        AudioTrackSink::write(self, au)
+    }
+    fn played_ms(&self) -> Option<u64> {
+        AudioTrackSink::played_ms(self)
+    }
+    fn flush(&self) {
+        AudioTrackSink::flush(self)
+    }
+    fn set_paused(&self, paused: bool) {
+        // Until the first AU is written the track must not play (empty direct
+        // track → "dead IAudioTrack"); the lazy start in write() handles it.
+        if !self.started.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        if paused {
+            self.pause()
+        } else {
+            self.play()
+        }
+    }
+}
+
 impl Drop for AudioTrackSink {
     fn drop(&mut self) {
-        self.call_void(jni::jni_str!("stop"));
-        self.call_void(jni::jni_str!("release"));
+        // Block concurrent write/clock callers first, then stop+release the
+        // native track DIRECTLY (the guarded call_void would now no-op).
+        self.stopped.store(true, std::sync::atomic::Ordering::Release);
+        let vm = android_vm();
+        let _ = vm.attach_current_thread(|env| -> Result<(), jni::errors::Error> {
+            env.call_method(self.track.as_obj(), jni::jni_str!("stop"), jni::jni_sig!("()V"), &[])?;
+            env.call_method(self.track.as_obj(), jni::jni_str!("release"), jni::jni_sig!("()V"), &[])?;
+            Ok(())
+        });
     }
 }

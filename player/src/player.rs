@@ -535,6 +535,13 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
     // the chunky audio-played counter ≈ the true offset).
     let mut drift_min_window = i64::MAX;
     let mut emitted_playing = false;
+    // Have we presented at least one frame on this pipeline run? Drives the
+    // seek-while-paused preview: the pause gate below only parks AFTER one
+    // frame is on screen, so a fresh pipeline (cold start or post-seek)
+    // always paints its first at-target frame even when paused — the user
+    // sees where they landed instead of a stale frozen frame. Pauses during
+    // playback (presented_frame already true) park immediately as before.
+    let mut presented_frame = false;
     // Starvation tracking — flips when the decoder hasn't produced a
     // frame for >300 ms (typically a network outage hitting the
     // download side and propagating through the empty decoder queue).
@@ -565,8 +572,10 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
             break;
         }
         // Park here if pause() was called. Note: when stop fires during
-        // a pause, we still want to exit cleanly.
-        if paused.load(Ordering::Relaxed) {
+        // a pause, we still want to exit cleanly. Gated on `presented_frame`
+        // so a seek/start while paused still paints one frame (see above)
+        // before we honour the pause.
+        if paused.load(Ordering::Relaxed) && presented_frame {
             let pause_started = Instant::now();
             tokio::select! {
                 _ = pause_notify.notified() => {}
@@ -842,8 +851,11 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
         renderer.set_subtitle_pts(pts_ms as i64);
 
         // Emit `Playing` once on the first rendered frame after a sync
-        // loop (re)starts. Buffering→Playing transition.
-        if !emitted_playing {
+        // loop (re)starts (Buffering→Playing transition) — but NOT for a
+        // preview frame painted while paused: that must keep the consumer's
+        // state Paused. Leaving emitted_playing false means the first frame
+        // after resume makes the transition.
+        if !emitted_playing && !paused.load(Ordering::Relaxed) {
             let _ = events.send(PlayerEvent::Playing);
             emitted_playing = true;
         }
@@ -851,6 +863,8 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
         let frame_w = frame.width;
         let frame_h = frame.height;
         renderer.render_frame(frame).await;
+        // One frame is now on screen — from here the pause gate parks.
+        presented_frame = true;
 
         let render_done = start_time
             .elapsed()

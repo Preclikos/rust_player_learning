@@ -1977,6 +1977,10 @@ impl VideoRenderer {
             self.queue.submit([encoder.finish()]);
             self.pre_present_notify();
             self.queue.present(surface_texture);
+            // Drain deferred destruction here too (see the main path below) —
+            // this degraded clear-loop runs every frame when renderer init
+            // failed, so it would otherwise accumulate for the whole session.
+            let _ = self.device.poll(wgpu::PollType::Poll);
             return;
         };
 
@@ -2134,6 +2138,16 @@ impl VideoRenderer {
                 keep.pop_front();
             }
         }
+
+        // Drain wgpu's deferred-destruction queue once per frame — same as the
+        // Vulkan path below. Even though the OES path imports the video texture
+        // outside wgpu (the present hook does raw GL), every frame still does
+        // `queue.submit([])` + `present()`, whose per-submission tracking sits
+        // in `Device::lock_life` until something polls. Without this they
+        // accumulate for the whole session — memory climbs and the per-submit
+        // bookkeeping grows, surfacing as playback that's smooth at first and
+        // progressively stutters. `Maintain::Poll` is non-blocking.
+        let _ = self.device.poll(wgpu::PollType::Poll);
     }
 
     #[cfg(target_os = "android")]
@@ -2238,6 +2252,10 @@ impl VideoRenderer {
             self.queue.submit([encoder.finish()]);
             self.pre_present_notify();
             self.queue.present(surface_texture);
+            // Drain deferred destruction here too (see the main path below) —
+            // this degraded clear-loop runs every frame when renderer init
+            // failed, so it would otherwise accumulate for the whole session.
+            let _ = self.device.poll(wgpu::PollType::Poll);
             return;
         };
 

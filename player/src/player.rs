@@ -542,6 +542,12 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
     // sees where they landed instead of a stale frozen frame. Pauses during
     // playback (presented_frame already true) park immediately as before.
     let mut presented_frame = false;
+    // Per-second HEALTH heartbeat baselines: previous cumulative counters,
+    // so the stats tick can log frame DROPS and DECODES as a per-second
+    // delta (a climbing cumulative number is hard to read live). See the
+    // stats emit block below.
+    let mut last_health_dropped = 0u64;
+    let mut last_health_decoded = 0u64;
     // Starvation tracking — flips when the decoder hasn't produced a
     // frame for >300 ms (typically a network outage hitting the
     // download side and propagating through the empty decoder queue).
@@ -925,16 +931,39 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
             }
             drift_min_window = i64::MAX;
             let decoder_name = stats.decoder_name.lock().unwrap().clone();
+            // Hoist the counters out of the event literal: net_stall_ms is
+            // swap-reset on read, and the HEALTH line below reuses all of them.
+            let decoded_total = stats.video_frames_decoded.load(Ordering::Relaxed);
+            let dropped_total = stats.video_frames_dropped.load(Ordering::Relaxed);
+            let net_stall = stats.net_stall_ms.swap(0, Ordering::Relaxed);
             let _ = events.send(PlayerEvent::Stats {
-                video_frames_decoded: stats.video_frames_decoded.load(Ordering::Relaxed),
-                video_frames_dropped: stats.video_frames_dropped.load(Ordering::Relaxed),
+                video_frames_decoded: decoded_total,
+                video_frames_dropped: dropped_total,
                 audio_underruns: stats.audio_underruns.load(Ordering::Relaxed),
-                net_stall_ms: stats.net_stall_ms.swap(0, Ordering::Relaxed),
+                net_stall_ms: net_stall,
                 decoder_name,
                 current_resolution: Some((frame_w, frame_h)),
                 audio_peak_db: audio_sink.last_peak_db(),
                 av_drift_ms: drift_out,
             });
+
+            // HEALTH heartbeat: a single warn line per second WHEN something
+            // is off — frames dropped this second, A/V drift past ~2 frames,
+            // or the decoder blocked on the network. Deltas (not cumulative)
+            // so a glance at logcat shows the pattern: e.g. `drops=+2/s` every
+            // ~2s points at the segment-boundary LATE drain. Silent when
+            // healthy so it doesn't drown the log.
+            let dropped_delta = dropped_total.saturating_sub(last_health_dropped);
+            let decoded_delta = decoded_total.saturating_sub(last_health_decoded);
+            last_health_dropped = dropped_total;
+            last_health_decoded = decoded_total;
+            let drift = drift_out.unwrap_or(0);
+            if dropped_delta > 0 || drift.abs() > 80 || net_stall > 0 {
+                log::warn!(
+                    "[vsync] HEALTH drops=+{}/s decoded={}/s drift={}ms net_stall={}ms res={}x{}",
+                    dropped_delta, decoded_delta, drift, net_stall, frame_w, frame_h
+                );
+            }
             last_stats_emit = Instant::now();
         }
 

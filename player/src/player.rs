@@ -564,6 +564,13 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
     // on the first frame as (raw_pts - elapsed), making frame 0 render immediately
     // and all subsequent frames at their correct relative positions.
     let mut pts_base: Option<u64> = None;
+    // Presentation-schedule anchor: (CLOCK_MONOTONIC ns, pts_us_rel) that locks
+    // the per-frame release/present timestamp to the PTS cadence instead of
+    // recomputing `now + (pts − audio_clock)` every frame (which injected the
+    // audio clock's quantization jitter into the schedule = judder). Re-anchored
+    // on resume, on a LATE drain, or when the locked cadence drifts out of its
+    // lead window (see the present block below).
+    let mut present_anchor: Option<(i64, i64)> = None;
     // Playback master clock: audio-disciplined, 0-based, rebased to this
     // pipeline's timeline. Video paces to it; the same seam serves passthrough
     // / multichannel / other renderers (see MediaClock).
@@ -596,6 +603,11 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
             // emitted_playing was sticky-true from startup, so the gate
             // below would swallow the Paused→Playing transition.
             emitted_playing = false;
+            // Wall time advanced through the whole pause but media time did
+            // not — the locked present cadence is now stale. Drop the anchor so
+            // the first post-resume frame re-establishes it (this is the burst
+            // of judder that showed up "especially after pause/resume").
+            present_anchor = None;
         }
         // Race recv against a 300 ms timeout so we can detect that
         // the decoder pipeline has stopped producing frames (network
@@ -714,6 +726,23 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
                 frame_idx, pts_ms, last_pts_ms, last_pts_ms - pts_ms, elapsed);
         }
 
+        // Render budget = how far ahead of the target PTS we wake and queue the
+        // frame. Direct MediaCodec queues a larger lead so released buffers keep
+        // returning to the codec (only ~4 in flight); the GL path needs only the
+        // GPU's draw headroom. Hoisted out of the sleep branch so the present
+        // anchor below can bound its lead by the same value.
+        #[cfg(target_os = "android")]
+        let render_budget_ms = if matches!(
+            frame.native,
+            crate::decoders::PlatformFrame::MediaCodecDirect(_)
+        ) {
+            100
+        } else {
+            RENDER_BUDGET_MS
+        };
+        #[cfg(not(target_os = "android"))]
+        let render_budget_ms = RENDER_BUDGET_MS;
+
         if elapsed > pts_ms {
             let late_ms = elapsed - pts_ms;
             if late_ms > 80 {
@@ -737,6 +766,10 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
                         Err(_) => break,
                     }
                 }
+                // Cadence broke (we fell behind and skipped frames) — drop the
+                // anchor so the catch-up frame goes out ASAP instead of
+                // inheriting the now-stale locked cadence.
+                present_anchor = None;
                 if drained > 0 {
                     stats
                         .video_frames_dropped
@@ -765,17 +798,6 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
             // reorder window only hold ~4), so queueing 2-3 frames ahead in
             // SurfaceFlinger is what bridges the segment-boundary decoder
             // warmup that the GL path bridged with its 32-image pool.
-            #[cfg(target_os = "android")]
-            let render_budget_ms = if matches!(
-                frame.native,
-                crate::decoders::PlatformFrame::MediaCodecDirect(_)
-            ) {
-                100
-            } else {
-                RENDER_BUDGET_MS
-            };
-            #[cfg(not(target_os = "android"))]
-            let render_budget_ms = RENDER_BUDGET_MS;
             let target_wake_ms = pts_ms.saturating_sub(render_budget_ms);
             if target_wake_ms > elapsed {
                 tokio::select! {
@@ -799,17 +821,49 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
         let base_us = base as i64 * 1_000;
         let pts_us_rel = (raw_pts_us - base_us).max(0);
         let elapsed_us = clock.now_us(pause_skew);
-        let pts_to_go_ns = (pts_us_rel - elapsed_us).max(0) * 1_000;
-        frame.desired_present_ns = clock_monotonic_ns() + pts_to_go_ns;
+        let now_ns = clock_monotonic_ns();
+        // Lock the present/release timestamp to the PTS cadence instead of
+        // recomputing `now + (pts − audio_clock)` every frame. The audio clock
+        // is a quantized staircase (per-callback `samples_consumed`, wall-
+        // interpolated) and its jitter — plus the `.max(0)` clamp firing
+        // whenever interpolation briefly overshot the next frame's PTS — landed
+        // frames on the wrong VSync = judder, worst right after resume when the
+        // anchor and output-latency readings lurch. Anchor once (replicating the
+        // old lead exactly), then advance by pure PTS deltas so the schedule the
+        // compositor / MediaCodec sees is perfectly regular.
+        let (anchor_ns, anchor_pts_us) = match present_anchor {
+            Some(a) => a,
+            None => {
+                let lead_ns = (pts_us_rel - elapsed_us).max(0) * 1_000;
+                let a = (now_ns + lead_ns, pts_us_rel);
+                present_anchor = Some(a);
+                a
+            }
+        };
+        let mut present_ns = anchor_ns + (pts_us_rel - anchor_pts_us) * 1_000;
+        // Re-anchor if the locked cadence drifts out of [0, budget+slack] ahead
+        // of now — slow audio-DAC↔CLOCK_MONOTONIC crystal drift over a long soak
+        // would otherwise either schedule into the past (→ next-VSync collapse,
+        // judder returns) or run so far ahead that direct-mode output buffers
+        // stay captive (→ dequeue stall, cf. #23). Each correction is a single
+        // sub-frame nudge, invisible.
+        let max_lead_ns = (render_budget_ms as i64 + 40) * 1_000_000;
+        let lead_ns = present_ns - now_ns;
+        if lead_ns < 0 || lead_ns > max_lead_ns {
+            present_ns = now_ns + lead_ns.clamp(0, max_lead_ns);
+            present_anchor = Some((present_ns, pts_us_rel));
+        }
+        frame.desired_present_ns = present_ns;
+        let present_lead_ms = (present_ns - now_ns).max(0) / 1_000_000;
 
         // DIAG (#23): first few frames' pacing — tells us whether the direct
         // pipeline renders promptly (releasing codec buffers) or schedules
         // present far in the future (buffers stay captive → dequeue_input stall).
         if frame_idx < 3 {
             log::debug!(
-                "[vsync] frame #{} pts_ms={} elapsed_ms={} pts_rel_ms={} pts_to_go_ms={} base={}",
+                "[vsync] frame #{} pts_ms={} elapsed_ms={} pts_rel_ms={} lead_ms={} base={}",
                 frame_idx, pts_ms, elapsed_us / 1000, pts_us_rel / 1000,
-                pts_to_go_ns / 1_000_000, base
+                present_lead_ms, base
             );
         }
 
@@ -835,13 +889,13 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
         let delta_pts = pts_ms.saturating_sub(last_pts_ms);
 
         // DIAG: per-frame pacing. interval_ms = wall ms between renders (~41 at
-        // 24fps; jitter here = judder), elapsed = master clock, pts_to_go = the
-        // scheduled lead. Reveals clock-jitter judder that doesn't trip LATE.
+        // 24fps; jitter here = judder), elapsed = master clock, lead = the
+        // PTS-anchored present lead. Reveals clock-jitter judder that doesn't trip LATE.
         if frame_idx % 60 == 0 {
             log::info!(
-                "[vsync] f#{} pts={}ms elapsed={}ms interval={}ms dpts={}ms pts_to_go={}ms",
+                "[vsync] f#{} pts={}ms elapsed={}ms interval={}ms dpts={}ms lead={}ms",
                 frame_idx, pts_ms, elapsed_us / 1000, interval_ms, delta_pts,
-                pts_to_go_ns / 1_000_000
+                present_lead_ms
             );
         }
 

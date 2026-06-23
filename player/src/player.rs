@@ -1227,10 +1227,24 @@ async fn av_sync_handler<V: VideoSink, A: AudioSink>(
     // sink that never reports a position (mocks) or genuine leading silence
     // still starts. Skipped while paused.
     if !paused.load(Ordering::Relaxed) && audio_sink.played_ms().is_some() {
+        // A bitstream passthrough AudioTrack only starts its head after the feed
+        // primes it past the start threshold (~2.5 s on the HDMI AVR), far longer
+        // than a cpal PCM head (which advances on the first callback). With the
+        // old 500 ms cap the gate timed out, anchored start_time to the wall, and
+        // video ran ahead on the wall fallback for the whole prime — then the
+        // head took over and the clock lurched (a brief freeze + a baked-in
+        // ~audio-behind offset, ~1.8 s on 4K). Wait long enough for the head to
+        // actually begin so start_time anchors to real audio start and video
+        // begins in sync — no wall run-ahead, no handoff lurch.
+        let gate_cap = if audio_sink.is_passthrough() {
+            Duration::from_millis(4000)
+        } else {
+            Duration::from_millis(500)
+        };
         let gate = Instant::now();
         while audio_sink.played_ms().unwrap_or(1) == 0 {
-            if gate.elapsed() > Duration::from_millis(500) {
-                log::debug!("[vsync] audio-start gate timed out; anchoring anyway");
+            if gate.elapsed() > gate_cap {
+                log::debug!("[vsync] audio-start gate timed out ({}ms); anchoring anyway", gate_cap.as_millis());
                 break;
             }
             tokio::select! {

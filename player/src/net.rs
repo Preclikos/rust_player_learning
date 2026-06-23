@@ -173,6 +173,17 @@ fn build_client() -> Client {
     Client::new()
 }
 
+/// A `reqwest::Client` with the SAME TLS configuration the player uses
+/// internally (webpki-roots + rustls on macOS/iOS/Android, system TLS
+/// elsewhere). Exposed so downstream consumers — e.g. a `LicenseResolver`
+/// making its own POST — don't fall back to `reqwest::Client::new()`, which on
+/// Android + reqwest 0.13 uses rustls-platform-verifier and fails unless its
+/// Java helper classes are bundled. Use this for any auxiliary HTTPS the player
+/// itself doesn't route through `HttpClient`.
+pub fn tls_client() -> Client {
+    build_client()
+}
+
 impl HttpClient {
     pub fn new() -> Self {
         Self {

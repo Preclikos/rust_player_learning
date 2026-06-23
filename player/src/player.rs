@@ -2379,6 +2379,17 @@ async fn audio_passthrough_task(
             // below). This is enough to cross the start threshold so resume
             // plays immediately.
             const PRIME_PAUSED_TARGET_MS: i64 = 3_000;
+            // Stall watchdog: in steady playback the head should drain the
+            // buffer at ~real time. If over STALL_WINDOW_MS it advances less
+            // than STALL_MIN_ADVANCE_MS (well under 25% of real time) while we
+            // hold data and aren't paused, the output has wedged — the head, and
+            // the video clock paced to it, would crawl until the next seek
+            // rebuilds the track. (Observed on 4K/ec-3: head ~2% of real time,
+            // video at 1 fps, only a seek recovered it.)
+            const STALL_WINDOW_MS: u64 = 3_000;
+            const STALL_MIN_ADVANCE_MS: i64 = 750;
+            let mut chk_played = sink.played_ms().unwrap_or(0) as i64;
+            let mut chk_wall = Instant::now();
             loop {
                 if stop_flag.load(Ordering::Relaxed) {
                     return Ok(());
@@ -2412,6 +2423,25 @@ async fn audio_passthrough_task(
                 // playback to drain it.
                 if au_ms - (base_pts_ms + played) <= AHEAD_MS {
                     break;
+                }
+                // We have data buffered but the head isn't taking it. Measure the
+                // head rate over STALL_WINDOW_MS; if it's crawling (and we aren't
+                // paused) the track wedged — nudge it and log the ground truth.
+                if chk_wall.elapsed() >= Duration::from_millis(STALL_WINDOW_MS) {
+                    let advanced = played - chk_played;
+                    let paused = sink.is_paused();
+                    if !paused && advanced < STALL_MIN_ADVANCE_MS {
+                        let (have_ts, frame_pos) = sink.head_debug();
+                        log::warn!(
+                            "[audio-pt] STALL: head +{}ms in {}ms (played={}ms write_ahead={}ms \
+                             paused={} have_ts={} frame_pos={}) — nudging (pause→play)",
+                            advanced, chk_wall.elapsed().as_millis(), played,
+                            au_ms - (base_pts_ms + played), paused, have_ts, frame_pos
+                        );
+                        sink.recover_stall();
+                    }
+                    chk_played = played;
+                    chk_wall = Instant::now();
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }

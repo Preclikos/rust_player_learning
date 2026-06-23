@@ -94,6 +94,19 @@ pub trait AudioPassthrough: Send + Sync {
     fn is_paused(&self) -> bool {
         false
     }
+    /// Nudge a wedged output. The feed calls this when the playback head has
+    /// stopped advancing at the real rate even though data is buffered and we
+    /// aren't paused — e.g. a direct AudioTrack whose AVR lost lock after an
+    /// underrun and won't resume on its own. Default no-op; the AudioTrack impl
+    /// toggles pause→play (without touching the desired-paused state).
+    fn recover_stall(&self) {}
+    /// `getTimestamp` diagnostics for the stall watchdog log: `(have_ts,
+    /// raw_frame_pos)`. Lets the feed record whether the framework reported a
+    /// fresh timestamp and what raw frame position it gave, to tell a genuine
+    /// slow/wedged head from an under-reporting `getTimestamp`.
+    fn head_debug(&self) -> (bool, i64) {
+        (false, 0)
+    }
 }
 
 /// Receives decoded PCM audio and feeds it to the output device.

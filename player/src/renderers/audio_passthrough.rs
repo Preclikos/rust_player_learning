@@ -401,6 +401,54 @@ impl crate::renderers::AudioPassthrough for AudioTrackSink {
             self.play()
         }
     }
+    fn recover_stall(&self) {
+        // Only meaningful once playing; never override a real pause.
+        if !self.started.load(std::sync::atomic::Ordering::Acquire)
+            || self.paused.load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
+        // Toggle pause→play to kick a track whose head wedged (AVR lost lock).
+        self.pause();
+        self.play();
+    }
+    fn head_debug(&self) -> (bool, i64) {
+        if !self.started.load(std::sync::atomic::Ordering::Acquire)
+            || self.stopped.load(std::sync::atomic::Ordering::Acquire)
+        {
+            return (false, 0);
+        }
+        let vm = android_vm();
+        vm.attach_current_thread(|env| -> Result<(bool, i64), jni::errors::Error> {
+            let ts = env.new_object(
+                jni::jni_str!("android/media/AudioTimestamp"),
+                jni::jni_sig!("()V"),
+                &[],
+            )?;
+            let have_ts = env
+                .call_method(
+                    self.track.as_obj(),
+                    jni::jni_str!("getTimestamp"),
+                    jni::jni_sig!("(Landroid/media/AudioTimestamp;)Z"),
+                    &[(&ts).into()],
+                )?
+                .z()?;
+            let fp = if have_ts {
+                env.get_field(&ts, jni::jni_str!("framePosition"), jni::jni_sig!("J"))?
+                    .j()?
+            } else {
+                env.call_method(
+                    self.track.as_obj(),
+                    jni::jni_str!("getPlaybackHeadPosition"),
+                    jni::jni_sig!("()I"),
+                    &[],
+                )?
+                .i()? as u32 as i64
+            };
+            Ok((have_ts, fp))
+        })
+        .unwrap_or((false, 0))
+    }
 }
 
 impl Drop for AudioTrackSink {

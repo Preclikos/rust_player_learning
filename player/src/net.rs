@@ -145,6 +145,12 @@ pub struct HttpClient {
     callback_timeout: ArcSwap<Duration>,
 }
 
+/// A connection idle (no bytes) longer than this is treated as a stalled
+/// request: it fails so the RetryPolicy restarts it instead of hanging forever.
+const STALL_READ_TIMEOUT: Duration = Duration::from_secs(8);
+/// Cap establishing a connection so a dead/blackholed host doesn't hang.
+const STALL_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Build the reqwest client. On native-tls targets (Win/Linux) this is the
 /// default client (system Schannel/OpenSSL). On rustls targets
 /// (macOS/iOS/Android) we hand reqwest a preconfigured rustls config backed by
@@ -164,13 +170,26 @@ fn build_client() -> Client {
         .with_no_client_auth();
     Client::builder()
         .use_preconfigured_tls(tls)
+        // A request whose connection goes idle mid-body must FAIL, not hang
+        // forever — otherwise a stalled segment download never errors, the
+        // RetryPolicy never fires, and the pipeline starves indefinitely (the
+        // "video froze, audio crawled" stall). read_timeout fires only on
+        // inactivity (no bytes for the duration), so a slow-but-progressing
+        // download isn't killed; connect_timeout bounds a dead-server connect.
+        .connect_timeout(STALL_CONNECT_TIMEOUT)
+        .read_timeout(STALL_READ_TIMEOUT)
         .build()
         .expect("reqwest client (rustls + webpki-roots)")
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "android")))]
 fn build_client() -> Client {
-    Client::new()
+    // Same stall guards as the rustls path — see the comment there.
+    Client::builder()
+        .connect_timeout(STALL_CONNECT_TIMEOUT)
+        .read_timeout(STALL_READ_TIMEOUT)
+        .build()
+        .expect("reqwest client (system TLS)")
 }
 
 /// A `reqwest::Client` with the SAME TLS configuration the player uses

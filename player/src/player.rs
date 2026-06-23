@@ -475,6 +475,10 @@ impl<A: AudioSink> MediaClock<A> {
 }
 
 async fn video_sync_loop<V: VideoSink, A: AudioSink>(
+    // DIAG: pipeline generation id (one per play-loop (re)build). Tags HEALTH +
+    // start/exit so concurrent vsync loops (a superseded generation that didn't
+    // tear down) are visible in logcat — see ABR_REBUILD_ORPHANED_DOWNLOADER.
+    gen: u64,
     start_time: Arc<Instant>,
     // 0-based media position playback starts at (the requested seek/resume
     // TARGET, NOT segment-snapped). The audio-master clock (`MediaClock`)
@@ -586,6 +590,7 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
         seek_offset,
         audio_base_ms,
     );
+    log::info!("[vsync gen {}] loop start (seek_offset={}ms)", gen, seek_offset.as_millis());
     loop {
         if stop_flag.load(Ordering::Relaxed) {
             break;
@@ -995,8 +1000,8 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
             let drift = drift_out.unwrap_or(0);
             if dropped_delta > 0 || drift.abs() > 80 || net_stall > 0 {
                 log::warn!(
-                    "[vsync] HEALTH drops=+{}/s decoded={}/s drift={}ms net_stall={}ms res={}x{}",
-                    dropped_delta, decoded_delta, drift, net_stall, frame_w, frame_h
+                    "[vsync gen {}] HEALTH drops=+{}/s decoded={}/s drift={}ms net_stall={}ms res={}x{}",
+                    gen, dropped_delta, decoded_delta, drift, net_stall, frame_w, frame_h
                 );
             }
             last_stats_emit = Instant::now();
@@ -1141,6 +1146,8 @@ async fn audio_sync_loop<A: AudioSink>(
 }
 
 async fn av_sync_handler<V: VideoSink, A: AudioSink>(
+    // DIAG: pipeline generation id (see video_sync_loop).
+    gen: u64,
     seek_offset: Duration,
     // Absolute pts_us below which video frames are discarded (frame-accurate
     // seek: decode from the segment keyframe, render from the target). 0 = none.
@@ -1256,6 +1263,7 @@ async fn av_sync_handler<V: VideoSink, A: AudioSink>(
     let paused_audio = Arc::clone(&paused);
     let (_, _) = tokio::join!(
         tokio::spawn(video_sync_loop(
+            gen,
             start_time.clone(),
             seek_offset,
             audio_base_ms,
@@ -2663,6 +2671,8 @@ type VideoDecoderFactory = Arc<dyn Fn() -> Box<dyn HwVideoDecoder> + Send + Sync
 ///
 /// Audio keeps playing throughout — only the video pipeline is touched.
 async fn video_supervisor(
+    // DIAG: pipeline generation id (see video_sync_loop).
+    gen: u64,
     initial_repr: VideoRepresenation,
     initial_start_index: usize,
     frame_sender: Sender<DecodedVideoFrame>,
@@ -2734,6 +2744,7 @@ async fn video_supervisor(
     let mut current_repr = initial_repr;
     let mut cur_stop = Arc::new(Notify::new());
     let mut cur_flag = Arc::new(AtomicBool::new(false));
+    log::info!("[video gen {}] supervisor start (repr={} idx={})", gen, current_repr.id, initial_start_index);
     let (mut cur_handle, mut cur_soft_end) = spawn_pipeline(
         current_repr.clone(),
         initial_start_index,
@@ -3069,7 +3080,11 @@ async fn video_supervisor(
             cur_soft_end.store(new_start, Ordering::Relaxed);
             cur_flag.store(true, Ordering::Relaxed);
             cur_stop.notify_waiters();
+            log::info!("[video gen {}] soft-swap: awaiting OLD repr {} decode teardown", gen, current_repr.id);
             let _ = cur_handle.await;
+            log::info!("[video gen {}] soft-swap: OLD repr {} decode joined", gen, current_repr.id);
+        } else {
+            log::info!("[video gen {}] soft-swap: OLD repr {} already done", gen, current_repr.id);
         }
         // Splice NEW onto OLD's tail at the last RENDERED pts so NEW resumes on
         // the very next frame — forward-contiguous, no rewind and no future-PTS
@@ -4272,7 +4287,13 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                     mpsc::channel::<DecodedVideoFrame>(frame_cap);
                 let (sample_sender, sample_receiver) = mpsc::channel::<DecodedAudioFrame>(256);
 
+                // DIAG: one generation id per play-loop (re)build, shared by this
+                // iteration's video_supervisor + av_sync_handler so logcat shows
+                // if a superseded generation keeps running (orphaned pipeline).
+                static PIPELINE_GEN: AtomicU64 = AtomicU64::new(0);
+                let gen = PIPELINE_GEN.fetch_add(1, Ordering::Relaxed);
                 let video = tokio::spawn(video_supervisor(
+                    gen,
                     video_representation,
                     video_start_index,
                     frame_sender,
@@ -4389,6 +4410,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                 // Gates the ABR tick off this fragile startup window.
                 pipeline_live.store(false, Ordering::Relaxed);
                 av_sync_handler(
+                    gen,
                     seek_offset,
                     discard_below_us,
                     video_ready.clone(),

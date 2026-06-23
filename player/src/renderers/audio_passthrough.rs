@@ -25,8 +25,13 @@ const CONTENT_TYPE_MOVIE: i32 = 3;
 // android.media.AudioTrack
 const MODE_STREAM: i32 = 1;
 const STATE_INITIALIZED: i32 = 1;
-// Compressed frames are tiny (E-AC-3 ≤ ~2 KiB); this buffers ~tens of frames.
-const BUFFER_SIZE_BYTES: i32 = 64 * 1024;
+// A *direct* E-AC-3 track won't begin output until enough compressed data is
+// buffered to cross its start threshold (~1–2 s of media observed on the Google
+// TV Streamer + HDMI AVR). The buffer MUST exceed that threshold: the feed's
+// prime phase relies on writing past it before `write` blocks, otherwise the
+// track never starts and the head-paced feed deadlocks. 256 KiB ≈ 2.7 s at the
+// 768 kbps test bitrate — comfortably above the observed ~2.5 s start point.
+const BUFFER_SIZE_BYTES: i32 = 256 * 1024;
 
 fn android_vm() -> jni::JavaVM {
     let ctx = ndk_context::android_context();
@@ -271,7 +276,7 @@ impl AudioTrackSink {
             return None;
         }
         let vm = android_vm();
-        let res = vm.attach_current_thread(|env| -> Result<i64, jni::errors::Error> {
+        let res = vm.attach_current_thread(|env| -> Result<(i64, bool, i64), jni::errors::Error> {
             let ts = env.new_object(
                 jni::jni_str!("android/media/AudioTimestamp"),
                 jni::jni_sig!("()V"),
@@ -297,7 +302,7 @@ impl AudioTrackSink {
                     .get_field(&ts, jni::jni_str!("nanoTime"), jni::jni_sig!("J"))?
                     .j()?;
                 let dt_ns = clock_monotonic_ns() - nano_time;
-                Ok(frame_pos + dt_ns * self.sample_rate as i64 / 1_000_000_000)
+                Ok((frame_pos + dt_ns * self.sample_rate as i64 / 1_000_000_000, true, frame_pos))
             } else {
                 let head = env
                     .call_method(
@@ -307,11 +312,24 @@ impl AudioTrackSink {
                         &[],
                     )?
                     .i()?;
-                Ok(head as u32 as i64)
+                Ok((head as u32 as i64, false, head as u32 as i64))
             }
         });
         match res {
-            Ok(frames) => Some((frames.max(0) as u64) * 1000 / self.sample_rate as u64),
+            Ok((frames, have_ts, raw_frame_pos)) => {
+                // Rate-limited trace — whether the playback head is advancing
+                // (the prime/start-threshold behaviour, see audio_passthrough_task).
+                use std::sync::atomic::{AtomicU64, Ordering};
+                static N: AtomicU64 = AtomicU64::new(0);
+                if N.fetch_add(1, Ordering::Relaxed) % 30 == 0 {
+                    log::debug!(
+                        "[audio-pt] played_ms probe: have_ts={} raw_frame_pos={} interp_frames={} -> {}ms",
+                        have_ts, raw_frame_pos, frames,
+                        (frames.max(0) as u64) * 1000 / self.sample_rate as u64
+                    );
+                }
+                Some((frames.max(0) as u64) * 1000 / self.sample_rate as u64)
+            }
             Err(_) => None,
         }
     }

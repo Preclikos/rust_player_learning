@@ -2287,22 +2287,37 @@ async fn audio_passthrough_task(
                 }
                 base_pts_ms = au_ms;
             }
-            // Pace the feed to the PLAYBACK HEAD: keep the write at most AHEAD_MS
-            // of media ahead of what's actually playing. AudioTrack.write does
-            // NOT back-pressure (HDMI swallows the bitstream faster than
-            // realtime). Pacing on wall time instead buffered the whole
-            // video-startup gap (~2s, while the track sat paused) ahead of
-            // playback — exactly the offset we measured (write_ahead≈1970ms).
-            // Head-pacing bounds it to AHEAD_MS. Safe from the earlier deadlock
-            // now that the track only starts at the av_sync anchor, so `played`
-            // reliably advances once playback begins (during the pre-anchor
-            // prime, played==0 and we fill just AHEAD_MS, then wait for play()).
-            const AHEAD_MS: i64 = 200;
+            // Two-phase feed. PRIME: an E-AC-3 *direct* AudioTrack does not
+            // begin output — `getTimestamp` stays false / `played_ms` reads 0 —
+            // until enough compressed data is buffered to cross its start
+            // threshold (empirically well over the old 200 ms window; ~1–2 s of
+            // media on the Google TV Streamer + HDMI AVR). So until the playback
+            // head first moves we DON'T gate on it: we just keep writing, and
+            // `AudioTrack.write` (blocking, STREAM mode) back-pressures on the
+            // track's own buffer once it fills. Gating on the head before it has
+            // started is the deadlock we hit: 200 ms never reached the threshold
+            // → head never moved → feed waited forever → the video clock (which
+            // reads `played_ms`) froze and the decoder back-pressured to ~1 fps.
+            //
+            // STEADY: once the head is moving, pace to keep the write at most
+            // AHEAD_MS of media ahead of the real playback position, so the head
+            // stays a usable clock and seek teardown doesn't strand seconds of
+            // queued audio. (Wall-pacing instead buffered the whole startup gap
+            // ahead — write_ahead≈1970 ms — which is why we pace on the head.)
+            const AHEAD_MS: i64 = 750;
             loop {
                 if stop_flag.load(Ordering::Relaxed) {
                     return Ok(());
                 }
                 let played = sink.played_ms().unwrap_or(0) as i64;
+                // Prime phase: head not started yet → write now (write() blocks
+                // on the full track buffer for backpressure; the buffer is sized
+                // above the start threshold so we can reach it without blocking).
+                if played == 0 {
+                    break;
+                }
+                // Steady phase: within the ahead budget → write; else wait for
+                // playback to drain it.
                 if au_ms - (base_pts_ms + played) <= AHEAD_MS {
                     break;
                 }
@@ -2314,6 +2329,7 @@ async fn audio_passthrough_task(
             tokio::task::block_in_place(|| sink.write(au));
             au_count += 1;
             if !first_au_written {
+                log::debug!("[audio-pt] first AU written (au_ms={}), play() armed", au_ms);
                 audio_ready.notify_one();
                 first_au_written = true;
             }

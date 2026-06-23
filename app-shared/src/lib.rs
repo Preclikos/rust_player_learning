@@ -215,14 +215,28 @@ pub async fn run_test_playback(mut player: Player) {
         video_repr.hdr10, video_repr.dolby_vision
     );
 
+    // Audio passthrough opt-in (Android, bitstream to HDMI/AVR). Same dual
+    // mechanism as direct.txt / video_pref.txt: an env var on desktop, or a
+    // one-line `audio_passthrough.txt` (== "1") in the app's external files
+    // dir on Android. When on, we force an `ec-3` track and tell the player
+    // to feed the raw bitstream to an AudioTrack instead of decoding to PCM:
+    //   adb shell "echo 1 > /sdcard/Android/data/cz.preclikos.rust_player/files/audio_passthrough.txt"
+    let passthrough =
+        sub_pref("RUST_PLAYER_AUDIO_PASSTHROUGH", "audio_passthrough.txt").as_deref() == Some("1");
+
     // Audio: prefer an AAC (mp4a*) representation since the Android
     // MediaCodec backend can't configure EC-3 / AC-3 without an esds box.
     // Desktop accepts either, so this is a safe lowest-common-denominator.
     // Override via `RUST_PLAYER_AUDIO=ec-3` (or `ac-3`, `mp4a`) for runtime
-    // testing of the AudioToolbox / FFmpeg / MediaCodec AC-3 paths.
-    let codec_prefix: String =
-        std::env::var("RUST_PLAYER_AUDIO").unwrap_or_else(|_| "mp4a".to_string());
-    log::info!("audio preference: codec prefix = {}", codec_prefix);
+    // testing of the AudioToolbox / FFmpeg / MediaCodec AC-3 paths; on Android
+    // the same value can come from an `audio_pref.txt` file. Passthrough forces
+    // `ec-3` (the bitstream sink only handles E-AC-3 / AC-3).
+    let codec_prefix: String = sub_pref("RUST_PLAYER_AUDIO", "audio_pref.txt")
+        .unwrap_or_else(|| if passthrough { "ec-3".to_string() } else { "mp4a".to_string() });
+    log::info!(
+        "audio preference: codec prefix = {} (passthrough={})",
+        codec_prefix, passthrough
+    );
     let (audio_adapt, audio_repr) = match tracks
         .audio
         .iter()
@@ -249,6 +263,22 @@ pub async fn run_test_playback(mut player: Player) {
         "selected audio {} {}Hz",
         audio_repr.codecs, audio_repr.bandwidth
     );
+
+    // Engage bitstream passthrough once a codec the sink understands is
+    // selected. The player still self-gates: it only takes the bitstream
+    // path when the selected codec is ec-3/ac-3 AND the AudioTrack sink
+    // builds, falling back to PCM otherwise.
+    if passthrough {
+        if matches!(audio_repr.codecs.as_str(), "ec-3" | "ac-3") {
+            player.set_audio_passthrough(true);
+            log::info!("audio passthrough enabled (opt-in, codec={})", audio_repr.codecs);
+        } else {
+            log::warn!(
+                "audio passthrough requested but selected codec is {} (no ec-3/ac-3 rep) — staying PCM",
+                audio_repr.codecs
+            );
+        }
+    }
 
     // Subtitles: pick the first text track when the manifest has one and a
     // font is available. Android always has Roboto; desktop honours

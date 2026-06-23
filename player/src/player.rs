@@ -259,10 +259,11 @@ pub struct Player<V: VideoSink = VideoRenderer, A: AudioSink = AudioRenderer> {
     /// `set_subtitle_track` / `clear_subtitle_track`.
     subtitle_representation: Arc<StdMutex<Option<tracks::text::TextRepresenation>>>,
 
-    /// Android direct mode: `ANativeWindow*` (as usize) of the dedicated
-    /// video plane the decoder renders into. 0 = classic renderer path.
-    /// Set once by the host before play(); consumed at pipeline build.
-    video_output_window: Arc<AtomicUsize>,
+    /// Android direct mode: the dedicated video-plane `ANativeWindow` the
+    /// decoder renders into (0 = classic renderer path). Set by the host before
+    /// play(); consumed at pipeline build. Wrapped in [`DirectWindow`] so we
+    /// hold an acquired ref for the player's lifetime (the AFR/Surface UAF).
+    video_output_window: Arc<DirectWindow>,
 
     /// Adaptive frame rate (Android direct mode): when set, the player hints
     /// the video plane's content fps to the OS via `ANativeWindow_setFrameRate`
@@ -1950,6 +1951,61 @@ fn set_window_frame_rate(window: usize, fps: f32) {
     }
 }
 
+/// Owns the direct-mode video-plane `ANativeWindow` for the player's lifetime.
+///
+/// The host hands us a raw `ANativeWindow*` via `set_video_output_window`. We
+/// take an `ANativeWindow_acquire` reference on it and only release when the
+/// last `Player` clone drops (or the host installs a different window). Without
+/// that owned ref the host's `SurfaceView` teardown could free the window — and
+/// its internal mutex — while a pipeline rebuild is still asserting AFR on it,
+/// crashing in `ANativeWindow_setFrameRate*` → `Surface::hook_query` with
+/// "pthread_mutex_lock on a destroyed mutex" (SIGABRT). Holding the ref keeps
+/// the window object alive, so a stale `setFrameRate` is at worst a no-op, not a
+/// use-after-free. The pointer is still stored as a `usize` for the lock-free
+/// reads on the build path; this type just bolts lifetime onto it.
+struct DirectWindow(AtomicUsize);
+
+impl DirectWindow {
+    fn new() -> Self {
+        DirectWindow(AtomicUsize::new(0))
+    }
+
+    /// Current window pointer (0 = none / classic renderer path).
+    fn get(&self) -> usize {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    /// Install `window` (0 to clear), acquiring it and releasing the previous.
+    /// Balanced per call: each `set` releases exactly the ref the prior `set`
+    /// acquired, so repeated identical sets don't leak or over-release.
+    fn set(&self, window: usize) {
+        #[cfg(target_os = "android")]
+        unsafe {
+            if window != 0 {
+                ndk_sys::ANativeWindow_acquire(window as *mut ndk_sys::ANativeWindow);
+            }
+            let old = self.0.swap(window, Ordering::Relaxed);
+            if old != 0 {
+                ndk_sys::ANativeWindow_release(old as *mut ndk_sys::ANativeWindow);
+            }
+        }
+        #[cfg(not(target_os = "android"))]
+        self.0.store(window, Ordering::Relaxed);
+    }
+}
+
+impl Drop for DirectWindow {
+    fn drop(&mut self) {
+        #[cfg(target_os = "android")]
+        unsafe {
+            let w = self.0.load(Ordering::Relaxed);
+            if w != 0 {
+                ndk_sys::ANativeWindow_release(w as *mut ndk_sys::ANativeWindow);
+            }
+        }
+    }
+}
+
 struct SwapSplice {
     started: Instant,
     skip_below_pts_us: i64,
@@ -2305,6 +2361,16 @@ async fn audio_passthrough_task(
             // queued audio. (Wall-pacing instead buffered the whole startup gap
             // ahead — write_ahead≈1970 ms — which is why we pace on the head.)
             const AHEAD_MS: i64 = 750;
+            // Upper bound on PRIME. A live track crosses its start threshold
+            // (~2.5 s here) and the head moves well before this — and a live
+            // track's write() blocks on the full buffer anyway, so write_ahead
+            // can't climb. If we've buffered this far with the head STILL at 0,
+            // this sink will never become the active output: a stale duplicate
+            // left over from a pipeline rebuild, or a genuinely unsupported
+            // output. Abandon the feed instead of priming unbounded — without
+            // this cap such a task writes forever (write_ahead → minutes), the
+            // observed runaway/leak after an audio-track switch.
+            const PRIME_MAX_AHEAD_MS: i64 = 10_000;
             loop {
                 if stop_flag.load(Ordering::Relaxed) {
                     return Ok(());
@@ -2314,6 +2380,14 @@ async fn audio_passthrough_task(
                 // on the full track buffer for backpressure; the buffer is sized
                 // above the start threshold so we can reach it without blocking).
                 if played == 0 {
+                    if au_ms - base_pts_ms > PRIME_MAX_AHEAD_MS {
+                        log::warn!(
+                            "[audio-pt] playback head never started after {}ms buffered — \
+                             abandoning passthrough feed (stale pipeline or unsupported output)",
+                            au_ms - base_pts_ms
+                        );
+                        return Ok(());
+                    }
                     break;
                 }
                 // Steady phase: within the ahead budget → write; else wait for
@@ -3107,7 +3181,7 @@ impl Player<VideoRenderer, AudioRenderer> {
             video_switch_tx: Arc::new(StdMutex::new(None)),
             buffer_target_secs: Arc::new(AtomicU32::new(DEFAULT_BUFFER_TARGET_SECS)),
             subtitle_representation: Arc::new(StdMutex::new(None)),
-            video_output_window: Arc::new(AtomicUsize::new(0)),
+            video_output_window: Arc::new(DirectWindow::new()),
             adaptive_frame_rate: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             audio_passthrough: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pipeline_live: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -3526,12 +3600,14 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
     /// video pipeline delivers them, and the renderer surface only
     /// carries subtitles/UI. Takes effect at the next `play()`.
     ///
-    /// # Safety contract
-    /// The window must stay valid (acquired) until after the player is
-    /// dropped or this is reset to null.
+    /// The player takes its own `ANativeWindow_acquire` ref on the window and
+    /// holds it until the player is dropped or a different window is installed,
+    /// so it stays alive even if the host releases its `Surface` (preventing the
+    /// AFR `setFrameRate`-on-destroyed-Surface crash). Pass null to release the
+    /// player's ref — call this from the host's `surfaceDestroyed` before it
+    /// releases the Surface.
     pub fn set_video_output_window(&self, window: *mut std::ffi::c_void) {
-        self.video_output_window
-            .store(window as usize, Ordering::Relaxed);
+        self.video_output_window.set(window as usize);
     }
 
     /// Adaptive frame rate (Android direct mode). When enabled (the default),
@@ -4131,7 +4207,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                 // a deep channel deadlocks the decoder outright. 2 in the
                 // channel + 2 in the reorder buffer + 1 rendering leaves
                 // the codec breathing room.
-                let direct_window = video_output_window.load(Ordering::Relaxed);
+                let direct_window = video_output_window.get();
                 // Adaptive frame rate: hint the content fps to the video plane
                 // so the display can match its refresh rate. Idempotent — fine
                 // to re-assert on every (re)build (seek / ABR swap).

@@ -564,18 +564,6 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
     // on the first frame as (raw_pts - elapsed), making frame 0 render immediately
     // and all subsequent frames at their correct relative positions.
     let mut pts_base: Option<u64> = None;
-    // De-judder smoother state: (present_ns, pts_us_rel) of the last frame, so
-    // the next frame's present time can be snapped to the smooth media cadence
-    // (last + Δpts) instead of inheriting the audio clock's frame-to-frame
-    // wobble. Bounded to ±PRESENT_SMOOTH_NS of the raw value (see present block).
-    let mut last_present: Option<(i64, i64)> = None;
-    // Max deviation of the smoothed present time from the raw `now + (pts −
-    // clock)` value. ≥ the audio clock's per-callback quantization (~one cpal
-    // buffer) so steady-state wobble is fully absorbed, yet small enough that a
-    // seek / LATE / resume jump (raw moves further than this) is followed at
-    // once and the cadence re-bases — so this can never schedule meaningfully
-    // further from reality than the proven raw formula already did.
-    const PRESENT_SMOOTH_NS: i64 = 40_000_000;
     // Playback master clock: audio-disciplined, 0-based, rebased to this
     // pipeline's timeline. Video paces to it; the same seam serves passthrough
     // / multichannel / other renderers (see MediaClock).
@@ -812,29 +800,7 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
         let pts_us_rel = (raw_pts_us - base_us).max(0);
         let elapsed_us = clock.now_us(pause_skew);
         let pts_to_go_ns = (pts_us_rel - elapsed_us).max(0) * 1_000;
-        let raw_present_ns = clock_monotonic_ns() + pts_to_go_ns;
-        // De-judder: `raw_present_ns` carries the audio master clock's
-        // frame-to-frame wobble (it's a quantized per-callback staircase, wall-
-        // interpolated), enough to land a frame on the wrong VSync = visible
-        // judder, worst right after resume when the clock anchor + output
-        // latency lurch. The ideal present time advances by exactly the media
-        // delta from the previous frame; snap to it, but only within
-        // ±PRESENT_SMOOTH_NS of raw so a seek / LATE-drain / resume jump (raw
-        // moves further than the window) is followed at once and the cadence
-        // re-bases on the next frame. The raw formula above is untouched, so the
-        // sleep gate / LATE drain / clock all behave exactly as before.
-        let present_ns = match last_present {
-            Some((last_ns, last_pts_us)) => {
-                let ideal_ns = last_ns + (pts_us_rel - last_pts_us) * 1_000;
-                ideal_ns.clamp(
-                    raw_present_ns - PRESENT_SMOOTH_NS,
-                    raw_present_ns + PRESENT_SMOOTH_NS,
-                )
-            }
-            None => raw_present_ns,
-        };
-        last_present = Some((present_ns, pts_us_rel));
-        frame.desired_present_ns = present_ns;
+        frame.desired_present_ns = clock_monotonic_ns() + pts_to_go_ns;
 
         // DIAG (#23): first few frames' pacing — tells us whether the direct
         // pipeline renders promptly (releasing codec buffers) or schedules

@@ -4561,7 +4561,12 @@ async fn download_task(
 
     let segment_slice = &segments[..];
     for i in start_index..segment_slice.len() {
-        if stop_flag.load(Ordering::Relaxed) {
+        // A dropped receiver means the consumer (this pipeline's decode side) is
+        // gone — a rebuild/ABR swap tore it down. Stop immediately; this is not
+        // a network failure and must NOT hit the retry path, or an orphaned
+        // downloader spams "downstream receiver dropped" for 30 s and wedges the
+        // rebuild (see ABR_REBUILD_ORPHANED_DOWNLOADER handoff).
+        if stop_flag.load(Ordering::Relaxed) || segment_sender.is_closed() {
             break;
         }
         // Soft end: supervisor sets this to the NEW pipeline's start
@@ -4591,7 +4596,9 @@ async fn download_task(
         let mut should_break = false;
         let mut last_err: Option<Box<dyn Error + Send + Sync>> = None;
         loop {
-            if stop_flag.load(Ordering::Relaxed) {
+            // stop, or the receiver vanished (pipeline torn down) → terminate,
+            // never retry a dropped channel.
+            if stop_flag.load(Ordering::Relaxed) || segment_sender.is_closed() {
                 should_break = true;
                 break;
             }
@@ -4622,6 +4629,13 @@ async fn download_task(
                     break;
                 }
                 Some(Err(e)) => {
+                    // Receiver dropped mid-send = consumer gone, not a transport
+                    // error. Stop now instead of retrying (the SendError-loop wedge).
+                    if segment_sender.is_closed() {
+                        log::debug!("[dl] segment {} receiver gone — stopping (pipeline torn down)", i);
+                        should_break = true;
+                        break;
+                    }
                     log::warn!(
                         "[dl] segment {} failed, retrying in {:?}: {}",
                         i, backoff, e

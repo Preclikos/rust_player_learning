@@ -61,6 +61,13 @@ pub struct AudioTrackSink {
     /// in a loop (no audio). The feed gates the first write on video readiness,
     /// so playback begins with the first real audio, in step with video.
     started: std::sync::atomic::AtomicBool,
+    /// Desired paused state, honored ACROSS the lazy start. A `set_paused(true)`
+    /// before the first AU can't touch the not-yet-playing track, so we remember
+    /// it here and the lazy start in `write` skips `play()` while paused — else
+    /// pausing during a seek/buffer (before audio begins) would be silently
+    /// dropped and the first AU would start the track anyway (audio plays while
+    /// the user paused; the clock then runs ahead of the parked video).
+    paused: std::sync::atomic::AtomicBool,
 }
 
 // The GlobalRef + VM handle are thread-safe to use from the audio task.
@@ -221,6 +228,7 @@ impl AudioTrackSink {
                     sample_rate,
                     stopped: std::sync::atomic::AtomicBool::new(false),
                     started: std::sync::atomic::AtomicBool::new(false),
+                    paused: std::sync::atomic::AtomicBool::new(false),
                 })
             }
             Err(e) => {
@@ -252,7 +260,13 @@ impl AudioTrackSink {
         // Lazily start playback on the first AU: the track now has real data, so
         // play() begins output with actual audio (no silent pre-roll counted by
         // the clock, no "dead IAudioTrack" from getTimestamp on an idle track).
-        if !self.started.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        // Honor a pause that arrived before audio began (seek/buffer): mark the
+        // track started (so a later set_paused(false) can play it) but DON'T
+        // play() while paused — otherwise audio runs under a user pause and the
+        // clock runs ahead of the parked video.
+        if !self.started.swap(true, std::sync::atomic::Ordering::AcqRel)
+            && !self.paused.load(std::sync::atomic::Ordering::Acquire)
+        {
             self.call_void(jni::jni_str!("play"));
         }
     }
@@ -366,9 +380,18 @@ impl crate::renderers::AudioPassthrough for AudioTrackSink {
     fn flush(&self) {
         AudioTrackSink::flush(self)
     }
+    fn is_paused(&self) -> bool {
+        self.paused.load(std::sync::atomic::Ordering::Acquire)
+    }
     fn set_paused(&self, paused: bool) {
+        // Always record the desired state — the lazy start in write() reads it,
+        // so a pause/resume that arrives BEFORE the first AU (during a seek or
+        // initial buffer) isn't lost.
+        self.paused
+            .store(paused, std::sync::atomic::Ordering::Release);
         // Until the first AU is written the track must not play (empty direct
-        // track → "dead IAudioTrack"); the lazy start in write() handles it.
+        // track → "dead IAudioTrack"); the lazy start in write() applies the
+        // remembered state once it has data.
         if !self.started.load(std::sync::atomic::Ordering::Acquire) {
             return;
         }

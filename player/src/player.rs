@@ -2361,16 +2361,24 @@ async fn audio_passthrough_task(
             // queued audio. (Wall-pacing instead buffered the whole startup gap
             // ahead — write_ahead≈1970 ms — which is why we pace on the head.)
             const AHEAD_MS: i64 = 750;
-            // Upper bound on PRIME. A live track crosses its start threshold
-            // (~2.5 s here) and the head moves well before this — and a live
-            // track's write() blocks on the full buffer anyway, so write_ahead
-            // can't climb. If we've buffered this far with the head STILL at 0,
-            // this sink will never become the active output: a stale duplicate
-            // left over from a pipeline rebuild, or a genuinely unsupported
-            // output. Abandon the feed instead of priming unbounded — without
-            // this cap such a task writes forever (write_ahead → minutes), the
-            // observed runaway/leak after an audio-track switch.
-            const PRIME_MAX_AHEAD_MS: i64 = 10_000;
+            // Upper bound on PRIME (NOT while paused — see below). Catches the
+            // runaway: a stale duplicate feed left over from a pipeline rebuild
+            // whose sink never becomes the active output, so its head stays 0
+            // and its write() never blocks → it buffers forever (write_ahead →
+            // minutes, the observed leak after an audio-track switch). Generous
+            // because a *live* but slowly-locking output (an HDMI AVR waking
+            // from standby) also shows head 0 with non-blocking writes for a
+            // while — seen >10 s on a cold soundbar — and abandoning a live
+            // pipeline strands it with no recovery. 30 s clears realistic AVR
+            // wake yet still bounds a dead sink to seconds, not minutes.
+            const PRIME_MAX_AHEAD_MS: i64 = 30_000;
+            // While paused before the head starts, buffer only this far then
+            // idle: a paused/not-yet-started track's write() does NOT block, so
+            // without a cap the feed would run the buffer away (and a head still
+            // at 0 *because we're paused* would trip the dead-sink abandon
+            // below). This is enough to cross the start threshold so resume
+            // plays immediately.
+            const PRIME_PAUSED_TARGET_MS: i64 = 3_000;
             loop {
                 if stop_flag.load(Ordering::Relaxed) {
                     return Ok(());
@@ -2380,6 +2388,16 @@ async fn audio_passthrough_task(
                 // on the full track buffer for backpressure; the buffer is sized
                 // above the start threshold so we can reach it without blocking).
                 if played == 0 {
+                    // Paused before the head started: head reads 0 because we're
+                    // paused, not because the sink is dead. Buffer a little for a
+                    // prompt resume, then wait — do NOT abandon.
+                    if sink.is_paused() {
+                        if au_ms - base_pts_ms >= PRIME_PAUSED_TARGET_MS {
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                            continue;
+                        }
+                        break;
+                    }
                     if au_ms - base_pts_ms > PRIME_MAX_AHEAD_MS {
                         log::warn!(
                             "[audio-pt] playback head never started after {}ms buffered — \
@@ -4272,6 +4290,18 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                             None
                         };
                     audio_sink.set_passthrough(pt_sink.clone());
+                    // Re-apply the user's current pause intent onto the freshly
+                    // installed sink. A pause()/resume() that landed during the
+                    // rebuild (while passthrough was momentarily None) only
+                    // touched the old sink; without re-asserting it here the new
+                    // bitstream sink starts un-paused and its first AU lazily
+                    // play()s regardless — audio would run under a user pause
+                    // while video stays parked, and the clock would then race
+                    // ahead (the "audio plays, video frozen, then fast-forward
+                    // on resume" seek-while-buffering bug).
+                    if pt_sink.is_some() {
+                        audio_sink.set_paused(paused.load(Ordering::Relaxed));
+                    }
                     audio = if let Some(sink) = pt_sink {
                         drop(sample_sender);
                         log::info!("[audio] passthrough engaged ({})", audio_representation.codecs);

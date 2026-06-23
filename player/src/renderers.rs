@@ -87,6 +87,13 @@ pub trait AudioPassthrough: Send + Sync {
     }
     fn flush(&self);
     fn set_paused(&self, paused: bool);
+    /// Whether the sink is currently paused. The feed consults this so it can
+    /// tell "playback head hasn't started because we're paused" (legitimate —
+    /// keep the buffer, wait for resume) from "head never started on a dead /
+    /// stale sink" (abandon). Defaults to never-paused for trivial impls.
+    fn is_paused(&self) -> bool {
+        false
+    }
 }
 
 /// Receives decoded PCM audio and feeds it to the output device.

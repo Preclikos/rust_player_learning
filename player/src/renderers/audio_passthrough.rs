@@ -290,7 +290,19 @@ impl AudioTrackSink {
             return None;
         }
         let vm = android_vm();
-        let res = vm.attach_current_thread(|env| -> Result<(i64, bool, i64), jni::errors::Error> {
+        // Closure returns (have_ts, value_frames, consumed_frames):
+        //   have_ts=true  → value = PRESENTED position (getTimestamp, interp to
+        //                   now), consumed = getPlaybackHeadPosition (now).
+        //   have_ts=false → value = consumed = getPlaybackHeadPosition.
+        let res = vm.attach_current_thread(|env| -> Result<(bool, i64, i64), jni::errors::Error> {
+            let head = env
+                .call_method(
+                    self.track.as_obj(),
+                    jni::jni_str!("getPlaybackHeadPosition"),
+                    jni::jni_sig!("()I"),
+                    &[],
+                )?
+                .i()? as u32 as i64;
             let ts = env.new_object(
                 jni::jni_str!("android/media/AudioTimestamp"),
                 jni::jni_sig!("()V"),
@@ -316,29 +328,47 @@ impl AudioTrackSink {
                     .get_field(&ts, jni::jni_str!("nanoTime"), jni::jni_sig!("J"))?
                     .j()?;
                 let dt_ns = clock_monotonic_ns() - nano_time;
-                Ok((frame_pos + dt_ns * self.sample_rate as i64 / 1_000_000_000, true, frame_pos))
+                Ok((true, frame_pos + dt_ns * self.sample_rate as i64 / 1_000_000_000, head))
             } else {
-                let head = env
-                    .call_method(
-                        self.track.as_obj(),
-                        jni::jni_str!("getPlaybackHeadPosition"),
-                        jni::jni_sig!("()I"),
-                        &[],
-                    )?
-                    .i()?;
-                Ok((head as u32 as i64, false, head as u32 as i64))
+                Ok((false, head, head))
             }
         });
+        // Cached AVR decode latency (CONSUMED − PRESENTED frames). The device's
+        // E-AC-3 decode latency is stable, so we learn it once getTimestamp is
+        // valid and reuse it for the next pipeline's pre-getTimestamp window.
+        // Process-wide (each seek builds a fresh sink), 0 = not yet known.
+        use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+        static AVR_LATENCY_FRAMES: AtomicI64 = AtomicI64::new(0);
         match res {
-            Ok((frames, have_ts, raw_frame_pos)) => {
-                // Rate-limited trace — whether the playback head is advancing
-                // (the prime/start-threshold behaviour, see audio_passthrough_task).
-                use std::sync::atomic::{AtomicU64, Ordering};
+            Ok((have_ts, value, consumed)) => {
+                let frames = if have_ts {
+                    // Learn the consumed→presented gap (AVR latency) for next time.
+                    let lat = consumed - value;
+                    if lat > 0 && lat < self.sample_rate as i64 * 5 {
+                        AVR_LATENCY_FRAMES.store(lat, Ordering::Relaxed);
+                    }
+                    value
+                } else {
+                    // getTimestamp not valid yet: getPlaybackHeadPosition is the
+                    // CONSUMED position, which runs ahead of audible audio by the
+                    // AVR latency. Subtract the cached latency so this estimate
+                    // matches the PRESENTED position getTimestamp will soon report
+                    // — the source handoff is then continuous (no clock lurch /
+                    // post-start frame slowdown). Raw consumed only on the very
+                    // first start (cache still 0), one transient then primed.
+                    let lat = AVR_LATENCY_FRAMES.load(Ordering::Relaxed);
+                    if lat > 0 {
+                        (value - lat).max(0)
+                    } else {
+                        value
+                    }
+                };
                 static N: AtomicU64 = AtomicU64::new(0);
                 if N.fetch_add(1, Ordering::Relaxed) % 30 == 0 {
                     log::debug!(
-                        "[audio-pt] played_ms probe: have_ts={} raw_frame_pos={} interp_frames={} -> {}ms",
-                        have_ts, raw_frame_pos, frames,
+                        "[audio-pt] played_ms: have_ts={} value={} consumed={} lat_cache={} -> {}ms",
+                        have_ts, value, consumed,
+                        AVR_LATENCY_FRAMES.load(Ordering::Relaxed),
                         (frames.max(0) as u64) * 1000 / self.sample_rate as u64
                     );
                 }

@@ -1226,11 +1226,25 @@ async fn av_sync_handler<V: VideoSink, A: AudioSink>(
     // the "audio delayed after switching" the user reported. Bounded so a
     // sink that never reports a position (mocks) or genuine leading silence
     // still starts. Skipped while paused.
+    // A bitstream passthrough AudioTrack only starts its head once the feed has
+    // primed it past the start threshold (~2.5 s on the HDMI AVR) — far longer
+    // than a cpal PCM head (which advances on the first callback). With the old
+    // 500 ms cap the gate timed out, start_time anchored to the wall, and video
+    // paced on the wall fallback through the prime, then re-synced to the head —
+    // a brief frame slowdown at every (re)start. Waiting for the head to begin
+    // (it breaks as soon as played_ms ticks, so the wait is ~the prime, not the
+    // full cap) anchors video to real audio start so it begins in step — no
+    // wall-paced slowdown. cpal keeps the 500 ms cap.
     if !paused.load(Ordering::Relaxed) && audio_sink.played_ms().is_some() {
+        let gate_cap = if audio_sink.is_passthrough() {
+            Duration::from_millis(4000)
+        } else {
+            Duration::from_millis(500)
+        };
         let gate = Instant::now();
         while audio_sink.played_ms().unwrap_or(1) == 0 {
-            if gate.elapsed() > Duration::from_millis(500) {
-                log::debug!("[vsync] audio-start gate timed out; anchoring anyway");
+            if gate.elapsed() > gate_cap {
+                log::debug!("[vsync] audio-start gate timed out ({}ms); anchoring anyway", gate_cap.as_millis());
                 break;
             }
             tokio::select! {

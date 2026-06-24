@@ -1,5 +1,16 @@
 # Handoff — no public stop(): playback survives teardown (audio plays in background)
 
+> **✅ FIXED `b798f59` (player) + bridge rewire (pending pin bump).** `Player::stop()`
+> now clears `seek_target` (so the self-restarting play loop EXITS, not rebuilds)
+> before setting stop_flag/notify, pauses audible output incl. the passthrough
+> AudioTrack, flushes cpal, and detaches+releases the passthrough sink — the
+> `JoinHandle` from `play()` then completes, so the caller can await it to know
+> the pipeline is gone. Bridge `run_playback` now does `player.stop().await` +
+> awaits `play_task` (bounded 5s) on shutdown instead of `pause()`+`abort()`.
+> Deploy order: push player → bump `rust-bridge/Cargo.toml` rev → the staged
+> bridge change compiles → rebuild + verify Back/Home stops audio AND no second
+> pipeline spawns on the next nativeStart.
+
 **Status:** OPEN (host has a stopgap). Found in the BlackZone TV app: pressing
 Back (or backgrounding via Home) saved progress and tore down the host UI, but
 **audio kept playing in the background** and pipeline tasks lingered.

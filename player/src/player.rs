@@ -1227,24 +1227,10 @@ async fn av_sync_handler<V: VideoSink, A: AudioSink>(
     // sink that never reports a position (mocks) or genuine leading silence
     // still starts. Skipped while paused.
     if !paused.load(Ordering::Relaxed) && audio_sink.played_ms().is_some() {
-        // A bitstream passthrough AudioTrack only starts its head after the feed
-        // primes it past the start threshold (~2.5 s on the HDMI AVR), far longer
-        // than a cpal PCM head (which advances on the first callback). With the
-        // old 500 ms cap the gate timed out, anchored start_time to the wall, and
-        // video ran ahead on the wall fallback for the whole prime — then the
-        // head took over and the clock lurched (a brief freeze + a baked-in
-        // ~audio-behind offset, ~1.8 s on 4K). Wait long enough for the head to
-        // actually begin so start_time anchors to real audio start and video
-        // begins in sync — no wall run-ahead, no handoff lurch.
-        let gate_cap = if audio_sink.is_passthrough() {
-            Duration::from_millis(4000)
-        } else {
-            Duration::from_millis(500)
-        };
         let gate = Instant::now();
         while audio_sink.played_ms().unwrap_or(1) == 0 {
-            if gate.elapsed() > gate_cap {
-                log::debug!("[vsync] audio-start gate timed out ({}ms); anchoring anyway", gate_cap.as_millis());
+            if gate.elapsed() > Duration::from_millis(500) {
+                log::debug!("[vsync] audio-start gate timed out; anchoring anyway");
                 break;
             }
             tokio::select! {
@@ -4628,7 +4614,6 @@ async fn download_task(
         // transparently, and only a genuine extended outage ends the
         // pipeline.
         let retry_started = Instant::now();
-        let started = retry_started;
         let mut should_break = false;
         let mut last_err: Option<Box<dyn Error + Send + Sync>> = None;
         loop {
@@ -4692,14 +4677,12 @@ async fn download_task(
                 }
             }
         }
-        if let Some(s) = stats.as_ref() {
-            // Anything longer than ~250 ms blocked on a single segment counts
-            // as net stall — the decoder downstream is starving.
-            let elapsed_ms = started.elapsed().as_millis() as u64;
-            if elapsed_ms > 250 {
-                s.net_stall_ms.fetch_add(elapsed_ms - 250, Ordering::Relaxed);
-            }
-        }
+        // net_stall is accumulated inside download_and_queue from the actual
+        // network time vs the segment's media duration (see there). It must NOT
+        // be measured from `started.elapsed()` here: that wall span includes the
+        // time `send()` blocks on a FULL channel — i.e. it spikes precisely when
+        // the buffer is HEALTHY/full (backpressure), which flashed the host's
+        // loading spinner periodically during otherwise-fine playback.
         if should_break {
             break;
         }
@@ -4877,6 +4860,21 @@ async fn download_and_queue(
         })?;
     if let Some(s) = stats {
         update_bandwidth_ewma(&s.bandwidth_bps_ewma, dl.data.len(), dl.elapsed);
+        // net_stall = how much SLOWER than realtime this segment downloaded.
+        // A large segment that arrives in ~its own media duration is keeping
+        // pace (no stall); only download time BEYOND that means the link can't
+        // sustain the bitrate and the buffer is draining toward a real rebuffer.
+        // Measured from the network time (`dl.elapsed`) only — NOT the wall span
+        // that includes `send()` blocking on a full channel (healthy buffer
+        // backpressure), which is what made this spike during fine playback.
+        let dl_ms = dl.elapsed.as_millis() as u64;
+        let seg_ms = segment
+            .end_time()
+            .saturating_sub(segment.start_time())
+            .as_millis() as u64;
+        if dl_ms > seg_ms {
+            s.net_stall_ms.fetch_add(dl_ms - seg_ms, Ordering::Relaxed);
+        }
     }
     let data_segment = DataSegment {
         id: index,

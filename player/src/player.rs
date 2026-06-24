@@ -4512,13 +4512,32 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
     /// The cpal stream now stays alive across `stop()` and is only
     /// torn down when the AudioRenderer itself is dropped — i.e. when
     /// the last Player handle is dropped.
+    ///
+    /// To wait until the pipeline is actually gone, `await` the `JoinHandle`
+    /// that `play()` returned: clearing `seek_target` here makes the
+    /// self-restarting play loop EXIT (instead of rebuilding) once its tasks
+    /// observe the stop, so that handle completes. The bridge must `stop()` +
+    /// await that handle on teardown rather than dropping/aborting it —
+    /// dropping a tokio `JoinHandle` detaches the task, it does not cancel it,
+    /// which is why playback (and audio) survived a host teardown.
     pub async fn stop(&self) {
+        // Cancel any pending seek/track-switch FIRST: a `Some` seek_target at the
+        // play loop's tail makes it rebuild a fresh pipeline instead of ending.
+        // Clearing it (with stop_flag set) makes the loop break and play() return.
+        *self.seek_target.write().await = None;
         self.stop_flag.store(true, Ordering::Relaxed);
         self.stop.notify_waiters();
-        // Drain any samples still queued for cpal and park the device
-        // until the next play() unpauses it. Mirrors what seek() and
+        // Stop audible output immediately — with passthrough engaged this pauses
+        // the bitstream AudioTrack (not just cpal).
+        self.audio_renderer.set_paused(true);
+        // Drain any samples still queued for cpal. Mirrors what seek() and
         // play()-startup do for the same "switching pipelines" reason.
         self.audio_renderer.flush();
+        // Release the bitstream passthrough AudioTrack so it stops owning the
+        // HDMI output (its feed task also exits on stop_flag and drops its ref;
+        // detaching here makes the renderer stop reading a dying sink as the
+        // clock). set_passthrough(None) un-pauses cpal, so re-park it after.
+        self.audio_renderer.set_passthrough(None);
         self.audio_renderer.set_paused(true);
     }
 

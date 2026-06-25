@@ -18,6 +18,10 @@ mod utils;
 // canonical types — see PLAYER_INTEGRATION.md.
 pub use abr::{AbrStrategy, AbrVideoProfile};
 pub use capabilities::{capabilities, probe_capabilities, PlayerCapabilities};
+/// The track tree returned by [`Player::get_tracks`]. Adaptation/representation
+/// types stay reachable through its public `video`/`audio`/`text` fields — a
+/// consumer reads them via inference (no need to name the inner types).
+pub use tracks::Tracks;
 pub use events::{
     BufferingReason, Fps, PlayerErrorKind, PlayerEvent, TrackInfo, TrackKind,
 };
@@ -78,7 +82,6 @@ use tracks::audio::{AudioAdaptation, AudioRepresentation};
 use tracks::{
     segment::Segment,
     video::{VideoAdaptation, VideoRepresenation},
-    Tracks,
 };
 use url::Url;
 

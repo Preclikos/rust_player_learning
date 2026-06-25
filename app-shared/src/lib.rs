@@ -7,6 +7,8 @@ use std::collections::HashMap;
 
 use player::Player;
 
+pub mod bridge;
+
 /// Encrypted DASH stream used by every shell for smoke-testing the
 /// pipeline end-to-end (manifest fetch, CENC decryption, A/V sync).
 pub const TEST_MANIFEST_URL: &str = "https://preclikos.cz/examples/encrypted/manifest.mpd";
@@ -35,7 +37,7 @@ pub fn test_clearkeys() -> HashMap<String, String> {
 /// touch, so a one-line `video_pref.txt` there acts as the env var:
 ///   adb shell "mkdir -p /sdcard/Android/data/cz.preclikos.rust_player/files"
 ///   adb shell "echo hdr > /sdcard/Android/data/cz.preclikos.rust_player/files/video_pref.txt"
-fn video_pref() -> Option<String> {
+pub(crate) fn video_pref() -> Option<String> {
     if let Ok(v) = std::env::var("RUST_PLAYER_VIDEO") {
         let v = v.trim().to_string();
         if !v.is_empty() {
@@ -62,7 +64,7 @@ fn video_pref() -> Option<String> {
 /// the `env` var on desktop, or a one-line `<file>` in the app's external
 /// files dir on Android (`adb push`-able without root). Returns the
 /// trimmed value or `None` when unset. `file` is only read on Android.
-fn sub_pref(env: &str, file: &str) -> Option<String> {
+pub(crate) fn sub_pref(env: &str, file: &str) -> Option<String> {
     if let Ok(v) = std::env::var(env) {
         let v = v.trim().to_string();
         if !v.is_empty() {
@@ -93,7 +95,7 @@ fn sub_pref(env: &str, file: &str) -> Option<String> {
 /// accepts names (`yellow`, `white`, …) or hex (`#FFCC00`); size accepts a
 /// numeric scale (`1.2`) or a name (`small`/`medium`/`large`/`xlarge`).
 /// Unset or unparseable values fall back to the default.
-fn subtitle_style() -> player::SubtitleStyle {
+pub(crate) fn subtitle_style() -> player::SubtitleStyle {
     let mut style = player::SubtitleStyle::DEFAULT;
     if let Some(c) = sub_pref("RUST_PLAYER_SUB_COLOR", "sub_color.txt") {
         match player::SubtitleStyle::parse_color(&c) {
@@ -152,6 +154,36 @@ pub async fn run_test_playback(mut player: Player) {
         }
     };
 
+    apply_default_tracks(&player, &tracks);
+
+    // Re-spawn the play() task on natural exit so the stream loops
+    // continuously — useful for soak testing the pipeline.
+    let player_for_loop = player.clone();
+    tokio::spawn(async move {
+        loop {
+            let handle = match player_for_loop.play() {
+                Ok(h) => h,
+                Err(e) => {
+                    log::error!("play(): {}", e);
+                    break;
+                }
+            };
+            let _ = handle.await;
+        }
+    });
+}
+
+/// Pick a sensible default video + audio (+ subtitle) track on `player`,
+/// honouring the same `video_pref` / audio / subtitle / passthrough
+/// preferences across every shell. Shared by [`run_test_playback`] and the
+/// [`bridge`] core so the two paths can't drift apart.
+///
+/// The Android MediaCodec audio backend currently understands only
+/// `mp4a` (AAC); other codecs in the manifest's audio adaptations would
+/// fail to configure. The desktop FFmpeg backend handles everything, so
+/// the helper prefers an `mp4a` representation when one is available and
+/// falls back to the last/first one otherwise.
+pub(crate) fn apply_default_tracks(player: &Player, tracks: &player::Tracks) {
     // Video: representation picked by `video_pref()` (default: first
     // adaptation, index 5 = 720p HEVC in the preclikos.cz fixture,
     // matching what both shells used to hardcode). The hdr/dv preferences
@@ -307,20 +339,4 @@ pub async fn run_test_playback(mut player: Player) {
         player.set_subtitle_track(text_repr);
         log::info!("selected subtitle track {}", text_repr.id);
     }
-
-    // Re-spawn the play() task on natural exit so the stream loops
-    // continuously — useful for soak testing the pipeline.
-    let player_for_loop = player.clone();
-    tokio::spawn(async move {
-        loop {
-            let handle = match player_for_loop.play() {
-                Ok(h) => h,
-                Err(e) => {
-                    log::error!("play(): {}", e);
-                    break;
-                }
-            };
-            let _ = handle.await;
-        }
-    });
 }

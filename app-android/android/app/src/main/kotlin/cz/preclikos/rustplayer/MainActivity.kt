@@ -1,7 +1,7 @@
 package cz.preclikos.rustplayer
 
 import android.app.Activity
-import android.content.Context
+import android.app.AlertDialog
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.drawable.ColorDrawable
@@ -12,55 +12,54 @@ import android.view.Gravity
 import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.SurfaceView
+import android.view.View
 import android.view.WindowManager
+import android.widget.Button
 import android.widget.FrameLayout
+import android.widget.LinearLayout
+import android.widget.SeekBar
+import android.widget.TextView
+import org.json.JSONArray
+import org.json.JSONObject
 
 /**
- * Host Activity for the embedded Rust player smoke test.
+ * Host Activity for the embedded Rust player.
  *
  * Two stacked SurfaceViews (the layering real apps use):
+ *   - [videoView] (bottom): MediaCodec renders into it DIRECTLY in direct mode.
+ *   - [overlayView] (top, translucent): the wgpu/GLES surface (subtitles/UI, or
+ *     video itself in the GL path).
  *
- *   - [videoView] (bottom): MediaCodec renders into it DIRECTLY in the
- *     "direct" playback mode — the decoded frames ride a hardware video
- *     plane, which is what lets the HWC pass HDR10/HDR10+/DV signals
- *     (incl. dynamic metadata) through to the display untouched.
- *   - [overlayView] (top, translucent): the wgpu/GLES surface. In direct
- *     mode it carries only subtitles/UI over transparent pixels; in the
- *     classic mode it carries the video itself (GL tonemap path).
- *
- * Both surfaces are forwarded to Rust over JNI once both exist.
+ * On top of those is a small transport-controls bar driven through [RustPlayer]
+ * — play/pause, a seek bar, and a track picker — exercising the unified bridge
+ * control surface end to end.
  */
 class MainActivity : Activity(), SurfaceHolder.Callback {
 
-    // Opaque pointer to the Rust-side Handle (0 = not started).
-    private var handle: Long = 0L
+    private val player by lazy { RustPlayer(this) }
 
     private lateinit var videoView: SurfaceView
     private lateinit var overlayView: SurfaceView
     private lateinit var videoFrame: FrameLayout
 
+    private lateinit var playPauseButton: Button
+    private lateinit var seekBar: SeekBar
+    private lateinit var timeLabel: TextView
+
     private var videoSurface: Surface? = null
     private var overlaySurface: Surface? = null
     private var overlayW = 0
     private var overlayH = 0
+    private var userSeeking = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        instance = this
-        // Keep the screen on during playback without a WakeLock.
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-
-        // Black window background: any region not covered by the video or
-        // overlay (pre-first-frame, pillarbox gutters) must be black, not
-        // the theme default (observed green on the Google TV Streamer).
         window.setBackgroundDrawable(ColorDrawable(Color.BLACK))
 
         val root = FrameLayout(this)
 
-        // Video plane (bottom). Wrapped in its own FrameLayout whose size is
-        // adjusted to the content aspect ratio from onVideoSize() — MediaCodec
-        // stretches to fill the surface, so the surface itself must have the
-        // video's aspect.
+        // Video plane (bottom), shaped to content aspect in onVideoSize().
         videoFrame = FrameLayout(this)
         videoView = SurfaceView(this)
         videoView.holder.addCallback(VideoCallback())
@@ -80,7 +79,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             ),
         )
 
-        // GL overlay (top, translucent).
+        // GL overlay (translucent, above the video plane).
         overlayView = SurfaceView(this)
         overlayView.setZOrderMediaOverlay(true)
         overlayView.holder.setFormat(PixelFormat.TRANSLUCENT)
@@ -93,59 +92,145 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             ),
         )
 
+        // Transport controls (regular Views draw above both SurfaceViews).
+        root.addView(buildControls(), FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT,
+            FrameLayout.LayoutParams.WRAP_CONTENT,
+            Gravity.BOTTOM,
+        ))
+
         setContentView(root)
+
+        player.listener = PlayerListener()
     }
 
-    /** Called from Rust (any thread) when the content size is known. */
-    fun onVideoSize(width: Int, height: Int) {
-        if (width <= 0 || height <= 0) return
-        runOnUiThread {
-            val parentW = (videoFrame.parent as FrameLayout).width
-            val parentH = (videoFrame.parent as FrameLayout).height
-            if (parentW == 0 || parentH == 0) return@runOnUiThread
-            val videoAspect = width.toFloat() / height.toFloat()
-            val parentAspect = parentW.toFloat() / parentH.toFloat()
-            val lp = videoFrame.layoutParams as FrameLayout.LayoutParams
-            if (videoAspect > parentAspect) {
-                lp.width = parentW
-                lp.height = (parentW / videoAspect).toInt()
-            } else {
-                lp.height = parentH
-                lp.width = (parentH * videoAspect).toInt()
-            }
-            lp.gravity = Gravity.CENTER
-            videoFrame.layoutParams = lp
+    private fun buildControls(): View {
+        val bar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setBackgroundColor(Color.argb(160, 0, 0, 0))
+            setPadding(24, 16, 24, 16)
+            gravity = Gravity.CENTER_VERTICAL
         }
+        playPauseButton = Button(this).apply {
+            text = "▮▮"
+            setOnClickListener { player.togglePlayPause() }
+        }
+        seekBar = SeekBar(this).apply {
+            max = 0
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(sb: SeekBar, progress: Int, fromUser: Boolean) {}
+                override fun onStartTrackingTouch(sb: SeekBar) { userSeeking = true }
+                override fun onStopTrackingTouch(sb: SeekBar) {
+                    userSeeking = false
+                    player.seekTo(sb.progress.toLong())
+                }
+            })
+        }
+        timeLabel = TextView(this).apply {
+            setTextColor(Color.WHITE)
+            text = "0:00 / 0:00"
+        }
+        val tracksButton = Button(this).apply {
+            text = "Tracks"
+            setOnClickListener { showTracksDialog() }
+        }
+        bar.addView(playPauseButton)
+        bar.addView(seekBar, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        bar.addView(timeLabel)
+        bar.addView(tracksButton)
+        return bar
+    }
+
+    private fun showTracksDialog() {
+        val root = try {
+            JSONObject(player.tracksJson())
+        } catch (e: Exception) {
+            return
+        }
+        val labels = ArrayList<String>()
+        val actions = ArrayList<() -> Unit>()
+
+        fun addGroup(prefix: String, key: String, pick: (Int, Int) -> Unit) {
+            val arr: JSONArray = root.optJSONArray(key) ?: return
+            for (i in 0 until arr.length()) {
+                val t = arr.getJSONObject(i)
+                labels.add("$prefix: ${t.optString("label")}")
+                val adapt = t.optInt("adapt")
+                val repr = t.optInt("repr")
+                actions.add { pick(adapt, repr) }
+            }
+        }
+
+        labels.add("Video: Auto (ABR)"); actions.add { player.selectVideoAuto() }
+        addGroup("Video", "video") { a, r -> player.selectVideo(a, r) }
+        addGroup("Audio", "audio") { a, r -> player.selectAudio(a, r) }
+        labels.add("Subtitles: Off"); actions.add { player.clearSubtitles() }
+        addGroup("Subtitle", "text") { a, r -> player.selectSubtitle(a, r) }
+
+        AlertDialog.Builder(this)
+            .setTitle("Tracks")
+            .setItems(labels.toTypedArray()) { _, which -> actions[which]() }
+            .show()
+    }
+
+    private inner class PlayerListener : RustPlayer.Listener {
+        override fun onVideoSize(width: Int, height: Int) = applyVideoAspect(width, height)
+        override fun onPlaying() { playPauseButton.text = "▮▮" }
+        override fun onPaused() { playPauseButton.text = "▶" }
+        override fun onPosition(positionMs: Long, durationMs: Long) {
+            if (durationMs > 0 && seekBar.max != durationMs.toInt()) seekBar.max = durationMs.toInt()
+            if (!userSeeking) seekBar.progress = positionMs.toInt()
+            timeLabel.text = "${fmt(positionMs)} / ${fmt(durationMs)}"
+        }
+    }
+
+    private fun fmt(ms: Long): String {
+        if (ms <= 0) return "0:00"
+        val totalSec = ms / 1000
+        return "%d:%02d".format(totalSec / 60, totalSec % 60)
+    }
+
+    /** Shape the video SurfaceView to the content aspect (MediaCodec stretches). */
+    private fun applyVideoAspect(width: Int, height: Int) {
+        if (width <= 0 || height <= 0) return
+        val parentW = (videoFrame.parent as FrameLayout).width
+        val parentH = (videoFrame.parent as FrameLayout).height
+        if (parentW == 0 || parentH == 0) return
+        val videoAspect = width.toFloat() / height.toFloat()
+        val parentAspect = parentW.toFloat() / parentH.toFloat()
+        val lp = videoFrame.layoutParams as FrameLayout.LayoutParams
+        if (videoAspect > parentAspect) {
+            lp.width = parentW
+            lp.height = (parentW / videoAspect).toInt()
+        } else {
+            lp.height = parentH
+            lp.width = (parentH * videoAspect).toInt()
+        }
+        lp.gravity = Gravity.CENTER
+        videoFrame.layoutParams = lp
     }
 
     private inner class VideoCallback : SurfaceHolder.Callback {
         override fun surfaceCreated(holder: SurfaceHolder) {}
-
         override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
             videoSurface = holder.surface
             maybeStart()
         }
-
         override fun surfaceDestroyed(holder: SurfaceHolder) {
             videoSurface = null
-            // The video surface dying invalidates the whole player (the
-            // decoder renders into it) — tear down like the overlay path.
             teardown()
         }
     }
 
-    // Overlay (this) callbacks ------------------------------------------------
-
-    override fun surfaceCreated(holder: SurfaceHolder) {
-        // Defer to surfaceChanged, which also gives us the size.
-    }
+    // Overlay (this) callbacks.
+    override fun surfaceCreated(holder: SurfaceHolder) {}
 
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
         overlaySurface = holder.surface
         overlayW = width
         overlayH = height
-        if (handle != 0L) {
-            nativeSetSize(handle, width, height)
+        if (player.isStarted) {
+            player.setSize(width, height)
         } else {
             maybeStart()
         }
@@ -159,27 +244,16 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private fun maybeStart() {
         val overlay = overlaySurface ?: return
         val video = videoSurface ?: return
-        if (handle == 0L) {
-            handle = nativeStart(
-                applicationContext, this, overlay, video,
-                overlayW, overlayH, displayHdrTypes(),
-            )
+        if (!player.isStarted) {
+            player.start(overlay, video, overlayW, overlayH, displayHdrTypes())
         }
     }
 
     private fun teardown() {
-        if (handle != 0L) {
-            nativeDestroy(handle)
-            handle = 0L
-        }
+        if (player.isStarted) player.release()
     }
 
-    /**
-     * Bitmask of HDR formats the current display can render natively
-     * (bit 0 = Dolby Vision, 1 = HDR10, 2 = HLG, 3 = HDR10+), passed to the
-     * native player so it can choose PQ passthrough over shader tonemapping.
-     * 0 = SDR-only display (or caps unavailable).
-     */
+    /** HDR formats the display can render natively (bit 0 DV, 1 HDR10, 2 HLG, 3 HDR10+). */
     private fun displayHdrTypes(): Int {
         val display: Display? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             display
@@ -198,39 +272,5 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             }
         }
         return mask
-    }
-
-    companion object {
-        @JvmStatic
-        var instance: MainActivity? = null
-            private set
-
-        init {
-            System.loadLibrary("app_android")
-        }
-
-        // @JvmStatic on companion-object externs produces JNI symbol names on the
-        // *outer* class (Java_cz_preclikos_rustplayer_MainActivity_…), which matches
-        // what the Rust extern "system" fn names already expose.
-
-        // The Context is forwarded so the Rust side can seed ndk_context with
-        // (JavaVM, Activity); the Activity itself is kept for UI callbacks
-        // (onVideoSize aspect updates).
-        @JvmStatic
-        private external fun nativeStart(
-            context: Context,
-            activity: MainActivity,
-            overlaySurface: Surface,
-            videoSurface: Surface,
-            width: Int,
-            height: Int,
-            displayHdrTypes: Int,
-        ): Long
-
-        @JvmStatic
-        private external fun nativeSetSize(handle: Long, width: Int, height: Int)
-
-        @JvmStatic
-        private external fun nativeDestroy(handle: Long)
     }
 }

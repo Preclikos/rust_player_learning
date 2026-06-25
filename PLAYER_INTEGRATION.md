@@ -161,6 +161,35 @@ Full Dolby Vision / HDR10+ passthrough on tvOS will use
 `AVSampleBufferDisplayLayer` (the direct-mode analog); not implemented
 yet.
 
+### 3.4 Reference bridge core (`app-shared`)
+
+The bundled Android/iOS shells don't each re-implement the embed glue.
+The platform-agnostic part lives once in **`app_shared::bridge`** — a
+thin, reusable layer over the player that a host binds to by:
+
+1. constructing a `Player` for its surface (§3.2 / §3.3),
+2. implementing the `BridgeHost` trait — `on_event(json)` plus the
+   provider hooks `intercept` / `resolve_key`, and
+3. calling `bridge::start(player, url, host) -> BridgeHandle`.
+
+`BridgeHandle` is the **unified control surface** both shells expose
+verbatim: `play` / `pause` / `seek_ms` / `set_volume` /
+`position_ms` / `duration_ms` / `is_paused` / `tracks_json` /
+`set_video_track` (+ `_soft` / `_auto`) / `set_audio_track` /
+`set_subtitle_track` / `clear_subtitles` / `resize` / `shutdown`.
+
+The core owns the open_url → prepare → tracks → `play()` orchestration,
+a track-switch command channel, and the event pump that serializes every
+`PlayerEvent` to one **unified JSON** schema (`{"type": …}`) — the same
+events and the same `tracks_json` shape on both platforms. The Android
+shell forwards that JSON to a Kotlin `PlayerBridge.onEvent(String)` and
+wraps it in a `RustPlayer` listener; the iOS shell forwards it through a
+C `event_cb`. Provider policy is delegated to the host the same way on
+both: Android via a synchronous JNI upcall (`resolveKey([B)[B`), iOS via
+an async oneshot token bridge (`bz_intercept_complete` /
+`bz_resolve_key_complete`). This is deliberately the shape a future
+generated **player → ready-made Kotlin/Swift binding** would wrap.
+
 ## 4. Network injection
 
 Implemented exactly as originally specced — summary:

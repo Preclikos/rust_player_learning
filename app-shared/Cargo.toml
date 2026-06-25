@@ -11,4 +11,5 @@ edition = "2021"
 [dependencies]
 player = { path = "../player" }
 tokio = { version = "1.52", features = ["rt", "macros", "sync"] }
+async-trait = "0.1"
 log = "0.4"

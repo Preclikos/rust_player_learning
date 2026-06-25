@@ -211,6 +211,7 @@ version = "0.1.0"
 dependencies = [
  "android_logger",
  "app-shared",
+ "async-trait",
  "jni 0.21.1",
  "log",
  "ndk-context",
@@ -224,6 +225,7 @@ name = "app-ios"
 version = "0.1.0"
 dependencies = [
  "app-shared",
+ "async-trait",
  "log",
  "oslog",
  "player",
@@ -234,6 +236,7 @@ dependencies = [
 name = "app-shared"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "log",
  "player",
  "tokio",

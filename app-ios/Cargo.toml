@@ -14,5 +14,8 @@ path = "src/lib.rs"
 player = { path = "../player" }
 app-shared = { path = "../app-shared" }
 tokio = { version = "1.52", features = ["full"] }
+# BridgeHost is an #[async_trait] impl; the Swift/ObjC provider hooks use an
+# async oneshot token bridge.
+async-trait = "0.1"
 log = "0.4"
 oslog = "0.2"

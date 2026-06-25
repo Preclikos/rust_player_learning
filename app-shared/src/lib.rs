@@ -154,7 +154,8 @@ pub async fn run_test_playback(mut player: Player) {
         }
     };
 
-    apply_default_tracks(&player, &tracks);
+    // Shell behaviour: file-flag passthrough, auto-select the first subtitle.
+    apply_default_tracks(&player, &tracks, None, true);
 
     // Re-spawn the play() task on natural exit so the stream loops
     // continuously — useful for soak testing the pipeline.
@@ -183,7 +184,17 @@ pub async fn run_test_playback(mut player: Player) {
 /// fail to configure. The desktop FFmpeg backend handles everything, so
 /// the helper prefers an `mp4a` representation when one is available and
 /// falls back to the last/first one otherwise.
-pub(crate) fn apply_default_tracks(player: &Player, tracks: &player::Tracks) {
+/// `passthrough_override`: `Some(b)` forces audio passthrough on/off (a product
+/// host has already made the sink-gated decision); `None` keeps the shell's
+/// env / `audio_passthrough.txt` file-flag behaviour. `auto_select_subtitle`:
+/// when `false`, no subtitle track is auto-selected (the host applies its own
+/// language/forced policy after play).
+pub(crate) fn apply_default_tracks(
+    player: &Player,
+    tracks: &player::Tracks,
+    passthrough_override: Option<bool>,
+    auto_select_subtitle: bool,
+) {
     // Video: representation picked by `video_pref()` (default: first
     // adaptation, index 5 = 720p HEVC in the preclikos.cz fixture,
     // matching what both shells used to hardcode). The hdr/dv preferences
@@ -253,8 +264,9 @@ pub(crate) fn apply_default_tracks(player: &Player, tracks: &player::Tracks) {
     // dir on Android. When on, we force an `ec-3` track and tell the player
     // to feed the raw bitstream to an AudioTrack instead of decoding to PCM:
     //   adb shell "echo 1 > /sdcard/Android/data/cz.preclikos.rust_player/files/audio_passthrough.txt"
-    let passthrough =
-        sub_pref("RUST_PLAYER_AUDIO_PASSTHROUGH", "audio_passthrough.txt").as_deref() == Some("1");
+    let passthrough = passthrough_override.unwrap_or_else(|| {
+        sub_pref("RUST_PLAYER_AUDIO_PASSTHROUGH", "audio_passthrough.txt").as_deref() == Some("1")
+    });
 
     // Audio: prefer an AAC (mp4a*) representation since the Android
     // MediaCodec backend can't configure EC-3 / AC-3 without an esds box.
@@ -310,6 +322,12 @@ pub(crate) fn apply_default_tracks(player: &Player, tracks: &player::Tracks) {
                 audio_repr.codecs
             );
         }
+    }
+
+    // Product hosts pick their own subtitle (language + forced policy) after
+    // play, so they disable auto-selection.
+    if !auto_select_subtitle {
+        return;
     }
 
     // Subtitles: pick the first text track when the manifest has one and a

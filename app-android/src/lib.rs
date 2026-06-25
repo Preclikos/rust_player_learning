@@ -23,7 +23,7 @@
 use std::ffi::c_void;
 use std::sync::{Arc, OnceLock};
 
-use app_shared::bridge::{self, BoxError, BridgeHandle, BridgeHost};
+use app_shared::bridge::{self, BoxError, BridgeHandle, BridgeHost, StartConfig};
 use async_trait::async_trait;
 use jni::objects::{GlobalRef, JByteArray, JClass, JObject, JValue};
 use jni::sys::{jboolean, jfloat, jint, jlong, jstring};
@@ -255,6 +255,7 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeStart(
         player,
         app_shared::TEST_MANIFEST_URL.to_string(),
         host.clone(),
+        StartConfig::default(),
     );
 
     let handle = Box::new(Handle {

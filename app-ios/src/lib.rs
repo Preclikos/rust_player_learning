@@ -24,7 +24,9 @@ use std::os::raw::{c_char, c_int};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use app_shared::bridge::{self, BoxError, BridgeHandle, BridgeHost, PreparedRequest, RequestKind};
+use app_shared::bridge::{
+    self, BoxError, BridgeHandle, BridgeHost, PreparedRequest, RequestKind, StartConfig,
+};
 use async_trait::async_trait;
 use player::Player;
 use tokio::sync::oneshot;
@@ -205,6 +207,7 @@ pub extern "C" fn bz_player_create(
         player,
         app_shared::TEST_MANIFEST_URL.to_string(),
         host.clone(),
+        StartConfig::default(),
     );
 
     Box::into_raw(Box::new(Handle {

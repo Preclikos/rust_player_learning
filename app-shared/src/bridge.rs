@@ -97,6 +97,34 @@ enum Cmd {
     ClearSubs,
 }
 
+/// Pre-`play()` configuration for [`start`]. `Default` reproduces the
+/// self-contained test-shell behaviour (file-flag audio passthrough,
+/// auto-select the first subtitle, no resume), so `app-android` / `app-ios`
+/// pass `StartConfig::default()` and are unchanged. A product host overrides
+/// these to drive resume, a real sink-gated passthrough decision, and its own
+/// (post-play) subtitle selection.
+pub struct StartConfig {
+    /// Seek here before the first `play()` (resume). `None` starts at 0.
+    pub start_position: Option<Duration>,
+    /// `Some(true/false)` forces passthrough on/off (the host already made the
+    /// `isDirectPlaybackSupported` + codec decision); `None` keeps the shell's
+    /// env / `audio_passthrough.txt` file-flag behaviour.
+    pub audio_passthrough: Option<bool>,
+    /// Auto-select the first subtitle track during default selection. Product
+    /// hosts set `false` and apply their own language/forced policy after play.
+    pub auto_select_subtitle: bool,
+}
+
+impl Default for StartConfig {
+    fn default() -> Self {
+        Self {
+            start_position: None,
+            audio_passthrough: None,
+            auto_select_subtitle: true,
+        }
+    }
+}
+
 /// Opaque handle the shell keeps for the player's lifetime. Cheap to hold; all
 /// state lives behind `Arc`s shared with the background orchestrator + event
 /// pump. Track switches are dispatched through a command channel because the
@@ -113,7 +141,12 @@ pub struct BridgeHandle {
 /// open_url → prepare → tracks → play() orchestrator, and return a handle. The
 /// caller's `player` clone must keep its surface alive until the handle (and
 /// every clone) is dropped.
-pub fn start(player: Player, manifest_url: String, host: Arc<dyn BridgeHost>) -> BridgeHandle {
+pub fn start(
+    player: Player,
+    manifest_url: String,
+    host: Arc<dyn BridgeHost>,
+    config: StartConfig,
+) -> BridgeHandle {
     player.set_request_interceptor(Arc::new(HostInterceptor(host.clone())));
     player.set_license_resolver(Arc::new(HostResolver(host.clone())));
 
@@ -132,6 +165,7 @@ pub fn start(player: Player, manifest_url: String, host: Arc<dyn BridgeHost>) ->
         duration_ms.clone(),
         cmd_rx,
         shutdown.clone(),
+        config,
     ));
 
     BridgeHandle {
@@ -228,6 +262,7 @@ async fn orchestrate(
     duration_ms: Arc<AtomicU64>,
     mut cmd_rx: mpsc::UnboundedReceiver<Cmd>,
     shutdown: Arc<Notify>,
+    config: StartConfig,
 ) {
     if let Err(e) = player.open_url(&manifest_url).await {
         host.on_event(error_json("other", &format!("open_url: {e}")));
@@ -248,9 +283,19 @@ async fn orchestrate(
     *tracks_json.lock().unwrap() = tracks_to_json(&tracks);
     host.on_event(obj("tracks_ready"));
 
-    // Same default selection (video_pref / audio mp4a / subtitle font+style /
-    // passthrough opt-in) every shell uses — shared so paths can't drift.
-    crate::apply_default_tracks(&player, &tracks);
+    // Resume position must be set before the first play().
+    if let Some(pos) = config.start_position {
+        player.set_start_position(Some(pos));
+    }
+
+    // Default selection (video_pref / audio codec / subtitle font+style),
+    // honouring the host's passthrough + auto-subtitle policy.
+    crate::apply_default_tracks(
+        &player,
+        &tracks,
+        config.audio_passthrough,
+        config.auto_select_subtitle,
+    );
 
     // Initial playback. play() resolves on EndOfStream / stop / exhausted
     // retries; the event pump reports those to the host. We don't auto-loop —
@@ -334,6 +379,7 @@ fn spawn_event_pump(
     duration_ms: Arc<AtomicU64>,
 ) {
     tokio::spawn(async move {
+        let mut last_size = (0u32, 0u32);
         loop {
             match rx.recv().await {
                 Ok(ev) => {
@@ -341,6 +387,21 @@ fn spawn_event_pump(
                         PlayerEvent::ManifestLoaded { duration, .. }
                         | PlayerEvent::Position { duration, .. } => {
                             duration_ms.store(duration.as_millis() as u64, Ordering::Relaxed);
+                        }
+                        // Synthesize a dedicated video-size event the first time
+                        // (and whenever) the rendered resolution changes, so a
+                        // consumer can shape its video plane without parsing the
+                        // periodic `stats` event. (current_resolution is the only
+                        // place the player reports post-ABR size.)
+                        PlayerEvent::Stats {
+                            current_resolution: Some((w, h)),
+                            ..
+                        } if (*w, *h) != last_size && *w > 0 && *h > 0 => {
+                            last_size = (*w, *h);
+                            host.on_event(format!(
+                                r#"{{"type":"video_size","width":{},"height":{}}}"#,
+                                w, h
+                            ));
                         }
                         _ => {}
                     }
@@ -359,7 +420,9 @@ fn spawn_event_pump(
 /// `{"type": "...", <fields>}` where `type` is one of `idle`,
 /// `manifest_loaded`, `prepared`, `buffering`, `playing`, `paused`,
 /// `position`, `track_changed`, `glitch_recovered`, `stats`, `end_of_stream`,
-/// `error`.
+/// `error`. (The pump additionally synthesizes a `video_size` event —
+/// `{"type":"video_size","width","height"}` — when the rendered resolution
+/// first appears / changes; it is not produced here.)
 pub fn event_to_json(ev: &PlayerEvent) -> String {
     match ev {
         PlayerEvent::Idle => obj("idle"),
@@ -480,13 +543,14 @@ pub fn tracks_to_json(t: &Tracks) -> String {
         .enumerate()
         .flat_map(|(ai, a)| {
             let lang = a.language().unwrap_or("").to_string();
+            let forced = a.is_forced();
             a.representations
                 .iter()
                 .enumerate()
                 .map(move |(ri, r)| {
                     format!(
-                        r#"{{"adapt":{},"repr":{},"id":{},"lang":{},"codecs":{},"bandwidth":{},"label":{}}}"#,
-                        ai, ri, r.id, jstr(&lang), jstr(&r.codecs), r.bandwidth, jstr(&r.label())
+                        r#"{{"adapt":{},"repr":{},"id":{},"lang":{},"forced":{},"codecs":{},"bandwidth":{},"label":{}}}"#,
+                        ai, ri, r.id, jstr(&lang), forced, jstr(&r.codecs), r.bandwidth, jstr(&r.label())
                     )
                 })
                 .collect::<Vec<_>>()

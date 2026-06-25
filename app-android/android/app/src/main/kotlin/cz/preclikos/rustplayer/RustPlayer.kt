@@ -120,7 +120,7 @@ class RustPlayer(private val context: Context) {
             "paused" -> l.onPaused()
             "buffering" -> l.onBuffering()
             "position" -> l.onPosition(o.optLong("position_ms"), o.optLong("duration_ms"))
-            "stats" -> {
+            "video_size", "stats" -> {
                 val w = o.optInt("width")
                 val h = o.optInt("height")
                 if (w > 0 && h > 0) l.onVideoSize(w, h)

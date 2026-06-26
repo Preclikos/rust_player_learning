@@ -37,7 +37,14 @@ needs a specific starting rung can `change_video_track` after start (a richer
 `BridgeHost::configure` hook — option (B) in the original analysis — remains the path if hosts
 need full index-based pre-play track control).
 
-### Gap 1c — default video pick is a test-fixture index → no playback on product content  ⛳ NEEDS FIX
+### Gap 1c — default video pick is a test-fixture index → no playback on product content  ✅ RESOLVED
+
+**Landed (`7a12dd4`):** the `None` branch now picks the highest rung `≤ 1080p`
+(`all().filter(|(_,r)| r.height <= 1080).max_by_key(|(_,r)| r.height)`), falling back to the
+first rep — works on any manifest, ABR adapts up. The interim `RUST_PLAYER_VIDEO=0` host hack
+is no longer needed. `video_pref` / `RUST_PLAYER_VIDEO` overrides unchanged.
+
+Original analysis (kept for context):
 
 Device-found migrating BlackZone TV onto the core: `apply_default_tracks` (`lib.rs:242`)
 picks video with `video_pref().None => first_adapt.representations.get(5)` — index 5 is the

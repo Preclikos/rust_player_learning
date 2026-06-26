@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Library manifest. The namespace lives in build.gradle.kts (AGP 8). The
+     player needs INTERNET to fetch the manifest/segments; merged into the
+     consuming app's manifest. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.INTERNET" />
+</manifest>

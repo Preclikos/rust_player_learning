@@ -38,3 +38,4 @@ Thumbs.db
 # Native libraries are produced by the buildRust* Gradle tasks
 # (cargo ndk → cdylib). Don't commit the generated .so files.
 app/src/main/jniLibs/
+rustplayer/src/main/jniLibs/

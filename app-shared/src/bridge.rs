@@ -104,8 +104,14 @@ enum Cmd {
 /// these to drive resume, a real sink-gated passthrough decision, and its own
 /// (post-play) subtitle selection.
 pub struct StartConfig {
-    /// Seek here before the first `play()` (resume). `None` starts at 0.
+    /// Absolute resume position, applied before the first `play()`. `None`
+    /// starts at 0 (unless [`start_fraction`](Self::start_fraction) is set).
     pub start_position: Option<Duration>,
+    /// Resume as a fraction of the real media duration (`0.0..=1.0`), resolved
+    /// against the duration discovered in `prepare()` — for product apps that
+    /// store resume as a percent and can't compute the exact `Duration` before
+    /// play. Used only when `start_position` is `None`.
+    pub start_fraction: Option<f32>,
     /// `Some(true/false)` forces passthrough on/off (the host already made the
     /// `isDirectPlaybackSupported` + codec decision); `None` keeps the shell's
     /// env / `audio_passthrough.txt` file-flag behaviour.
@@ -119,6 +125,7 @@ impl Default for StartConfig {
     fn default() -> Self {
         Self {
             start_position: None,
+            start_fraction: None,
             audio_passthrough: None,
             auto_select_subtitle: true,
         }
@@ -283,9 +290,17 @@ async fn orchestrate(
     *tracks_json.lock().unwrap() = tracks_to_json(&tracks);
     host.on_event(obj("tracks_ready"));
 
-    // Resume position must be set before the first play().
-    if let Some(pos) = config.start_position {
-        player.set_start_position(Some(pos));
+    // Resume must be set before the first play(): an absolute position if the
+    // host gave one, otherwise a fraction of the now-known real duration
+    // (product apps store resume as a percent and can't compute the exact
+    // Duration until prepare() reveals it).
+    let resume = config.start_position.or_else(|| {
+        config
+            .start_fraction
+            .map(|f| tracks.duration.mul_f32(f.clamp(0.0, 1.0)))
+    });
+    if resume.is_some() {
+        player.set_start_position(resume);
     }
 
     // Default selection (video_pref / audio codec / subtitle font+style),

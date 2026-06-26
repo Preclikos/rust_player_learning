@@ -37,6 +37,39 @@ needs a specific starting rung can `change_video_track` after start (a richer
 `BridgeHost::configure` hook — option (B) in the original analysis — remains the path if hosts
 need full index-based pre-play track control).
 
+### Gap 1b — `start_position` is absolute, but product resume is a percent  ✅ RESOLVED
+
+**Landed:** `StartConfig` now also has `start_fraction: Option<f32>`; `orchestrate()` resolves it
+against the real duration before play — `start_position.or_else(|| start_fraction.map(|f|
+tracks.duration.mul_f32(f.clamp(0.0,1.0))))` — so absolute wins if both are set, else the fraction
+is used. `Default` adds `start_fraction: None`, shells unchanged. The BlackZone host passes
+`start_fraction: Some(progress/100.0)` for frame-accurate percent resume.
+
+Original analysis (kept for context):
+
+BlackZone (and most catalog apps) store resume as a **percent of duration**, and the host does
+NOT know the exact media duration before play — its metadata `runtime` is in whole **minutes**
+(`MediaItem.runtime`, rendered `runtime/60`h `runtime%60`m), so `runtime*60000*pct` rounds to
+minute granularity → up to ~30 s off at high percents. The exact duration is only known inside
+`orchestrate()` after `prepare()`/`get_tracks()` — which is exactly where `start_position` is
+applied. So the host cannot fill `start_position: Option<Duration>` precisely.
+
+**Ask:** add a fraction variant resolved against the real duration in `orchestrate()`:
+```rust
+pub struct StartConfig {
+    pub start_position: Option<Duration>,  // absolute (kept)
+    pub start_fraction: Option<f32>,       // 0.0..=1.0 of duration; resolved at play, wins if set
+    pub audio_passthrough: Option<bool>,
+    pub auto_select_subtitle: bool,
+}
+```
+In `orchestrate`, before play: `let pos = config.start_position.or_else(|| config.start_fraction
+.map(|f| duration.mul_f32(f.clamp(0.0, 1.0))));  player.set_start_position(pos);`. `Default` adds
+`start_fraction: None` → shells unchanged. This mirrors what our old native bridge already did
+(`resume_ms = tracks.duration * pct/100` computed inside the orchestration, pre-play) — it just
+needs to live in the core now. Then the BlackZone host passes `start_fraction: Some(progress/100)`
+and resume stays frame-accurate.
+
 ## Gap 2 — `forced` on text tracks  ✅ RESOLVED
 
 `tracks_to_json` text entries now include `"forced": bool` (from

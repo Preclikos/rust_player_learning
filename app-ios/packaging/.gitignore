@@ -1,0 +1,6 @@
+# Build artifacts produced by scripts/build_xcframework.sh — never committed
+# (CI rebuilds them; releases attach the zip).
+build/
+RustPlayerFFI.xcframework/
+RustPlayerFFI.xcframework.zip
+.build/

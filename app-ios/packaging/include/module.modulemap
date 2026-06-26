@@ -1,0 +1,4 @@
+module RustPlayerFFI {
+    header "rustplayer_ffi.h"
+    export *
+}

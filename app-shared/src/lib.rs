@@ -239,7 +239,14 @@ pub(crate) fn apply_default_tracks(
             .parse::<usize>()
             .ok()
             .and_then(|i| first_adapt.representations.get(i).map(|r| (first_adapt, r))),
-        None => first_adapt.representations.get(5).map(|r| (first_adapt, r)),
+        // Product-safe default: highest rung at or below 1080p (ABR adapts up
+        // from there), falling back to the first rep. The old fixed index 5
+        // was the 720p rung of the preclikos test fixture and is `None` on
+        // product manifests with fewer reps — which failed play() outright.
+        None => all()
+            .filter(|(_, r)| r.height <= 1080)
+            .max_by_key(|(_, r)| r.height)
+            .or_else(|| first_adapt.representations.first().map(|r| (first_adapt, r))),
     };
     let (video_adapt, video_repr) = match picked {
         Some(p) => p,

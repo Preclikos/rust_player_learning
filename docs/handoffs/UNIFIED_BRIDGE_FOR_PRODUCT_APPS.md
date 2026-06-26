@@ -37,6 +37,31 @@ needs a specific starting rung can `change_video_track` after start (a richer
 `BridgeHost::configure` hook — option (B) in the original analysis — remains the path if hosts
 need full index-based pre-play track control).
 
+### Gap 1c — default video pick is a test-fixture index → no playback on product content  ⛳ NEEDS FIX
+
+Device-found migrating BlackZone TV onto the core: `apply_default_tracks` (`lib.rs:242`)
+picks video with `video_pref().None => first_adapt.representations.get(5)` — index 5 is the
+720p rung of the preclikos.cz test fixture. Product manifests have far fewer reps (e.g. 3:
+1080p/720p/480p), so `get(5)` is `None` →
+```
+E app_shared: no video representation matches preference None (and default index 5 is missing)
+E app_shared::bridge: play(): Video Track not set
+```
+`play()` then fails and **nothing plays**. And there is no host recovery: `play()` errors inside
+`orchestrate()` before the host can `change_video_track`, and `video_pref()` only reads
+`RUST_PLAYER_VIDEO` / a file under the *test app's* package dir — a product app can't set it
+cleanly. (BlackZone has an INTERIM `std::env::set_var("RUST_PLAYER_VIDEO","0")` in its
+`nativeStart` to force the first rep so it can test the migration — please make that unnecessary.)
+
+**Ask:** make the `None` branch pick a product-safe default instead of the fixed index 5 —
+e.g. the highest rep `≤ 1080p` (then ABR adapts), falling back to the first rep:
+```rust
+None => all().filter(|(_, r)| r.height <= 1080).max_by_key(|(_, r)| r.height)
+              .or_else(|| first_adapt.representations.first().map(|r| (first_adapt, r))),
+```
+(or expose a `StartConfig.video_pref: Option<...>` so the host states it explicitly). The fixture
+default can move to the shells' `StartConfig` so they keep index-5 behaviour.
+
 ### Gap 1b — `start_position` is absolute, but product resume is a percent  ✅ RESOLVED
 
 **Landed:** `StartConfig` now also has `start_fraction: Option<f32>`; `orchestrate()` resolves it

@@ -3,13 +3,13 @@
 // This is the iOS shell of the *unified bridge core* (the `bridge` crate),
 // the FFI mirror of the Android shell. The Objective-C host (`ios/RustPlayer/
 // main.m`) owns the app lifecycle and a `CAMetalLayer`, hands it to
-// `bz_player_create`, and gets back an opaque handle it drives through the same
+// `rustplayer_player_create`, and gets back an opaque handle it drives through the same
 // unified control surface the Android JNI exposes.
 //
 // Events flow Rust→host as unified JSON via a C `event_cb`. The provider hooks
 // (`intercept` / `resolve_key`) use an **async token bridge**: Rust fires the
 // host callback with a token and awaits a oneshot; the host calls back
-// `bz_intercept_complete(token, …)` / `bz_resolve_key_complete(token, …)`.
+// `rustplayer_intercept_complete(token, …)` / `rustplayer_resolve_key_complete(token, …)`.
 // (The test host completes them synchronously — passthrough + baked ClearKeys.)
 //
 //   * Build with `./ios/build_sim.sh` (links librustplayer.a into the Obj-C app).
@@ -28,7 +28,9 @@ use bridge::{
     self, BoxError, BridgeHandle, BridgeHost, PreparedRequest, RequestKind, StartConfig,
 };
 use async_trait::async_trait;
+use bytes::Bytes;
 use player::{Player, SubtitleStyle};
+use reqwest::Method;
 use tokio::sync::oneshot;
 
 // --- C ABI callback types ----------------------------------------------------
@@ -169,6 +171,32 @@ unsafe fn cstr(p: *const c_char) -> String {
     }
 }
 
+/// Read a NUL-terminated flat `[k0,v0,k1,v1,...,NULL]` C array into pairs.
+/// A trailing key with no value (odd count before the NULL) is dropped.
+///
+/// SAFETY: `headers` is either NULL or points to such an array, valid for the
+/// duration of this call.
+unsafe fn read_flat_headers(headers: *const *const c_char) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    if headers.is_null() {
+        return out;
+    }
+    let mut i = 0isize;
+    loop {
+        let kp = *headers.offset(i);
+        if kp.is_null() {
+            break;
+        }
+        let vp = *headers.offset(i + 1);
+        if vp.is_null() {
+            break; // dangling key without a value
+        }
+        out.push((cstr(kp), cstr(vp)));
+        i += 2;
+    }
+    out
+}
+
 // --- lifecycle ---------------------------------------------------------------
 
 /// Create a player rendering into `metal_layer` (a `CAMetalLayer*`), wire the
@@ -176,9 +204,10 @@ unsafe fn cstr(p: *const c_char) -> String {
 /// opaque handle (or NULL on failure). The host guarantees the layer + `user`
 /// outlive the player.
 ///
-/// Declare in the Obj-C host (see `blackzone_player.h`-style decls in main.m).
+/// Declare in the Obj-C host (see the `extern` decls in main.m, or include
+/// `rustplayer_ffi.h`).
 #[no_mangle]
-pub extern "C" fn bz_player_create(
+pub extern "C" fn rustplayer_player_create(
     metal_layer: *mut c_void,
     width: u32,
     height: u32,
@@ -193,15 +222,15 @@ pub extern "C" fn bz_player_create(
 ) -> *mut c_void {
     init_once();
     if metal_layer.is_null() {
-        log::error!("bz_player_create: null metal_layer");
+        log::error!("rustplayer_player_create: null metal_layer");
         return std::ptr::null_mut();
     }
     let manifest = unsafe { cstr(manifest_url) };
     if manifest.is_empty() {
-        log::error!("bz_player_create: empty manifest_url");
+        log::error!("rustplayer_player_create: empty manifest_url");
         return std::ptr::null_mut();
     }
-    log::info!("bz_player_create: {}x{} url={}", width, height, manifest);
+    log::info!("rustplayer_player_create: {}x{} url={}", width, height, manifest);
 
     let host = Arc::new(IosHost {
         intercept_cb,
@@ -235,7 +264,7 @@ pub extern "C" fn bz_player_create(
 }
 
 #[no_mangle]
-pub extern "C" fn bz_player_set_size(handle: *mut c_void, width: u32, height: u32, _scale: f32) {
+pub extern "C" fn rustplayer_player_set_size(handle: *mut c_void, width: u32, height: u32, _scale: f32) {
     if let Some(h) = unsafe { handle_ref(handle) } {
         let _guard = runtime().enter();
         h.bridge.resize(width.max(1), height.max(1));
@@ -243,7 +272,7 @@ pub extern "C" fn bz_player_set_size(handle: *mut c_void, width: u32, height: u3
 }
 
 #[no_mangle]
-pub extern "C" fn bz_player_play(handle: *mut c_void) {
+pub extern "C" fn rustplayer_player_play(handle: *mut c_void) {
     if let Some(h) = unsafe { handle_ref(handle) } {
         let _guard = runtime().enter();
         h.bridge.play();
@@ -251,7 +280,7 @@ pub extern "C" fn bz_player_play(handle: *mut c_void) {
 }
 
 #[no_mangle]
-pub extern "C" fn bz_player_pause(handle: *mut c_void) {
+pub extern "C" fn rustplayer_player_pause(handle: *mut c_void) {
     if let Some(h) = unsafe { handle_ref(handle) } {
         let _guard = runtime().enter();
         h.bridge.pause();
@@ -259,14 +288,14 @@ pub extern "C" fn bz_player_pause(handle: *mut c_void) {
 }
 
 #[no_mangle]
-pub extern "C" fn bz_player_is_paused(handle: *mut c_void) -> bool {
+pub extern "C" fn rustplayer_player_is_paused(handle: *mut c_void) -> bool {
     unsafe { handle_ref(handle) }
         .map(|h| h.bridge.is_paused())
         .unwrap_or(false)
 }
 
 #[no_mangle]
-pub extern "C" fn bz_player_seek_ms(handle: *mut c_void, position_ms: i64) {
+pub extern "C" fn rustplayer_player_seek_ms(handle: *mut c_void, position_ms: i64) {
     if let Some(h) = unsafe { handle_ref(handle) } {
         let _guard = runtime().enter();
         h.bridge.seek_ms(position_ms);
@@ -274,30 +303,30 @@ pub extern "C" fn bz_player_seek_ms(handle: *mut c_void, position_ms: i64) {
 }
 
 #[no_mangle]
-pub extern "C" fn bz_player_position_ms(handle: *mut c_void) -> i64 {
+pub extern "C" fn rustplayer_player_position_ms(handle: *mut c_void) -> i64 {
     unsafe { handle_ref(handle) }
         .map(|h| h.bridge.position_ms())
         .unwrap_or(0)
 }
 
 #[no_mangle]
-pub extern "C" fn bz_player_duration_ms(handle: *mut c_void) -> i64 {
+pub extern "C" fn rustplayer_player_duration_ms(handle: *mut c_void) -> i64 {
     unsafe { handle_ref(handle) }
         .map(|h| h.bridge.duration_ms())
         .unwrap_or(0)
 }
 
 #[no_mangle]
-pub extern "C" fn bz_player_set_volume(handle: *mut c_void, volume: f32) {
+pub extern "C" fn rustplayer_player_set_volume(handle: *mut c_void, volume: f32) {
     if let Some(h) = unsafe { handle_ref(handle) } {
         let _guard = runtime().enter();
         h.bridge.set_volume(volume);
     }
 }
 
-/// Returns a heap C string the caller MUST free with [`bz_string_free`].
+/// Returns a heap C string the caller MUST free with [`rustplayer_string_free`].
 #[no_mangle]
-pub extern "C" fn bz_player_tracks_json(handle: *mut c_void) -> *mut c_char {
+pub extern "C" fn rustplayer_player_tracks_json(handle: *mut c_void) -> *mut c_char {
     let json = unsafe { handle_ref(handle) }
         .map(|h| h.bridge.tracks_json())
         .unwrap_or_else(|| "{}".to_string());
@@ -308,7 +337,7 @@ pub extern "C" fn bz_player_tracks_json(handle: *mut c_void) -> *mut c_char {
 }
 
 #[no_mangle]
-pub extern "C" fn bz_string_free(s: *mut c_char) {
+pub extern "C" fn rustplayer_string_free(s: *mut c_char) {
     if !s.is_null() {
         unsafe {
             drop(CString::from_raw(s));
@@ -317,7 +346,7 @@ pub extern "C" fn bz_string_free(s: *mut c_char) {
 }
 
 #[no_mangle]
-pub extern "C" fn bz_player_select_video(handle: *mut c_void, adapt: u32, repr: u32, soft: bool) {
+pub extern "C" fn rustplayer_player_select_video(handle: *mut c_void, adapt: u32, repr: u32, soft: bool) {
     if let Some(h) = unsafe { handle_ref(handle) } {
         if soft {
             h.bridge.set_video_track_soft(adapt as usize, repr as usize);
@@ -328,28 +357,28 @@ pub extern "C" fn bz_player_select_video(handle: *mut c_void, adapt: u32, repr: 
 }
 
 #[no_mangle]
-pub extern "C" fn bz_player_select_video_auto(handle: *mut c_void) {
+pub extern "C" fn rustplayer_player_select_video_auto(handle: *mut c_void) {
     if let Some(h) = unsafe { handle_ref(handle) } {
         h.bridge.set_video_auto();
     }
 }
 
 #[no_mangle]
-pub extern "C" fn bz_player_select_audio(handle: *mut c_void, adapt: u32, repr: u32) {
+pub extern "C" fn rustplayer_player_select_audio(handle: *mut c_void, adapt: u32, repr: u32) {
     if let Some(h) = unsafe { handle_ref(handle) } {
         h.bridge.set_audio_track(adapt as usize, repr as usize);
     }
 }
 
 #[no_mangle]
-pub extern "C" fn bz_player_select_subtitle(handle: *mut c_void, adapt: u32, repr: u32) {
+pub extern "C" fn rustplayer_player_select_subtitle(handle: *mut c_void, adapt: u32, repr: u32) {
     if let Some(h) = unsafe { handle_ref(handle) } {
         h.bridge.set_subtitle_track(adapt as usize, repr as usize);
     }
 }
 
 #[no_mangle]
-pub extern "C" fn bz_player_clear_subtitles(handle: *mut c_void) {
+pub extern "C" fn rustplayer_player_clear_subtitles(handle: *mut c_void) {
     if let Some(h) = unsafe { handle_ref(handle) } {
         h.bridge.clear_subtitles();
     }
@@ -359,7 +388,7 @@ pub extern "C" fn bz_player_clear_subtitles(handle: *mut c_void) {
 
 /// ARGB ints (like Android `Color` / ExoPlayer `CaptionStyleCompat`).
 #[no_mangle]
-pub extern "C" fn bz_player_set_subtitle_style(
+pub extern "C" fn rustplayer_player_set_subtitle_style(
     handle: *mut c_void,
     text_argb: i32,
     outline_argb: i32,
@@ -387,7 +416,7 @@ pub extern "C" fn bz_player_set_subtitle_style(
 }
 
 #[no_mangle]
-pub extern "C" fn bz_player_set_subtitle_safe_inset_bottom(handle: *mut c_void, bottom_px: u32) {
+pub extern "C" fn rustplayer_player_set_subtitle_safe_inset_bottom(handle: *mut c_void, bottom_px: u32) {
     if let Some(h) = unsafe { handle_ref(handle) } {
         h.bridge.player().set_subtitle_safe_insets(bottom_px);
     }
@@ -395,7 +424,7 @@ pub extern "C" fn bz_player_set_subtitle_safe_inset_bottom(handle: *mut c_void, 
 
 /// Verbose logging toggle (default off → per-frame spam gated).
 #[no_mangle]
-pub extern "C" fn bz_player_set_verbose_logging(enabled: bool) {
+pub extern "C" fn rustplayer_player_set_verbose_logging(enabled: bool) {
     log::set_max_level(if enabled {
         log::LevelFilter::Debug
     } else {
@@ -404,7 +433,7 @@ pub extern "C" fn bz_player_set_verbose_logging(enabled: bool) {
 }
 
 #[no_mangle]
-pub extern "C" fn bz_player_destroy(handle: *mut c_void) {
+pub extern "C" fn rustplayer_player_destroy(handle: *mut c_void) {
     if handle.is_null() {
         return;
     }
@@ -416,19 +445,54 @@ pub extern "C" fn bz_player_destroy(handle: *mut c_void) {
 
 // --- host → Rust completion callbacks (async token bridge) -------------------
 
+/// C mirror of [`PreparedRequest`] (see `RustPlayerPreparedRequest` in
+/// rustplayer_ffi.h). All fields but `url` are optional; the host fills it in
+/// its request filter and hands a pointer to [`rustplayer_intercept_complete`].
+#[repr(C)]
+pub struct RustPlayerPreparedRequest {
+    url: *const c_char,
+    headers: *const *const c_char, // flat [k0,v0,...,NULL] or NULL
+    method: *const c_char,         // "GET"/"POST"/... or NULL
+    body: *const u8,               // optional; NULL = none
+    body_len: usize,
+}
+
 #[no_mangle]
-pub extern "C" fn bz_intercept_complete(token: u64, url: *const c_char) {
-    let url = unsafe { cstr(url) };
+pub extern "C" fn rustplayer_intercept_complete(token: u64, prepared: *const RustPlayerPreparedRequest) {
+    if prepared.is_null() {
+        rustplayer_intercept_fail(token, std::ptr::null());
+        return;
+    }
+    // SAFETY: the host keeps `prepared` and everything it points at alive for
+    // the duration of this call (see the header contract).
+    let p = unsafe { &*prepared };
+    let url = unsafe { cstr(p.url) };
+    let headers = unsafe { read_flat_headers(p.headers) };
+    let method = if p.method.is_null() {
+        None
+    } else {
+        // Unparseable method strings fall back to the kind default rather than
+        // failing the request.
+        Method::from_bytes(unsafe { cstr(p.method) }.as_bytes()).ok()
+    };
+    let body = if p.body.is_null() || p.body_len == 0 {
+        None
+    } else {
+        let slice = unsafe { std::slice::from_raw_parts(p.body, p.body_len) };
+        Some(Bytes::copy_from_slice(slice))
+    };
     if let Some(tx) = intercept_registry().lock().unwrap().remove(&token) {
         let _ = tx.send(Ok(PreparedRequest {
             url,
-            ..Default::default()
+            headers,
+            method,
+            body,
         }));
     }
 }
 
 #[no_mangle]
-pub extern "C" fn bz_intercept_fail(token: u64, message: *const c_char) {
+pub extern "C" fn rustplayer_intercept_fail(token: u64, message: *const c_char) {
     let m = unsafe { cstr(message) };
     if let Some(tx) = intercept_registry().lock().unwrap().remove(&token) {
         let _ = tx.send(Err(m));
@@ -436,9 +500,9 @@ pub extern "C" fn bz_intercept_fail(token: u64, message: *const c_char) {
 }
 
 #[no_mangle]
-pub extern "C" fn bz_resolve_key_complete(token: u64, key16: *const u8) {
+pub extern "C" fn rustplayer_resolve_key_complete(token: u64, key16: *const u8) {
     if key16.is_null() {
-        bz_resolve_key_fail(token, std::ptr::null());
+        rustplayer_resolve_key_fail(token, std::ptr::null());
         return;
     }
     let mut key = [0u8; 16];
@@ -449,7 +513,7 @@ pub extern "C" fn bz_resolve_key_complete(token: u64, key16: *const u8) {
 }
 
 #[no_mangle]
-pub extern "C" fn bz_resolve_key_fail(token: u64, message: *const c_char) {
+pub extern "C" fn rustplayer_resolve_key_fail(token: u64, message: *const c_char) {
     let m = unsafe { cstr(message) };
     if let Some(tx) = resolve_registry().lock().unwrap().remove(&token) {
         let _ = tx.send(Err(if m.is_empty() {

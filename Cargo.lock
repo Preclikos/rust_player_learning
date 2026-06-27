@@ -389,9 +389,11 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bridge",
+ "bytes",
  "log",
  "oslog",
  "player",
+ "reqwest",
  "tokio",
 ]
 

@@ -8,7 +8,7 @@
 > `nativeStart`/`bridge::start`. C = `setVideoSurface`/`setSubtitleSafeInsetBottom`/
 > `setAdaptiveFrameRate`/`setSubtitleStyle`/`setVerboseLogging`. The `:app` smoke
 > test now supplies a `TestProvider` (baked keys via `resolveKey`) + the test URL.
-> iOS mirrored (`RustPlayerProvider` intercept/resolveKey already; `bz_player_create`
+> iOS mirrored (`RustPlayerProvider` intercept/resolveKey already; `rustplayer_player_create`
 > takes the URL + config; subtitle-style/safe-inset/verbose knobs) — not built on a
 > Mac yet. **Re-publish** a new version (was 0.0.1, test-shaped) after the planned
 > project restructure.

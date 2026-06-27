@@ -2,13 +2,13 @@
 //
 // The Objective-C host owns the app lifecycle and a CAMetalLayer-backed view,
 // then drives the unified bridge core (`app_shared::bridge`, FFI in
-// app-ios/src/lib.rs) through `bz_player_*`. It implements the three host
+// app-ios/src/lib.rs) through `rustplayer_player_*`. It implements the three host
 // callbacks the bridge needs:
 //   - event_cb        — unified JSON player events → update the UI
 //   - intercept_cb    — provider hook: passthrough (test stream needs no auth)
 //   - resolve_key_cb  — provider hook: return the baked ClearKey for a KID
 // Both provider callbacks complete the async token synchronously — the bridge
-// awaits a oneshot on the Rust side and resumes when we call bz_*_complete.
+// awaits a oneshot on the Rust side and resumes when we call rustplayer_*_complete.
 
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
@@ -18,39 +18,48 @@
 
 // --- FFI surface exported by libapp_ios.a (see app-ios/src/lib.rs) ----------
 
-typedef void (*bz_intercept_cb)(void *user, const char *url, int kind, uint64_t token);
-typedef void (*bz_resolve_key_cb)(void *user, const uint8_t *kid, uint64_t token);
-typedef void (*bz_event_cb)(void *user, const char *json);
+typedef void (*rustplayer_intercept_cb)(void *user, const char *url, int kind, uint64_t token);
+typedef void (*rustplayer_resolve_key_cb)(void *user, const uint8_t *kid, uint64_t token);
+typedef void (*rustplayer_event_cb)(void *user, const char *json);
 
-extern void *bz_player_create(void *metal_layer, uint32_t width, uint32_t height,
+extern void *rustplayer_player_create(void *metal_layer, uint32_t width, uint32_t height,
                               const char *manifest_url, float start_fraction,
                               int32_t audio_passthrough, bool auto_select_subtitle,
-                              bz_intercept_cb intercept_cb, bz_resolve_key_cb resolve_key_cb,
-                              bz_event_cb event_cb, void *user);
+                              rustplayer_intercept_cb intercept_cb, rustplayer_resolve_key_cb resolve_key_cb,
+                              rustplayer_event_cb event_cb, void *user);
 
 // Bundled encrypted DASH test stream (smoke test only).
 #define TEST_MANIFEST_URL "https://preclikos.cz/examples/encrypted/manifest.mpd"
-extern void bz_player_set_size(void *handle, uint32_t width, uint32_t height, float scale);
-extern void bz_player_play(void *handle);
-extern void bz_player_pause(void *handle);
-extern bool bz_player_is_paused(void *handle);
-extern void bz_player_seek_ms(void *handle, int64_t position_ms);
-extern int64_t bz_player_position_ms(void *handle);
-extern int64_t bz_player_duration_ms(void *handle);
-extern void bz_player_set_volume(void *handle, float volume);
-extern char *bz_player_tracks_json(void *handle);
-extern void bz_string_free(char *s);
-extern void bz_player_select_video(void *handle, uint32_t adapt, uint32_t repr, bool soft);
-extern void bz_player_select_video_auto(void *handle);
-extern void bz_player_select_audio(void *handle, uint32_t adapt, uint32_t repr);
-extern void bz_player_select_subtitle(void *handle, uint32_t adapt, uint32_t repr);
-extern void bz_player_clear_subtitles(void *handle);
-extern void bz_player_destroy(void *handle);
+extern void rustplayer_player_set_size(void *handle, uint32_t width, uint32_t height, float scale);
+extern void rustplayer_player_play(void *handle);
+extern void rustplayer_player_pause(void *handle);
+extern bool rustplayer_player_is_paused(void *handle);
+extern void rustplayer_player_seek_ms(void *handle, int64_t position_ms);
+extern int64_t rustplayer_player_position_ms(void *handle);
+extern int64_t rustplayer_player_duration_ms(void *handle);
+extern void rustplayer_player_set_volume(void *handle, float volume);
+extern char *rustplayer_player_tracks_json(void *handle);
+extern void rustplayer_string_free(char *s);
+extern void rustplayer_player_select_video(void *handle, uint32_t adapt, uint32_t repr, bool soft);
+extern void rustplayer_player_select_video_auto(void *handle);
+extern void rustplayer_player_select_audio(void *handle, uint32_t adapt, uint32_t repr);
+extern void rustplayer_player_select_subtitle(void *handle, uint32_t adapt, uint32_t repr);
+extern void rustplayer_player_clear_subtitles(void *handle);
+extern void rustplayer_player_destroy(void *handle);
 
-extern void bz_intercept_complete(uint64_t token, const char *url);
-extern void bz_intercept_fail(uint64_t token, const char *message);
-extern void bz_resolve_key_complete(uint64_t token, const uint8_t *key16);
-extern void bz_resolve_key_fail(uint64_t token, const char *message);
+// Generic request-filter result (mirrors RustPlayerPreparedRequest in rustplayer_ffi.h).
+typedef struct {
+    const char *url;
+    const char *const *headers;   // [k0,v0,...,NULL] or NULL
+    const char *method;           // "GET"/"POST"/... or NULL
+    const uint8_t *body;          // optional; NULL = none
+    size_t body_len;
+} RustPlayerPreparedRequest;
+
+extern void rustplayer_intercept_complete(uint64_t token, const RustPlayerPreparedRequest *prepared);
+extern void rustplayer_intercept_fail(uint64_t token, const char *message);
+extern void rustplayer_resolve_key_complete(uint64_t token, const uint8_t *key16);
+extern void rustplayer_resolve_key_fail(uint64_t token, const char *message);
 
 // --- Metal-backed view -------------------------------------------------------
 
@@ -90,7 +99,10 @@ static void intercept_cb(void *user, const char *url, int kind, uint64_t token) 
     (void)user;
     (void)kind;
     // Test provider: pass the URL through unchanged, no auth headers.
-    bz_intercept_complete(token, url);
+    RustPlayerPreparedRequest prepared = {
+        .url = url, .headers = NULL, .method = NULL, .body = NULL, .body_len = 0,
+    };
+    rustplayer_intercept_complete(token, &prepared);
 }
 
 static void resolve_key_cb(void *user, const uint8_t *kid, uint64_t token) {
@@ -106,11 +118,11 @@ static void resolve_key_cb(void *user, const uint8_t *kid, uint64_t token) {
     static const uint8_t key2[16] = {0x62, 0x7e, 0xf7, 0x2b, 0x42, 0xd9, 0x87, 0x70,
                                       0xde, 0xc2, 0x0e, 0xca, 0xb4, 0x6c, 0xd1, 0xf4};
     if (kid && memcmp(kid, kid1, 16) == 0) {
-        bz_resolve_key_complete(token, key1);
+        rustplayer_resolve_key_complete(token, key1);
     } else if (kid && memcmp(kid, kid2, 16) == 0) {
-        bz_resolve_key_complete(token, key2);
+        rustplayer_resolve_key_complete(token, key2);
     } else {
-        bz_resolve_key_fail(token, "no baked key for KID");
+        rustplayer_resolve_key_fail(token, "no baked key for KID");
     }
 }
 
@@ -208,21 +220,21 @@ static void resolve_key_cb(void *user, const uint8_t *kid, uint64_t token) {
 
     if (self.handle == NULL) {
         NSLog(@"[host] starting embedded player %ux%u (scale %.1f)", w, h, scale);
-        self.handle = bz_player_create((__bridge void *)layer, w, h,
+        self.handle = rustplayer_player_create((__bridge void *)layer, w, h,
                                        TEST_MANIFEST_URL, -1.0f, -1, true,
                                        intercept_cb, resolve_key_cb, event_cb,
                                        (__bridge void *)self);
     } else {
-        bz_player_set_size(self.handle, w, h, (float)scale);
+        rustplayer_player_set_size(self.handle, w, h, (float)scale);
     }
 }
 
 - (void)togglePlay {
     if (self.handle == NULL) return;
-    if (bz_player_is_paused(self.handle)) {
-        bz_player_play(self.handle);
+    if (rustplayer_player_is_paused(self.handle)) {
+        rustplayer_player_play(self.handle);
     } else {
-        bz_player_pause(self.handle);
+        rustplayer_player_pause(self.handle);
     }
 }
 
@@ -233,7 +245,7 @@ static void resolve_key_cb(void *user, const uint8_t *kid, uint64_t token) {
 - (void)seekEnded {
     self.userSeeking = NO;
     if (self.handle != NULL) {
-        bz_player_seek_ms(self.handle, (int64_t)self.seekSlider.value);
+        rustplayer_player_seek_ms(self.handle, (int64_t)self.seekSlider.value);
     }
 }
 
@@ -272,10 +284,10 @@ static void resolve_key_cb(void *user, const uint8_t *kid, uint64_t token) {
 
 - (void)showTracks {
     if (self.handle == NULL) return;
-    char *cjson = bz_player_tracks_json(self.handle);
+    char *cjson = rustplayer_player_tracks_json(self.handle);
     if (cjson == NULL) return;
     NSString *jsonStr = [NSString stringWithUTF8String:cjson];
-    bz_string_free(cjson);
+    rustplayer_string_free(cjson);
 
     NSData *data = [jsonStr dataUsingEncoding:NSUTF8StringEncoding];
     NSDictionary *root = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
@@ -289,7 +301,7 @@ static void resolve_key_cb(void *user, const uint8_t *kid, uint64_t token) {
     [sheet addAction:[UIAlertAction actionWithTitle:@"Video: Auto (ABR)"
                                               style:UIAlertActionStyleDefault
                                             handler:^(UIAlertAction *a) {
-                                                bz_player_select_video_auto(handle);
+                                                rustplayer_player_select_video_auto(handle);
                                             }]];
 
     NSArray *video = root[@"video"];
@@ -300,7 +312,7 @@ static void resolve_key_cb(void *user, const uint8_t *kid, uint64_t token) {
         [sheet addAction:[UIAlertAction actionWithTitle:label
                                                   style:UIAlertActionStyleDefault
                                                 handler:^(UIAlertAction *a) {
-                                                    bz_player_select_video(handle, adapt, repr, false);
+                                                    rustplayer_player_select_video(handle, adapt, repr, false);
                                                 }]];
     }
 
@@ -312,14 +324,14 @@ static void resolve_key_cb(void *user, const uint8_t *kid, uint64_t token) {
         [sheet addAction:[UIAlertAction actionWithTitle:label
                                                   style:UIAlertActionStyleDefault
                                                 handler:^(UIAlertAction *a) {
-                                                    bz_player_select_audio(handle, adapt, repr);
+                                                    rustplayer_player_select_audio(handle, adapt, repr);
                                                 }]];
     }
 
     [sheet addAction:[UIAlertAction actionWithTitle:@"Subtitles: Off"
                                               style:UIAlertActionStyleDefault
                                             handler:^(UIAlertAction *a) {
-                                                bz_player_clear_subtitles(handle);
+                                                rustplayer_player_clear_subtitles(handle);
                                             }]];
 
     NSArray *text = root[@"text"];
@@ -330,7 +342,7 @@ static void resolve_key_cb(void *user, const uint8_t *kid, uint64_t token) {
         [sheet addAction:[UIAlertAction actionWithTitle:label
                                                   style:UIAlertActionStyleDefault
                                                 handler:^(UIAlertAction *a) {
-                                                    bz_player_select_subtitle(handle, adapt, repr);
+                                                    rustplayer_player_select_subtitle(handle, adapt, repr);
                                                 }]];
     }
 
@@ -345,7 +357,7 @@ static void resolve_key_cb(void *user, const uint8_t *kid, uint64_t token) {
 
 - (void)dealloc {
     if (self.handle != NULL) {
-        bz_player_destroy(self.handle);
+        rustplayer_player_destroy(self.handle);
         self.handle = NULL;
     }
 }

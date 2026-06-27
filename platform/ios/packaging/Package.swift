@@ -17,14 +17,14 @@ let package = Package(
         .library(name: "RustPlayer", targets: ["RustPlayer"]),
     ],
     targets: [
-        // Released binary (ios-v0.1.1). Local dev: run build_xcframework.sh and
+        // Released binary (ios-v0.1.2). Local dev: run build_xcframework.sh and
         // swap to `.binaryTarget(name: "RustPlayerFFI", path: "RustPlayerFFI.xcframework")`.
         // NOTE: bump BOTH url + checksum on every release tag — they must match
         // the zip attached to that tag's GitHub Release.
         .binaryTarget(
             name: "RustPlayerFFI",
-            url: "https://github.com/Preclikos/rust_player_learning/releases/download/ios-v0.1.1/RustPlayerFFI.xcframework.zip",
-            checksum: "1d0121f705a327695b23c3898873377328c365cb0c6004e06241780fdaf6cdf4"
+            url: "https://github.com/Preclikos/rust_player_learning/releases/download/ios-v0.1.2/RustPlayerFFI.xcframework.zip",
+            checksum: "99f451487adc48093ad16103284d56e8fe1bd3b472a59bf2ed1e569accfff610"
         ),
         .target(
             name: "RustPlayer",

@@ -2,16 +2,17 @@
 # Packages (cz.preclikos:rustplayer:<version>). Consumers then add it as a plain
 # Gradle dependency — no NDK / cargo / Rust on their side.
 #
-# Runs on the self-hosted Linux+Android runner ("makak"), which already has the
-# Android SDK/NDK, JDK, and a C toolchain. Trigger: push a tag `android-v1.2.3`,
-# or run manually with an explicit version.
+# Runs on the self-hosted Linux runner ("makak"). JDK + Android SDK are
+# provisioned per-job via setup-java / setup-android (same as BlackZoneAndroid);
+# the NDK + Rust toolchain are added on top for our cargo-ndk cdylib build.
+# Trigger: push a tag `android-v1.2.3`, or run manually with an explicit version.
 name: Publish Android AAR
 
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: "rustplayer version (e.g. 0.1.0)"
+        description: "rustplayer version (e.g. 0.0.1)"
         required: true
   push:
     tags: ["android-v*"]
@@ -24,6 +25,18 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: "21"
+          distribution: temurin
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install NDK
+        run: sdkmanager --install "ndk;29.0.13113456"
 
       - name: Ensure Rust Android targets + cargo-ndk
         run: |
@@ -45,6 +58,5 @@ jobs:
           GITHUB_ACTOR: ${{ github.actor }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         # :rustplayer:publish → preReleaseBuild → buildRustRelease + copyLibCxxShared.
-        # NDK comes from the runner's ANDROID_NDK_HOME / Android SDK (resolveNdkDir
-        # in rustplayer/build.gradle.kts).
+        # The buildRust task resolves the NDK from the SDK (ndk;29.0.13113456).
         run: bash ./gradlew :rustplayer:publish -Prustplayer.version=${{ steps.ver.outputs.version }} --no-daemon --stacktrace

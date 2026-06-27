@@ -15,6 +15,11 @@ path = "src/lib.rs"
 player = { path = "../../player" }
 bridge = { path = "../../bridge" }
 tokio = { version = "1.52", features = ["full"] }
+# Only the `Method` / `Bytes` types, to build a full PreparedRequest at the FFI
+# boundary. Same versions player uses so the types unify (no features needed —
+# we never construct a reqwest client here).
+reqwest = { version = "0.13", default-features = false }
+bytes = "1"
 # BridgeHost is an #[async_trait] impl; the Swift/ObjC provider hooks use an
 # async oneshot token bridge.
 async-trait = "0.1"

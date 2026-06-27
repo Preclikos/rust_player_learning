@@ -7,21 +7,39 @@ import RustPlayerFFI
 /// resolution. `intercept` defaults to passthrough; `resolveKey` is required.
 /// Mirrors the Rust `BridgeHost` provider hooks (and the Kotlin `PlayerBridge`).
 public protocol RustPlayerProvider: AnyObject {
-    func intercept(url: String, kind: BZRequestKind) async throws -> RustPreparedRequest
+    func intercept(url: String, kind: RustPlayerRequestKind) async throws -> RustPreparedRequest
     func resolveKey(kid: Data) async throws -> Data
 }
 
 public extension RustPlayerProvider {
-    func intercept(url: String, kind: BZRequestKind) async throws -> RustPreparedRequest {
+    func intercept(url: String, kind: RustPlayerRequestKind) async throws -> RustPreparedRequest {
         RustPreparedRequest(url: url) // passthrough
     }
 }
 
-/// What the interceptor wants fetched. (Headers/method/body are a future
-/// extension — the FFI completion currently carries only the final URL.)
+/// What the interceptor wants fetched — the generic request-filter result
+/// (cf. Shaka request filters / ExoPlayer `ResolvingDataSource` + header
+/// setters). Rewrite the `url` and/or add `headers`, and optionally override
+/// the `method`/`body`. `headers` are opaque key/value pairs the consumer
+/// chose — the library applies no auth scheme of its own. All but `url`
+/// default to empty, so `RustPreparedRequest(url:)` stays a plain passthrough.
 public struct RustPreparedRequest {
     public let url: String
-    public init(url: String) { self.url = url }
+    /// Headers to ADD to the request (client defaults are kept).
+    public let headers: [(String, String)]
+    /// Method override ("GET"/"POST"/…); nil = default for the kind.
+    public let method: String?
+    /// Body substitution (e.g. a POST filter); nil = none.
+    public let body: Data?
+    public init(url: String,
+                headers: [(String, String)] = [],
+                method: String? = nil,
+                body: Data? = nil) {
+        self.url = url
+        self.headers = headers
+        self.method = method
+        self.body = body
+    }
 }
 
 /// Player events, delivered on the main thread. All methods have default
@@ -86,7 +104,7 @@ public final class RustPlayer {
         let user = Unmanaged.passUnretained(self).toOpaque()
         let ap: Int32 = audioPassthrough == nil ? -1 : (audioPassthrough! ? 1 : 0)
         handle = manifestURL.withCString { urlPtr in
-            bz_player_create(
+            rustplayer_player_create(
                 Unmanaged.passUnretained(layer).toOpaque(),
                 max(w, 1), max(h, 1),
                 urlPtr, startFraction ?? -1, ap, autoSelectSubtitle,
@@ -98,50 +116,50 @@ public final class RustPlayer {
 
     public func setSize(_ size: CGSize, scale: CGFloat) {
         guard let handle else { return }
-        bz_player_set_size(handle, UInt32(size.width * scale), UInt32(size.height * scale), Float(scale))
+        rustplayer_player_set_size(handle, UInt32(size.width * scale), UInt32(size.height * scale), Float(scale))
     }
 
-    public func play() { handle.map { bz_player_play($0) } }
-    public func pause() { handle.map { bz_player_pause($0) } }
+    public func play() { handle.map { rustplayer_player_play($0) } }
+    public func pause() { handle.map { rustplayer_player_pause($0) } }
     public func togglePlayPause() {
         guard let handle else { return }
-        if bz_player_is_paused(handle) { bz_player_play(handle) } else { bz_player_pause(handle) }
+        if rustplayer_player_is_paused(handle) { rustplayer_player_play(handle) } else { rustplayer_player_pause(handle) }
     }
-    public var isPaused: Bool { handle.map { bz_player_is_paused($0) } ?? false }
-    public func seek(toMs ms: Int64) { handle.map { bz_player_seek_ms($0, ms) } }
-    public var positionMs: Int64 { handle.map { bz_player_position_ms($0) } ?? 0 }
-    public var durationMs: Int64 { handle.map { bz_player_duration_ms($0) } ?? 0 }
-    public func setVolume(_ v: Float) { handle.map { bz_player_set_volume($0, v) } }
+    public var isPaused: Bool { handle.map { rustplayer_player_is_paused($0) } ?? false }
+    public func seek(toMs ms: Int64) { handle.map { rustplayer_player_seek_ms($0, ms) } }
+    public var positionMs: Int64 { handle.map { rustplayer_player_position_ms($0) } ?? 0 }
+    public var durationMs: Int64 { handle.map { rustplayer_player_duration_ms($0) } ?? 0 }
+    public func setVolume(_ v: Float) { handle.map { rustplayer_player_set_volume($0, v) } }
 
     public func tracksJSON() -> String {
-        guard let handle, let c = bz_player_tracks_json(handle) else { return "{}" }
-        defer { bz_string_free(c) }
+        guard let handle, let c = rustplayer_player_tracks_json(handle) else { return "{}" }
+        defer { rustplayer_string_free(c) }
         return String(cString: c)
     }
 
     public func selectVideo(adapt: UInt32, repr: UInt32, soft: Bool = false) {
-        handle.map { bz_player_select_video($0, adapt, repr, soft) }
+        handle.map { rustplayer_player_select_video($0, adapt, repr, soft) }
     }
-    public func selectVideoAuto() { handle.map { bz_player_select_video_auto($0) } }
-    public func selectAudio(adapt: UInt32, repr: UInt32) { handle.map { bz_player_select_audio($0, adapt, repr) } }
-    public func selectSubtitle(adapt: UInt32, repr: UInt32) { handle.map { bz_player_select_subtitle($0, adapt, repr) } }
-    public func clearSubtitles() { handle.map { bz_player_clear_subtitles($0) } }
+    public func selectVideoAuto() { handle.map { rustplayer_player_select_video_auto($0) } }
+    public func selectAudio(adapt: UInt32, repr: UInt32) { handle.map { rustplayer_player_select_audio($0, adapt, repr) } }
+    public func selectSubtitle(adapt: UInt32, repr: UInt32) { handle.map { rustplayer_player_select_subtitle($0, adapt, repr) } }
+    public func clearSubtitles() { handle.map { rustplayer_player_clear_subtitles($0) } }
 
     // --- generic knobs ---
 
     /// ARGB ints (like Android `Color` / ExoPlayer `CaptionStyleCompat`).
     public func setSubtitleStyle(textArgb: Int32, outlineArgb: Int32, sizeScale: Float) {
-        handle.map { bz_player_set_subtitle_style($0, textArgb, outlineArgb, sizeScale) }
+        handle.map { rustplayer_player_set_subtitle_style($0, textArgb, outlineArgb, sizeScale) }
     }
     public func setSubtitleSafeInsetBottom(_ px: UInt32) {
-        handle.map { bz_player_set_subtitle_safe_inset_bottom($0, px) }
+        handle.map { rustplayer_player_set_subtitle_safe_inset_bottom($0, px) }
     }
     public func setVerboseLogging(_ enabled: Bool) {
-        bz_player_set_verbose_logging(enabled)
+        rustplayer_player_set_verbose_logging(enabled)
     }
 
     public func destroy() {
-        if let handle { bz_player_destroy(handle); self.handle = nil }
+        if let handle { rustplayer_player_destroy(handle); self.handle = nil }
     }
 
     // Decode one unified-JSON event and dispatch to the delegate (main thread).
@@ -183,34 +201,75 @@ public final class RustPlayer {
 // They recover the `RustPlayer` from the `user` pointer and bridge provider
 // hooks to the async token completions.
 
-private let eventCallback: bz_event_cb = { user, json in
+private let eventCallback: rustplayer_event_cb = { user, json in
     guard let user, let json else { return }
     let player = Unmanaged<RustPlayer>.fromOpaque(user).takeUnretainedValue()
     let s = String(cString: json)
     DispatchQueue.main.async { player.handleEvent(s) }
 }
 
-private let interceptCallback: bz_intercept_cb = { user, url, kind, token in
-    guard let user, let url else { bz_intercept_fail(token, "null intercept args"); return }
+private let interceptCallback: rustplayer_intercept_cb = { user, url, kind, token in
+    guard let user, let url else { rustplayer_intercept_fail(token, "null intercept args"); return }
     let player = Unmanaged<RustPlayer>.fromOpaque(user).takeUnretainedValue()
     let urlStr = String(cString: url)
-    let reqKind = BZRequestKind(rawValue: UInt32(bitPattern: kind))
+    let reqKind = RustPlayerRequestKind(rawValue: UInt32(bitPattern: kind))
     Task {
         do {
             guard let provider = player.providerRef else {
-                urlStr.withCString { bz_intercept_complete(token, $0) }
+                completeIntercept(token, RustPreparedRequest(url: urlStr))
                 return
             }
             let prepared = try await provider.intercept(url: urlStr, kind: reqKind)
-            prepared.url.withCString { bz_intercept_complete(token, $0) }
+            completeIntercept(token, prepared)
         } catch {
-            bz_intercept_fail(token, error.localizedDescription)
+            rustplayer_intercept_fail(token, error.localizedDescription)
         }
     }
 }
 
-private let resolveKeyCallback: bz_resolve_key_cb = { user, kid, token in
-    guard let user, let kid else { bz_resolve_key_fail(token, "null kid"); return }
+/// Marshal a `RustPreparedRequest` into the flat C `RustPlayerPreparedRequest` and
+/// resolve the in-flight intercept. Every C string is `strdup`'d so the
+/// pointers stay valid across the synchronous completion call, then freed.
+private func completeIntercept(_ token: UInt64, _ prepared: RustPreparedRequest) {
+    let urlC = strdup(prepared.url)
+    let methodC: UnsafeMutablePointer<CChar>? = prepared.method.map { strdup($0) }
+    // Flat [k0,v0,...] of owned C strings (NUL terminator appended below).
+    var ownedHeaders: [UnsafeMutablePointer<CChar>?] = []
+    for (k, v) in prepared.headers {
+        ownedHeaders.append(strdup(k))
+        ownedHeaders.append(strdup(v))
+    }
+    defer {
+        free(urlC)
+        if let methodC { free(methodC) }
+        for p in ownedHeaders { free(p) }
+    }
+    var headerPtrs: [UnsafePointer<CChar>?] = ownedHeaders.map { $0.map(UnsafePointer.init) }
+    headerPtrs.append(nil) // NUL-terminate
+
+    func send(body: UnsafePointer<UInt8>?, bodyLen: Int) {
+        headerPtrs.withUnsafeBufferPointer { hb in
+            var req = RustPlayerPreparedRequest(
+                url: urlC.map { UnsafePointer($0) },
+                headers: prepared.headers.isEmpty ? nil : hb.baseAddress,
+                method: methodC.map { UnsafePointer($0) },
+                body: body,
+                body_len: bodyLen)
+            rustplayer_intercept_complete(token, &req)
+        }
+    }
+
+    if let body = prepared.body, !body.isEmpty {
+        body.withUnsafeBytes { raw in
+            send(body: raw.bindMemory(to: UInt8.self).baseAddress, bodyLen: body.count)
+        }
+    } else {
+        send(body: nil, bodyLen: 0)
+    }
+}
+
+private let resolveKeyCallback: rustplayer_resolve_key_cb = { user, kid, token in
+    guard let user, let kid else { rustplayer_resolve_key_fail(token, "null kid"); return }
     let player = Unmanaged<RustPlayer>.fromOpaque(user).takeUnretainedValue()
     let kidData = Data(bytes: kid, count: 16)
     Task {
@@ -219,10 +278,10 @@ private let resolveKeyCallback: bz_resolve_key_cb = { user, kid, token in
             let key = try await provider.resolveKey(kid: kidData)
             guard key.count == 16 else { throw RustPlayerError.badKeyLength(key.count) }
             key.withUnsafeBytes { raw in
-                bz_resolve_key_complete(token, raw.bindMemory(to: UInt8.self).baseAddress!)
+                rustplayer_resolve_key_complete(token, raw.bindMemory(to: UInt8.self).baseAddress!)
             }
         } catch {
-            bz_resolve_key_fail(token, error.localizedDescription)
+            rustplayer_resolve_key_fail(token, error.localizedDescription)
         }
     }
 }

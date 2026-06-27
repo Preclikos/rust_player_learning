@@ -45,9 +45,15 @@ build_lib() {
 
     echo "==> [$rust_target] cargo build -p app-ios --release" >&2
     rustup target add "$rust_target" >/dev/null 2>&1
+    # IPHONEOS_DEPLOYMENT_TARGET is what rustc/clang stamp the platform
+    # min-version load command from — for BOTH device and simulator targets.
+    # Without it the simulator slice defaults to the SDK version (e.g. 17.4),
+    # which trips `ld` "built for newer 'iOS-simulator' version" warnings when
+    # an app links it at 15.0. ($min_flag only reaches bindgen, not codegen.)
     PKG_CONFIG_PATH="$ffprefix/lib/pkgconfig" \
     PKG_CONFIG_ALLOW_CROSS=1 \
     PKG_CONFIG_ALL_STATIC=1 \
+    IPHONEOS_DEPLOYMENT_TARGET="$MIN_IOS" \
     BINDGEN_EXTRA_CLANG_ARGS="-isysroot $sdk_path -arch $arch $min_flag" \
         cargo build -p bridge-ios --target "$rust_target" --release \
         --manifest-path "$REPO_ROOT/Cargo.toml" >&2

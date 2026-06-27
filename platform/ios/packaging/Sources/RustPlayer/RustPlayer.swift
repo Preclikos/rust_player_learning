@@ -42,8 +42,12 @@ public struct RustPreparedRequest {
     }
 }
 
-/// Player events, delivered on the main thread. All methods have default
-/// no-op implementations — implement only what you need.
+/// Player events, delivered on the main thread. The protocol is `@MainActor`
+/// (events are dispatched to main), so conformers — typically a `@MainActor`
+/// view/engine — can touch main-actor state from these callbacks without
+/// isolation warnings. All methods have default no-op implementations —
+/// implement only what you need.
+@MainActor
 public protocol RustPlayerDelegate: AnyObject {
     func rustPlayerDidPrepare(_ player: RustPlayer)
     func rustPlayer(_ player: RustPlayer, didLoadTracks json: String)
@@ -163,6 +167,7 @@ public final class RustPlayer {
     }
 
     // Decode one unified-JSON event and dispatch to the delegate (main thread).
+    @MainActor
     fileprivate func handleEvent(_ json: String) {
         guard let data = json.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -205,7 +210,10 @@ private let eventCallback: rustplayer_event_cb = { user, json in
     guard let user, let json else { return }
     let player = Unmanaged<RustPlayer>.fromOpaque(user).takeUnretainedValue()
     let s = String(cString: json)
-    DispatchQueue.main.async { player.handleEvent(s) }
+    // Hop to the main actor: handleEvent (and the @MainActor delegate it calls)
+    // is main-isolated. `Task { @MainActor in }` keeps this iOS 15-compatible
+    // (MainActor.assumeIsolated is iOS 17+).
+    Task { @MainActor in player.handleEvent(s) }
 }
 
 private let interceptCallback: rustplayer_intercept_cb = { user, url, kind, token in
@@ -244,15 +252,17 @@ private func completeIntercept(_ token: UInt64, _ prepared: RustPreparedRequest)
         if let methodC { free(methodC) }
         for p in ownedHeaders { free(p) }
     }
-    var headerPtrs: [UnsafePointer<CChar>?] = ownedHeaders.map { $0.map(UnsafePointer.init) }
+    // `UnsafePointer.init` is overloaded — spell out the Pointee so the
+    // mutable→const conversion isn't ambiguous (it otherwise fails to compile).
+    var headerPtrs: [UnsafePointer<CChar>?] = ownedHeaders.map { $0.map { UnsafePointer<CChar>($0) } }
     headerPtrs.append(nil) // NUL-terminate
 
     func send(body: UnsafePointer<UInt8>?, bodyLen: Int) {
         headerPtrs.withUnsafeBufferPointer { hb in
             var req = RustPlayerPreparedRequest(
-                url: urlC.map { UnsafePointer($0) },
+                url: urlC.map { UnsafePointer<CChar>($0) },
                 headers: prepared.headers.isEmpty ? nil : hb.baseAddress,
-                method: methodC.map { UnsafePointer($0) },
+                method: methodC.map { UnsafePointer<CChar>($0) },
                 body: body,
                 body_len: bodyLen)
             rustplayer_intercept_complete(token, &req)

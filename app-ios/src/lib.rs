@@ -28,7 +28,7 @@ use app_shared::bridge::{
     self, BoxError, BridgeHandle, BridgeHost, PreparedRequest, RequestKind, StartConfig,
 };
 use async_trait::async_trait;
-use player::Player;
+use player::{Player, SubtitleStyle};
 use tokio::sync::oneshot;
 
 // --- C ABI callback types ----------------------------------------------------
@@ -182,6 +182,10 @@ pub extern "C" fn bz_player_create(
     metal_layer: *mut c_void,
     width: u32,
     height: u32,
+    manifest_url: *const c_char,
+    start_fraction: f32,        // < 0 = no resume
+    audio_passthrough: i32,     // -1 = default, 0 = off, 1 = on
+    auto_select_subtitle: bool,
     intercept_cb: InterceptCb,
     resolve_key_cb: ResolveKeyCb,
     event_cb: EventCb,
@@ -192,7 +196,12 @@ pub extern "C" fn bz_player_create(
         log::error!("bz_player_create: null metal_layer");
         return std::ptr::null_mut();
     }
-    log::info!("bz_player_create: {}x{}", width, height);
+    let manifest = unsafe { cstr(manifest_url) };
+    if manifest.is_empty() {
+        log::error!("bz_player_create: empty manifest_url");
+        return std::ptr::null_mut();
+    }
+    log::info!("bz_player_create: {}x{} url={}", width, height, manifest);
 
     let host = Arc::new(IosHost {
         intercept_cb,
@@ -203,12 +212,21 @@ pub extern "C" fn bz_player_create(
 
     let _guard = runtime().enter();
     let player = Player::new_from_metal_layer(metal_layer, width.max(1), height.max(1));
-    let bridge = bridge::start(
-        player,
-        app_shared::TEST_MANIFEST_URL.to_string(),
-        host.clone(),
-        StartConfig::default(),
-    );
+    let config = StartConfig {
+        start_position: None,
+        start_fraction: if start_fraction >= 0.0 {
+            Some(start_fraction)
+        } else {
+            None
+        },
+        audio_passthrough: match audio_passthrough {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        },
+        auto_select_subtitle,
+    };
+    let bridge = bridge::start(player, manifest, host.clone(), config);
 
     Box::into_raw(Box::new(Handle {
         bridge,
@@ -335,6 +353,54 @@ pub extern "C" fn bz_player_clear_subtitles(handle: *mut c_void) {
     if let Some(h) = unsafe { handle_ref(handle) } {
         h.bridge.clear_subtitles();
     }
+}
+
+// --- generic player knobs ---
+
+/// ARGB ints (like Android `Color` / ExoPlayer `CaptionStyleCompat`).
+#[no_mangle]
+pub extern "C" fn bz_player_set_subtitle_style(
+    handle: *mut c_void,
+    text_argb: i32,
+    outline_argb: i32,
+    size_scale: f32,
+) {
+    let Some(h) = (unsafe { handle_ref(handle) }) else {
+        return;
+    };
+    fn argb_to_rgba(c: i32) -> [u8; 4] {
+        let c = c as u32;
+        [
+            ((c >> 16) & 0xff) as u8,
+            ((c >> 8) & 0xff) as u8,
+            (c & 0xff) as u8,
+            ((c >> 24) & 0xff) as u8,
+        ]
+    }
+    let style = SubtitleStyle {
+        text_color: argb_to_rgba(text_argb),
+        outline_color: argb_to_rgba(outline_argb),
+        size_scale,
+    }
+    .sanitised();
+    h.bridge.player().set_subtitle_style(style);
+}
+
+#[no_mangle]
+pub extern "C" fn bz_player_set_subtitle_safe_inset_bottom(handle: *mut c_void, bottom_px: u32) {
+    if let Some(h) = unsafe { handle_ref(handle) } {
+        h.bridge.player().set_subtitle_safe_insets(bottom_px);
+    }
+}
+
+/// Verbose logging toggle (default off → per-frame spam gated).
+#[no_mangle]
+pub extern "C" fn bz_player_set_verbose_logging(enabled: bool) {
+    log::set_max_level(if enabled {
+        log::LevelFilter::Debug
+    } else {
+        log::LevelFilter::Info
+    });
 }
 
 #[no_mangle]

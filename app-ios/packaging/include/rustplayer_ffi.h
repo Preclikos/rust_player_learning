@@ -33,6 +33,8 @@ typedef enum {
 // Lifecycle. `metal_layer` is a CAMetalLayer*; `user` is an opaque host pointer
 // passed back to every callback. Returns an opaque handle (NULL on failure).
 void *bz_player_create(void *metal_layer, uint32_t width, uint32_t height,
+                       const char *manifest_url, float start_fraction,
+                       int32_t audio_passthrough, bool auto_select_subtitle,
                        bz_intercept_cb intercept_cb, bz_resolve_key_cb resolve_key_cb,
                        bz_event_cb event_cb, void *user);
 void bz_player_set_size(void *handle, uint32_t width, uint32_t height, float scale);
@@ -55,6 +57,11 @@ void bz_player_select_video_auto(void *handle);
 void bz_player_select_audio(void *handle, uint32_t adapt, uint32_t repr);
 void bz_player_select_subtitle(void *handle, uint32_t adapt, uint32_t repr);
 void bz_player_clear_subtitles(void *handle);
+
+// Generic knobs.
+void bz_player_set_subtitle_style(void *handle, int32_t text_argb, int32_t outline_argb, float size_scale);
+void bz_player_set_subtitle_safe_inset_bottom(void *handle, uint32_t bottom_px);
+void bz_player_set_verbose_logging(bool enabled);
 
 // Provider-hook completions (called by the host to resolve an in-flight
 // intercept_cb / resolve_key_cb, identified by its token).

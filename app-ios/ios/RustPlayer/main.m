@@ -23,8 +23,13 @@ typedef void (*bz_resolve_key_cb)(void *user, const uint8_t *kid, uint64_t token
 typedef void (*bz_event_cb)(void *user, const char *json);
 
 extern void *bz_player_create(void *metal_layer, uint32_t width, uint32_t height,
+                              const char *manifest_url, float start_fraction,
+                              int32_t audio_passthrough, bool auto_select_subtitle,
                               bz_intercept_cb intercept_cb, bz_resolve_key_cb resolve_key_cb,
                               bz_event_cb event_cb, void *user);
+
+// Bundled encrypted DASH test stream (smoke test only).
+#define TEST_MANIFEST_URL "https://preclikos.cz/examples/encrypted/manifest.mpd"
 extern void bz_player_set_size(void *handle, uint32_t width, uint32_t height, float scale);
 extern void bz_player_play(void *handle);
 extern void bz_player_pause(void *handle);
@@ -204,6 +209,7 @@ static void resolve_key_cb(void *user, const uint8_t *kid, uint64_t token) {
     if (self.handle == NULL) {
         NSLog(@"[host] starting embedded player %ux%u (scale %.1f)", w, h, scale);
         self.handle = bz_player_create((__bridge void *)layer, w, h,
+                                       TEST_MANIFEST_URL, -1.0f, -1, true,
                                        intercept_cb, resolve_key_cb, event_cb,
                                        (__bridge void *)self);
     } else {

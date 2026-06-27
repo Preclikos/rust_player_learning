@@ -22,6 +22,9 @@ import android.widget.TextView
 import org.json.JSONArray
 import org.json.JSONObject
 
+/** Bundled encrypted DASH test stream (smoke test only). */
+private const val TEST_MANIFEST_URL = "https://preclikos.cz/examples/encrypted/manifest.mpd"
+
 /**
  * Host Activity for the embedded Rust player.
  *
@@ -245,8 +248,35 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         val overlay = overlaySurface ?: return
         val video = videoSurface ?: return
         if (!player.isStarted) {
-            player.start(overlay, video, overlayW, overlayH, displayHdrTypes())
+            player.start(
+                overlay, video, overlayW, overlayH, displayHdrTypes(),
+                manifestUrl = TEST_MANIFEST_URL,
+                provider = TestProvider,
+            )
         }
+    }
+
+    /**
+     * The :app smoke test is just one consumer of the generic library: it plays
+     * the bundled encrypted test stream and supplies the baked ClearKeys via the
+     * standard provider hook (a real app would call its licence server here).
+     */
+    private object TestProvider : RustPlayerProvider {
+        // KID(hex) → 16-byte key (matches app_shared::test_clearkeys()).
+        private val keys: Map<String, ByteArray> = mapOf(
+            "0fd37dac41c0e987e68d43b801b1210c" to hex("fd8d9f408c2bd702970afcd3b219e791"),
+            "519af81ab2d284f52aa8257d96b5e4bd" to hex("627ef72b42d98770dec20ecab46cd1f4"),
+        )
+
+        override fun resolveKey(kid: ByteArray): ByteArray? = keys[kid.toHex()]
+        // onRequest defaults to identity — the test stream needs no auth/rewrite.
+
+        private fun hex(s: String): ByteArray =
+            ByteArray(s.length / 2) {
+                ((s[it * 2].digitToInt(16) shl 4) or s[it * 2 + 1].digitToInt(16)).toByte()
+            }
+
+        private fun ByteArray.toHex(): String = joinToString("") { "%02x".format(it) }
     }
 
     private fun teardown() {

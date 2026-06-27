@@ -23,6 +23,10 @@ object NativeBridge {
         width: Int,
         height: Int,
         displayHdrTypes: Int,
+        manifestUrl: String,
+        startFraction: Float,        // < 0 = no resume
+        audioPassthrough: Int,       // -1 = default, 0 = off, 1 = on
+        autoSelectSubtitle: Boolean,
     ): Long
 
     external fun nativeSetSize(handle: Long, width: Int, height: Int)
@@ -40,4 +44,11 @@ object NativeBridge {
     external fun nativeSetSubtitleTrack(handle: Long, adapt: Int, repr: Int)
     external fun nativeClearSubtitles(handle: Long)
     external fun nativeDestroy(handle: Long)
+
+    // Generic player knobs.
+    external fun nativeSetVideoOutputWindow(handle: Long, surface: Surface?)
+    external fun nativeSetSubtitleSafeInsetBottom(handle: Long, bottomPx: Int)
+    external fun nativeSetAdaptiveFrameRate(handle: Long, enabled: Boolean)
+    external fun nativeSetSubtitleStyle(handle: Long, textArgb: Int, outlineArgb: Int, sizeScale: Float)
+    external fun nativeSetVerboseLogging(enabled: Boolean)
 }

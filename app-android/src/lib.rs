@@ -1,64 +1,62 @@
-// Android bridge — EMBEDDED into a host Activity's Surfaces (no winit).
+// Android bridge — EMBEDDED into a host's Surfaces (no winit).
 //
-// This is the Android shell of the *unified bridge core* (`app_shared::bridge`).
-// The shell stays thin: it converts the host `Surface`s into `ANativeWindow`s,
-// implements `BridgeHost` (forwarding player events to a Kotlin `PlayerBridge`
-// object as JSON, and the provider hooks back into Kotlin), then hands a
-// `Player` to `bridge::start` and exposes the unified control surface over JNI.
+// This is the Android shell of the unified bridge core (`app_shared::bridge`),
+// exposing a GENERIC, ExoPlayer/Shaka-style player over JNI: the host provides
+// a manifest URL + a request/key provider, and the library plays it. NO
+// app-specific concepts (auth, CDN, DRM endpoints) live here — those go in the
+// host's provider hooks (`onRequest` / `resolveKey`), invisible to the player.
 //
-// All the open_url → prepare → tracks → play() orchestration, the event JSON
-// schema, and the track-switch command channel live in `app_shared::bridge` —
-// shared verbatim with the iOS shell. The same shape is what a future generated
-// Kotlin binding would wrap.
-//
-// It is still self-contained: it plays the bundled encrypted test stream
-// (`app_shared::TEST_MANIFEST_URL`). The provider hooks are TEST policy — the
-// Kotlin `PlayerBridge` returns passthrough headers and the baked ClearKeys.
-//
-// Build with cargo-ndk (Gradle's buildRust task does this automatically):
-//   cargo ndk -t arm64-v8a build -p app-android
+// JNI symbols: Java_cz_preclikos_rustplayer_NativeBridge_*. The idiomatic API
+// is the Kotlin `RustPlayer` wrapper; the `:app` smoke test is just one consumer.
 
 #![cfg(target_os = "android")]
 
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use app_shared::bridge::{self, BoxError, BridgeHandle, BridgeHost, StartConfig};
+use app_shared::bridge::{
+    self, BoxError, BridgeHandle, BridgeHost, PreparedRequest, RequestKind, StartConfig,
+};
 use async_trait::async_trait;
-use jni::objects::{GlobalRef, JByteArray, JClass, JObject, JValue};
+use jni::objects::{GlobalRef, JByteArray, JClass, JObject, JObjectArray, JString, JValue};
 use jni::sys::{jboolean, jfloat, jint, jlong, jstring};
 use jni::{JNIEnv, JavaVM};
-use player::Player;
+use player::{Player, SubtitleStyle};
 
-/// Player bridge + the `ANativeWindow` refs it renders into. The window refs
-/// are acquired by `ANativeWindow_fromSurface` and must outlive the player's
-/// wgpu surface / MediaCodec output, so we keep them here and release them in
-/// `nativeDestroy` *after* the bridge (and player) is dropped.
+/// Player bridge + the `ANativeWindow` refs it renders into.
 struct Handle {
     bridge: BridgeHandle,
     /// Keeps the host callback object + JavaVM alive for the player's lifetime.
     _host: Arc<AndroidHost>,
     /// Overlay (wgpu/GLES) window — UI/subtitles, or video in non-direct mode.
     native_window: *mut ndk_sys::ANativeWindow,
-    /// Video plane window — MediaCodec renders into it in direct mode.
-    video_window: *mut ndk_sys::ANativeWindow,
+    /// Video plane window — MediaCodec renders into it in direct mode. Swappable
+    /// at runtime (`setVideoSurface`), so behind an atomic with old-ref release.
+    video_window: AtomicPtr<ndk_sys::ANativeWindow>,
 }
 
-/// Implements the platform-agnostic [`BridgeHost`]: pushes player events to the
-/// Kotlin `PlayerBridge.onEvent(String)` and delegates the provider hooks to
-/// `PlayerBridge.resolveKey([B)[B`. Auth header injection is left as the
-/// default passthrough (the test stream needs none).
+/// Bridges the platform-agnostic [`BridgeHost`] to a Kotlin provider object:
+/// `onEvent(String)` (events), `onRequest(String,int)->String[]` (URL rewrite +
+/// headers), `resolveKey([B)->[B` (DRM key). All generic — no app knowledge.
 struct AndroidHost {
     vm: JavaVM,
-    /// Global ref to the Kotlin `PlayerBridge` object passed to `nativeStart`.
+    /// Global ref to the Kotlin provider bridge passed to `nativeStart`.
     cb: GlobalRef,
+}
+
+fn request_kind_int(kind: RequestKind) -> i32 {
+    match kind {
+        RequestKind::Manifest => 0,
+        RequestKind::InitSegment => 1,
+        RequestKind::Segment => 2,
+        RequestKind::License => 3,
+    }
 }
 
 #[async_trait]
 impl BridgeHost for AndroidHost {
     fn on_event(&self, json: String) {
-        // Runs on a Tokio worker — attach to the JVM for the upcall. Kotlin
-        // hops to the UI thread itself (RustPlayer dispatches on the main looper).
         let Ok(mut env) = self.vm.attach_current_thread() else {
             return;
         };
@@ -72,10 +70,51 @@ impl BridgeHost for AndroidHost {
         }
     }
 
+    async fn intercept(
+        &self,
+        url: String,
+        kind: RequestKind,
+    ) -> Result<PreparedRequest, BoxError> {
+        // Synchronous JNI upcall (no await → future stays Send). Kotlin returns
+        // a flat String[]: [finalUrl, k1, v1, k2, v2, …]. null/empty = passthrough.
+        let mut env = self.vm.attach_current_thread()?;
+        let jurl = env.new_string(&url)?;
+        let res = env.call_method(
+            self.cb.as_obj(),
+            "onRequest",
+            "(Ljava/lang/String;I)[Ljava/lang/String;",
+            &[JValue::Object(&jurl), JValue::Int(request_kind_int(kind))],
+        )?;
+        let obj = res.l()?;
+        if obj.is_null() {
+            return Ok(PreparedRequest { url, ..Default::default() });
+        }
+        let arr = JObjectArray::from(obj);
+        let len = env.get_array_length(&arr)?;
+        if len < 1 {
+            return Ok(PreparedRequest { url, ..Default::default() });
+        }
+        let elem = |env: &mut JNIEnv, i: i32| -> Result<String, BoxError> {
+            let o = env.get_object_array_element(&arr, i)?;
+            Ok(env.get_string(&JString::from(o))?.into())
+        };
+        let new_url = elem(&mut env, 0)?;
+        let mut headers = Vec::new();
+        let mut i = 1;
+        while i + 1 < len {
+            let k = elem(&mut env, i)?;
+            let v = elem(&mut env, i + 1)?;
+            headers.push((k, v));
+            i += 2;
+        }
+        Ok(PreparedRequest {
+            url: new_url,
+            headers,
+            ..Default::default()
+        })
+    }
+
     async fn resolve_key(&self, kid: [u8; 16]) -> Result<[u8; 16], BoxError> {
-        // Synchronous JNI upcall (no await inside, so the future stays Send).
-        // The test PlayerBridge does a constant-time map lookup, so blocking
-        // the worker briefly is fine.
         let mut env = self.vm.attach_current_thread()?;
         let jkid = env.byte_array_from_slice(&kid)?;
         let res = env.call_method(
@@ -86,7 +125,7 @@ impl BridgeHost for AndroidHost {
         )?;
         let obj = res.l()?;
         if obj.is_null() {
-            return Err("PlayerBridge.resolveKey returned null".into());
+            return Err("provider.resolveKey returned null (no key)".into());
         }
         let arr = JByteArray::from(obj);
         let bytes = env.convert_byte_array(&arr)?;
@@ -99,8 +138,7 @@ impl BridgeHost for AndroidHost {
     }
 }
 
-/// Dedicated multi-thread Tokio runtime. The host owns the UI thread / looper,
-/// so the player needs its own runtime for decode/render/download tasks.
+/// Dedicated multi-thread Tokio runtime (the host owns the UI looper).
 fn runtime() -> &'static tokio::runtime::Runtime {
     static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
     RT.get_or_init(|| {
@@ -111,9 +149,7 @@ fn runtime() -> &'static tokio::runtime::Runtime {
     })
 }
 
-/// Seed `ndk_context` with (JavaVM, Activity) so cpal et al. can resolve the
-/// Android runtime. Idempotent; the global ref is intentionally leaked because
-/// the process keeps the Activity around for its whole lifetime.
+/// Seed `ndk_context` with (JavaVM, Context) so cpal et al. resolve the runtime.
 fn init_ndk_context(env: &mut JNIEnv, context: &JObject) {
     static ONCE: OnceLock<()> = OnceLock::new();
     ONCE.get_or_init(|| {
@@ -150,12 +186,12 @@ unsafe fn handle_ref<'a>(handle: jlong) -> Option<&'a Handle> {
     }
 }
 
-/// `NativeBridge.nativeStart(Context, PlayerBridge, Surface, Surface, int, int, int) -> long`.
+/// `nativeStart(Context, provider, overlaySurface, videoSurface, w, h, hdrTypes,
+/// manifestUrl, startFraction, audioPassthrough, autoSelectSubtitle) -> long`.
 ///
-/// Builds a player rendering into the overlay `Surface` (and, in direct mode,
-/// decoding into the video `Surface`), wires the `PlayerBridge` callback object,
-/// and starts the bundled encrypted test stream via `app_shared::bridge`.
-/// Returns an opaque handle (`jlong`) or 0 on failure.
+/// Builds a player rendering into the surfaces, wires the generic provider, and
+/// starts `manifestUrl`. `startFraction` < 0 = no resume; `audioPassthrough`
+/// -1 = library default, 0/1 = off/on. Returns an opaque handle or 0.
 #[no_mangle]
 pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeStart(
     mut env: JNIEnv,
@@ -167,9 +203,21 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeStart(
     width: jint,
     height: jint,
     display_hdr_types: jint,
+    manifest_url: JString,
+    start_fraction: jfloat,
+    audio_passthrough: jint,
+    auto_select_subtitle: jboolean,
 ) -> jlong {
     init_logging();
     init_ndk_context(&mut env, &context);
+
+    let manifest: String = match env.get_string(&manifest_url) {
+        Ok(s) => s.into(),
+        Err(_) => {
+            log::error!("nativeStart: manifestUrl missing");
+            return 0;
+        }
+    };
 
     let native_window = unsafe {
         ndk_sys::ANativeWindow_fromSurface(env.get_raw() as *mut _, surface.as_raw() as *mut _)
@@ -189,13 +237,8 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeStart(
 
     let w = width.max(1) as u32;
     let h = height.max(1) as u32;
-    log::info!(
-        "nativeStart: {}x{} display_hdr_types={:#06b}",
-        w, h, display_hdr_types
-    );
+    log::info!("nativeStart: {}x{} hdr={:#06b} url={}", w, h, display_hdr_types, manifest);
 
-    // Build the host callback bridge from the JavaVM + a global ref to the
-    // Kotlin PlayerBridge.
     let vm = match env.get_java_vm() {
         Ok(vm) => vm,
         Err(e) => {
@@ -210,7 +253,7 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeStart(
     let cb = match env.new_global_ref(&bridge_cb) {
         Ok(g) => g,
         Err(e) => {
-            log::error!("nativeStart: new_global_ref(bridge): {}", e);
+            log::error!("nativeStart: new_global_ref(provider): {}", e);
             unsafe {
                 ndk_sys::ANativeWindow_release(native_window);
                 ndk_sys::ANativeWindow_release(video_window);
@@ -220,54 +263,42 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeStart(
     };
     let host = Arc::new(AndroidHost { vm, cb });
 
-    // Building the renderer block_on's and spawns Tokio tasks internally.
     let _guard = runtime().enter();
     let player = Player::new_from_android_surface(native_window as *mut c_void, w, h);
 
-    // HDR passthrough opt-in (same file-flag mechanism as before).
-    let passthrough_optin = std::fs::read_to_string(
-        "/storage/emulated/0/Android/data/cz.preclikos.rust_player/files/hdr_passthrough.txt",
-    )
-    .map(|s| s.trim() == "1")
-    .unwrap_or(false);
-    if passthrough_optin {
+    if display_hdr_types != 0 {
         player.set_display_hdr_types(display_hdr_types as u32);
-    } else {
-        log::info!("nativeStart: HDR passthrough opt-in absent — shader tonemap path");
     }
+    // Direct MediaCodec→Surface mode is the production path (HW video plane →
+    // native HDR/DV). Always on; the host detaches via setVideoSurface(null).
+    player.set_video_output_window(video_window as *mut c_void);
 
-    // Direct MediaCodec→Surface mode (opt-out via direct.txt == "0").
-    let direct = std::fs::read_to_string(
-        "/storage/emulated/0/Android/data/cz.preclikos.rust_player/files/direct.txt",
-    )
-    .map(|s| s.trim() != "0")
-    .unwrap_or(true);
-    if direct {
-        player.set_video_output_window(video_window as *mut c_void);
-        log::info!("nativeStart: direct MediaCodec→Surface mode enabled");
-    } else {
-        log::info!("nativeStart: direct mode disabled by direct.txt — GL path");
-    }
+    let config = StartConfig {
+        start_position: None,
+        start_fraction: if start_fraction >= 0.0 {
+            Some(start_fraction)
+        } else {
+            None
+        },
+        audio_passthrough: match audio_passthrough {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        },
+        auto_select_subtitle: auto_select_subtitle != 0,
+    };
 
-    // Hand off to the shared bridge core: wires interceptor/resolver, spawns
-    // the event pump + orchestrator (open_url → prepare → tracks → play()).
-    let bridge = bridge::start(
-        player,
-        app_shared::TEST_MANIFEST_URL.to_string(),
-        host.clone(),
-        StartConfig::default(),
-    );
+    let bridge = bridge::start(player, manifest, host.clone(), config);
 
     let handle = Box::new(Handle {
         bridge,
         _host: host,
         native_window,
-        video_window,
+        video_window: AtomicPtr::new(video_window),
     });
     Box::into_raw(handle) as jlong
 }
 
-/// `nativeSetSize(long, int, int)` — reconfigure on layout change.
 #[no_mangle]
 pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetSize(
     _env: JNIEnv,
@@ -279,7 +310,6 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetSize(
     let Some(h) = (unsafe { handle_ref(handle) }) else {
         return;
     };
-    // `resize` spawns a renderer-resize task; needs the runtime context.
     let _guard = runtime().enter();
     h.bridge.resize(width.max(1) as u32, height.max(1) as u32);
 }
@@ -444,6 +474,107 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeClearSubt
     }
 }
 
+// --- generic player knobs (parity with ExoPlayer surface/track/format API) ---
+
+/// Re-point (or detach with a null surface) the MediaCodec video plane. Use on
+/// a surface swap / background→foreground; pass null to stop rendering to an
+/// abandoned window.
+#[no_mangle]
+pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetVideoOutputWindow(
+    env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    surface: JObject,
+) {
+    let Some(h) = (unsafe { handle_ref(handle) }) else {
+        return;
+    };
+    let new_window = if surface.is_null() {
+        std::ptr::null_mut()
+    } else {
+        unsafe {
+            ndk_sys::ANativeWindow_fromSurface(env.get_raw() as *mut _, surface.as_raw() as *mut _)
+        }
+    };
+    let _guard = runtime().enter();
+    h.bridge
+        .player()
+        .set_video_output_window(new_window as *mut c_void);
+    let old = h.video_window.swap(new_window, Ordering::AcqRel);
+    if !old.is_null() {
+        unsafe { ndk_sys::ANativeWindow_release(old) };
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetSubtitleSafeInsetBottom(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    bottom_px: jint,
+) {
+    if let Some(h) = unsafe { handle_ref(handle) } {
+        h.bridge.player().set_subtitle_safe_insets(bottom_px.max(0) as u32);
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetAdaptiveFrameRate(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    enabled: jboolean,
+) {
+    if let Some(h) = unsafe { handle_ref(handle) } {
+        h.bridge.player().set_adaptive_frame_rate(enabled != 0);
+    }
+}
+
+/// ARGB ints (Android `Color`), like ExoPlayer `CaptionStyleCompat`.
+#[no_mangle]
+pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetSubtitleStyle(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    text_argb: jint,
+    outline_argb: jint,
+    size_scale: jfloat,
+) {
+    let Some(h) = (unsafe { handle_ref(handle) }) else {
+        return;
+    };
+    fn argb_to_rgba(c: jint) -> [u8; 4] {
+        let c = c as u32;
+        [
+            ((c >> 16) & 0xff) as u8, // R
+            ((c >> 8) & 0xff) as u8,  // G
+            (c & 0xff) as u8,         // B
+            ((c >> 24) & 0xff) as u8, // A
+        ]
+    }
+    let style = SubtitleStyle {
+        text_color: argb_to_rgba(text_argb),
+        outline_color: argb_to_rgba(outline_argb),
+        size_scale,
+    }
+    .sanitised();
+    h.bridge.player().set_subtitle_style(style);
+}
+
+/// Verbose logging toggle (default off → per-frame vsync/HEALTH spam gated).
+#[no_mangle]
+pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetVerboseLogging(
+    _env: JNIEnv,
+    _class: JClass,
+    enabled: jboolean,
+) {
+    log::set_max_level(if enabled != 0 {
+        log::LevelFilter::Debug
+    } else {
+        log::LevelFilter::Info
+    });
+}
+
 /// `nativeDestroy(long)` — tear down and release the window refs.
 #[no_mangle]
 pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeDestroy(
@@ -462,13 +593,14 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeDestroy(
         native_window,
         video_window,
     } = *h;
-    // Stop the orchestrator + drop the player (its wgpu surface AND the
-    // MediaCodec attached to the video window) before releasing the windows.
     bridge.shutdown();
     drop(bridge);
     drop(_host);
+    let vwin = video_window.load(Ordering::Acquire);
     unsafe {
         ndk_sys::ANativeWindow_release(native_window);
-        ndk_sys::ANativeWindow_release(video_window);
+        if !vwin.is_null() {
+            ndk_sys::ANativeWindow_release(vwin);
+        }
     }
 }

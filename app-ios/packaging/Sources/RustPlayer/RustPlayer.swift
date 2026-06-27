@@ -66,26 +66,34 @@ public final class RustPlayer {
 
     public var isStarted: Bool { handle != nil }
 
-    /// Build the player on `layer` and start the given manifest. Pass the
-    /// provider that resolves auth + DRM keys.
-    public func start(layer: CAMetalLayer, manifestURL: String, provider: RustPlayerProvider) {
+    /// Build the player on `layer` and play `manifestURL`. The `provider`
+    /// resolves auth/CDN/DRM (all app-side). `startFraction` resumes at 0..1 of
+    /// duration; `audioPassthrough` nil = library default; `autoSelectSubtitle`
+    /// default-on.
+    public func start(
+        layer: CAMetalLayer,
+        manifestURL: String,
+        provider: RustPlayerProvider,
+        startFraction: Float? = nil,
+        audioPassthrough: Bool? = nil,
+        autoSelectSubtitle: Bool = true
+    ) {
         guard handle == nil else { return }
         self.provider = provider
         let scale = layer.contentsScale > 0 ? layer.contentsScale : 1
         let w = UInt32(layer.bounds.width * scale)
         let h = UInt32(layer.bounds.height * scale)
         let user = Unmanaged.passUnretained(self).toOpaque()
-
-        // NOTE: open_url currently lives behind the FFI's create() (the bundled
-        // test stream). A product `bz_player_open_url(handle, url)` is the next
-        // FFI addition; until then `manifestURL` is informational here.
-        _ = manifestURL
-        handle = bz_player_create(
-            Unmanaged.passUnretained(layer).toOpaque(),
-            max(w, 1), max(h, 1),
-            interceptCallback, resolveKeyCallback, eventCallback,
-            user
-        )
+        let ap: Int32 = audioPassthrough == nil ? -1 : (audioPassthrough! ? 1 : 0)
+        handle = manifestURL.withCString { urlPtr in
+            bz_player_create(
+                Unmanaged.passUnretained(layer).toOpaque(),
+                max(w, 1), max(h, 1),
+                urlPtr, startFraction ?? -1, ap, autoSelectSubtitle,
+                interceptCallback, resolveKeyCallback, eventCallback,
+                user
+            )
+        }
     }
 
     public func setSize(_ size: CGSize, scale: CGFloat) {
@@ -118,6 +126,19 @@ public final class RustPlayer {
     public func selectAudio(adapt: UInt32, repr: UInt32) { handle.map { bz_player_select_audio($0, adapt, repr) } }
     public func selectSubtitle(adapt: UInt32, repr: UInt32) { handle.map { bz_player_select_subtitle($0, adapt, repr) } }
     public func clearSubtitles() { handle.map { bz_player_clear_subtitles($0) } }
+
+    // --- generic knobs ---
+
+    /// ARGB ints (like Android `Color` / ExoPlayer `CaptionStyleCompat`).
+    public func setSubtitleStyle(textArgb: Int32, outlineArgb: Int32, sizeScale: Float) {
+        handle.map { bz_player_set_subtitle_style($0, textArgb, outlineArgb, sizeScale) }
+    }
+    public func setSubtitleSafeInsetBottom(_ px: UInt32) {
+        handle.map { bz_player_set_subtitle_safe_inset_bottom($0, px) }
+    }
+    public func setVerboseLogging(_ enabled: Bool) {
+        bz_player_set_verbose_logging(enabled)
+    }
 
     public func destroy() {
         if let handle { bz_player_destroy(handle); self.handle = nil }

@@ -7,12 +7,10 @@ import android.view.Surface
 import org.json.JSONObject
 
 /**
- * Idiomatic Kotlin wrapper over [NativeBridge] + the unified bridge core. This
- * is the API an app actually uses: typed control methods plus a [Listener] that
- * receives decoded player events on the **main thread**.
- *
- * It mirrors the shape a future generated binding (`player → ready-made Kotlin`)
- * would expose, so the test app exercises the real product ergonomics.
+ * Idiomatic, GENERAL-PURPOSE player (the ExoPlayer/Shaka model): give it a
+ * manifest URL + a [RustPlayerProvider] (auth / CDN / DRM, all app-side) and it
+ * plays. Events arrive on the main thread via [Listener]. No app-specific
+ * concepts live in this library.
  */
 class RustPlayer(private val context: Context) {
 
@@ -33,17 +31,44 @@ class RustPlayer(private val context: Context) {
 
     private var handle: Long = 0L
     private val main = Handler(Looper.getMainLooper())
-
-    // Native worker fires onEvent off-thread; hop to the main looper before
-    // touching the listener / UI.
-    private val bridge = PlayerBridge { json -> main.post { dispatch(json) } }
+    private var bridge: PlayerBridge? = null
 
     val isStarted: Boolean get() = handle != 0L
 
-    fun start(overlay: Surface, video: Surface, width: Int, height: Int, displayHdrTypes: Int) {
+    /**
+     * Build the player on the given surfaces and play [manifestUrl].
+     *
+     * @param provider auth/CDN/DRM hooks (default: identity requests, no keys).
+     * @param startFraction resume at 0..1 of duration, or null to start at 0.
+     * @param audioPassthrough true/false to force, null for the library default.
+     * @param autoSelectSubtitle default-on (ExoPlayer-like); pass false if the
+     *   app drives its own subtitle selection.
+     */
+    fun start(
+        overlay: Surface,
+        video: Surface,
+        width: Int,
+        height: Int,
+        displayHdrTypes: Int,
+        manifestUrl: String,
+        provider: RustPlayerProvider = object : RustPlayerProvider {},
+        startFraction: Float? = null,
+        audioPassthrough: Boolean? = null,
+        autoSelectSubtitle: Boolean = true,
+    ) {
         if (handle != 0L) return
+        val b = PlayerBridge(provider) { json -> main.post { dispatch(json) } }
+        bridge = b
         handle = NativeBridge.nativeStart(
-            context.applicationContext, bridge, overlay, video, width, height, displayHdrTypes,
+            context.applicationContext, b, overlay, video, width, height, displayHdrTypes,
+            manifestUrl,
+            startFraction ?: -1f,
+            when (audioPassthrough) {
+                null -> -1
+                false -> 0
+                true -> 1
+            },
+            autoSelectSubtitle,
         )
     }
 
@@ -99,10 +124,36 @@ class RustPlayer(private val context: Context) {
         if (handle != 0L) NativeBridge.nativeClearSubtitles(handle)
     }
 
+    // --- generic knobs (ExoPlayer-style) ---
+
+    /** Re-attach on a surface swap, or detach (null) on background. */
+    fun setVideoSurface(surface: Surface?) {
+        if (handle != 0L) NativeBridge.nativeSetVideoOutputWindow(handle, surface)
+    }
+
+    fun setSubtitleSafeInsetBottom(px: Int) {
+        if (handle != 0L) NativeBridge.nativeSetSubtitleSafeInsetBottom(handle, px)
+    }
+
+    fun setAdaptiveFrameRate(enabled: Boolean) {
+        if (handle != 0L) NativeBridge.nativeSetAdaptiveFrameRate(handle, enabled)
+    }
+
+    /** ARGB ints (Android `Color`), like ExoPlayer `CaptionStyleCompat`. */
+    fun setSubtitleStyle(textArgb: Int, outlineArgb: Int, sizeScale: Float) {
+        if (handle != 0L) NativeBridge.nativeSetSubtitleStyle(handle, textArgb, outlineArgb, sizeScale)
+    }
+
+    /** Verbose logging (default off; gates per-frame vsync/HEALTH spam). */
+    fun setVerboseLogging(enabled: Boolean) {
+        NativeBridge.nativeSetVerboseLogging(enabled)
+    }
+
     fun release() {
         if (handle != 0L) {
             NativeBridge.nativeDestroy(handle)
             handle = 0L
+            bridge = null
         }
     }
 

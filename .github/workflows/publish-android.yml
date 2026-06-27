@@ -47,4 +47,4 @@ jobs:
         # :rustplayer:publish → preReleaseBuild → buildRustRelease + copyLibCxxShared.
         # NDK comes from the runner's ANDROID_NDK_HOME / Android SDK (resolveNdkDir
         # in rustplayer/build.gradle.kts).
-        run: ./gradlew :rustplayer:publish -Prustplayer.version=${{ steps.ver.outputs.version }} --no-daemon --stacktrace
+        run: bash ./gradlew :rustplayer:publish -Prustplayer.version=${{ steps.ver.outputs.version }} --no-daemon --stacktrace

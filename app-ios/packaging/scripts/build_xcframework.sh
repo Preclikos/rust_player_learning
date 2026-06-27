@@ -38,24 +38,26 @@ build_lib() {
     local ffprefix="$REPO_ROOT/player/vendor/$ff_platform"
     local sdk_path; sdk_path="$(xcrun --sdk "$sdk" --show-sdk-path)"
 
-    echo "==> [$rust_target] FFmpeg ($ff_platform)"
-    bash "$REPO_ROOT/player/scripts/build-ffmpeg.sh" "$ff_platform"
+    # All diagnostics + sub-builds go to STDERR; the ONLY thing this function
+    # writes to stdout is the merged-lib path (its captured return value).
+    echo "==> [$rust_target] FFmpeg ($ff_platform)" >&2
+    bash "$REPO_ROOT/player/scripts/build-ffmpeg.sh" "$ff_platform" >&2
 
-    echo "==> [$rust_target] cargo build -p app-ios --release"
-    rustup target add "$rust_target" >/dev/null
+    echo "==> [$rust_target] cargo build -p app-ios --release" >&2
+    rustup target add "$rust_target" >/dev/null 2>&1
     PKG_CONFIG_PATH="$ffprefix/lib/pkgconfig" \
     PKG_CONFIG_ALLOW_CROSS=1 \
     PKG_CONFIG_ALL_STATIC=1 \
     BINDGEN_EXTRA_CLANG_ARGS="-isysroot $sdk_path -arch $arch $min_flag" \
         cargo build -p app-ios --target "$rust_target" --release \
-        --manifest-path "$REPO_ROOT/Cargo.toml"
+        --manifest-path "$REPO_ROOT/Cargo.toml" >&2
 
     local staticlib="$REPO_ROOT/target/$rust_target/release/libapp_ios.a"
     [ -f "$staticlib" ] || { echo "missing $staticlib" >&2; exit 1; }
 
     # Merge bridge + all FFmpeg static libs into one library for this arch.
     local merged="$OUT_DIR/librustplayer-$rust_target.a"
-    libtool -static -o "$merged" "$staticlib" "$ffprefix"/lib/*.a
+    libtool -static -o "$merged" "$staticlib" "$ffprefix"/lib/*.a >&2
     echo "$merged"
 }
 

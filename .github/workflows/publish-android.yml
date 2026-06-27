@@ -2,10 +2,9 @@
 # Packages (cz.preclikos:rustplayer:<version>). Consumers then add it as a plain
 # Gradle dependency — no NDK / cargo / Rust on their side.
 #
-# Trigger: push a tag `android-v1.2.3`, or run manually with an explicit version.
-#
-# NOTE: not yet run in CI — the Android FFmpeg vendored build (via
-# ffmpeg-sys-next during cargo-ndk) may need extra apt packages; tune on first run.
+# Runs on the self-hosted Linux+Android runner ("makak"), which already has the
+# Android SDK/NDK, JDK, and a C toolchain. Trigger: push a tag `android-v1.2.3`,
+# or run manually with an explicit version.
 name: Publish Android AAR
 
 on:
@@ -19,30 +18,17 @@ on:
 
 jobs:
   publish:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux]
     permissions:
       contents: read
       packages: write
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "17"
-
-      - name: Toolchain deps (FFmpeg vendored build)
-        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev nasm pkg-config
-
-      - name: Rust + Android targets + cargo-ndk
+      - name: Ensure Rust Android targets + cargo-ndk
         run: |
           rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
-          cargo install cargo-ndk --locked
-
-      - uses: android-actions/setup-android@v3
-
-      - name: Install NDK
-        run: sdkmanager "ndk;29.0.13113456"
+          command -v cargo-ndk >/dev/null || cargo install cargo-ndk --locked
 
       - name: Resolve version
         id: ver
@@ -58,6 +44,7 @@ jobs:
         env:
           GITHUB_ACTOR: ${{ github.actor }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/29.0.13113456
         # :rustplayer:publish → preReleaseBuild → buildRustRelease + copyLibCxxShared.
+        # NDK comes from the runner's ANDROID_NDK_HOME / Android SDK (resolveNdkDir
+        # in rustplayer/build.gradle.kts).
         run: ./gradlew :rustplayer:publish -Prustplayer.version=${{ steps.ver.outputs.version }} --no-daemon --stacktrace

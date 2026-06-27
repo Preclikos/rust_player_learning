@@ -1,12 +1,10 @@
-# Build RustPlayerFFI.xcframework (device + simulator, Rust player + FFmpeg) on
-# a macOS runner and attach the zip + its SwiftPM checksum to a GitHub Release.
-# Consumers point the SwiftPM `binaryTarget` at the release zip + checksum — no
-# Rust toolchain on their side.
+# Build RustPlayerFFI.xcframework (device + simulator, Rust player + FFmpeg) and
+# attach the zip + its SwiftPM checksum to a GitHub Release. Consumers point the
+# SwiftPM `binaryTarget` at the release zip + checksum — no Rust on their side.
 #
-# Trigger: push a tag `ios-v1.2.3`, or run manually.
-#
-# NOTE: not yet run in CI — first run on a Mac will confirm the FFmpeg merge +
-# the Package.swift link set. See app-ios/packaging/README.md.
+# Runs on the self-hosted macOS runner ("preclikoss-iMac-Pro", Intel) which has
+# Xcode. A workflow_dispatch run just BUILDS the xcframework (validation); a
+# tag `ios-v1.2.3` also attaches it to the release.
 name: Publish iOS XCFramework
 
 on:
@@ -16,16 +14,13 @@ on:
 
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: [self-hosted, macOS]
     permissions:
       contents: write   # attach asset to the release
     steps:
       - uses: actions/checkout@v4
 
-      - name: Select Xcode
-        run: sudo xcode-select -switch /Applications/Xcode.app/Contents/Developer
-
-      - name: Rust + iOS targets
+      - name: Ensure Rust iOS targets
         run: rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
 
       - name: Build XCFramework

@@ -24,18 +24,18 @@ jobs:
         run: rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
 
       - name: Build XCFramework
-        run: bash app-ios/packaging/scripts/build_xcframework.sh
+        run: bash platform/ios/packaging/scripts/build_xcframework.sh
 
       - name: Compute checksum
         id: cs
-        working-directory: app-ios/packaging
+        working-directory: platform/ios/packaging
         run: echo "checksum=$(swift package compute-checksum RustPlayerFFI.xcframework.zip)" >> "$GITHUB_OUTPUT"
 
       - name: Attach to release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: app-ios/packaging/RustPlayerFFI.xcframework.zip
+          files: platform/ios/packaging/RustPlayerFFI.xcframework.zip
           body: |
             `RustPlayerFFI.xcframework` — set the SwiftPM `binaryTarget`:
             ```

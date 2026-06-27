@@ -7,13 +7,13 @@ $ErrorActionPreference = 'Stop'
 $adb  = "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe"
 $pkg  = 'cz.preclikos.rust_player'
 $root = $PSScriptRoot
-$android = Join-Path $root 'app-android\android'
+$android = Join-Path $root 'platform\android\android'
 
 # ── 1. Rust build ────────────────────────────────────────────────────────────
 Write-Host "=== Building Rust ($(if ($Release) {'release'} else {'debug'})) ===" -ForegroundColor Cyan
 $rustArgs = @('ndk', '-t', 'arm64-v8a',
-              '-o', (Join-Path $root 'app-android\android\app\src\main\jniLibs'),
-              'build', '-p', 'app-android')
+              '-o', (Join-Path $root 'platform\android\android\rustplayer\src\main\jniLibs'),
+              'build', '-p', 'bridge-android')
 if ($Release) { $rustArgs += '--release' }
 Push-Location $root
 cargo @rustArgs
@@ -39,19 +39,19 @@ if ($LASTEXITCODE -ne 0) { throw "adb install failed" }
 Write-Host "=== Launching app ===" -ForegroundColor Cyan
 & $adb shell am force-stop $pkg
 Start-Sleep -Milliseconds 500
-& $adb shell am start -n "$pkg/android.app.NativeActivity"
+& $adb shell am start -n "$pkg/cz.preclikos.rustplayer.MainActivity"
 
 # ── 4. Stream relevant logcat lines ──────────────────────────────────────────
-# Log tag structure (via android_logger, using Rust module path as tag):
-#   app_android          — lib.rs top-level (window created, track selected)
+# Log tag structure (via android_logger, using the Rust lib name as tag):
+#   rustplayer           — platform/android lib.rs (nativeStart, track selected)
 #   player::decoders::med.. — mediacodec.rs (configured, stall, MAX_IMAGES)
 #   player::player (truncated) — player.rs (vsync LATE, sync producer warnings)
 #   RustStdoutStderr     — println!/eprintln! (segment consuming/producing)
 Write-Host "=== Logcat (Ctrl+C to stop) ===" -ForegroundColor Cyan
-Write-Host "    Tags: app_android | player:: | RustStdoutStderr | W/E level"
+Write-Host "    Tags: rustplayer | player:: | RustStdoutStderr | W/E level"
 & $adb logcat -c
 Start-Sleep -Milliseconds 800
 
 & $adb logcat | Select-String -Pattern `
-    'app_android|player::|RustStdoutStderr|stall|LATE|MAX_IMAGES|acquire_next|W player|E player' `
+    'rustplayer|player::|RustStdoutStderr|stall|LATE|MAX_IMAGES|acquire_next|W player|E player' `
     -SimpleMatch:$false

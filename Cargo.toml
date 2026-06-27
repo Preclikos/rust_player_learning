@@ -1,10 +1,10 @@
 [workspace]
 members = [
-    "app",
-    "app-android",
-    "app-ios",
-    "app-shared",
-    "player"
+    "player",           # the engine (core library)
+    "bridge",           # platform-agnostic bridge core (events, provider hooks, orchestration)
+    "platform/android", # JNI cdylib → librustplayer.so (consumed by the :rustplayer AAR)
+    "platform/ios",     # FFI staticlib → RustPlayerFFI.xcframework
+    "examples/desktop", # winit desktop smoke test / reference consumer
 ]
 exclude = ["vendor"]
 resolver = "2"

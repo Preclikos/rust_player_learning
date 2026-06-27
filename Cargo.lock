@@ -187,62 +187,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
-name = "app"
-version = "0.1.0"
-dependencies = [
- "app-shared",
- "core-foundation 0.10.1",
- "core-foundation-sys",
- "env_logger",
- "ffmpeg-next",
- "log",
- "player",
- "pollster",
- "tokio",
- "wayland-client",
- "windows",
- "winit",
- "x11",
-]
-
-[[package]]
-name = "app-android"
-version = "0.1.0"
-dependencies = [
- "android_logger",
- "app-shared",
- "async-trait",
- "jni 0.21.1",
- "log",
- "ndk-context",
- "ndk-sys",
- "player",
- "tokio",
-]
-
-[[package]]
-name = "app-ios"
-version = "0.1.0"
-dependencies = [
- "app-shared",
- "async-trait",
- "log",
- "oslog",
- "player",
- "tokio",
-]
-
-[[package]]
-name = "app-shared"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "log",
- "player",
- "tokio",
-]
-
-[[package]]
 name = "arc-swap"
 version = "1.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -412,6 +356,43 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cdeb9d870516001442e364c5220d3574d2da8dc765554b4a617230d33fa58ef5"
 dependencies = [
  "objc2 0.6.4",
+]
+
+[[package]]
+name = "bridge"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "log",
+ "player",
+ "tokio",
+]
+
+[[package]]
+name = "bridge-android"
+version = "0.1.0"
+dependencies = [
+ "android_logger",
+ "async-trait",
+ "bridge",
+ "jni 0.21.1",
+ "log",
+ "ndk-context",
+ "ndk-sys",
+ "player",
+ "tokio",
+]
+
+[[package]]
+name = "bridge-ios"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bridge",
+ "log",
+ "oslog",
+ "player",
+ "tokio",
 ]
 
 [[package]]
@@ -875,6 +856,25 @@ checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "example-desktop"
+version = "0.1.0"
+dependencies = [
+ "bridge",
+ "core-foundation 0.10.1",
+ "core-foundation-sys",
+ "env_logger",
+ "ffmpeg-next",
+ "log",
+ "player",
+ "pollster",
+ "tokio",
+ "wayland-client",
+ "windows",
+ "winit",
+ "x11",
 ]
 
 [[package]]

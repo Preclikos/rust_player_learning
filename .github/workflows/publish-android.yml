@@ -53,7 +53,7 @@ jobs:
           fi
 
       - name: Build .so (all ABIs, release) + publish AAR
-        working-directory: app-android/android
+        working-directory: platform/android/android
         env:
           GITHUB_ACTOR: ${{ github.actor }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

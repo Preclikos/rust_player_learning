@@ -1,0 +1,22 @@
+[package]
+name = "bridge-ios"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+# librustplayer.a — merged with FFmpeg into RustPlayerFFI.xcframework.
+name = "rustplayer"
+crate-type = ["staticlib"]
+path = "src/lib.rs"
+
+# Dependencies are iOS-only so this crate is a no-op on desktop/Android
+# builds (workspace `cargo build` still passes).
+[target.'cfg(target_os = "ios")'.dependencies]
+player = { path = "../../player" }
+bridge = { path = "../../bridge" }
+tokio = { version = "1.52", features = ["full"] }
+# BridgeHost is an #[async_trait] impl; the Swift/ObjC provider hooks use an
+# async oneshot token bridge.
+async-trait = "0.1"
+log = "0.4"
+oslog = "0.2"

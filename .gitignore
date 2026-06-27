@@ -20,8 +20,9 @@ durations.txt
 stdout.log
 stderr.log
 
-# Stale build output location (real output goes to app-android/android/app/src/main/jniLibs)
-app-android/src/main/jniLibs/
+# Native .so output (cargo-ndk → the :rustplayer Gradle module's jniLibs).
+platform/android/android/rustplayer/src/main/jniLibs/
+platform/android/src/main/jniLibs/
 
 # iOS Simulator build output (RustPlayer.app bundle assembled by build_sim.sh)
 app-ios/ios/build/

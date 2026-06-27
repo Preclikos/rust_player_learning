@@ -1,0 +1,15 @@
+[package]
+name = "bridge"
+version = "0.1.0"
+edition = "2021"
+
+# Platform-agnostic bridge core: wraps the player engine with the unified
+# control surface, event pump (→ host as JSON), provider hooks (intercept /
+# resolve_key), and the open_url→prepare→tracks→play orchestration. The
+# platform crates (platform/android, platform/ios) are thin shells over this.
+
+[dependencies]
+player = { path = "../player" }
+tokio = { version = "1.52", features = ["rt", "macros", "sync"] }
+async-trait = "0.1"
+log = "0.4"

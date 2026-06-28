@@ -43,6 +43,13 @@ class RustPlayer(private val context: Context) {
      * @param audioPassthrough true/false to force, null for the library default.
      * @param autoSelectSubtitle default-on (ExoPlayer-like); pass false if the
      *   app drives its own subtitle selection.
+     * @param preferredAudioLang BCP-47 (e.g. "cs", "en") applied during default
+     *   selection — i.e. BEFORE the first frame. Use this instead of a
+     *   post-start [selectAudio]: selecting audio after playback starts triggers
+     *   a seek-rebuild (and, on a resume, can stall direct-mode decode); a
+     *   start-time preference is picked up with no rebuild. null = codec default.
+     * @param preferredSubtitleLang BCP-47 applied during default selection;
+     *   honoured even when [autoSelectSubtitle] is false. null = auto policy.
      */
     fun start(
         overlay: Surface,
@@ -55,6 +62,8 @@ class RustPlayer(private val context: Context) {
         startFraction: Float? = null,
         audioPassthrough: Boolean? = null,
         autoSelectSubtitle: Boolean = true,
+        preferredAudioLang: String? = null,
+        preferredSubtitleLang: String? = null,
     ) {
         if (handle != 0L) return
         val b = PlayerBridge(provider) { json -> main.post { dispatch(json) } }
@@ -69,6 +78,8 @@ class RustPlayer(private val context: Context) {
                 true -> 1
             },
             autoSelectSubtitle,
+            preferredAudioLang,
+            preferredSubtitleLang,
         )
     }
 

@@ -119,6 +119,20 @@ pub struct StartConfig {
     /// Auto-select the first subtitle track during default selection. Product
     /// hosts set `false` and apply their own language/forced policy after play.
     pub auto_select_subtitle: bool,
+    /// Preferred audio language (BCP-47, e.g. `"cs"`, `"en"`) applied DURING
+    /// default selection — i.e. before the first `play()`, while the pipeline
+    /// is not yet live. This is the rebuild-free way to honour a saved
+    /// audio-language preference: picking it here means `play()` starts on the
+    /// right track, with NO post-start `selectAudio()` (which would
+    /// `seek(position())`-rebuild on top of a resume — the BlackZone startup
+    /// stall). `None` keeps the codec-default pick. No match → codec default.
+    pub preferred_audio_language: Option<String>,
+    /// Preferred subtitle language (BCP-47) applied during default selection.
+    /// When `Some`, the matching text track is selected before first frame
+    /// regardless of [`auto_select_subtitle`](Self::auto_select_subtitle); the
+    /// host no longer needs a post-start `selectSubtitle()`. No match → falls
+    /// back to the `auto_select_subtitle` policy.
+    pub preferred_subtitle_language: Option<String>,
 }
 
 impl Default for StartConfig {
@@ -128,6 +142,8 @@ impl Default for StartConfig {
             start_fraction: None,
             audio_passthrough: None,
             auto_select_subtitle: true,
+            preferred_audio_language: None,
+            preferred_subtitle_language: None,
         }
     }
 }
@@ -310,6 +326,8 @@ async fn orchestrate(
         &tracks,
         config.audio_passthrough,
         config.auto_select_subtitle,
+        config.preferred_audio_language.as_deref(),
+        config.preferred_subtitle_language.as_deref(),
     );
 
     // Initial playback. play() resolves on EndOfStream / stop / exhausted

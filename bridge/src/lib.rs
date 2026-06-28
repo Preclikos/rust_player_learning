@@ -158,7 +158,7 @@ pub async fn run_test_playback(mut player: Player) {
     };
 
     // Shell behaviour: file-flag passthrough, auto-select the first subtitle.
-    apply_default_tracks(&player, &tracks, None, true);
+    apply_default_tracks(&player, &tracks, None, true, None, None);
 
     // Re-spawn the play() task on natural exit so the stream loops
     // continuously — useful for soak testing the pipeline.
@@ -192,11 +192,22 @@ pub async fn run_test_playback(mut player: Player) {
 /// env / `audio_passthrough.txt` file-flag behaviour. `auto_select_subtitle`:
 /// when `false`, no subtitle track is auto-selected (the host applies its own
 /// language/forced policy after play).
+/// Loose BCP-47 match: case-insensitive, primary-subtag only (so `"en"` matches
+/// a track tagged `"en-US"`, and vice-versa). Empty/absent track language never
+/// matches a concrete preference.
+fn lang_matches(track_lang: Option<&str>, want: &str) -> bool {
+    let Some(have) = track_lang else { return false };
+    let primary = |s: &str| s.split(['-', '_']).next().unwrap_or(s).to_ascii_lowercase();
+    !want.is_empty() && primary(have) == primary(want)
+}
+
 pub(crate) fn apply_default_tracks(
     player: &Player,
     tracks: &player::Tracks,
     passthrough_override: Option<bool>,
     auto_select_subtitle: bool,
+    preferred_audio_language: Option<&str>,
+    preferred_subtitle_language: Option<&str>,
 ) {
     // Video: representation picked by `video_pref()` (default: first
     // adaptation, index 5 = 720p HEVC in the preclikos.cz fixture,
@@ -291,14 +302,40 @@ pub(crate) fn apply_default_tracks(
         "audio preference: codec prefix = {} (passthrough={})",
         codec_prefix, passthrough
     );
-    let (audio_adapt, audio_repr) = match tracks
-        .audio
-        .iter()
-        .find_map(|a| {
-            a.representations
-                .iter()
-                .find(|r| r.codecs.starts_with(codec_prefix.as_str()))
-                .map(|r| (a, r))
+    // Host audio-language preference, applied HERE (before the first play(),
+    // pipeline not yet live) so the chosen track is honoured at startup with no
+    // post-start selectAudio() — which would seek-rebuild on top of a resume.
+    // Within the matching-language adaptation we still prefer the codec the
+    // backend wants. No match → fall through to the codec-default pick.
+    let lang_pick = preferred_audio_language.and_then(|want| {
+        // Among same-language adaptations, prefer the one carrying the codec the
+        // backend wants (e.g. mp4a on Android — picking the language's ec-3 rep
+        // would fail to configure). Fall back to the first matching-language rep.
+        let lang_adapts = || tracks.audio.iter().filter(|a| lang_matches(a.language(), want));
+        lang_adapts()
+            .find_map(|a| {
+                a.representations
+                    .iter()
+                    .find(|r| r.codecs.starts_with(codec_prefix.as_str()))
+                    .map(|r| (a, r))
+            })
+            .or_else(|| lang_adapts().find_map(|a| a.representations.first().map(|r| (a, r))))
+    });
+    if let Some(want) = preferred_audio_language {
+        log::info!(
+            "audio language preference {:?}: {}",
+            want,
+            if lang_pick.is_some() { "matched" } else { "no match, using codec default" }
+        );
+    }
+    let (audio_adapt, audio_repr) = match lang_pick
+        .or_else(|| {
+            tracks.audio.iter().find_map(|a| {
+                a.representations
+                    .iter()
+                    .find(|r| r.codecs.starts_with(codec_prefix.as_str()))
+                    .map(|r| (a, r))
+            })
         })
         .or_else(|| {
             tracks
@@ -334,25 +371,40 @@ pub(crate) fn apply_default_tracks(
         }
     }
 
-    // Product hosts pick their own subtitle (language + forced policy) after
-    // play, so they disable auto-selection.
-    if !auto_select_subtitle {
-        return;
+    // Subtitle selection, in priority order:
+    //   1. host language preference (applied before first frame, like audio),
+    //   2. the auto-select-first policy when the host hasn't opted out.
+    // A host-specified language is honoured even when auto_select_subtitle is
+    // false — that flag only governs the *implicit* first-track pick.
+    let sub_lang_pick = preferred_subtitle_language.and_then(|want| {
+        tracks.text.iter().find_map(|a| {
+            if lang_matches(a.language(), want) {
+                a.representations.first().map(|r| (a, r))
+            } else {
+                None
+            }
+        })
+    });
+    if let Some(want) = preferred_subtitle_language {
+        log::info!(
+            "subtitle language preference {:?}: {}",
+            want,
+            if sub_lang_pick.is_some() { "matched" } else { "no match" }
+        );
     }
+    let text_pick = sub_lang_pick.map(|(_, r)| r).or_else(|| {
+        if auto_select_subtitle {
+            tracks.text.first().and_then(|a| a.representations.first())
+        } else {
+            None
+        }
+    });
 
-    // Subtitles: pick the first text track when the manifest has one and a
-    // font is available. Android always has Roboto; desktop honours
-    // RUST_PLAYER_FONT. Opt out by deleting the track from the manifest —
-    // this is a smoke-test shell, visibility beats configurability.
-    if let Some(text_repr) = tracks
-        .text
-        .first()
-        .and_then(|a| a.representations.first())
-    {
-        // The overlay ships with an embedded DejaVu Sans default (wide
-        // glyph coverage — music notes, dashes, full diacritics), so a cue
-        // renders without any host font. `RUST_PLAYER_FONT` (env, or a
-        // `subtitle_font.txt` path on Android) only *overrides* that.
+    // Apply the chosen text track (font + style + select) when the manifest has
+    // one. Android always has Roboto; desktop honours RUST_PLAYER_FONT. The
+    // overlay ships an embedded DejaVu Sans default so a cue renders without a
+    // host font; RUST_PLAYER_FONT only *overrides* that.
+    if let Some(text_repr) = text_pick {
         if let Some(path) = sub_pref("RUST_PLAYER_FONT", "subtitle_font.txt") {
             match std::fs::read(&path) {
                 Ok(bytes) => match player.set_subtitle_font(bytes) {

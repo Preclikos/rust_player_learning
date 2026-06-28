@@ -27,6 +27,8 @@ object NativeBridge {
         startFraction: Float,        // < 0 = no resume
         audioPassthrough: Int,       // -1 = default, 0 = off, 1 = on
         autoSelectSubtitle: Boolean,
+        preferredAudioLang: String?,    // BCP-47, null = codec default
+        preferredSubtitleLang: String?, // BCP-47, null = auto-select policy
     ): Long
 
     external fun nativeSetSize(handle: Long, width: Int, height: Int)

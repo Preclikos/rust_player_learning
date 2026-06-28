@@ -207,6 +207,8 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeStart(
     start_fraction: jfloat,
     audio_passthrough: jint,
     auto_select_subtitle: jboolean,
+    preferred_audio_lang: JString,
+    preferred_subtitle_lang: JString,
 ) -> jlong {
     init_logging();
     init_ndk_context(&mut env, &context);
@@ -218,6 +220,17 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeStart(
             return 0;
         }
     };
+
+    // Optional BCP-47 language prefs (null / "" → None). Applied during default
+    // selection so no post-start selectAudio/selectSubtitle rebuild is needed.
+    let opt_lang = |env: &mut JNIEnv, s: &JString| -> Option<String> {
+        env.get_string(s)
+            .ok()
+            .map(Into::into)
+            .filter(|s: &String| !s.is_empty())
+    };
+    let preferred_audio_language = opt_lang(&mut env, &preferred_audio_lang);
+    let preferred_subtitle_language = opt_lang(&mut env, &preferred_subtitle_lang);
 
     let native_window = unsafe {
         ndk_sys::ANativeWindow_fromSurface(env.get_raw() as *mut _, surface.as_raw() as *mut _)
@@ -286,6 +299,8 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeStart(
             _ => None,
         },
         auto_select_subtitle: auto_select_subtitle != 0,
+        preferred_audio_language,
+        preferred_subtitle_language,
     };
 
     let bridge = bridge::start(player, manifest, host.clone(), config);

@@ -55,10 +55,44 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private var overlayH = 0
     private var userSeeking = false
 
+    // ---- BlackZone startup-storm repro (diagnostic) -------------------------
+    // Mimics BlackZone's PlaybackController start path to reproduce the 1-3fps
+    // direct-mode collapse: resume-seek (startFraction) + arm ABR right after
+    // start + change the audio track on the FIRST onPlaying (after first frame,
+    // so change_audio_track does the destructive seek(position()) rebuild on top
+    // of the resume). Toggle with:  adb shell am start -n .../MainActivity \
+    //   --ez storm true   (and optionally --ef storm_fraction 0.5)
+    // storm_fix:
+    //   (unset)      = BUG path: selectAudio on onPlaying (after first frame).
+    //   before_frame = apply audio pref on onTracks (before first frame).
+    //   start_param  = pass preferredAudioLang to start() — no selectAudio at all.
+    // storm_second_seek (default true): a 2nd resume seek 450ms after onPlaying,
+    //   mimicking BlackZone's maybeApplyMovieResume — more rebuild churn.
+    // storm_passthrough: force E-AC3 audio passthrough (slow AudioTrack start).
+    private var stormMode = false
+    private var stormFraction = 0.5f
+    private var stormFix = ""            // "", "before_frame", "start_param"
+    private var stormSecondSeek = true
+    private var stormPassthrough = false
+    private var stormAudioApplied = false
+    private var stormSecondSeekDone = false
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         window.setBackgroundDrawable(ColorDrawable(Color.BLACK))
+
+        stormMode = intent.getBooleanExtra("storm", false)
+        stormFraction = intent.getFloatExtra("storm_fraction", 0.5f)
+        stormFix = intent.getStringExtra("storm_fix") ?: ""
+        stormSecondSeek = intent.getBooleanExtra("storm_second_seek", true)
+        stormPassthrough = intent.getBooleanExtra("storm_passthrough", false)
+        if (stormMode) {
+            android.util.Log.i(
+                "rustplayer_repro",
+                "STORM fraction=$stormFraction fix='$stormFix' secondSeek=$stormSecondSeek passthrough=$stormPassthrough",
+            )
+        }
 
         val root = FrameLayout(this)
 
@@ -178,7 +212,23 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
     private inner class PlayerListener : RustPlayer.Listener {
         override fun onVideoSize(width: Int, height: Int) = applyVideoAspect(width, height)
-        override fun onPlaying() { playPauseButton.text = "▮▮" }
+        override fun onTracks(json: String) {
+            // FIX (a): apply the audio pref BEFORE the first frame. pipeline_live
+            // is still false, so change_audio_track stores the track and play()
+            // picks it up at startup — no destructive seek/rebuild.
+            if (stormMode && stormFix == "before_frame") applyStormAudio("onTracks")
+        }
+        override fun onPlaying() {
+            playPauseButton.text = "▮▮"
+            // BUG path (stormFix==""): apply the audio pref AFTER the first frame,
+            // exactly like BlackZone's onPlaying→applyLanguagePreference.
+            // pipeline_live is true, so change_audio_track does seek(position()) —
+            // a rebuild on the resume + freshly-armed ABR → 1-3fps collapse.
+            if (stormMode && stormFix == "") {
+                applyStormAudio("onPlaying")
+                maybeStormSecondSeek()
+            }
+        }
         override fun onPaused() { playPauseButton.text = "▶" }
         override fun onPosition(positionMs: Long, durationMs: Long) {
             if (durationMs > 0 && seekBar.max != durationMs.toInt()) seekBar.max = durationMs.toInt()
@@ -248,12 +298,76 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         val overlay = overlaySurface ?: return
         val video = videoSurface ?: return
         if (!player.isStarted) {
-            player.start(
-                overlay, video, overlayW, overlayH, displayHdrTypes(),
-                manifestUrl = TEST_MANIFEST_URL,
-                provider = TestProvider,
-            )
+            if (stormMode) {
+                val passthrough = if (stormPassthrough) true else null
+                if (stormFix == "start_param") {
+                    // FIX (b): hand the audio-language preference to start() so
+                    // it's applied during default selection — no post-start
+                    // selectAudio, hence no rebuild. (Our test stream is en-only,
+                    // so this picks the same mp4a track; the point is the path.)
+                    player.start(
+                        overlay, video, overlayW, overlayH, displayHdrTypes(),
+                        manifestUrl = TEST_MANIFEST_URL,
+                        provider = TestProvider,
+                        startFraction = stormFraction,
+                        audioPassthrough = passthrough,
+                        autoSelectSubtitle = false,
+                        preferredAudioLang = "en",
+                    )
+                } else {
+                    // BlackZone-style: resume mid-content + own subtitle selection.
+                    player.start(
+                        overlay, video, overlayW, overlayH, displayHdrTypes(),
+                        manifestUrl = TEST_MANIFEST_URL,
+                        provider = TestProvider,
+                        startFraction = stormFraction,
+                        audioPassthrough = passthrough,
+                        autoSelectSubtitle = false,
+                    )
+                }
+                // Arm ABR immediately after start (BlackZone's selectVideoAuto()).
+                player.selectVideoAuto()
+            } else {
+                player.start(
+                    overlay, video, overlayW, overlayH, displayHdrTypes(),
+                    manifestUrl = TEST_MANIFEST_URL,
+                    provider = TestProvider,
+                )
+            }
         }
+    }
+
+    /** Apply a non-default audio track, mimicking BlackZone's applyLanguagePreference. */
+    private fun applyStormAudio(where: String) {
+        if (stormAudioApplied) return
+        val audio = try {
+            JSONObject(player.tracksJson()).optJSONArray("audio")
+        } catch (e: Exception) {
+            null
+        } ?: return
+        if (audio.length() == 0) return
+        stormAudioApplied = true
+        // Pick the LAST audio rep so it differs from the default pick when
+        // possible (the change itself is what triggers the rebuild either way).
+        val t = audio.getJSONObject(audio.length() - 1)
+        val adapt = t.optInt("adapt")
+        val repr = t.optInt("repr")
+        android.util.Log.i("rustplayer_repro", "applyStormAudio($where) adapt=$adapt repr=$repr")
+        player.selectAudio(adapt, repr)
+    }
+
+    /** Second resume seek 450ms after first frame — BlackZone's maybeApplyMovieResume. */
+    private fun maybeStormSecondSeek() {
+        if (!stormSecondSeek || stormSecondSeekDone) return
+        stormSecondSeekDone = true  // fire once, like BlackZone's movieResumeApplied
+        playPauseButton.postDelayed({
+            val dur = player.durationMs
+            if (dur > 0) {
+                val target = (dur * stormFraction).toLong()
+                android.util.Log.i("rustplayer_repro", "stormSecondSeek to ${target}ms")
+                player.seekTo(target)
+            }
+        }, 450)
     }
 
     /**

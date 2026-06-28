@@ -254,6 +254,8 @@ pub extern "C" fn rustplayer_player_create(
             _ => None,
         },
         auto_select_subtitle,
+        // iOS bridge does not yet expose language prefs; wire when needed.
+        ..Default::default()
     };
     let bridge = bridge::start(player, manifest, host.clone(), config);
 

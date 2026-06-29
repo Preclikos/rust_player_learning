@@ -4344,11 +4344,11 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                     let pt_sink: Option<Arc<dyn crate::renderers::AudioPassthrough>> =
                         if want_passthrough {
                             let enc = if audio_representation.codecs == "ac-3" {
-                                renderers::audio_passthrough::ENCODING_AC3
+                                renderers::audio::audio_passthrough::ENCODING_AC3
                             } else {
-                                renderers::audio_passthrough::ENCODING_E_AC3
+                                renderers::audio::audio_passthrough::ENCODING_E_AC3
                             };
-                            renderers::audio_passthrough::AudioTrackSink::new(
+                            renderers::audio::audio_passthrough::AudioTrackSink::new(
                                 enc,
                                 audio_representation.audio_sampling_rate,
                                 audio_representation.channels.unwrap_or(6) as u16,

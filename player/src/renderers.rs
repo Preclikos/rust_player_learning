@@ -1,6 +1,4 @@
 pub mod audio;
-#[cfg(target_os = "android")]
-pub mod audio_passthrough;
 pub mod subtitle;
 pub mod video;
 

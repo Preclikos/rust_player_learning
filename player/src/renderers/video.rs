@@ -511,7 +511,6 @@ impl VideoRenderer {
                 power_preference: wgpu::PowerPreference::default(),
                 compatible_surface: Some(&surface),
                 force_fallback_adapter: false,
-                apply_limit_buckets: false,
             })
             .await
             .unwrap();
@@ -757,7 +756,7 @@ impl VideoRenderer {
                     vertex: wgpu::VertexState {
                         module,
                         entry_point: Some("vs_main"),
-                        buffers: &[Some(Vertex::desc())],
+                        buffers: &[Vertex::desc()],
                         compilation_options: wgpu::PipelineCompilationOptions::default(),
                     },
                     fragment: Some(wgpu::FragmentState {
@@ -1160,7 +1159,7 @@ impl VideoRenderer {
                 vertex: wgpu::VertexState {
                     module,
                     entry_point: Some("vs_main"),
-                    buffers: &[Some(Vertex::desc())],
+                    buffers: &[Vertex::desc()],
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
                 },
                 fragment: Some(wgpu::FragmentState {
@@ -1518,7 +1517,7 @@ impl VideoRenderer {
         }
         self.queue.submit([]);
         self.pre_present_notify();
-        self.queue.present(surface_texture);
+        surface_texture.present();
     }
 
     /// Last known drawable size (device pixels), kept current by the host via
@@ -2010,7 +2009,7 @@ impl VideoRenderer {
                 .await;
 
                 self.pre_present_notify();
-                self.queue.present(surface_texture);
+                surface_texture.present();
                 if is_p010_dbg {
                     log::trace!("[p010_render] step 8 OK: frame presented");
                 }
@@ -2217,7 +2216,7 @@ impl VideoRenderer {
             .await;
 
             self.pre_present_notify();
-            self.queue.present(surface_texture);
+            surface_texture.present();
         }
     }
 
@@ -2359,7 +2358,7 @@ impl VideoRenderer {
             }
             self.queue.submit([encoder.finish()]);
             self.pre_present_notify();
-            self.queue.present(surface_texture);
+            surface_texture.present();
             // Drain deferred destruction here too (see the main path below) —
             // this degraded clear-loop runs every frame when renderer init
             // failed, so it would otherwise accumulate for the whole session.
@@ -2505,7 +2504,7 @@ impl VideoRenderer {
         // then present — the hook fires inside present() and draws the OES quad.
         self.queue.submit([]);
         self.pre_present_notify();
-        self.queue.present(surface_texture);
+        surface_texture.present();
 
         // Keep this AHB alive for one extra frame. The GPU may still be sampling
         // from the OES texture after eglSwapBuffers returns; if we drop the AHB
@@ -2634,7 +2633,7 @@ impl VideoRenderer {
             }
             self.queue.submit([encoder.finish()]);
             self.pre_present_notify();
-            self.queue.present(surface_texture);
+            surface_texture.present();
             // Drain deferred destruction here too (see the main path below) —
             // this degraded clear-loop runs every frame when renderer init
             // failed, so it would otherwise accumulate for the whole session.
@@ -2766,7 +2765,7 @@ impl VideoRenderer {
         }
         self.queue.submit([encoder.finish()]);
         self.pre_present_notify();
-        self.queue.present(surface_texture);
+        surface_texture.present();
 
         // Same one-frame keepalive contract as the GLES path, plus the
         // VkDeviceMemory cleanup the GLES path doesn't need: AHB stays

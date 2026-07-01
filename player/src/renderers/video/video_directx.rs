@@ -580,11 +580,12 @@ pub fn create_texture_from_dx12_resource(
         log_dx12_device_removed_reason(device);
 
         log::trace!("[dx12_wrap] before create_texture_from_hal");
-        let result = device.create_texture_from_hal::<Dx12>(
-            texture,
-            desc,
-            wgpu::wgt::TextureUses::RESOURCE | wgpu::wgt::TextureUses::COPY_SRC,
-        );
+        // wgpu 29.0.3: create_texture_from_hal derives HAL usage from the
+        // descriptor; the old explicit `TextureUses` hint arg was removed. Make
+        // the descriptor advertise the same intent (sampling + copy-src).
+        let mut desc = desc.clone();
+        desc.usage |= wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC;
+        let result = device.create_texture_from_hal::<Dx12>(texture, &desc);
         log::trace!("[dx12_wrap] create_texture_from_hal returned; device post-check:");
         log_dx12_device_removed_reason(device);
         result

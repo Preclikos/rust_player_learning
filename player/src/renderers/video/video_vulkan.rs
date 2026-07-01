@@ -73,7 +73,6 @@ pub fn create_texture_from_vk_image(
                 view_formats: &[],
                 usage: api_usage,
             },
-            hal_usage,
         )
     }
 }

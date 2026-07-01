@@ -1,6 +1,9 @@
 pub mod audio;
 pub mod subtitle;
 pub mod video;
+// Additive: offscreen VideoSink for in-app (shared-device) video. Does not
+// affect the windowed `video` renderer.
+pub mod video_offscreen;
 
 use std::future::Future;
 

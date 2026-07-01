@@ -67,6 +67,12 @@ use renderers::audio::AudioRenderer;
 use renderers::video::VideoRenderer;
 use renderers::{AudioSink, VideoSink};
 
+// Additive: re-export the offscreen ring handle + a convenience alias. Offscreen
+// (in-app) video reuses `VideoRenderer` with an offscreen target, so the in-app
+// player is the same concrete type as the windowed desktop player.
+pub use renderers::video_offscreen::OffscreenTarget;
+pub type OffscreenPlayer = Player<VideoRenderer, AudioRenderer>;
+
 use arc_swap::ArcSwap;
 use std::collections::HashMap;
 use std::error::Error;
@@ -3275,6 +3281,56 @@ impl Player<VideoRenderer, AudioRenderer> {
             // calling in), so a current handle is always available here. Storing
             // it lets `resize`/`seek`/track-switch spawn from any thread later.
             rt: tokio::runtime::Handle::current(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Additive: in-app (offscreen) construction. Reuses `VideoRenderer` with an
+// offscreen target, so the in-app player is the SAME concrete type as the
+// windowed desktop player — every existing method applies unchanged. Nothing in
+// the windowed path calls these; existing consumers are unaffected.
+// ---------------------------------------------------------------------------
+
+impl Player<VideoRenderer, AudioRenderer> {
+    /// In-app video path: render decoded frames into an offscreen wgpu texture
+    /// on a device the host SHARES with its compositor (Slint/iced/egui), then
+    /// pull [`current_video_texture`](Self::current_video_texture) each
+    /// frame-ready for zero-copy import. No window, no swapchain.
+    ///
+    /// `device`/`queue` MUST be the host's own, created with
+    /// `TEXTURE_FORMAT_NV12 | P010 | 16BIT_NORM` on desktop (see the feature set
+    /// in `video.rs::new_with_surface`) so the hardware-decoded frame import
+    /// works. Must be called inside a Tokio runtime.
+    pub async fn new_offscreen(
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        backend: wgpu::Backend,
+        width: u32,
+        height: u32,
+    ) -> Self {
+        let video_renderer = Arc::new(VideoRenderer::new_offscreen(
+            device, queue, backend, width, height,
+        ));
+        let audio_renderer = Arc::new(AudioRenderer::new());
+        Self::from_renderers(video_renderer, audio_renderer)
+    }
+
+    /// The freshest finished video texture, for the host to wrap with its GUI's
+    /// texture-import API (e.g. `slint::Image::try_from`). Cheap — clones a
+    /// handle to the already-published offscreen texture. Offscreen mode only.
+    pub fn current_video_texture(&self) -> wgpu::Texture {
+        self.video_renderer
+            .offscreen_target()
+            .expect("current_video_texture requires offscreen mode")
+            .current_texture()
+    }
+
+    /// Register a callback fired after each offscreen frame is published, so the
+    /// host can request a redraw / re-import the texture. No-op in windowed mode.
+    pub fn set_frame_ready_callback<F: Fn() + Send + Sync + 'static>(&self, cb: F) {
+        if let Some(t) = self.video_renderer.offscreen_target() {
+            t.set_on_ready(Box::new(cb));
         }
     }
 }

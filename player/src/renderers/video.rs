@@ -10,6 +10,8 @@ use video_frame::VideoFrame;
 use video_metal::{MetalNV12Frame, MetalTextureCache};
 use wgpu::{Backends, Buffer};
 use wgpu::{Device, SurfaceConfiguration};
+// Additive: alternate offscreen output for in-app video (shared-device).
+use super::video_offscreen::{OffscreenTarget, OFFSCREEN_FORMAT};
 
 #[cfg(target_os = "windows")]
 mod video_directx;
@@ -249,9 +251,14 @@ pub struct VideoRenderer {
     tex_x_max: Arc<RwLock<f32>>,
     #[cfg_attr(not(target_os = "android"), allow(dead_code))]
     tex_y_max: Arc<RwLock<f32>>,
-    surface: Arc<Mutex<wgpu::Surface<'static>>>,
+    // `None` in offscreen (in-app) mode — mutually exclusive with `offscreen`.
+    surface: Option<Arc<Mutex<wgpu::Surface<'static>>>>,
     surface_format: TextureFormat,
-    surface_config: Arc<RwLock<SurfaceConfiguration>>,
+    // `None` in offscreen mode.
+    surface_config: Option<Arc<RwLock<SurfaceConfiguration>>>,
+    /// `Some` in offscreen mode: render into a host-shared texture ring instead
+    /// of a swapchain. See [`OffscreenTarget`]. Mutually exclusive with `surface`.
+    offscreen: Option<Arc<OffscreenTarget>>,
     sampler: Sampler,
     // None on devices where NV12 is unavailable (e.g. MT8696 Vulkan on Google
     // TV). Creating the NV12 shader/pipeline on those drivers triggers a crash
@@ -1009,9 +1016,10 @@ impl VideoRenderer {
             frame_size: Arc::new(RwLock::new(PhysicalSize::new(0, 0))),
             tex_x_max: Arc::new(RwLock::new(1.0_f32)),
             tex_y_max: Arc::new(RwLock::new(1.0_f32)),
-            surface: Arc::new(Mutex::new(surface)),
+            surface: Some(Arc::new(Mutex::new(surface))),
             surface_format,
-            surface_config: Arc::new(RwLock::new(surface_config)),
+            surface_config: Some(Arc::new(RwLock::new(surface_config))),
+            offscreen: None,
             sampler,
             vertex_buffer,
             texture_bind_group_layout,
@@ -1048,6 +1056,417 @@ impl VideoRenderer {
         renderer
     }
 
+    // ───────────────────────── offscreen (in-app) path ─────────────────────
+    // Additive. Builds a `VideoRenderer` that draws into a host-shared texture
+    // ring instead of a swapchain. Reuses the exact per-frame draw
+    // (`encode_and_submit`); the only duplicated code is the deterministic
+    // pipeline setup below (a verbatim copy of the `new_with_surface` block, so
+    // that constructor stays untouched).
+
+    /// Verbatim copy of `new_with_surface`'s render-resource block, factored so
+    /// `new_offscreen` can build the same SDR + HDR pipelines without touching
+    /// the windowed constructor. Callers must have already ensured the device
+    /// exposes NV12/P010 (desktop always does).
+    fn build_render_resources(
+        device: &Device,
+        surface_format: TextureFormat,
+    ) -> (
+        Option<BindGroupLayout>,
+        Option<RenderPipeline>,
+        Option<RenderPipeline>,
+        Option<Arc<RwLock<Buffer>>>,
+        Option<wgpu::Buffer>,
+        Option<HdrDetect>,
+    ) {
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: std::num::NonZeroU64::new(HDR_TONEMAP_UNIFORM_SIZE),
+                    },
+                    count: None,
+                },
+            ],
+            label: Some("texture_bind_group_layout"),
+        });
+
+        let hdr_detect_frag_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: std::num::NonZeroU64::new(HDR_DETECT_BUFFER_SIZE),
+                    },
+                    count: None,
+                }],
+                label: Some("hdr_detect_frag_layout"),
+            });
+
+        let shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
+        let shader_hdr = device.create_shader_module(wgpu::include_wgsl!("shader_hdr.wgsl"));
+        let shader_hdr_detect =
+            device.create_shader_module(wgpu::include_wgsl!("shader_hdr_detect.wgsl"));
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Pipeline Layout"),
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        let pipeline_layout_hdr = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Pipeline Layout (HDR)"),
+            bind_group_layouts: &[Some(&layout), Some(&hdr_detect_frag_layout)],
+            immediate_size: 0,
+        });
+
+        let make_pipeline = |label: &'static str,
+                             module: &wgpu::ShaderModule,
+                             pl: &wgpu::PipelineLayout| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(pl),
+                vertex: wgpu::VertexState {
+                    module,
+                    entry_point: Some("vs_main"),
+                    buffers: &[Some(Vertex::desc())],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module,
+                    entry_point: Some("fs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: surface_format,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+
+        let pipeline = make_pipeline("Render Pipeline (SDR/NV12)", &shader, &pipeline_layout);
+        let pipeline_hdr =
+            make_pipeline("Render Pipeline (HDR/P010)", &shader_hdr, &pipeline_layout_hdr);
+
+        let vertices = generate_verticles(1., 1., 1.);
+        let vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Vertex Buffer"),
+            contents: bytemuck::cast_slice(&vertices),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
+        let tonemap_uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("HDR Tonemap Uniform"),
+            contents: &[0u8; HDR_TONEMAP_UNIFORM_SIZE as usize],
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let detect_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("HDR Detect Buffer"),
+            size: HDR_DETECT_BUFFER_SIZE,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+
+        let detect_frag_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &hdr_detect_frag_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: detect_buffer.as_entire_binding(),
+            }],
+            label: Some("hdr_detect_frag_bind_group"),
+        });
+
+        let detect_compute_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: std::num::NonZeroU64::new(HDR_TONEMAP_UNIFORM_SIZE),
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: std::num::NonZeroU64::new(HDR_DETECT_BUFFER_SIZE),
+                        },
+                        count: None,
+                    },
+                ],
+                label: Some("hdr_detect_compute_layout"),
+            });
+
+        let detect_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("HDR Detect Pipeline Layout"),
+                bind_group_layouts: &[Some(&detect_compute_layout)],
+                immediate_size: 0,
+            });
+        let make_detect_pipeline = |label: &'static str, entry: &'static str| {
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(label),
+                layout: Some(&detect_pipeline_layout),
+                module: &shader_hdr_detect,
+                entry_point: Some(entry),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            })
+        };
+
+        let hdr_detect = HdrDetect {
+            buffer: detect_buffer,
+            frag_bind_group: detect_frag_bind_group,
+            compute_layout: detect_compute_layout,
+            publish: make_detect_pipeline("HDR Detect (publish)", "cs_publish"),
+            accumulate: make_detect_pipeline("HDR Detect (accumulate)", "cs_accumulate"),
+            finalize: make_detect_pipeline("HDR Detect (finalize)", "cs_finalize"),
+        };
+
+        (
+            Some(layout),
+            Some(pipeline),
+            Some(pipeline_hdr),
+            Some(Arc::new(RwLock::new(vb))),
+            Some(tonemap_uniform),
+            Some(hdr_detect),
+        )
+    }
+
+    /// In-app video: render into a host-shared texture ring on `device`/`queue`
+    /// (the same the host composites with) instead of a swapchain. Desktop only;
+    /// the host must have requested `TEXTURE_FORMAT_NV12 | P010 | 16BIT_NORM`.
+    pub fn new_offscreen(
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        backend: wgpu::Backend,
+        width: u32,
+        height: u32,
+    ) -> Self {
+        let size = PhysicalSize::new(width.max(1), height.max(1));
+        // Pipelines must target the format the host samples.
+        let surface_format = OFFSCREEN_FORMAT;
+        let (
+            texture_bind_group_layout,
+            render_pipeline,
+            render_pipeline_hdr,
+            vertex_buffer,
+            hdr_tonemap_uniform,
+            hdr_detect,
+        ) = Self::build_render_resources(&device, surface_format);
+
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            ..Default::default()
+        });
+
+        let offscreen = OffscreenTarget::new(device.clone(), size);
+        let (command_sender, command_receiver) = mpsc::channel(32);
+
+        // Built before `device` is moved into the struct (mirrors new_with_surface).
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let metal_cache = MetalTextureCache::new(&device);
+
+        let renderer = VideoRenderer {
+            surface_size: Arc::new(std::sync::RwLock::new(size)),
+            pre_present: std::sync::Mutex::new(None),
+            device,
+            backend,
+            queue,
+            frame_size: Arc::new(RwLock::new(PhysicalSize::new(0, 0))),
+            tex_x_max: Arc::new(RwLock::new(1.0_f32)),
+            tex_y_max: Arc::new(RwLock::new(1.0_f32)),
+            surface: None,
+            surface_format,
+            surface_config: None,
+            offscreen: Some(offscreen),
+            sampler,
+            vertex_buffer,
+            texture_bind_group_layout,
+            render_pipeline,
+            render_pipeline_hdr,
+            hdr_tonemap_uniform,
+            hdr_detect,
+            hdr_tonemap_params: Arc::new(arc_swap::ArcSwap::from_pointee(
+                crate::HdrTonemapParams::DEFAULT,
+            )),
+            command_sender,
+            subtitle_overlay: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(target_os = "android")]
+            gles_oes_renderer: None,
+            #[cfg(target_os = "android")]
+            gles_oes_pending: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(target_os = "android")]
+            ahb_keepalive: Arc::new(std::sync::Mutex::new(
+                std::collections::VecDeque::with_capacity(4),
+            )),
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            metal_cache,
+            #[cfg(target_os = "android")]
+            display_hdr_types: std::sync::atomic::AtomicU32::new(0),
+            subtitle_safe_bottom_px: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(target_os = "android")]
+            android_window: 0,
+            #[cfg(target_os = "android")]
+            android_pq_session: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(target_os = "android")]
+            overlay_presented_gen: std::sync::atomic::AtomicU64::new(0),
+        };
+
+        renderer.spawn_command_thread(command_receiver);
+        renderer
+    }
+
+    /// Host handle to the offscreen ring (offscreen mode only).
+    pub fn offscreen_target(&self) -> Option<Arc<OffscreenTarget>> {
+        self.offscreen.clone()
+    }
+
+    /// Shared per-frame draw: HDR detection compute (HDR only) → video quad →
+    /// subtitle overlay → submit. Target-agnostic — the caller supplies the
+    /// destination `target_view` (swapchain texture view or offscreen ring
+    /// view) and its dimensions. Does NOT present/publish; the caller does that
+    /// after this returns (surface: `queue.present`, offscreen: `publish`).
+    #[allow(clippy::too_many_arguments)]
+    async fn encode_and_submit(
+        &self,
+        target_view: &wgpu::TextureView,
+        target_w: u32,
+        target_h: u32,
+        texture_bind_group: &wgpu::BindGroup,
+        render_pipeline: &wgpu::RenderPipeline,
+        is_hdr: bool,
+        detect_bind_group: Option<&wgpu::BindGroup>,
+        wg_x: u32,
+        wg_y: u32,
+        vertex_buffer: &wgpu::Buffer,
+        overlay_snapshot: Option<Arc<super::subtitle::SubtitleOverlay>>,
+    ) {
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+
+        if let Some(detect_group) = detect_bind_group {
+            let det = self
+                .hdr_detect
+                .as_ref()
+                .expect("detect bind group exists without resources");
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+            cpass.set_pipeline(&det.publish);
+            cpass.set_bind_group(0, detect_group, &[]);
+            cpass.dispatch_workgroups(1, 1, 1);
+            cpass.set_pipeline(&det.accumulate);
+            cpass.dispatch_workgroups(wg_x, wg_y, 1);
+            cpass.set_pipeline(&det.finalize);
+            cpass.dispatch_workgroups(1, 1, 1);
+        }
+
+        {
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target_view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+
+            render_pass.set_pipeline(render_pipeline);
+            render_pass.set_bind_group(0, texture_bind_group, &[]);
+            if is_hdr {
+                if let Some(det) = self.hdr_detect.as_ref() {
+                    render_pass.set_bind_group(1, &det.frag_bind_group, &[]);
+                }
+            }
+            render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+            render_pass.draw(0..6, 0..1);
+
+            if let Some(overlay) = overlay_snapshot {
+                overlay.draw_into(
+                    &mut render_pass,
+                    target_w,
+                    target_h,
+                    self.subtitle_safe_bottom_px
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                );
+            }
+        }
+
+        self.queue.submit([encoder.finish()]);
+    }
+
     /// Direct mode: present the overlay surface when (and only when) the
     /// active subtitle changed — appearing, changing text, or clearing.
     /// Video rides its own surface plane, so the GL surface stays
@@ -1072,7 +1491,7 @@ impl VideoRenderer {
         }
         log::debug!("[subs] presenting overlay gen={} (subtitle={})", gen, subtitle.is_some());
 
-        let surface = self.surface.lock().await;
+        let surface = self.surface.as_ref().expect("surface (android)").lock().await;
         let surface_texture = match surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t)
             | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
@@ -1159,8 +1578,9 @@ impl VideoRenderer {
     }
 
     fn spawn_command_thread(&self, mut command_receiver: Receiver<VideoRendererCommand>) {
-        let surface = Arc::clone(&self.surface);
-        let config = Arc::clone(&self.surface_config);
+        let surface = self.surface.clone(); // Option (None in offscreen mode)
+        let config = self.surface_config.clone(); // Option (None in offscreen mode)
+        let offscreen = self.offscreen.clone(); // Option (Some in offscreen mode)
         let frame_size = Arc::clone(&self.frame_size);
         let tex_y_max = Arc::clone(&self.tex_y_max);
         let vertex_buffer = self.vertex_buffer.clone(); // Option<Arc<...>>
@@ -1226,13 +1646,19 @@ impl VideoRenderer {
                         // Keep the size cell current so later inner_size() reads
                         // (render path, ChangeFrameSize) see the new layout.
                         *surface_size.write().unwrap() = new_size;
-                        let new_config = {
-                            let mut config_guard = config.write().await;
-                            config_guard.width = new_size.width;
-                            config_guard.height = new_size.height;
-                            config_guard.clone()
-                        };
-                        surface.lock().await.configure(&device, &new_config);
+                        // Windowed: reconfigure the swapchain. Offscreen:
+                        // reallocate the shared texture ring at the new size.
+                        if let (Some(config), Some(surface)) = (&config, &surface) {
+                            let new_config = {
+                                let mut config_guard = config.write().await;
+                                config_guard.width = new_size.width;
+                                config_guard.height = new_size.height;
+                                config_guard.clone()
+                            };
+                            surface.lock().await.configure(&device, &new_config);
+                        } else if let Some(off) = &offscreen {
+                            off.resize(new_size);
+                        }
                         if let Some(vb) = &vertex_buffer {
                             let frame_size = frame_size.read().await;
                             let ty_max = *tex_y_max.read().await;
@@ -1481,7 +1907,6 @@ impl VideoRenderer {
         }
 
         {
-            let surface = self.surface.lock().await;
             let vb_arc = self.vertex_buffer.as_ref().expect("no vertex buffer");
             let vertex_buffer = vb_arc.read().await;
             // P010 imported frames go through the HDR (Rec.2020 + PQ → SDR) pipeline;
@@ -1494,134 +1919,101 @@ impl VideoRenderer {
                 _ => self.render_pipeline.as_ref().expect("no render pipeline"),
             };
 
-            if is_p010_dbg {
-                log::trace!("[p010_render] step 5: get_current_texture");
-            }
-            let surface_texture = match surface.get_current_texture() {
-                wgpu::CurrentSurfaceTexture::Success(t) => t,
-                wgpu::CurrentSurfaceTexture::Suboptimal(t) => {
-                    // Suboptimal: surface is valid but swapchain config no longer
-                    // perfectly matches (e.g. display transform changed). Render
-                    // to it anyway to avoid dropping the frame; queue a resize so
-                    // the config is corrected before the next frame.
-                    log::warn!("[renderer] suboptimal surface — queuing resize, rendering anyway");
-                    let _ = self.command_sender.try_send(
-                        VideoRendererCommand::Resize(self.inner_size()),
-                    );
-                    t
-                }
-                other => {
-                    log::warn!("surface texture not available: {:?}", other);
-                    #[cfg(target_os = "windows")]
-                    if self.backend == wgpu::Backend::Dx12 {
-                        video_directx::log_dx12_device_removed_reason(&self.device);
-                    }
-                    return;
-                }
-            };
+            // Resolve overlay snapshot BEFORE begin_render_pass so no
+            // async/mutex hazard happens inside the render-pass scope.
+            let overlay_snapshot = self.subtitle_overlay.lock().unwrap().clone();
 
-            let texture_view = surface_texture
-                .texture
-                .create_view(&wgpu::TextureViewDescriptor {
-                    format: Some(self.surface_format),
-                    ..Default::default()
-                });
-
-            // Resolve overlay + surface dims BEFORE begin_render_pass so
-            // no async/mutex hazard happens inside the render-pass scope.
-            let overlay_snapshot = self
-                .subtitle_overlay
-                .lock()
-                .unwrap()
-                .clone();
-            let (surface_w, surface_h) = {
-                let cfg = self.surface_config.read().await;
-                (cfg.width, cfg.height)
-            };
-
-            if is_p010_dbg {
-                log::trace!("[p010_render] step 6: create_command_encoder + begin_render_pass");
-                #[cfg(target_os = "windows")]
-                video_directx::log_dx12_device_removed_reason(&self.device);
-            }
-            let mut encoder = self.device.create_command_encoder(&Default::default());
-
-            // Frame peak/average detection (tonemap_opencl detect_peak_avg)
-            // — HDR frames only, entirely on the GPU. `publish` runs FIRST
-            // so this draw maps with previous-frames statistics, exactly
-            // like the filter (its kernel reads the rolling totals before
-            // the last workgroup advances them).
-            if let Some(detect_group) = detect_bind_group.as_ref() {
-                let det = self
-                    .hdr_detect
+            if let Some(off) = self.offscreen.clone() {
+                // In-app (offscreen) path: draw into the host-shared ring, then
+                // publish. Same draw as the windowed path (encode_and_submit).
+                let (idx, view) = off.acquire();
+                let sz = off.size();
+                self.encode_and_submit(
+                    &view,
+                    sz.width,
+                    sz.height,
+                    &texture_bind_group,
+                    render_pipeline,
+                    is_hdr,
+                    detect_bind_group.as_ref(),
+                    wg_x,
+                    wg_y,
+                    &vertex_buffer,
+                    overlay_snapshot,
+                )
+                .await;
+                off.publish(idx);
+            } else {
+                // Windowed path — behaviour unchanged (surface lock held across
+                // present so a concurrent resize can't reconfigure mid-frame).
+                let surface = self
+                    .surface
                     .as_ref()
-                    .expect("detect bind group exists without resources");
-                let mut cpass =
-                    encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
-                cpass.set_pipeline(&det.publish);
-                cpass.set_bind_group(0, detect_group, &[]);
-                cpass.dispatch_workgroups(1, 1, 1);
-                cpass.set_pipeline(&det.accumulate);
-                cpass.dispatch_workgroups(wg_x, wg_y, 1);
-                cpass.set_pipeline(&det.finalize);
-                cpass.dispatch_workgroups(1, 1, 1);
-            }
-
-            {
-                let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: None,
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &texture_view,
-                        resolve_target: None,
-                        depth_slice: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                });
-
+                    .expect("surface in windowed mode")
+                    .lock()
+                    .await;
                 if is_p010_dbg {
-                    log::trace!("[p010_render] step 7: set_pipeline + set_bind_group + draw");
+                    log::trace!("[p010_render] step 5: get_current_texture");
                 }
-                render_pass.set_pipeline(render_pipeline);
-                render_pass.set_bind_group(0, &texture_bind_group, &[]);
-                // The HDR pipeline's group 1 = detection result (read-only
-                // storage). SDR pipelines have no group 1.
-                if is_hdr {
-                    if let Some(det) = self.hdr_detect.as_ref() {
-                        render_pass.set_bind_group(1, &det.frag_bind_group, &[]);
+                let surface_texture = match surface.get_current_texture() {
+                    wgpu::CurrentSurfaceTexture::Success(t) => t,
+                    wgpu::CurrentSurfaceTexture::Suboptimal(t) => {
+                        log::warn!(
+                            "[renderer] suboptimal surface — queuing resize, rendering anyway"
+                        );
+                        let _ = self
+                            .command_sender
+                            .try_send(VideoRendererCommand::Resize(self.inner_size()));
+                        t
                     }
-                }
-                render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
-                render_pass.draw(0..6, 0..1);
+                    other => {
+                        log::warn!("surface texture not available: {:?}", other);
+                        #[cfg(target_os = "windows")]
+                        if self.backend == wgpu::Backend::Dx12 {
+                            video_directx::log_dx12_device_removed_reason(&self.device);
+                        }
+                        return;
+                    }
+                };
 
-                if let Some(overlay) = overlay_snapshot {
-                    overlay.draw_into(
-                    &mut render_pass,
+                let texture_view =
+                    surface_texture
+                        .texture
+                        .create_view(&wgpu::TextureViewDescriptor {
+                            format: Some(self.surface_format),
+                            ..Default::default()
+                        });
+
+                let (surface_w, surface_h) = {
+                    let cfg = self
+                        .surface_config
+                        .as_ref()
+                        .expect("config in windowed mode")
+                        .read()
+                        .await;
+                    (cfg.width, cfg.height)
+                };
+
+                self.encode_and_submit(
+                    &texture_view,
                     surface_w,
                     surface_h,
-                    self.subtitle_safe_bottom_px
-                        .load(std::sync::atomic::Ordering::Relaxed),
-                );
-                }
-            }
+                    &texture_bind_group,
+                    render_pipeline,
+                    is_hdr,
+                    detect_bind_group.as_ref(),
+                    wg_x,
+                    wg_y,
+                    &vertex_buffer,
+                    overlay_snapshot,
+                )
+                .await;
 
-            if is_p010_dbg {
-                log::trace!("[p010_render] step 8: queue.submit + present");
-                #[cfg(target_os = "windows")]
-                video_directx::log_dx12_device_removed_reason(&self.device);
-            }
-            // Submit the command in the queue to execute
-            self.queue.submit([encoder.finish()]);
-            self.pre_present_notify();
-            self.queue.present(surface_texture);
-            if is_p010_dbg {
-                log::trace!("[p010_render] step 8 OK: frame presented");
+                self.pre_present_notify();
+                self.queue.present(surface_texture);
+                if is_p010_dbg {
+                    log::trace!("[p010_render] step 8 OK: frame presented");
+                }
             }
         }
     }
@@ -1736,7 +2128,6 @@ impl VideoRenderer {
             None
         };
 
-        let surface = self.surface.lock().await;
         let vb_arc = self.vertex_buffer.as_ref().expect("no vertex buffer");
         let vertex_buffer = vb_arc.read().await;
         let render_pipeline = if is_hdr {
@@ -1746,96 +2137,88 @@ impl VideoRenderer {
         } else {
             self.render_pipeline.as_ref().expect("no render pipeline")
         };
-
-        let surface_texture = match surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(t) => t,
-            wgpu::CurrentSurfaceTexture::Suboptimal(t) => {
-                log::warn!("[renderer] suboptimal surface — queuing resize, rendering anyway");
-                let _ = self
-                    .command_sender
-                    .try_send(VideoRendererCommand::Resize(self.inner_size()));
-                t
-            }
-            other => {
-                log::warn!("surface texture not available: {:?}", other);
-                return;
-            }
-        };
-
-        let texture_view = surface_texture.texture.create_view(&wgpu::TextureViewDescriptor {
-            format: Some(self.surface_format),
-            ..Default::default()
-        });
-
         let overlay_snapshot = self.subtitle_overlay.lock().unwrap().clone();
-        let (surface_w, surface_h) = {
-            let cfg = self.surface_config.read().await;
-            (cfg.width, cfg.height)
-        };
 
-        let mut encoder = self.device.create_command_encoder(&Default::default());
-
-        // Frame peak/average detection — HDR frames only, publish first so
-        // this draw maps with previous-frames statistics (see p010_render).
-        if let Some(detect_group) = detect_bind_group.as_ref() {
-            let det = self
-                .hdr_detect
+        if let Some(off) = self.offscreen.clone() {
+            // In-app (offscreen) path — same draw, published to the shared ring.
+            let (idx, view) = off.acquire();
+            let sz = off.size();
+            self.encode_and_submit(
+                &view,
+                sz.width,
+                sz.height,
+                &texture_bind_group,
+                render_pipeline,
+                is_hdr,
+                detect_bind_group.as_ref(),
+                wg_x,
+                wg_y,
+                &vertex_buffer,
+                overlay_snapshot,
+            )
+            .await;
+            off.publish(idx);
+        } else {
+            let surface = self
+                .surface
                 .as_ref()
-                .expect("detect bind group exists without resources");
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
-            cpass.set_pipeline(&det.publish);
-            cpass.set_bind_group(0, detect_group, &[]);
-            cpass.dispatch_workgroups(1, 1, 1);
-            cpass.set_pipeline(&det.accumulate);
-            cpass.dispatch_workgroups(wg_x, wg_y, 1);
-            cpass.set_pipeline(&det.finalize);
-            cpass.dispatch_workgroups(1, 1, 1);
-        }
+                .expect("surface in windowed mode")
+                .lock()
+                .await;
 
-        {
-            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: None,
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &texture_view,
-                    resolve_target: None,
-                    depth_slice: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-
-            render_pass.set_pipeline(render_pipeline);
-            render_pass.set_bind_group(0, &texture_bind_group, &[]);
-            // The HDR pipeline's group 1 = detection result (read-only
-            // storage). The SDR pipeline has no group 1.
-            if is_hdr {
-                if let Some(det) = self.hdr_detect.as_ref() {
-                    render_pass.set_bind_group(1, &det.frag_bind_group, &[]);
+            let surface_texture = match surface.get_current_texture() {
+                wgpu::CurrentSurfaceTexture::Success(t) => t,
+                wgpu::CurrentSurfaceTexture::Suboptimal(t) => {
+                    log::warn!(
+                        "[renderer] suboptimal surface — queuing resize, rendering anyway"
+                    );
+                    let _ = self
+                        .command_sender
+                        .try_send(VideoRendererCommand::Resize(self.inner_size()));
+                    t
                 }
-            }
-            render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
-            render_pass.draw(0..6, 0..1);
+                other => {
+                    log::warn!("surface texture not available: {:?}", other);
+                    return;
+                }
+            };
 
-            if let Some(overlay) = overlay_snapshot {
-                overlay.draw_into(
-                    &mut render_pass,
-                    surface_w,
-                    surface_h,
-                    self.subtitle_safe_bottom_px
-                        .load(std::sync::atomic::Ordering::Relaxed),
-                );
-            }
+            let texture_view =
+                surface_texture
+                    .texture
+                    .create_view(&wgpu::TextureViewDescriptor {
+                        format: Some(self.surface_format),
+                        ..Default::default()
+                    });
+
+            let (surface_w, surface_h) = {
+                let cfg = self
+                    .surface_config
+                    .as_ref()
+                    .expect("config in windowed mode")
+                    .read()
+                    .await;
+                (cfg.width, cfg.height)
+            };
+
+            self.encode_and_submit(
+                &texture_view,
+                surface_w,
+                surface_h,
+                &texture_bind_group,
+                render_pipeline,
+                is_hdr,
+                detect_bind_group.as_ref(),
+                wg_x,
+                wg_y,
+                &vertex_buffer,
+                overlay_snapshot,
+            )
+            .await;
+
+            self.pre_present_notify();
+            self.queue.present(surface_texture);
         }
-
-        self.queue.submit([encoder.finish()]);
-        self.pre_present_notify();
-        self.queue.present(surface_texture);
     }
 
     /// macOS / iOS: render a `CVPixelBufferOwned` from VTDecompressionSession.
@@ -1925,7 +2308,7 @@ impl VideoRenderer {
             }
         }
 
-        let surface = self.surface.lock().await;
+        let surface = self.surface.as_ref().expect("surface (android)").lock().await;
         let surface_texture = match surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t)
             | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
@@ -2210,7 +2593,7 @@ impl VideoRenderer {
                     "[android_vk] NV12 pipeline unavailable (adapter didn't expose TEXTURE_FORMAT_NV12) — blue clear"
                 );
             });
-            let surface = self.surface.lock().await;
+            let surface = self.surface.as_ref().expect("surface (android)").lock().await;
             let surface_texture = match surface.get_current_texture() {
                 wgpu::CurrentSurfaceTexture::Success(t)
                 | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
@@ -2337,7 +2720,7 @@ impl VideoRenderer {
             ],
         });
 
-        let surface = self.surface.lock().await;
+        let surface = self.surface.as_ref().expect("surface (android)").lock().await;
         let vbuf_read = vbuf.read().await;
         let surface_texture = match surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t) => t,

@@ -372,11 +372,11 @@ fn build_plane_texture(
     };
 
     let wgpu_texture = unsafe {
-        device.create_texture_from_hal::<wgpu::hal::api::Metal>(
-            hal_texture,
-            &desc,
-            wgpu::TextureUses::RESOURCE,
-        )
+        // wgpu 29.0.3: create_texture_from_hal derives HAL usage from the
+        // descriptor; the old explicit `TextureUses::RESOURCE` hint arg was
+        // removed. `desc.usage` already advertises TEXTURE_BINDING (sampling),
+        // which is exactly what RESOURCE mapped to.
+        device.create_texture_from_hal::<wgpu::hal::api::Metal>(hal_texture, &desc)
     };
 
     Ok((cv_tex, wgpu_texture))

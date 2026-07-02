@@ -3330,7 +3330,7 @@ impl Player<VideoRenderer, AudioRenderer> {
     /// host can request a redraw / re-import the texture. No-op in windowed mode.
     pub fn set_frame_ready_callback<F: Fn() + Send + Sync + 'static>(&self, cb: F) {
         if let Some(t) = self.video_renderer.offscreen_target() {
-            t.set_on_ready(Box::new(cb));
+            t.set_on_ready(cb);
         }
     }
 }

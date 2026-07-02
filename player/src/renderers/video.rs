@@ -1306,6 +1306,33 @@ impl VideoRenderer {
         width: u32,
         height: u32,
     ) -> Self {
+        // Fail at construction, not at the first decoded frame: the Android
+        // HW-decode render path (MediaCodec/OES) requires a window surface and
+        // would panic on `expect("surface (android)")` frames later.
+        assert!(
+            !cfg!(target_os = "android"),
+            "VideoRenderer::new_offscreen is desktop-only; Android needs the windowed path"
+        );
+        // Same fail-fast for the host-device contract: without these features
+        // the first hardware-decoded NV12/P010 frame import dies deep inside
+        // wgpu validation instead of pointing at the constructor docs. Metal
+        // imports via CVMetalTextureCache plane views and needs only 16BIT_NORM.
+        let needed = if backend == wgpu::Backend::Metal {
+            wgpu::Features::TEXTURE_FORMAT_16BIT_NORM
+        } else {
+            wgpu::Features::TEXTURE_FORMAT_NV12
+                | wgpu::Features::TEXTURE_FORMAT_P010
+                | wgpu::Features::TEXTURE_FORMAT_16BIT_NORM
+        };
+        let missing = needed - device.features();
+        if !missing.is_empty() {
+            log::warn!(
+                "[offscreen] host device is missing {missing:?}; hardware-decoded \
+                 frame import will fail — create the device with these features \
+                 (see Player::new_offscreen docs)"
+            );
+        }
+
         let size = PhysicalSize::new(width.max(1), height.max(1));
         // Pipelines must target the format the host samples.
         let surface_format = OFFSCREEN_FORMAT;
@@ -1925,8 +1952,9 @@ impl VideoRenderer {
             if let Some(off) = self.offscreen.clone() {
                 // In-app (offscreen) path: draw into the host-shared ring, then
                 // publish. Same draw as the windowed path (encode_and_submit).
-                let (idx, view) = off.acquire();
-                let sz = off.size();
+                // `acquire` returns the size of the view it handed out — a
+                // resize applied inside it can't desync view and layout.
+                let (idx, view, sz) = off.acquire();
                 self.encode_and_submit(
                     &view,
                     sz.width,
@@ -2140,8 +2168,7 @@ impl VideoRenderer {
 
         if let Some(off) = self.offscreen.clone() {
             // In-app (offscreen) path — same draw, published to the shared ring.
-            let (idx, view) = off.acquire();
-            let sz = off.size();
+            let (idx, view, sz) = off.acquire();
             self.encode_and_submit(
                 &view,
                 sz.width,

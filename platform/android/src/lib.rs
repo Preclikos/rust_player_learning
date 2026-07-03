@@ -75,74 +75,126 @@ impl BridgeHost for AndroidHost {
         url: String,
         kind: RequestKind,
     ) -> Result<PreparedRequest, BoxError> {
-        // Synchronous JNI upcall (no await → future stays Send). Kotlin returns
-        // a flat String[]: [finalUrl, k1, v1, k2, v2, …]. null/empty = passthrough.
-        let mut env = self.vm.attach_current_thread()?;
-        let jurl = env.new_string(&url)?;
-        let res = env.call_method(
-            self.cb.as_obj(),
-            "onRequest",
-            "(Ljava/lang/String;I)[Ljava/lang/String;",
-            &[JValue::Object(&jurl), JValue::Int(request_kind_int(kind))],
-        )?;
-        let obj = res.l()?;
-        if obj.is_null() {
-            return Ok(PreparedRequest { url, ..Default::default() });
-        }
-        let arr = JObjectArray::from(obj);
-        let len = env.get_array_length(&arr)?;
-        if len < 1 {
-            return Ok(PreparedRequest { url, ..Default::default() });
-        }
-        let elem = |env: &mut JNIEnv, i: i32| -> Result<String, BoxError> {
-            let o = env.get_object_array_element(&arr, i)?;
-            Ok(env.get_string(&JString::from(o))?.into())
-        };
-        let new_url = elem(&mut env, 0)?;
-        let mut headers = Vec::new();
-        let mut i = 1;
-        while i + 1 < len {
-            let k = elem(&mut env, i)?;
-            let v = elem(&mut env, i + 1)?;
-            headers.push((k, v));
-            i += 2;
-        }
-        Ok(PreparedRequest {
-            url: new_url,
-            headers,
-            ..Default::default()
+        // The JNI upcall runs on the BLOCKING pool, not a runtime worker: the
+        // host's onRequest typically performs a synchronous network round-trip
+        // (link resolution, token refresh). At playback start 4-6 segment
+        // requests intercept CONCURRENTLY (buffer fill, cold caches) — run
+        // inline they block every runtime worker at once, the timer driver
+        // included, and the whole pipeline (vsync pacing, audio feed, all
+        // watchdogs) freezes into the ~1 fps startup convoy documented in
+        // docs/handoffs/AUDIO_PAUSE_WEDGE_AND_STARTUP_CONVOY.md.
+        let cb = self.cb.clone();
+        tokio::task::spawn_blocking(move || -> Result<PreparedRequest, String> {
+            let vm = vm_from_ndk_context();
+            let mut env = vm.attach_current_thread().map_err(|e| e.to_string())?;
+            let jurl = env.new_string(&url).map_err(|e| e.to_string())?;
+            let res = env
+                .call_method(
+                    cb.as_obj(),
+                    "onRequest",
+                    "(Ljava/lang/String;I)[Ljava/lang/String;",
+                    &[JValue::Object(&jurl), JValue::Int(request_kind_int(kind))],
+                )
+                .map_err(|e| e.to_string())?;
+            let obj = res.l().map_err(|e| e.to_string())?;
+            if obj.is_null() {
+                return Ok(PreparedRequest { url, ..Default::default() });
+            }
+            let arr = JObjectArray::from(obj);
+            let len = env.get_array_length(&arr).map_err(|e| e.to_string())?;
+            if len < 1 {
+                return Ok(PreparedRequest { url, ..Default::default() });
+            }
+            let mut elem = |env: &mut JNIEnv, i: i32| -> Result<String, String> {
+                let o = env
+                    .get_object_array_element(&arr, i)
+                    .map_err(|e| e.to_string())?;
+                Ok(env
+                    .get_string(&JString::from(o))
+                    .map_err(|e| e.to_string())?
+                    .into())
+            };
+            let new_url = elem(&mut env, 0)?;
+            let mut headers = Vec::new();
+            let mut i = 1;
+            while i + 1 < len {
+                let k = elem(&mut env, i)?;
+                let v = elem(&mut env, i + 1)?;
+                headers.push((k, v));
+                i += 2;
+            }
+            Ok(PreparedRequest {
+                url: new_url,
+                headers,
+                ..Default::default()
+            })
         })
+        .await
+        .map_err(|e| -> BoxError { format!("intercept join: {e}").into() })?
+        .map_err(|e| -> BoxError { e.into() })
     }
 
     async fn resolve_key(&self, kid: [u8; 16]) -> Result<[u8; 16], BoxError> {
-        let mut env = self.vm.attach_current_thread()?;
-        let jkid = env.byte_array_from_slice(&kid)?;
-        let res = env.call_method(
-            self.cb.as_obj(),
-            "resolveKey",
-            "([B)[B",
-            &[JValue::Object(&jkid)],
-        )?;
-        let obj = res.l()?;
-        if obj.is_null() {
-            return Err("provider.resolveKey returned null (no key)".into());
-        }
-        let arr = JByteArray::from(obj);
-        let bytes = env.convert_byte_array(&arr)?;
-        if bytes.len() != 16 {
-            return Err(format!("resolveKey returned {} bytes, expected 16", bytes.len()).into());
-        }
-        let mut key = [0u8; 16];
-        key.copy_from_slice(&bytes);
-        Ok(key)
+        // Blocking pool for the same reason as `intercept`: the licence upcall
+        // does a synchronous HTTP POST in the host.
+        let cb = self.cb.clone();
+        tokio::task::spawn_blocking(move || -> Result<[u8; 16], String> {
+            let vm = vm_from_ndk_context();
+            let mut env = vm.attach_current_thread().map_err(|e| e.to_string())?;
+            let jkid = env.byte_array_from_slice(&kid).map_err(|e| e.to_string())?;
+            let res = env
+                .call_method(cb.as_obj(), "resolveKey", "([B)[B", &[JValue::Object(&jkid)])
+                .map_err(|e| e.to_string())?;
+            let obj = res.l().map_err(|e| e.to_string())?;
+            if obj.is_null() {
+                return Err("provider.resolveKey returned null (no key)".into());
+            }
+            let arr = JByteArray::from(obj);
+            let bytes = env.convert_byte_array(&arr).map_err(|e| e.to_string())?;
+            if bytes.len() != 16 {
+                return Err(format!("resolveKey returned {} bytes, expected 16", bytes.len()));
+            }
+            let mut key = [0u8; 16];
+            key.copy_from_slice(&bytes);
+            Ok(key)
+        })
+        .await
+        .map_err(|e| -> BoxError { format!("resolve_key join: {e}").into() })?
+        .map_err(|e| -> BoxError { e.into() })
     }
 }
 
+/// The process-wide `JavaVM` from `ndk_context` (seeded in `init_ndk_context`).
+/// Used by blocking-pool upcalls, which can't borrow `&self` across the
+/// `spawn_blocking` 'static boundary.
+fn vm_from_ndk_context() -> JavaVM {
+    let ctx = ndk_context::android_context();
+    unsafe { JavaVM::from_raw(ctx.vm().cast()) }.expect("JavaVM from ndk_context")
+}
+
 /// Dedicated multi-thread Tokio runtime (the host owns the UI looper).
+///
+/// Worker floor of 6 (not the core-count default): the MediaCodec decode paths
+/// sit in blocking dequeue/retry loops INSIDE async task polls (mediacodec.rs /
+/// mediacodec_audio.rs use `std::thread::sleep` + blocking NDK dequeues), so a
+/// worker is held for the whole wait. On a low-core TV SoC the default pool is
+/// 2-4 workers — when the video and audio decoders both stall (video waits for
+/// the sync loop to release codec buffers; audio waits on a full channel), ALL
+/// workers are held, the reactive tasks (vsync pacing, audio_sync, av_sync,
+/// every timer) stop being polled entirely and playback freezes at ~1 fps with
+/// the process idle. Observed as a ~40% startup race on the Google TV Streamer
+/// (see docs/handoffs/AUDIO_PAUSE_WEDGE_AND_STARTUP_CONVOY.md). The floor keeps
+/// headroom so the chronically-blocking polls can never exhaust the pool; the
+/// long-term fix is moving those dequeue loops onto `spawn_blocking`.
 fn runtime() -> &'static tokio::runtime::Runtime {
     static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
     RT.get_or_init(|| {
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .max(6);
         tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(workers)
             .enable_all()
             .build()
             .expect("tokio runtime")

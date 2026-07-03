@@ -64,6 +64,16 @@ pub struct AudioRenderer {
     /// `set_paused` delegate to it. `None` if the track couldn't be created.
     #[cfg(target_os = "android")]
     pcm_sink: Option<Arc<audio_track_pcm::AudioTrackPcmSink>>,
+    /// Android only: HOST pause state. `Player::pause/resume` land on the
+    /// INHERENT `set_paused` (concrete-type calls in player.rs), which sets this
+    /// so the writer stops consuming — a user pause must go silent immediately
+    /// and hold the queued samples for resume. Internal transport parks
+    /// (av_sync anchor gate / starvation gates / seek re-parks) arrive through
+    /// the `AudioSink` TRAIT from generic code and only park the TRACK: halting
+    /// consumption there risks backing the pipeline up into its startup convoy
+    /// (see docs/handoffs/AUDIO_PAUSE_WEDGE_AND_STARTUP_CONVOY.md).
+    #[cfg(target_os = "android")]
+    host_paused: Arc<AtomicBool>,
 }
 
 enum AudioRendererCommand {
@@ -114,12 +124,20 @@ impl AudioRenderer {
             (t.0, t.1)
         };
         // Android outputs PCM through an AudioTrack (cpal/AAudio is stolen on some
-        // TV HALs); the cpal stop/command machinery is unused on this path.
+        // TV HALs); the cpal stop/command machinery is unused on this path. The
+        // writer's consumption gates on HOST pause only, which starts false (like
+        // the Player-level `paused`) — the ctor-true `paused_flag` is cpal-only.
+        #[cfg(target_os = "android")]
+        let host_paused = Arc::new(AtomicBool::new(false));
         #[cfg(target_os = "android")]
         let (sample_sender, sample_rate, pcm_sink) = {
             drop(command_receiver);
             drop(stop);
-            audio_track_pcm::start_output(flush_flag.clone(), volume.clone())
+            audio_track_pcm::start_output(
+                flush_flag.clone(),
+                host_paused.clone(),
+                volume.clone(),
+            )
         };
 
         AudioRenderer {
@@ -137,6 +155,8 @@ impl AudioRenderer {
             passthrough: std::sync::Mutex::new(None),
             #[cfg(target_os = "android")]
             pcm_sink,
+            #[cfg(target_os = "android")]
+            host_paused,
         }
     }
 
@@ -211,8 +231,23 @@ impl AudioRenderer {
         self.flush_flag.store(true, Ordering::Relaxed);
     }
 
+    /// HOST pause/unpause. This inherent method is what `Player::pause/resume/
+    /// open_url/stop` call (`self.audio_renderer.set_paused(..)` on the concrete
+    /// type — it shadows the trait method); internal transport parks from
+    /// generic code resolve to the TRAIT impl instead. A host pause must go
+    /// silent immediately and stop the writer's consumption (`host_paused`), and
+    /// a host resume must ALWAYS wake the track — even one parked by an internal
+    /// gate (e.g. the seek re-park of an ABR rebuild that ran mid-pause), which
+    /// nothing else unparks after resume.
     pub fn set_paused(&self, paused: bool) {
         self.paused_flag.store(paused, Ordering::Relaxed);
+        #[cfg(target_os = "android")]
+        {
+            self.host_paused.store(paused, Ordering::Relaxed);
+            if let Some(s) = self.pcm_sink.as_ref() {
+                s.set_paused(paused);
+            }
+        }
     }
 
     pub fn get_volume(&self) -> f32 {
@@ -321,11 +356,16 @@ impl super::AudioSink for AudioRenderer {
             pt.set_paused(paused);
             return;
         }
-        // Android AudioTrack output: drive its play/pause (lazy-started).
+        // TRAIT path = internal transport parks (av_sync anchor gate, starvation
+        // gates, seek re-parks — reached from generic code). On Android park only
+        // the TRACK: consumption must keep running through internal parks or the
+        // pipeline backs up into its startup convoy (see the audio_track_pcm
+        // module docs). Host pause goes through the inherent method.
         #[cfg(target_os = "android")]
         if let Some(s) = self.pcm_sink.as_ref() {
             s.set_paused(paused);
         }
+        #[cfg(not(target_os = "android"))]
         AudioRenderer::set_paused(self, paused)
     }
 

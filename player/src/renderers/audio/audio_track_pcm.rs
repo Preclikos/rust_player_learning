@@ -32,7 +32,7 @@ const CONTENT_TYPE_MOVIE: i32 = 3;
 // android.media.AudioTrack
 const MODE_STREAM: i32 = 1;
 const STATE_INITIALIZED: i32 = 1;
-const WRITE_BLOCKING: i32 = 0;
+const WRITE_NON_BLOCKING: i32 = 1;
 
 fn android_vm() -> jni::JavaVM {
     let ctx = ndk_context::android_context();
@@ -227,35 +227,72 @@ impl AudioTrackPcmSink {
         }
     }
 
-    /// Write interleaved-stereo f32 samples (blocking — back-pressures the writer
-    /// to the device's consumption rate, which makes the playback head a clock).
-    pub fn write_floats(&self, samples: &[f32]) {
-        if self.stopped.load(Ordering::Acquire) || samples.is_empty() {
-            return;
-        }
-        let vm = android_vm();
-        let _ = vm.attach_current_thread(|env| -> Result<(), jni::errors::Error> {
-            let arr = env.new_float_array(samples.len())?;
-            env.set_float_array_region(&arr, 0, samples)?;
-            // write(float[], offsetInFloats, sizeInFloats, WRITE_BLOCKING)
-            env.call_method(
-                self.track.as_obj(),
-                jni::jni_str!("write"),
-                jni::jni_sig!("([FIII)I"),
-                &[
-                    (&arr).into(),
-                    0i32.into(),
-                    (samples.len() as i32).into(),
-                    WRITE_BLOCKING.into(),
-                ],
-            )?;
-            Ok(())
-        });
-        // Lazily start on the first real samples, honoring a pause that arrived
-        // first (seek/buffer): mark started so a later set_paused(false) can play,
-        // but don't play() while paused.
-        if !self.started.swap(true, Ordering::AcqRel) && !self.paused.load(Ordering::Acquire) {
-            self.call_void(jni::jni_str!("play"));
+    /// Write interleaved-stereo f32 samples with the same back-pressure
+    /// behaviour as a blocking `AudioTrack.write` (the writer paces to the
+    /// device's consumption rate, which makes the playback head a clock) — but
+    /// implemented as NON-blocking writes in a retry loop that stays responsive:
+    /// a blocking JNI write parked on a paused track wedged the writer thread,
+    /// so a flush/rebuild issued during a long pause (the ABR tick fires there)
+    /// was never serviced and resume played nothing. `abort` (the renderer's
+    /// flush flag) abandons the remainder immediately — the caller drains the
+    /// queue right after; teardown (`stopped`) exits too.
+    pub fn write_floats(&self, samples: &[f32], abort: &AtomicBool) {
+        let mut off = 0usize;
+        while off < samples.len() {
+            if self.stopped.load(Ordering::Acquire) || abort.load(Ordering::Relaxed) {
+                return;
+            }
+            let chunk = &samples[off..];
+            let vm = android_vm();
+            let written = vm
+                .attach_current_thread(|env| -> Result<i32, jni::errors::Error> {
+                    let arr = env.new_float_array(chunk.len())?;
+                    env.set_float_array_region(&arr, 0, chunk)?;
+                    // write(float[], offsetInFloats, sizeInFloats, WRITE_NON_BLOCKING)
+                    let n = env
+                        .call_method(
+                            self.track.as_obj(),
+                            jni::jni_str!("write"),
+                            jni::jni_sig!("([FIII)I"),
+                            &[
+                                (&arr).into(),
+                                0i32.into(),
+                                (chunk.len() as i32).into(),
+                                WRITE_NON_BLOCKING.into(),
+                            ],
+                        )?
+                        .i()?;
+                    Ok(n)
+                })
+                .unwrap_or(-1);
+            if written < 0 {
+                return; // JNI failure — drop the batch rather than spin
+            }
+            if written > 0 {
+                off += written as usize;
+                if !self.started.swap(true, Ordering::AcqRel) {
+                    log::info!(
+                        "[audio-pcm] first write accepted (n={written}) paused={}",
+                        self.paused.load(Ordering::Acquire)
+                    );
+                }
+                // The track has data and is supposed to be running — make sure it
+                // actually IS. The lazy first-write play() and the unpark in
+                // set_paused can race each other at startup (av_sync's unpark and
+                // the starvation gates fire around the same instant as the first
+                // samples); if the play() is lost, the head never starts, the
+                // audio clock freezes at 0 and the whole pipeline starves into
+                // its 1 fps convoy. One JNI getPlayState per accepted batch
+                // (~12/s) self-heals any such lost transition within ~85 ms.
+                if !self.paused.load(Ordering::Acquire) && !self.is_playing() {
+                    log::info!("[audio-pcm] track has data but isn't playing — starting it");
+                    self.call_void(jni::jni_str!("play"));
+                }
+            } else {
+                // Device buffer full (or track parked): let it drain, staying
+                // responsive to flush/teardown.
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
         }
     }
 
@@ -298,11 +335,37 @@ impl AudioTrackPcmSink {
         });
     }
 
+    /// True when `AudioTrack.getPlayState() == PLAYSTATE_PLAYING` (3). Used by
+    /// the writer's self-heal; errs on "playing" so a JNI failure can't spam
+    /// play() calls.
+    fn is_playing(&self) -> bool {
+        if self.stopped.load(Ordering::Acquire) {
+            return true;
+        }
+        let vm = android_vm();
+        vm.attach_current_thread(|env| -> Result<bool, jni::errors::Error> {
+            let state = env
+                .call_method(
+                    self.track.as_obj(),
+                    jni::jni_str!("getPlayState"),
+                    jni::jni_sig!("()I"),
+                    &[],
+                )?
+                .i()?;
+            Ok(state == 3) // AudioTrack.PLAYSTATE_PLAYING
+        })
+        .unwrap_or(true)
+    }
+
     pub fn set_paused(&self, paused: bool) {
-        self.paused.store(paused, Ordering::Release);
+        let prev = self.paused.swap(paused, Ordering::AcqRel);
+        let started = self.started.load(Ordering::Acquire);
+        if prev != paused {
+            log::info!("[audio-pcm] set_paused({paused}) started={started}");
+        }
         // Before the first write the track has no data — don't touch it; the lazy
         // start in write_floats() applies the remembered state once it has data.
-        if !self.started.load(Ordering::Acquire) {
+        if !started {
             return;
         }
         if paused {
@@ -342,13 +405,16 @@ impl Drop for AudioTrackPcmSink {
 }
 
 /// Start the Android PCM output: create the [`AudioTrackPcmSink`] and a dedicated
-/// writer thread that pulls resampled stereo f32 from the channel and
-/// blocking-writes it to the track (the blocking write back-pressures the
-/// producer to the device rate, so the playback head is a usable clock). Returns
-/// the sink so the renderer can read its clock + drive pause. `None` sink ⇒ no
-/// audio (video falls back to the wall clock).
+/// writer thread that pulls resampled stereo f32 from the channel and writes it
+/// to the track. The write paces to the device rate (so the playback head is a
+/// usable clock) but is built from NON-blocking writes internally and aborts on
+/// the flush flag — a blocking write parked on a paused track wedged the writer,
+/// so a flush/rebuild issued during a long pause was never serviced and resume
+/// played nothing. Returns the sink so the renderer can read its clock + drive
+/// pause. `None` sink ⇒ no audio (video falls back to the wall clock).
 pub(super) fn start_output(
     flush_flag: Arc<AtomicBool>,
+    host_paused: Arc<AtomicBool>,
     volume: Arc<AtomicU32>,
 ) -> (Sender<f32>, u32, Option<Arc<AudioTrackPcmSink>>) {
     let out_rate = 48_000u32;
@@ -361,9 +427,21 @@ pub(super) fn start_output(
                 .name("bz-audio-pcm-out".into())
                 .spawn(move || {
                     let mut batch: Vec<f32> = Vec::with_capacity(8192);
+                    // DIAG heartbeat (sparse): sink/track state while samples flow.
+                    let mut last_beat = std::time::Instant::now();
                     // Blocks until samples arrive; exits when the sender (the
                     // AudioRenderer) is dropped on teardown.
                     while let Some(first) = sample_receiver.blocking_recv() {
+                        if last_beat.elapsed() >= std::time::Duration::from_secs(5) {
+                            last_beat = std::time::Instant::now();
+                            log::info!(
+                                "[audio-pcm] writer: host_paused={} sink_paused={} playing={} played_ms={:?}",
+                                host_paused.load(Ordering::Relaxed),
+                                sink.paused.load(Ordering::Acquire),
+                                sink.is_playing(),
+                                sink.played_ms(),
+                            );
+                        }
                         // Seek/rebuild: drop queued PCM. We deliberately do NOT
                         // flush the track — keeping its head cumulative so the
                         // clock baselines exactly like the cpal counter; the
@@ -371,6 +449,25 @@ pub(super) fn start_output(
                         if flush_flag.swap(false, Ordering::Relaxed) {
                             while sample_receiver.try_recv().is_ok() {}
                             continue;
+                        }
+                        // Host pause: hold this sample and don't consume further —
+                        // queued samples must survive the pause so resume picks up
+                        // exactly where it left off (the track itself was paused
+                        // by the inherent set_paused). Without this gate the
+                        // writer keeps feeding the buffered ~2 s into the track
+                        // (audio bleeding on after the user paused). The flush
+                        // flag stays serviced so a rebuild issued mid-pause (the
+                        // ABR tick fires there) still drains.
+                        if host_paused.load(Ordering::Relaxed) {
+                            while host_paused.load(Ordering::Relaxed)
+                                && !flush_flag.load(Ordering::Relaxed)
+                            {
+                                std::thread::sleep(std::time::Duration::from_millis(15));
+                            }
+                            if flush_flag.swap(false, Ordering::Relaxed) {
+                                while sample_receiver.try_recv().is_ok() {}
+                                continue;
+                            }
                         }
                         batch.clear();
                         batch.push(first);
@@ -386,7 +483,10 @@ pub(super) fn start_output(
                                 *s *= vol;
                             }
                         }
-                        sink.write_floats(&batch);
+                        // Paces like a blocking write but aborts on flush (the
+                        // remainder is dropped; the NEXT loop turn swaps the flag
+                        // and drains the queue).
+                        sink.write_floats(&batch, &flush_flag);
                     }
                 })
                 .expect("spawn audio pcm output thread");

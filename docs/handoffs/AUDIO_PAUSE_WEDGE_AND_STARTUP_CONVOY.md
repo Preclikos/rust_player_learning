@@ -1,8 +1,47 @@
-# The 1 fps "convoy" (root causes: AudioFlinger underrun-drop + present-stamp wedge) + long-pause wedge
+# The 1 fps "convoy" / "audio never starts" saga — root cause: the half-frame write spin
 
-**Status:** root-caused and FIXED, device-verified (Google TV Streamer,
-`kirkwood`, armv7). Fixed across 0.1.4 (pause wedge) and 0.1.5 (convoy).
-**Date:** 2026-07-03 … 2026-07-06.
+**Status:** root-caused and FIXED, device-verified 10/10 clean cold starts
+with audio (Google TV Streamer, `kirkwood`, armv7 — note: this device runs a
+32-BIT-ONLY Android build, `abilist=armeabi-v7a,armeabi`). Fixed across 0.1.4
+(pause wedge) and 0.1.5 (convoy + audio wedge family).
+**Date:** 2026-07-03 … 2026-07-07.
+
+## THE root cause (found last, explains almost everything)
+
+The AudioTrack writer thread batches samples INDIVIDUALLY from the mpsc
+channel, so a batch could end mid-frame (odd sample count — depends on how far
+the consumer outruns the producer, i.e. on decode/resampler timing: the
+lottery). `AudioTrack.write` only accepts WHOLE frames: the trailing 1-sample
+chunk returns 0 forever, and the writer's retry loop then spins on that batch
+for good. Everything downstream was a symptom of that spin:
+
+- writes "rejected" / tiny dribble acceptance → track started (via the
+  buffer-full fallback) with 1–3 frames of PCM,
+- AudioFlinger removes such a track from the mix (`BUFFER TIMEOUT: remove` /
+  underrun-drop after ~0.5 s of `kMaxTrackRetries`) while the CLIENT play
+  state keeps saying PLAYING (`stop(): called with 0 frames delivered`),
+- head frozen → audio clock frozen → video paces against it → 1 fps convoy;
+  partial acceptance runs produced the "crawl" look,
+- the writer never finished the batch → channel filled → put_samples parked →
+  decode/demux backpressure — the full pipeline starvation.
+
+Smoking gun (diag logging of the first writes of a track):
+`write#0: chunk=7 written=6; write#1..∞: chunk=1 written=0`. YouTube always
+worked on the same box at the same moment because ExoPlayer writes aligned
+buffers; our silence PROBE worked because it writes even-sized chunks.
+
+**Fix (audio_track_pcm.rs): frame-aligned batching.** The writer carries an
+odd trailing sample over to the next batch (`carry`; dropping it instead
+would swap L/R for everything after), resets the carry on flush (the producer
+restarts at a frame boundary), and `write_floats` additionally truncates any
+odd batch defensively so no caller can ever spin on a half frame. Measured:
+10/10 clean cold starts, audio playing, zero stall strikes.
+
+Falsified theories, so nobody re-walks them: TV-off / HDMI-sink-down, box-wide
+MS12 wedge episodes, PCM_FLOAT-vs-16BIT, FAST/LOW_LATENCY output path, track
+birth too soon after a previous track's death, post-reboot settling, idle-
+window recovery. Each looked plausible and each fell to a controlled
+experiment (YouTube playing while ours starved was the decisive control).
 
 ## Symptoms
 
@@ -67,7 +106,17 @@ pause (ABR fires mid-pause) → resume. Transient `no present fence` warnings
 for the first few frames remain (SF settling) — those fences DO fire; in the
 wedged state they never did.
 
-## Root cause 1b — the DEEPER trigger: AudioFlinger drops the underrunning track (FIXED in 0.1.5)
+## Root cause 1b — the middle layer: AudioFlinger drops the starved track (superseded by the half-frame spin above)
+
+> RETROSPECTIVE: everything observed in this section was real, but it is the
+> DOWNSTREAM half of the half-frame spin — the track was starved because the
+> writer was spinning, not because the HAL was broken. The layered defense
+> below ships anyway as hardening (the AF removal semantics and the AAudio
+> steal are genuine device behaviors). The "episodes" clustering is explained
+> by batch-parity determinism: identical content + identical cold-start
+> timing reproduce the same parity, so a given BUILD tended to be
+> consistently healthy or consistently wedged, and any rebuild reshuffled it
+> — which is why results seemed to shift with every experiment.
 
 The residual degraded starts (and the seek-backward wedge) were pinned with
 permanent per-stage counters (`StatsState.diag_*`, logged by the `bz-watchdog`
@@ -109,22 +158,26 @@ track while the CLIENT play state stays PLAYING (getPlayState is useless):
   with an empty 24624-frame buffer, head pinned at 0, `getUnderrunCount()` 0).
   Comes in box-wide EPISODES (whole hours), during which every new track —
   same process or fresh, before or after a reboot — is dead on arrival.
-  **Root cause of the episodes: the TV is OFF.** With no active HDMI sink the
-  Streamer's MediaTek/Dolby-MS12 output pipeline (`ms12_input_deep_buffer` in
-  the AF mix graph) stops consuming entirely instead of playing into the void
-  like most devices. Confirmed: episodes correlate exactly with the TV's
-  power state (CEC `mDeviceInfos` empty + One Touch Play timeout during an
-  episode); routing stays correct (HDMI_Sink port) and other apps' tracks
-  starve identically. Unfixable app-side — and it only ever affects playback
-  nobody is watching. The surrender layer keeps the player consistent and
-  restores audio within ~30 s of the TV coming back.
+  Episode trigger NOT fully pinned. Disproved: TV power (the TV was ON
+  through a multi-hour episode — CEC on this setup is blind, `mDeviceInfos`
+  stays empty and One Touch Play times out even with the TV on, so CEC is no
+  signal for anything here). Facts: the Streamer's MediaTek/Dolby-MS12 output
+  pipeline (`ms12_input_deep_buffer` in the AF mix graph) stops consuming
+  box-wide; routing stays correct (HDMI_Sink port); a reboot does NOT clear
+  it immediately (dead runs right after boot), yet the box recovered ~10 min
+  after a midnight reboot once testing paused. Working hypothesis: recovery
+  needs an IDLE window (continuous force-stop/start hammering may hold the
+  wedge in place). Whatever the trigger, it is unfixable app-side; the
+  surrender layer keeps video watchable and re-probes every 30 s so audio
+  returns by itself once the HAL recovers.
 
-**Fix (audio_track_pcm.rs): layered self-defense, all driven from the writer**
-1. *Prime before play*: `play()` only once ≥ ~100 ms is written, the device
-   buffer reports full, or 500 ms passed since the first accepted write —
-   starting with a near-empty buffer is what triggers the AF drop (`AT::add` →
-   `AT::remove` ~0.5 s later, `kMaxTrackRetries` underruns). All other play
-   paths (`set_paused` unpark) are gated on primed.
+**Hardening (audio_track_pcm.rs): layered self-defense, all driven from the writer**
+1. *Prime before play*: `play()` only once ≥ ~340 ms is written (the
+   deep-buffer mixer pulls ~256 ms chunks — `notificationFrames 12312`; a
+   track holding less than one chunk is removed with `BUFFER TIMEOUT`), the
+   device buffer reports full for a sustained ~500 ms of zero-writes, or
+   1.5 s passed since the first accepted write. All other play paths
+   (`set_paused` unpark) are gated on primed.
 2. *Rate watchdog* (`check_stall`, every writer iteration, judged per ~1 s):
    primed & unpaused ⇒ the head must advance ≥10 % of realtime. Catches both
    faces. Windows >3 s are re-baselined, not judged (writer idle ≠ stall).

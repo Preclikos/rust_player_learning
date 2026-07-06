@@ -6,16 +6,15 @@
 //! PCM output never plays and the audio clock never advances (video then starves
 //! to a slideshow). The compressed-passthrough path works there because it uses
 //! `AudioTrack`, not AAudio — so for non-passthrough PCM we use an `AudioTrack`
-//! too, configured `ENCODING_PCM_FLOAT`.
+//! too, configured `ENCODING_PCM_16BIT` (see the constant for why not FLOAT).
 //!
 //! Clock semantics mirror the cpal sink exactly: `played_ms` is the track's
 //! cumulative `getPlaybackHeadPosition` (frames presented since track creation),
 //! and a seek/rebuild NEVER calls `AudioTrack.flush()` — it only drains the Rust
 //! sample queue, leaving the small device buffer to play out (same tiny tail as
-//! cpal's device buffer). So `MediaClock` baselines it identically. The single
-//! exception is the last-resort stall heal in `write_floats`, which flushes to
-//! resync a wedged track and adds the discarded frames to the clock so the
-//! position stays continuous.
+//! cpal's device buffer). So `MediaClock` baselines it identically. When the
+//! stall heal replaces a wedged track (`recreate_track`) the discarded frames
+//! are added to the clock so the position stays continuous.
 //!
 //! Raw JNI (jni 0.22), mirroring `audio_passthrough::AudioTrackSink`.
 
@@ -27,7 +26,11 @@ use jni::refs::GlobalRef;
 use tokio::sync::mpsc::{self, Sender};
 
 // android.media.AudioFormat
-const ENCODING_PCM_FLOAT: i32 = 4;
+/// 16-bit PCM — the conventional Android output format (what every ExoPlayer
+/// app uses), adopted while chasing a wedge whose real cause turned out to be
+/// the half-frame write spin (see the writer's `carry`). PCM_FLOAT likely
+/// works too, but there is no reason to leave the well-trodden path.
+const ENCODING_PCM_16BIT: i32 = 2;
 const CHANNEL_OUT_STEREO: i32 = 12;
 // android.media.AudioAttributes
 const USAGE_MEDIA: i32 = 1;
@@ -42,7 +45,7 @@ fn android_vm() -> jni::JavaVM {
     unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) }
 }
 
-/// A PCM-float `AudioTrack`. The clock source for the non-passthrough Android path.
+/// A 16-bit PCM `AudioTrack`. The clock source for the non-passthrough Android path.
 pub struct AudioTrackPcmSink {
     /// The live `AudioTrack`. Behind a mutex because the stall heal can swap in
     /// a freshly built track when the current one wedges beyond client-side
@@ -104,12 +107,12 @@ unsafe impl Send for AudioTrackPcmSink {}
 unsafe impl Sync for AudioTrackPcmSink {}
 
 impl AudioTrackPcmSink {
-    /// Create a paused PCM-float `AudioTrack` at `sample_rate` / stereo. Returns
+    /// Create a paused 16-bit PCM `AudioTrack` at `sample_rate` / stereo. Returns
     /// `None` on any failure (caller then has no audio; video uses the wall clock).
     pub fn new(sample_rate: u32) -> Option<Self> {
         match Self::build_track(sample_rate) {
             Ok(track) => {
-                log::info!("[audio-pcm] AudioTrack PCM_FLOAT configured (paused): {}Hz stereo", sample_rate);
+                log::info!("[audio-pcm] AudioTrack PCM_16BIT configured (paused): {}Hz stereo", sample_rate);
                 Some(Self {
                     track: Mutex::new(track),
                     sample_rate,
@@ -133,7 +136,7 @@ impl AudioTrackPcmSink {
         }
     }
 
-    /// Build an initialized PCM-float `AudioTrack` (used by `new` and by the
+    /// Build an initialized 16-bit PCM `AudioTrack` (used by `new` and by the
     /// stall heal's `recreate_track`).
     fn build_track(
         sample_rate: u32,
@@ -148,7 +151,7 @@ impl AudioTrackPcmSink {
                         jni::jni_str!("android/media/AudioTrack"),
                         jni::jni_str!("getMinBufferSize"),
                         jni::jni_sig!("(III)I"),
-                        &[(sample_rate as i32).into(), mask.into(), ENCODING_PCM_FLOAT.into()],
+                        &[(sample_rate as i32).into(), mask.into(), ENCODING_PCM_16BIT.into()],
                     )?
                     .i()?;
                 let buffer_bytes = if min_buf > 0 {
@@ -158,7 +161,7 @@ impl AudioTrackPcmSink {
                     sample_rate as i32 * 2 * 4 / 10
                 };
 
-                // AudioFormat.Builder().setEncoding(PCM_FLOAT).setSampleRate(sr).setChannelMask(mask).build()
+                // AudioFormat.Builder().setEncoding(PCM_16BIT).setSampleRate(sr).setChannelMask(mask).build()
                 let fb = env.new_object(
                     jni::jni_str!("android/media/AudioFormat$Builder"),
                     jni::jni_sig!("()V"),
@@ -169,7 +172,7 @@ impl AudioTrackPcmSink {
                         &fb,
                         jni::jni_str!("setEncoding"),
                         jni::jni_sig!("(I)Landroid/media/AudioFormat$Builder;"),
-                        &[ENCODING_PCM_FLOAT.into()],
+                        &[ENCODING_PCM_16BIT.into()],
                     )?
                     .l()?;
                 let fb = env
@@ -348,16 +351,22 @@ impl AudioTrackPcmSink {
             log::info!("[audio-pcm] track recreated while paused — leaving unprimed");
             return true;
         }
-        let silence = vec![0f32; 8192];
-        let mut probe_floats = 0u64;
-        for _ in 0..4 {
+        // Fill most of the device buffer (24624 frames) with silence: the
+        // mixer pulls ~256 ms chunks and never touches a track holding less
+        // than one chunk (BUFFER TIMEOUT removal).
+        let silence = vec![0i16; 8192];
+        let mut probe_samples = 0u64;
+        for _ in 0..6 {
             // Non-blocking writes; a fresh track has ample space, so the
             // chunks land instantly. Errors just make the probe fail below.
-            probe_floats += self.write_probe_chunk(&silence);
+            probe_samples += self.write_probe_chunk(&silence);
         }
         self.call_void(jni::jni_str!("play"));
+        // The deep-buffer head updates only per HAL burst — allow ~2.5 s
+        // before declaring the track dead (a live probe was once mislabeled
+        // dead within 1 s while its frames demonstrably played out).
         let mut alive = false;
-        for _ in 0..10 {
+        for _ in 0..25 {
             if self.stopped.load(Ordering::Acquire) {
                 return false;
             }
@@ -372,7 +381,7 @@ impl AudioTrackPcmSink {
             // take it back out of the accounting so `played_ms` stays aligned
             // with real PCM (`dropped` accumulated over the episode is far
             // larger than one probe, but guard the subtraction anyway).
-            let probe_frames = probe_floats / 2;
+            let probe_frames = probe_samples / 2;
             let _ = self.dropped_frames.fetch_update(
                 Ordering::AcqRel,
                 Ordering::Acquire,
@@ -393,8 +402,8 @@ impl AudioTrackPcmSink {
     }
 
     /// Push one chunk of probe PCM with a short non-blocking retry budget.
-    /// Returns the number of floats the track accepted.
-    fn write_probe_chunk(&self, chunk: &[f32]) -> u64 {
+    /// Returns the number of samples (shorts) the track accepted.
+    fn write_probe_chunk(&self, chunk: &[i16]) -> u64 {
         let vm = android_vm();
         for _ in 0..5 {
             if self.stopped.load(Ordering::Acquire) {
@@ -403,13 +412,13 @@ impl AudioTrackPcmSink {
             let track = self.track.lock().unwrap();
             let written = vm
                 .attach_current_thread(|env| -> Result<i32, jni::errors::Error> {
-                    let arr = env.new_float_array(chunk.len())?;
-                    env.set_float_array_region(&arr, 0, chunk)?;
+                    let arr = env.new_short_array(chunk.len())?;
+                    env.set_short_array_region(&arr, 0, chunk)?;
                     let n = env
                         .call_method(
                             track.as_obj(),
                             jni::jni_str!("write"),
-                            jni::jni_sig!("([FIII)I"),
+                            jni::jni_sig!("([SIII)I"),
                             &[
                                 (&arr).into(),
                                 0i32.into(),
@@ -469,7 +478,22 @@ impl AudioTrackPcmSink {
                 }
             }
         }
-        while off < samples.len() {
+        // Convert once for the whole batch — the track is 16-bit (see
+        // ENCODING_PCM_16BIT); one short == one f32 sample, so all the offset
+        // and frame math below is unchanged.
+        let mut pcm: Vec<i16> = samples
+            .iter()
+            .map(|s| (s.clamp(-1.0, 1.0) * 32767.0) as i16)
+            .collect();
+        // Whole frames only — `write` never accepts a trailing half frame and
+        // retrying it returns 0 forever. The writer thread already carries odd
+        // samples between batches; this guard protects any other caller.
+        if pcm.len() % 2 == 1 {
+            log::warn!("[audio-pcm] odd batch of {} samples — truncating to whole frames", pcm.len());
+            pcm.pop();
+        }
+        let mut zero_streak = 0u32;
+        while off < pcm.len() {
             if self.stopped.load(Ordering::Acquire) || abort.load(Ordering::Relaxed) {
                 return;
             }
@@ -477,22 +501,22 @@ impl AudioTrackPcmSink {
             // (counting the remainder), don't keep retrying writes against the
             // dead track until the batch ends.
             if self.surrendered_until.lock().unwrap().is_some() {
-                self.discard_paced(samples.len() - off, abort);
+                self.discard_paced(pcm.len() - off, abort);
                 return;
             }
-            let chunk = &samples[off..];
+            let chunk = &pcm[off..];
             let vm = android_vm();
             let track = self.track.lock().unwrap();
             let written = vm
                 .attach_current_thread(|env| -> Result<i32, jni::errors::Error> {
-                    let arr = env.new_float_array(chunk.len())?;
-                    env.set_float_array_region(&arr, 0, chunk)?;
-                    // write(float[], offsetInFloats, sizeInFloats, WRITE_NON_BLOCKING)
+                    let arr = env.new_short_array(chunk.len())?;
+                    env.set_short_array_region(&arr, 0, chunk)?;
+                    // write(short[], offsetInShorts, sizeInShorts, WRITE_NON_BLOCKING)
                     let n = env
                         .call_method(
                             track.as_obj(),
                             jni::jni_str!("write"),
-                            jni::jni_sig!("([FIII)I"),
+                            jni::jni_sig!("([SIII)I"),
                             &[
                                 (&arr).into(),
                                 0i32.into(),
@@ -510,6 +534,7 @@ impl AudioTrackPcmSink {
             }
             if written > 0 {
                 off += written as usize;
+                zero_streak = 0;
                 let frames = written as u64 / 2;
                 self.written_frames.fetch_add(frames, Ordering::AcqRel);
                 if self.track_written.fetch_add(frames, Ordering::AcqRel) == 0 {
@@ -532,12 +557,17 @@ impl AudioTrackPcmSink {
                 }
             } else {
                 // Device buffer full (or track parked): let it drain, staying
-                // responsive to flush/teardown.
-                if !self.primed.swap(true, Ordering::AcqRel) {
-                    // Full buffer before the ~100 ms prime threshold tripped —
-                    // that IS fully primed; start now.
+                // responsive to flush/teardown. A single zero write is NOT
+                // proof of a full buffer (transient obtainBuffer misses were
+                // seen with a few hundred frames in) — only treat a SUSTAINED
+                // run of zeros as full, and only then consider it primed.
+                zero_streak += 1;
+                if zero_streak >= 50 && !self.primed.swap(true, Ordering::AcqRel) {
                     if !self.paused.load(Ordering::Acquire) && !self.is_playing() {
-                        log::info!("[audio-pcm] device buffer full — starting playback");
+                        log::info!(
+                            "[audio-pcm] device buffer full ({} frames) — starting playback",
+                            self.track_written.load(Ordering::Acquire)
+                        );
                         self.call_void(jni::jni_str!("play"));
                     }
                 }
@@ -640,8 +670,18 @@ impl AudioTrackPcmSink {
         st.head = head;
     }
 
-    /// Flip `primed` once the current track holds ≥ ~100 ms of PCM, or the
-    /// first write is ≥ 500 ms old (slow decode — start with what we have
+    /// Frames that must be written before `play()`. The deep-buffer/MS12 mixer
+    /// on the Streamer pulls in ~256 ms chunks (`notificationFrames 12312`,
+    /// frameCount 24624): a track started with less than one chunk never gets
+    /// pulled and AudioFlinger removes it with `BUFFER TIMEOUT` — the whole
+    /// "wedged track" family. ~340 ms (16384 frames @48k) is the amount the
+    /// probe empirically delivered; prime to that.
+    fn prime_frames(&self) -> u64 {
+        self.sample_rate as u64 * 340 / 1000
+    }
+
+    /// Flip `primed` once the current track holds ≥ `prime_frames`, or the
+    /// first write is ≥ 1.5 s old (slow decode — start with what we have
     /// rather than never). Returns the primed state.
     fn try_prime(&self) -> bool {
         if self.primed.load(Ordering::Acquire) {
@@ -652,8 +692,8 @@ impl AudioTrackPcmSink {
             .track_first_write
             .lock()
             .unwrap()
-            .is_some_and(|t| t.elapsed() >= std::time::Duration::from_millis(500));
-        if buffered >= self.sample_rate as u64 / 10 || timed_out {
+            .is_some_and(|t| t.elapsed() >= std::time::Duration::from_millis(1500));
+        if buffered >= self.prime_frames() || timed_out {
             self.primed.store(true, Ordering::Release);
             log::info!(
                 "[audio-pcm] primed ({buffered} frames buffered{})",
@@ -810,6 +850,15 @@ pub(super) fn start_output(
                 .name("bz-audio-pcm-out".into())
                 .spawn(move || {
                     let mut batch: Vec<f32> = Vec::with_capacity(8192);
+                    // Odd sample held over so every batch is WHOLE FRAMES. The
+                    // channel delivers individual samples, so a batch can end
+                    // mid-frame; `AudioTrack.write` only accepts whole frames,
+                    // and retrying a half-frame chunk returns 0 forever — the
+                    // writer then spins on one batch for good (this WAS the
+                    // probabilistic "audio never starts / wedges" bug). The
+                    // leftover must carry into the next batch, not be dropped:
+                    // dropping one sample swaps L/R for everything after it.
+                    let mut carry: Option<f32> = None;
                     // DIAG heartbeat (sparse): sink/track state while samples flow.
                     let mut last_beat = std::time::Instant::now();
                     // Blocks until samples arrive; exits when the sender (the
@@ -831,6 +880,8 @@ pub(super) fn start_output(
                         // small device buffer plays out (cpal does the same).
                         if flush_flag.swap(false, Ordering::Relaxed) {
                             while sample_receiver.try_recv().is_ok() {}
+                            // The producer restarts at a frame boundary.
+                            carry = None;
                             continue;
                         }
                         // Host pause: hold this sample and don't consume further —
@@ -849,16 +900,26 @@ pub(super) fn start_output(
                             }
                             if flush_flag.swap(false, Ordering::Relaxed) {
                                 while sample_receiver.try_recv().is_ok() {}
+                                carry = None;
                                 continue;
                             }
                         }
                         batch.clear();
+                        if let Some(c) = carry.take() {
+                            batch.push(c);
+                        }
                         batch.push(first);
                         while batch.len() < 8192 {
                             match sample_receiver.try_recv() {
                                 Ok(s) => batch.push(s),
                                 Err(_) => break,
                             }
+                        }
+                        if batch.len() % 2 == 1 {
+                            carry = batch.pop();
+                        }
+                        if batch.is_empty() {
+                            continue;
                         }
                         let vol = f32::from_bits(volume.load(Ordering::Relaxed));
                         if (vol - 1.0).abs() > f32::EPSILON {

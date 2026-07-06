@@ -22,8 +22,9 @@ import android.widget.TextView
 import org.json.JSONArray
 import org.json.JSONObject
 
-/** Bundled encrypted DASH test stream (smoke test only). */
-private const val TEST_MANIFEST_URL = "https://preclikos.cz/examples/encrypted/manifest.mpd"
+/** Bundled encrypted DASH test stream (smoke test only; has an AAC audio track
+ * so the Android PCM sink is exercised too). */
+private const val TEST_MANIFEST_URL = "https://preclikos.cz/examples/tearsofsteel_enc/manifest.mpd"
 
 /**
  * Host Activity for the embedded Rust player.
@@ -380,6 +381,9 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         private val keys: Map<String, ByteArray> = mapOf(
             "0fd37dac41c0e987e68d43b801b1210c" to hex("fd8d9f408c2bd702970afcd3b219e791"),
             "519af81ab2d284f52aa8257d96b5e4bd" to hex("627ef72b42d98770dec20ecab46cd1f4"),
+            // tearsofsteel_enc (examples/tearsofsteel_enc/keys.json)
+            "5fe47a2b5a43523cb79bb96e0a15d106" to hex("9355c4ddaedb22347380f4835b1f77e5"),
+            "643819c17e42b72a9fa50b617fa7db2b" to hex("635f62d75077894b3c193e5f8de0c9c1"),
         )
 
         override fun resolveKey(kid: ByteArray): ByteArray? = keys[kid.toHex()]

@@ -195,6 +195,7 @@ fn runtime() -> &'static tokio::runtime::Runtime {
             .max(6);
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(workers)
+            .thread_name("rustplayer-rt")
             .enable_all()
             .build()
             .expect("tokio runtime")

@@ -189,6 +189,24 @@ struct StatsState {
     /// this is the measurement that tells us when an active servo is
     /// warranted on a given device class.
     av_drift_ms: std::sync::atomic::AtomicI64,
+
+    // ---- pipeline stage counters (diagnostics) ------------------------------
+    // Cumulative per-stage progress counters, sampled by the watchdog thread
+    // (see `spawn_pipeline_watchdog`) so a stalled playback prints exactly
+    // WHICH stage stopped advancing. Cheap relaxed atomics; bumped at each
+    // stage's hot point.
+    /// Audio segments received by `audio_decoder_task`.
+    diag_audio_seg: AtomicU64,
+    /// Audio frames pushed into the audio_sync channel by the decoder.
+    diag_audio_dec: AtomicU64,
+    /// Audio frames received by `audio_sync_loop`.
+    diag_audio_sync: AtomicU64,
+    /// Audio frames fully handed to the sink (put_samples returned).
+    diag_audio_sunk: AtomicU64,
+    /// Video segments consumed (post-prepare) by `video_decoder_task`.
+    diag_video_seg: AtomicU64,
+    /// Video frames rendered by the vsync loop.
+    diag_video_ren: AtomicU64,
 }
 
 pub struct Player<V: VideoSink = VideoRenderer, A: AudioSink = AudioRenderer> {
@@ -590,6 +608,11 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
     // once and the cadence re-bases — so this can never schedule meaningfully
     // further from reality than the proven raw formula already did.
     const PRESENT_SMOOTH_NS: i64 = 40_000_000;
+    // Cap on how far in the future a frame's present stamp may point (see the
+    // clamp in the present block). 250 ms ≈ 6 frames at 24 fps — well inside
+    // the direct codec's 8-buffer output pool, so SurfaceFlinger can never be
+    // handed enough far-future frames to drain it.
+    const MAX_PRESENT_LEAD_NS: i64 = 250_000_000;
     // Playback master clock: audio-disciplined, 0-based, rebased to this
     // pipeline's timeline. Video paces to it; the same seam serves passthrough
     // / multichannel / other renderers (see MediaClock).
@@ -848,6 +871,15 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
             }
             None => raw_present_ns,
         };
+        // HARD CAP on how far in the future a frame may be stamped. The media
+        // clock can step BACKWARD between the pacing sleep and this stamp (the
+        // wall→audio handover at startup, underrun/seek re-anchors), which used
+        // to produce eglPresentationTime stamps seconds ahead — SurfaceFlinger
+        // held those frames, the direct codec's 8-buffer output pool drained,
+        // and playback wedged into a ~1 fps convoy ("no present fence for
+        // frame N"). Clamping keeps the buffer flowing through SF regardless of
+        // any clock discontinuity; pacing still comes from the sleep above.
+        let present_ns = present_ns.min(clock_monotonic_ns() + MAX_PRESENT_LEAD_NS);
         last_present = Some((present_ns, pts_us_rel));
         frame.desired_present_ns = present_ns;
 
@@ -918,6 +950,7 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
         let frame_w = frame.width;
         let frame_h = frame.height;
         renderer.render_frame(frame).await;
+        stats.diag_video_ren.fetch_add(1, Ordering::Relaxed);
         // One frame is now on screen — from here the pause gate parks.
         presented_frame = true;
 
@@ -1069,6 +1102,7 @@ async fn audio_sync_loop<A: AudioSink>(
                         Some(f) => f,
                         None => return,
                     };
+                    stats.diag_audio_sync.fetch_add(1, Ordering::Relaxed);
                     if starving {
                         starving = false;
                         if let StarvationTransition::ExitedBuffering =
@@ -1148,7 +1182,9 @@ async fn audio_sync_loop<A: AudioSink>(
             continue;
         }
         tokio::select! {
-            _ = sink.put_samples(&trimmed) => {}
+            _ = sink.put_samples(&trimmed) => {
+                stats.diag_audio_sunk.fetch_add(1, Ordering::Relaxed);
+            }
             _ = stop.notified() => return,
         }
     }
@@ -1182,6 +1218,36 @@ async fn av_sync_handler<V: VideoSink, A: AudioSink>(
     let _ = events.send(PlayerEvent::Buffering {
         reason: BufferingReason::Initial,
     });
+
+    // Pipeline watchdog: a plain OS thread (immune to any async-runtime state)
+    // that logs the per-stage progress counters every 3 s. When playback stalls,
+    // the first counter that stops advancing names the wedged stage directly —
+    // no more guessing which of download/decode/sync/sink/render died.
+    {
+        let stats = Arc::clone(&stats);
+        let stop_flag = Arc::clone(&stop_flag);
+        let position = Arc::clone(&position_ms);
+        std::thread::Builder::new()
+            .name("bz-watchdog".into())
+            .spawn(move || {
+                while !stop_flag.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_secs(3));
+                    log::info!(
+                        "[watchdog gen {}] a_seg={} a_dec={} a_sync={} a_sunk={} | v_seg={} v_dec={} v_ren={} | pos={}ms",
+                        gen,
+                        stats.diag_audio_seg.load(Ordering::Relaxed),
+                        stats.diag_audio_dec.load(Ordering::Relaxed),
+                        stats.diag_audio_sync.load(Ordering::Relaxed),
+                        stats.diag_audio_sunk.load(Ordering::Relaxed),
+                        stats.diag_video_seg.load(Ordering::Relaxed),
+                        stats.video_frames_decoded.load(Ordering::Relaxed),
+                        stats.diag_video_ren.load(Ordering::Relaxed),
+                        position.load(Ordering::Relaxed),
+                    );
+                }
+            })
+            .ok();
+    }
 
     // Wait for both decoders to produce their first output before setting
     // start_time. This ensures A/V sync is established from a common wall-clock
@@ -1468,6 +1534,7 @@ async fn video_decoder_task(
             );
         }
         log::debug!("[dec] consuming video segment: {}", prepared.id);
+        stats.diag_video_seg.fetch_add(1, Ordering::Relaxed);
         let data_vec = prepared.data_vec;
         let sample_info = prepared.sample_info;
 
@@ -1668,24 +1735,45 @@ async fn audio_decoder_task(
     let mut first_audio_signaled = false;
     while let Some(segment) = receiver.recv().await {
         log::debug!("[dec] consuming audio segment: {}", segment.id);
+        stats.diag_audio_seg.fetch_add(1, Ordering::Relaxed);
 
-        let mut data_vec = init_data.clone();
-        data_vec.extend_from_slice(&segment.data[..]);
-        decrypt_segment_in_place(&mut data_vec, track_crypto.as_ref())?;
+        // block_in_place: CENC decrypt of a whole segment is heavy CPU work
+        // (~100+ ms of software AES on 32-bit TV SoCs) — run inline on a
+        // runtime worker it stalls every other task scheduled there. The same
+        // rule as the video path (which offloads via spawn_blocking) and the
+        // MediaCodec calls below: BLOCKING WORK MUST NOT OCCUPY A RUNTIME
+        // WORKER, or the reactive tasks (vsync pacing, audio feed, timers)
+        // starve and playback degrades to a ~1 fps convoy.
+        let (data_vec, sample_info) = tokio::task::block_in_place(
+            || -> Result<(Vec<u8>, Vec<(usize, usize, i64, u64)>), Box<dyn Error + Send + Sync>> {
+                let mut data_vec = init_data.clone();
+                data_vec.extend_from_slice(&segment.data[..]);
+                decrypt_segment_in_place(&mut data_vec, track_crypto.as_ref())?;
 
-        let sample_info: Vec<(usize, usize, i64, u64)> = {
-            let mp4 = Mp4::read_bytes(&data_vec)
-                .map_err(|e| -> Box<dyn Error + Send + Sync> { format!("mp4: {}", e).into() })?;
-            let (_id, track) = mp4
-                .tracks()
-                .first_key_value()
-                .ok_or_else(|| -> Box<dyn Error + Send + Sync> { "no track".into() })?;
-            track
-                .samples
-                .iter()
-                .map(|s| (s.offset as usize, s.size as usize, s.composition_timestamp, s.timescale))
-                .collect()
-        };
+                let sample_info: Vec<(usize, usize, i64, u64)> = {
+                    let mp4 = Mp4::read_bytes(&data_vec).map_err(
+                        |e| -> Box<dyn Error + Send + Sync> { format!("mp4: {}", e).into() },
+                    )?;
+                    let (_id, track) = mp4
+                        .tracks()
+                        .first_key_value()
+                        .ok_or_else(|| -> Box<dyn Error + Send + Sync> { "no track".into() })?;
+                    track
+                        .samples
+                        .iter()
+                        .map(|s| {
+                            (
+                                s.offset as usize,
+                                s.size as usize,
+                                s.composition_timestamp,
+                                s.timescale,
+                            )
+                        })
+                        .collect()
+                };
+                Ok((data_vec, sample_info))
+            },
+        )?;
 
         for (offset, size, ts, ts_scale) in sample_info {
             if offset + size > data_vec.len() {
@@ -1711,6 +1799,7 @@ async fn audio_decoder_task(
                         if sender.send(frame).await.is_err() {
                             return Ok(());
                         }
+                        stats.diag_audio_dec.fetch_add(1, Ordering::Relaxed);
                         if !first_audio_signaled {
                             audio_ready.notify_one();
                             first_audio_signaled = true;

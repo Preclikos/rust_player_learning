@@ -19,14 +19,17 @@
 //!
 //! ## When this applies
 //!
-//! Only on platforms where the player owns the HDR→SDR conversion:
+//! On every platform where the player owns the HDR→SDR conversion:
 //!   - Windows (D3D11VA → DX12 P010 import → our shader_hdr.wgsl)
 //!   - Linux   (VAAPI    → Vulkan P010 import → our shader_hdr.wgsl)
+//!   - macOS / iOS (VideoToolbox → Metal plane import → the same
+//!     shader_hdr.wgsl). Preferred surface is 10-bit 'x420'; when VT
+//!     refuses it the 8-bit NV12 fallback is still a PQ/BT.2020 signal
+//!     (VT converts pixel format only, never colour) and tonemaps
+//!     through the same shader at 8-bit precision.
 //!
-//! On Apple platforms (macOS, iOS) VideoToolbox tonemaps internally and
-//! hands the renderer pre-converted 8-bit BT.709 NV12 — our HDR shader
-//! is never used. Calls to `set_hdr_tonemap` from those platforms are
-//! silently no-op (the API exists for cross-platform host code).
+//! Pipeline selection is per frame from the decoder-stamped
+//! `VideoColorInfo` (SPS VUI transfer), not from the surface bit depth.
 //!
 //! Use [`PlayerCapabilities::hdr_tonemap_tunable`](crate::PlayerCapabilities)
 //! at startup so the settings UI can hide the controls on platforms

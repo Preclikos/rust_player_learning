@@ -1727,7 +1727,7 @@ impl VideoRenderer {
         // offset (commonly several seconds in real DASH streams).
         #[cfg(target_os = "android")]
         let desired_present_ns = frame.desired_present_ns;
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_os = "ios", target_os = "macos"))]
         let frame_color = frame.color;
         #[cfg(target_os = "android")]
         let frame_hdr_meta = frame.hdr_meta;
@@ -1752,7 +1752,7 @@ impl VideoRenderer {
             }
             #[cfg(any(target_os = "ios", target_os = "macos"))]
             PlatformFrame::CvPixelBuffer(cv_buf) => {
-                self.render_cv_pixel_buffer(cv_buf).await;
+                self.render_cv_pixel_buffer(cv_buf, frame_color).await;
             }
             #[allow(unreachable_patterns)]
             _ => {}
@@ -2055,17 +2055,39 @@ impl VideoRenderer {
     /// take it by value instead of `&` to keep `render_frame`'s
     /// returned future `Send` across the await.
     #[cfg(any(target_os = "macos", target_os = "ios"))]
-    async fn render_metal_nv12(&self, metal_frame: MetalNV12Frame) {
+    async fn render_metal_nv12(
+        &self,
+        metal_frame: MetalNV12Frame,
+        color: crate::decoders::VideoColorInfo,
+    ) {
         let y_plane_view = metal_frame.y_texture.create_view(&Default::default());
         let uv_plane_view = metal_frame.uv_texture.create_view(&Default::default());
 
-        // 16-bit planes = a 10-bit P010-layout CVPixelBuffer ('x420') from
-        // VideoToolbox — PQ signal that goes through the HDR tonemap
-        // pipeline + detection passes, mirroring the desktop P010 path.
-        // 8-bit planes stay on the SDR pipeline (incl. HDR content VT
-        // already converted internally when the 10-bit destination was
-        // refused).
-        let is_hdr = metal_frame.y_texture.format() == TextureFormat::R16Unorm;
+        // Pipeline selection follows the frame's signalled transfer
+        // (PQ/HLG → HDR tonemap + detection passes, mirroring the desktop
+        // P010 path), NOT the plane bit depth: VTDecompressionSession only
+        // converts pixel format, never colour, so when the 10-bit 'x420'
+        // destination is refused the 8-bit NV12 fallback still carries a
+        // PQ/BT.2020 signal that must be tonemapped (at 8-bit quantization
+        // cost). The shader's limited-range expansion is bit-depth-agnostic
+        // — R8Unorm and P010-in-R16Unorm normalise to the same [0,1] codes.
+        let is_hdr = color.is_hdr();
+        {
+            // One line whenever the (pipeline, plane depth) combination
+            // changes — makes the field-debug question "did the tonemap
+            // actually run, and on which planes?" answerable from logs.
+            use std::sync::atomic::{AtomicU8, Ordering};
+            static LAST: AtomicU8 = AtomicU8::new(u8::MAX);
+            let is_10bit = metal_frame.y_texture.format() == TextureFormat::R16Unorm;
+            let state = is_hdr as u8 | (is_10bit as u8) << 1;
+            if LAST.swap(state, Ordering::Relaxed) != state {
+                log::info!(
+                    "Metal NV12 path: {} planes → {} pipeline",
+                    if is_10bit { "10-bit" } else { "8-bit" },
+                    if is_hdr { "HDR tonemap" } else { "SDR" },
+                );
+            }
+        }
         let (frame_w, frame_h) = (
             metal_frame.y_texture.width(),
             metal_frame.y_texture.height(),
@@ -2249,9 +2271,16 @@ impl VideoRenderer {
 
     /// macOS / iOS: render a `CVPixelBufferOwned` from VTDecompressionSession.
     /// Wraps the buffer into a `MetalNV12Frame` (two zero-copy MTLTextures)
-    /// and dispatches to the shared Metal NV12 helper.
+    /// and dispatches to the shared Metal NV12 helper. `color` is the
+    /// frame's signalled colour info — it decides SDR vs HDR-tonemap
+    /// pipeline (the plane bit depth alone can't: VT's 8-bit fallback
+    /// still carries a PQ/BT.2020 signal).
     #[cfg(any(target_os = "ios", target_os = "macos"))]
-    pub async fn render_cv_pixel_buffer(&self, buf: crate::decoders::CvPixelBufferOwned) {
+    pub async fn render_cv_pixel_buffer(
+        &self,
+        buf: crate::decoders::CvPixelBufferOwned,
+        color: crate::decoders::VideoColorInfo,
+    ) {
         let cache = match &self.metal_cache {
             Some(c) => c.clone(),
             None => {
@@ -2271,7 +2300,7 @@ impl VideoRenderer {
         // fine — Metal still has a live reference until queue.submit's
         // command buffer completes.
         drop(buf);
-        self.render_metal_nv12(mf).await;
+        self.render_metal_nv12(mf, color).await;
     }
 
     /// GLES zero-copy path: stores per-frame AHB data then calls queue.present().

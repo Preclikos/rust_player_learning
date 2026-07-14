@@ -86,7 +86,7 @@ paths. It now does an exact limited-range BT.709 decode.
 |-----------------|----------|--------------------------------------------------------|
 | Windows         | ✅       | wgpu shader (DX12, P010 import) + compute detection    |
 | Linux           | ✅       | Same (Vulkan, VAAPI P010 import)                       |
-| macOS / iOS     | ✅       | Same shader — VideoToolbox decodes to a 10-bit `x420` destination imported as R16/RG16 Metal planes. Falls back to VT's internal 8-bit conversion (then NOT tunable) if the 10-bit destination is refused. |
+| macOS / iOS     | ✅       | Same shader — VideoToolbox decodes to a 10-bit `x420` destination imported as R16/RG16 Metal planes. If the 10-bit destination is refused, the 8-bit NV12 fallback is still PQ/BT.2020 (VT never converts colour) and goes through the same tonemap, at 8-bit quantization cost. |
 | Android (GL path) | ✅     | GLSL ES port of the same math in the OES present hook; scene detection via a GL reduction pass + PBO readback (no compute in ES 3.0) |
 | Android (direct mode) | n/a | No tonemap — the display pipeline owns HDR. |
 

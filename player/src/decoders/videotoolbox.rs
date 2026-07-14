@@ -312,7 +312,7 @@ impl HwVideoDecoder for VideoToolboxDecoder {
         //   PixelFormatType = NV12 (420v) for SDR, or the P010-layout
         //   10-bit biplanar format ('x420') for PQ/HLG streams so the
         //   renderer's own tonemap (shader_hdr.wgsl) gets the full-depth
-        //   PQ signal instead of VideoToolbox's internal conversion.
+        //   PQ signal (the 8-bit fallback tonemaps too, at lower precision).
         //   MetalCompatibility = true (request IOSurface usable from Metal)
         //   IOSurfaceProperties = empty dict (signals "use IOSurface backing")
         // Builds the dict for one pixel format; called again for the 8-bit
@@ -369,10 +369,25 @@ impl HwVideoDecoder for VideoToolboxDecoder {
         };
 
         // HDR (PQ/HLG) wants the 10-bit surface so the wgpu tonemap path
-        // runs; everything else (incl. rare 10-bit SDR, which must NOT hit
-        // the HDR shader) decodes to 8-bit NV12 exactly as before.
+        // gets the full-depth signal; everything else (incl. rare 10-bit
+        // SDR, which must NOT hit the HDR shader) decodes to 8-bit NV12
+        // exactly as before. If the 10-bit destination is refused, the
+        // 8-bit fallback output is STILL PQ/BT.2020 (VT converts pixel
+        // format only, never colour) — the renderer selects the tonemap
+        // pipeline from the frame's VideoColorInfo, so HDR stays correct
+        // either way, just with 8-bit quantization of the PQ signal.
         let mut formats: Vec<i32> = Vec::with_capacity(2);
-        if params.color.is_hdr() {
+        // Debug knob: RUST_PLAYER_VT_FORCE_8BIT skips the 10-bit request so
+        // the 8-bit PQ fallback tonemap can be exercised on machines where
+        // 'x420' is normally accepted.
+        let force_8bit = std::env::var_os("RUST_PLAYER_VT_FORCE_8BIT").is_some();
+        if params.color.is_hdr() && force_8bit {
+            log::warn!(
+                "VideoToolbox: RUST_PLAYER_VT_FORCE_8BIT set — decoding HDR to \
+                 8-bit NV12 (player tonemap at 8-bit precision)"
+            );
+        }
+        if params.color.is_hdr() && !force_8bit {
             formats.push(K_CV_PIXEL_FORMAT_TYPE_420_YPCBCR10_BIPLANAR_VIDEO_RANGE);
         }
         formats.push(K_CV_PIXEL_FORMAT_TYPE_420_YPCBCR8_BIPLANAR_VIDEO_RANGE);
@@ -394,13 +409,22 @@ impl HwVideoDecoder for VideoToolboxDecoder {
             unsafe { CFRelease(dest_attrs) };
             last_status = st;
             if st == 0 && !session.is_null() {
-                if i > 0 && params.color.is_hdr() {
-                    log::warn!(
-                        "VideoToolbox: 10-bit destination refused — falling back to \
-                         8-bit NV12 (VT-internal HDR conversion)"
-                    );
-                } else if params.color.is_hdr() {
-                    log::info!("VideoToolbox: 10-bit P010 destination (player tonemap)");
+                if params.color.is_hdr() {
+                    if *fmt == K_CV_PIXEL_FORMAT_TYPE_420_YPCBCR10_BIPLANAR_VIDEO_RANGE {
+                        log::info!("VideoToolbox: 10-bit P010 destination (player tonemap)");
+                    } else if i > 0 {
+                        log::warn!(
+                            "VideoToolbox: 10-bit destination refused — falling back to \
+                             8-bit NV12 (still PQ/BT.2020; player tonemap applies at \
+                             8-bit precision)"
+                        );
+                    } else {
+                        // force_8bit path — the knob already logged the why.
+                        log::info!(
+                            "VideoToolbox: 8-bit NV12 destination (player tonemap at \
+                             8-bit precision)"
+                        );
+                    }
                 }
                 break;
             }

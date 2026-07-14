@@ -200,8 +200,9 @@ impl MetalNV12Frame {
         let uv_h = unsafe { CVPixelBufferGetHeightOfPlane(pixel_buffer, 1) };
 
         // 10-bit ('x420'/'xf20', P010 layout) imports as 16-bit-unorm plane
-        // textures; the R16Unorm Y plane is also what tells the render path
-        // to use the HDR tonemap pipeline. 8-bit NV12 stays R8/RG8.
+        // textures; 8-bit NV12 stays R8/RG8. SDR vs HDR-tonemap pipeline is
+        // decided by the frame's VideoColorInfo in render_metal_nv12, not
+        // by the plane format — an 8-bit VT fallback can still carry PQ.
         let pixel_format = unsafe { CVPixelBufferGetPixelFormatType(pixel_buffer) };
         let is_10bit = pixel_format == K_CV_PIXEL_FORMAT_420_YPCBCR10_BIPLANAR_VIDEO_RANGE
             || pixel_format == K_CV_PIXEL_FORMAT_420_YPCBCR10_BIPLANAR_FULL_RANGE;

@@ -62,6 +62,10 @@ void rustplayer_player_clear_subtitles(void *handle);
 // Generic knobs.
 void rustplayer_player_set_subtitle_style(void *handle, int32_t text_argb, int32_t outline_argb, float size_scale);
 void rustplayer_player_set_subtitle_safe_inset_bottom(void *handle, uint32_t bottom_px);
+// Debug/compat: force HDR video to an 8-bit decode destination (tonemap
+// still runs, at 8-bit precision). Applies from the next pipeline
+// (re)build (play / retry / ABR swap).
+void rustplayer_player_set_hdr_decode_8bit(void *handle, bool enabled);
 void rustplayer_player_set_verbose_logging(bool enabled);
 
 // What the host's request filter wants fetched — the generic request-filter

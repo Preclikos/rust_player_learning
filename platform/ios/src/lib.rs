@@ -424,6 +424,18 @@ pub extern "C" fn rustplayer_player_set_subtitle_safe_inset_bottom(handle: *mut 
     }
 }
 
+/// Debug/compat: force HDR (PQ/HLG) video to decode to an 8-bit
+/// destination. The in-player HDR→SDR tonemap still runs — colours stay
+/// correct, at 8-bit quantization of the PQ signal. Sampled at decoder
+/// configure time, so it applies from the next pipeline (re)build
+/// (play / retry / ABR swap). See player/HDR_TONEMAP.md.
+#[no_mangle]
+pub extern "C" fn rustplayer_player_set_hdr_decode_8bit(handle: *mut c_void, enabled: bool) {
+    if let Some(h) = unsafe { handle_ref(handle) } {
+        h.bridge.player().set_hdr_decode_8bit(enabled);
+    }
+}
+
 /// Verbose logging toggle (default off → per-frame spam gated).
 #[no_mangle]
 pub extern "C" fn rustplayer_player_set_verbose_logging(enabled: bool) {

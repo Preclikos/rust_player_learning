@@ -158,6 +158,12 @@ public final class RustPlayer {
     public func setSubtitleSafeInsetBottom(_ px: UInt32) {
         handle.map { rustplayer_player_set_subtitle_safe_inset_bottom($0, px) }
     }
+    /// Debug/compat: force HDR video to an 8-bit decode destination (the
+    /// in-player tonemap still runs, at 8-bit precision). Applies from the
+    /// next pipeline (re)build (play / retry / ABR swap).
+    public func setHdrDecode8bit(_ enabled: Bool) {
+        handle.map { rustplayer_player_set_hdr_decode_8bit($0, enabled) }
+    }
     public func setVerboseLogging(_ enabled: Bool) {
         rustplayer_player_set_verbose_logging(enabled)
     }

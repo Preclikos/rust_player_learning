@@ -306,6 +306,14 @@ pub struct Player<V: VideoSink = VideoRenderer, A: AudioSink = AudioRenderer> {
     /// and it transparently falls back to PCM decode when unsupported.
     audio_passthrough: Arc<std::sync::atomic::AtomicBool>,
 
+    /// Force HDR (PQ/HLG) video to decode to an 8-bit destination; the
+    /// in-player tonemap still runs, at 8-bit quantization of the PQ
+    /// signal. Debug/compat knob — currently honoured by the VideoToolbox
+    /// decoder (macOS/iOS) only. Seeded from the `RUST_PLAYER_VT_FORCE_8BIT`
+    /// env var; sampled at every decoder configure (play / retry / ABR
+    /// swap), so a change applies from the next (re)configure on.
+    hdr_decode_8bit: Arc<std::sync::atomic::AtomicBool>,
+
     /// True once the current pipeline has produced its first frame (set in
     /// av_sync_handler after video_ready, reset to false on every pipeline
     /// (re)build). The ABR tick consults it so the FIRST auto-switch can't
@@ -362,6 +370,7 @@ impl<V: VideoSink, A: AudioSink> Clone for Player<V, A> {
             video_output_window: Arc::clone(&self.video_output_window),
             adaptive_frame_rate: Arc::clone(&self.adaptive_frame_rate),
             audio_passthrough: Arc::clone(&self.audio_passthrough),
+            hdr_decode_8bit: Arc::clone(&self.hdr_decode_8bit),
             pipeline_live: Arc::clone(&self.pipeline_live),
             pending_resume: Arc::clone(&self.pending_resume),
             video_renderer: Arc::clone(&self.video_renderer),
@@ -2146,6 +2155,9 @@ async fn run_decode(
     splice: Option<SwapSplice>,
     // Android direct mode video window (0 = renderer path).
     direct_window: usize,
+    // Player-level HDR-to-8-bit decode switch, sampled here at configure
+    // time so ABR swaps / retries pick up a changed value.
+    hdr_decode_8bit: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     decoder.configure(VideoDecoderParams {
         codec: VideoCodec::Hevc,
@@ -2155,6 +2167,7 @@ async fn run_decode(
         color: pf.color,
         direct_window,
         dovi_profile: pf.dovi_profile,
+        force_8bit_hdr: hdr_decode_8bit.load(Ordering::Relaxed),
     })?;
     // Direct mode: let the input-buffer spin observe teardown so a seek /
     // track-switch can't strand the decode task in the spin (see [B] in
@@ -2197,6 +2210,7 @@ async fn video_play(
     soft_end_exclusive: Arc<AtomicUsize>,
     // Android direct mode video window (0 = renderer path).
     direct_window: usize,
+    hdr_decode_8bit: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     // Initial pipeline: nothing to overlap with, so download and decode run
     // back to back. `prime_target = MAX` → the readiness signal never fires
@@ -2223,6 +2237,7 @@ async fn video_play(
         stop_flag,
         None,
         direct_window,
+        hdr_decode_8bit,
     )
     .await
 }
@@ -2804,6 +2819,7 @@ async fn video_supervisor(
     origin: Duration,
     // Android direct mode video window (0 = renderer path).
     direct_window: usize,
+    hdr_decode_8bit: Arc<AtomicBool>,
     // Resume slot written when retries are exhausted: the NEXT play() call
     // starts from this position instead of zero ("continue where we
     // stopped" semantics for the consumer's manual retry).
@@ -2842,6 +2858,7 @@ async fn video_supervisor(
             segments_in_flight,
             soft_end.clone(),
             direct_window,
+            Arc::clone(&hdr_decode_8bit),
         ));
         (handle, soft_end)
     };
@@ -2970,6 +2987,7 @@ async fn video_supervisor(
                         let sender = frame_sender.clone();
                         let video_ready = video_ready.clone();
                         let decoder_factory = decoder_factory.clone();
+                        let hdr_decode_8bit = Arc::clone(&hdr_decode_8bit);
                         let splice_pts_us = pos_abs.as_micros() as i64;
                         async move {
                             let pf = video_prefetch(
@@ -2997,6 +3015,7 @@ async fn video_supervisor(
                                     skip_below_pts_us: splice_pts_us,
                                 }),
                                 direct_window,
+                                hdr_decode_8bit,
                             )
                             .await
                         }
@@ -3237,6 +3256,7 @@ async fn video_supervisor(
                 skip_below_pts_us: splice_pts_us,
             }),
             direct_window,
+            Arc::clone(&hdr_decode_8bit),
         ));
         cur_stop = new_stop;
         cur_flag = new_flag;
@@ -3359,6 +3379,9 @@ impl Player<VideoRenderer, AudioRenderer> {
             video_output_window: Arc::new(DirectWindow::new()),
             adaptive_frame_rate: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             audio_passthrough: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            hdr_decode_8bit: Arc::new(std::sync::atomic::AtomicBool::new(
+                std::env::var_os("RUST_PLAYER_VT_FORCE_8BIT").is_some(),
+            )),
             pipeline_live: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pending_resume: Arc::new(StdMutex::new(None)),
 
@@ -3862,6 +3885,22 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             .store(enabled, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Debug/compat switch: force HDR (PQ/HLG) video to decode to an
+    /// 8-bit destination. The in-player HDR→SDR tonemap still runs — the
+    /// picture stays colour-correct, just with 8-bit quantization of the
+    /// PQ signal. Currently honoured by the VideoToolbox decoder
+    /// (macOS/iOS); other platforms ignore it. Default OFF unless the
+    /// `RUST_PLAYER_VT_FORCE_8BIT` env var is set at Player construction.
+    ///
+    /// Sampled at decoder configure time, so a change applies from the
+    /// next pipeline (re)build (play, seek-restart, ABR swap) — not to
+    /// frames already in flight. Like `set_hdr_tonemap`, the player does
+    /// not persist this across instances.
+    pub fn set_hdr_decode_8bit(&self, enabled: bool) {
+        self.hdr_decode_8bit
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Initial playback position for the next `play()` (resume). Unlike
     /// `seek()` — which is fire-and-forget and races `play()`'s read of the
     /// seek target — this stores the position **synchronously**, so a
@@ -4256,6 +4295,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         let pending_resume = Arc::clone(&self.pending_resume);
         let pipeline_live = Arc::clone(&self.pipeline_live);
         let audio_passthrough = Arc::clone(&self.audio_passthrough);
+        let hdr_decode_8bit = Arc::clone(&self.hdr_decode_8bit);
         let play = tokio::spawn(async move {
             // ABR tick runs once for the whole play() lifetime (survives
             // every seek/track-switch restart below). On Manual it's a
@@ -4472,6 +4512,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                     seg_in_flight,
                     origin,
                     direct_window,
+                    Arc::clone(&hdr_decode_8bit),
                     Arc::clone(&pending_resume),
                 ));
 

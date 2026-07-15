@@ -377,14 +377,15 @@ impl HwVideoDecoder for VideoToolboxDecoder {
         // pipeline from the frame's VideoColorInfo, so HDR stays correct
         // either way, just with 8-bit quantization of the PQ signal.
         let mut formats: Vec<i32> = Vec::with_capacity(2);
-        // Debug knob: RUST_PLAYER_VT_FORCE_8BIT skips the 10-bit request so
-        // the 8-bit PQ fallback tonemap can be exercised on machines where
-        // 'x420' is normally accepted.
-        let force_8bit = std::env::var_os("RUST_PLAYER_VT_FORCE_8BIT").is_some();
+        // Debug/compat knob (Player::set_hdr_decode_8bit, env-seeded from
+        // RUST_PLAYER_VT_FORCE_8BIT): skip the 10-bit request so the 8-bit
+        // PQ fallback tonemap can be exercised on machines where 'x420' is
+        // normally accepted.
+        let force_8bit = params.force_8bit_hdr;
         if params.color.is_hdr() && force_8bit {
             log::warn!(
-                "VideoToolbox: RUST_PLAYER_VT_FORCE_8BIT set — decoding HDR to \
-                 8-bit NV12 (player tonemap at 8-bit precision)"
+                "VideoToolbox: 8-bit HDR decode forced (set_hdr_decode_8bit / \
+                 RUST_PLAYER_VT_FORCE_8BIT) — player tonemap at 8-bit precision"
             );
         }
         if params.color.is_hdr() && !force_8bit {

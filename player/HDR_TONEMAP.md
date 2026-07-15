@@ -170,6 +170,23 @@ if caps.hdr_tonemap_tunable {
 }
 ```
 
+## Debug/compat: 8-bit HDR decode (VideoToolbox)
+
+`Player::set_hdr_decode_8bit(true)` forces HDR (PQ/HLG) video to decode to
+an 8-bit NV12 destination instead of the preferred 10-bit `x420`. The
+tonemap still runs — the picture stays colour-correct, just with 8-bit
+quantization of the PQ signal. Use it to reproduce/diagnose the refused-
+10-bit fallback path, or as a compat escape hatch on machines where the
+10-bit surface misbehaves. Currently honoured by the VideoToolbox decoder
+(macOS/iOS) only; other platforms ignore it.
+
+- Default OFF; the `RUST_PLAYER_VT_FORCE_8BIT` env var (set at `Player`
+  construction) seeds it ON for the test shells.
+- Sampled at decoder configure time → applies from the next pipeline
+  (re)build (play, retry, ABR swap), not to frames in flight.
+- The active path is visible in logs: `VideoToolbox: … destination` and
+  `Metal NV12 path: … planes → … pipeline`.
+
 ## Persistence
 
 Unchanged: the **player does not persist** the value across runs. A host

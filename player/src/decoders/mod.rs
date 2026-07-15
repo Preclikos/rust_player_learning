@@ -65,6 +65,12 @@ pub struct VideoDecoderParams {
     /// instead of AHardwareBuffers. 0 = classic ImageReader/GL path.
     /// Ignored by the desktop / Apple decoders.
     pub direct_window: usize,
+    /// Force an 8-bit decode destination even for HDR (PQ/HLG) content —
+    /// the in-player tonemap still runs, at 8-bit quantization of the PQ
+    /// signal. Debug/compat knob, set via [`Player::set_hdr_decode_8bit`]
+    /// (crate::Player) and seeded from `RUST_PLAYER_VT_FORCE_8BIT`.
+    /// Honoured by the VideoToolbox decoder (macOS/iOS); ignored elsewhere.
+    pub force_8bit_hdr: bool,
     /// Dolby Vision profile (5/7/8) when the representation is DV. In
     /// direct mode the Android decoder then prefers the platform
     /// `video/dolby-vision` codec with the RPU NALs KEPT — full DV

@@ -1359,6 +1359,7 @@ async fn av_sync_handler<V: VideoSink, A: AudioSink>(
     let stats_audio = Arc::clone(&stats);
     let events_audio = Arc::clone(&events);
     let paused_audio = Arc::clone(&paused);
+    let end_position = Arc::clone(&position_ms);
     let (_, _) = tokio::join!(
         tokio::spawn(video_sync_loop(
             gen,
@@ -1391,10 +1392,33 @@ async fn av_sync_handler<V: VideoSink, A: AudioSink>(
     );
     // Both loops returning naturally (channels closed by decoder EOF) means
     // we hit end-of-stream. If we were stopped explicitly, the consumer is
-    // tearing down and doesn't care about EndOfStream — but emitting it
-    // regardless is harmless and idempotent.
+    // tearing down and doesn't care about EndOfStream.
+    //
+    // Positional gate: "both loops ended" is also what a silently dead
+    // pipeline looks like (e.g. an outage path that slipped past the
+    // supervisor). A genuine end plays out to the media duration, so
+    // anything that stops well short of it is reported as a network error
+    // instead of a fake EndOfStream.
     if !stop_flag.load(Ordering::Relaxed) {
-        let _ = events.send(PlayerEvent::EndOfStream);
+        const PREMATURE_END_GUARD_MS: u64 = 10_000;
+        let pos = end_position.load(Ordering::Relaxed);
+        let dur = media_duration.as_millis() as u64;
+        if dur == 0 || pos + PREMATURE_END_GUARD_MS >= dur {
+            let _ = events.send(PlayerEvent::EndOfStream);
+        } else {
+            log::error!(
+                "[av_sync] stream ended prematurely at {}ms of {}ms — reporting as network error",
+                pos, dur
+            );
+            let _ = events.send(PlayerEvent::Error {
+                kind: PlayerErrorKind::Network,
+                detail: format!(
+                    "stream ended prematurely at {}s of {}s (network outage?)",
+                    pos / 1000,
+                    dur / 1000
+                ),
+            });
+        }
     }
     stop.notify_waiters();
 }
@@ -2187,9 +2211,35 @@ async fn run_decode(
     ));
 
     let (dl_res, dec_res) = join!(pf.download_handle, decoder_task);
-    log_task_result("video download_task", dl_res);
-    log_task_result("video decoder_task", dec_res);
-    Ok(())
+    // Propagate failures so the supervisor's bounded retry actually fires —
+    // logging alone turned real download/decode deaths into "natural EOF".
+    // Download first: a decoder error is usually just the consequence of the
+    // feed dying.
+    let dl_err = flatten_task_result("video download_task", dl_res);
+    let dec_err = flatten_task_result("video decoder_task", dec_res);
+    match dl_err.or(dec_err) {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// Log and collapse a joined task result into `Some(error)` when either the
+/// task itself failed (panic/abort) or it returned `Err`.
+fn flatten_task_result<T>(
+    name: &str,
+    result: Result<Result<T, Box<dyn Error + Send + Sync>>, tokio::task::JoinError>,
+) -> Option<Box<dyn Error + Send + Sync>> {
+    match result {
+        Ok(Ok(_)) => None,
+        Ok(Err(e)) => {
+            log::error!("{}: {}", name, e);
+            Some(e)
+        }
+        Err(e) => {
+            log::error!("{}: join error: {}", name, e);
+            Some(format!("{name} panicked: {e}").into())
+        }
+    }
 }
 
 async fn video_play(
@@ -2350,9 +2400,12 @@ async fn audio_play(
     ));
 
     let (dl_res, dec_res) = join!(download_task, decoder_task);
-    log_task_result("audio download_task", dl_res);
-    log_task_result("audio decoder_task", dec_res);
-    Ok(())
+    let dl_err = flatten_task_result("audio download_task", dl_res);
+    let dec_err = flatten_task_result("audio decoder_task", dec_res);
+    match dl_err.or(dec_err) {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 /// Audio passthrough feed: download + decrypt the audio segments, slice the
@@ -4804,6 +4857,10 @@ async fn download_task(
     const SEGMENT_RETRY_TOTAL: Duration = Duration::from_secs(30);
 
     let segment_slice = &segments[..];
+    // Set when a segment was abandoned after SEGMENT_RETRY_TOTAL — turned
+    // into this task's Err below (natural completion / stop / soft-end /
+    // receiver-drop all stay Ok).
+    let mut gave_up: Option<Box<dyn Error + Send + Sync>> = None;
     for i in start_index..segment_slice.len() {
         // A dropped receiver means the consumer (this pipeline's decode side) is
         // gone — a rebuild/ABR swap tore it down. Stop immediately; this is not
@@ -4854,6 +4911,19 @@ async fn download_task(
                         .as_ref()
                         .map(|e| e.to_string())
                         .unwrap_or_else(|| "(no error captured)".to_string())
+                );
+                // Surface the give-up as an error. Returning Ok here made an
+                // extended outage indistinguishable from natural EOF: the
+                // decoder drained, the pipeline exited cleanly, the video
+                // supervisor saw "natural EOF" (no retry, no Error event)
+                // and av_sync emitted a fake EndOfStream — the consumer
+                // kicked the user out of playback and marked the title
+                // watched. An Err instead routes through the supervisor's
+                // bounded retry and, on exhaustion, PlayerEvent::Error.
+                gave_up = Some(
+                    last_err
+                        .take()
+                        .unwrap_or_else(|| "segment retries exhausted".into()),
                 );
                 should_break = true;
                 break;
@@ -4908,6 +4978,13 @@ async fn download_task(
         if should_break {
             break;
         }
+    }
+    if let Some(e) = gave_up {
+        return Err(format!(
+            "segment download gave up after {:?}: {}",
+            SEGMENT_RETRY_TOTAL, e
+        )
+        .into());
     }
     Ok(())
 }

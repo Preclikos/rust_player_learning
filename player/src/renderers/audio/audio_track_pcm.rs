@@ -25,6 +25,16 @@ use jni::objects::JObject;
 use jni::refs::GlobalRef;
 use tokio::sync::mpsc::{self, Sender};
 
+/// CLOCK_MONOTONIC now, in ns — the timebase of `AudioTimestamp.nanoTime`
+/// (TIMEBASE_MONOTONIC, the default), so the timestamp's frame position can
+/// be interpolated to the current instant. Same local copy as
+/// audio_passthrough.rs.
+fn clock_monotonic_ns() -> i64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    ts.tv_sec as i64 * 1_000_000_000 + ts.tv_nsec as i64
+}
+
 // android.media.AudioFormat
 /// 16-bit PCM — the conventional Android output format (what every ExoPlayer
 /// app uses), adopted while chasing a wedge whose real cause turned out to be
@@ -727,6 +737,99 @@ impl AudioTrackPcmSink {
         .ok()
     }
 
+    /// PRESENTED-frame position of the CURRENT track when available, else the
+    /// consumed head position corrected by the learned output latency.
+    ///
+    /// `getPlaybackHeadPosition` counts frames CONSUMED by the mixer; on
+    /// TV-class outputs (HDMI → TV processing → speakers, BT even more) the
+    /// audible sound lags that by the output-path latency, so a video clock
+    /// paced on the consumed position runs visibly AHEAD of the audio (the
+    /// "picture slightly leads on PCM" report). This mirrors the passthrough
+    /// sink's clock: `AudioTrack.getTimestamp()` gives the frame most recently
+    /// PRESENTED at the output (interpolated to now); while it's not valid yet
+    /// (first ~second of playback, or right after a heal flush) we fall back
+    /// to head − cached latency, with the consumed→presented gap learned
+    /// process-wide so later pipelines are corrected from their first frame
+    /// (same handoff-continuity trick as audio_passthrough.rs).
+    fn presented_frames(&self) -> Option<i64> {
+        use std::sync::atomic::AtomicI64;
+        // Learned CONSUMED − PRESENTED gap (output latency) in frames.
+        // Process-wide: seeks/heals rebuild the sink, the device latency
+        // doesn't change. 0 = not learned yet (raw head, today's behavior).
+        static PCM_LATENCY_FRAMES: AtomicI64 = AtomicI64::new(0);
+
+        if self.stopped.load(Ordering::Acquire) {
+            return None;
+        }
+        let sample_rate = self.sample_rate as i64;
+        let vm = android_vm();
+        let track = self.track.lock().unwrap();
+        let res = vm.attach_current_thread(
+            |env| -> Result<(bool, i64, i64), jni::errors::Error> {
+                let head = env
+                    .call_method(
+                        track.as_obj(),
+                        jni::jni_str!("getPlaybackHeadPosition"),
+                        jni::jni_sig!("()I"),
+                        &[],
+                    )?
+                    .i()? as u32 as i64;
+                let ts = env.new_object(
+                    jni::jni_str!("android/media/AudioTimestamp"),
+                    jni::jni_sig!("()V"),
+                    &[],
+                )?;
+                let have_ts = env
+                    .call_method(
+                        track.as_obj(),
+                        jni::jni_str!("getTimestamp"),
+                        jni::jni_sig!("(Landroid/media/AudioTimestamp;)Z"),
+                        &[(&ts).into()],
+                    )?
+                    .z()?;
+                if have_ts {
+                    let frame_pos = env
+                        .get_field(&ts, jni::jni_str!("framePosition"), jni::jni_sig!("J"))?
+                        .j()?;
+                    let nano_time = env
+                        .get_field(&ts, jni::jni_str!("nanoTime"), jni::jni_sig!("J"))?
+                        .j()?;
+                    let dt_ns = clock_monotonic_ns() - nano_time;
+                    // A stale timestamp (old nanoTime — e.g. pre-flush) would
+                    // extrapolate garbage; treat >1 s staleness as not valid.
+                    if dt_ns >= 0 && dt_ns < 1_000_000_000 {
+                        let presented = frame_pos + dt_ns * sample_rate / 1_000_000_000;
+                        return Ok((true, presented, head));
+                    }
+                }
+                Ok((false, head, head))
+            },
+        );
+        match res {
+            Ok((true, presented, head)) => {
+                // Sanity: presented can never exceed consumed. A post-flush
+                // transient where the timestamp still reflects the old track
+                // shows up as presented > head — ignore it and use the
+                // corrected head instead.
+                if presented <= head {
+                    let lat = head - presented;
+                    if lat < sample_rate * 2 {
+                        PCM_LATENCY_FRAMES.store(lat, Ordering::Relaxed);
+                    }
+                    Some(presented.max(0))
+                } else {
+                    let lat = PCM_LATENCY_FRAMES.load(Ordering::Relaxed);
+                    Some((head - lat).max(0))
+                }
+            }
+            Ok((false, head, _)) => {
+                let lat = PCM_LATENCY_FRAMES.load(Ordering::Relaxed);
+                Some((head - lat).max(0))
+            }
+            Err(_) => None,
+        }
+    }
+
     /// Cumulative presented-frame position as ms — the PCM clock source. `None`
     /// until the track is actually playing, so `MediaClock` uses the wall clock
     /// during startup (and if audio never starts, video still plays).
@@ -736,7 +839,7 @@ impl AudioTrackPcmSink {
         }
         let dropped = self.dropped_frames.load(Ordering::Acquire);
         let base = self.head_base.load(Ordering::Acquire);
-        self.head_frames()
+        self.presented_frames()
             .map(|frames| (base + frames.max(0) as u64 + dropped) * 1000 / self.sample_rate as u64)
     }
 

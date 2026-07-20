@@ -2477,6 +2477,7 @@ dependencies = [
  "ffmpeg-next",
  "ffmpeg-sys-next",
  "fontdue",
+ "futures-util",
  "glow",
  "hex",
  "iso8601-duration",

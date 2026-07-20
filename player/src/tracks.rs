@@ -14,10 +14,22 @@ use crate::tracks::text::{TextAdaptation, TextRepresenation};
 use crate::tracks::video::{VideoAdaptation, VideoRepresenation};
 use crate::utils::time::iso_to_std_duration;
 
+use futures_util::stream::{self, StreamExt, TryStreamExt};
 use iso8601_duration::Duration as IsoDuration;
 use segment::Segment;
 use std::error::Error;
 use std::time::Duration;
+
+/// prepare() network fan-out bounds. Every representation needs one sidx
+/// range GET (and, behind a link-resolving interceptor like BlackZone's,
+/// one CDN-resolution round trip in front of it). Doing them one at a time
+/// made prepare() cost ~2×N_reps serial round trips — the dominant share
+/// of time-to-first-frame on real manifests. Representations within an
+/// adaptation and adaptation sets themselves now download concurrently,
+/// bounded so a big ladder can't stampede the origin or the interceptor's
+/// blocking pool.
+const PREPARE_REP_CONCURRENCY: usize = 4;
+const PREPARE_ADAPTATION_CONCURRENCY: usize = 3;
 
 struct TracksResult {
     video: Vec<VideoAdaptation>,
@@ -381,7 +393,7 @@ impl Tracks {
         raw_mpd: &str,
         http: &HttpClient,
     ) -> Result<(VideoAdaptation, Vec<u32>), Box<dyn Error>> {
-        let mut video_representations: Vec<VideoRepresenation> = vec![];
+        let video_representations: Vec<VideoRepresenation>;
 
         // DASH lets @frameRate, @maxWidth, @maxHeight live either on the
         // AdaptationSet or on each Representation. Real-world manifests
@@ -437,17 +449,25 @@ impl Tracks {
 
         let adaptation_block = slice_adaptation_set(raw_mpd, adaptation.id);
 
-        let representations = &adaptation.representations;
-        for representation in representations {
-            let video_representation = Self::parse_video_representation(
-                base_url,
-                representation,
-                adaptation_block,
-                http,
-            )
-            .await?;
-            video_representations.push(video_representation);
-        }
+        // Concurrent (order-preserving) — see PREPARE_REP_CONCURRENCY.
+        // Errors cross the fan-out as String (Box<dyn Error> isn't Send and
+        // buffered() queues outputs, which would make prepare()'s future
+        // !Send); converted back at the edge.
+        let rep_futs: Vec<_> = adaptation
+            .representations
+            .iter()
+            .map(|representation| {
+                let fut = Self::parse_video_representation(
+                    base_url, representation, adaptation_block, http,
+                );
+                async move { fut.await.map_err(|e| e.to_string()) }
+            })
+            .collect();
+        video_representations = stream::iter(rep_futs)
+        .buffered(PREPARE_REP_CONCURRENCY)
+        .try_collect()
+        .await
+        .map_err(|e| -> Box<dyn Error> { e.into() })?;
 
         // Flatten serde's `Vec<Property>` to plain role-value strings.
         let roles = adaptation
@@ -482,7 +502,7 @@ impl Tracks {
         raw_mpd: &str,
         http: &HttpClient,
     ) -> Result<AudioAdaptation, Box<dyn Error>> {
-        let mut audio_representations: Vec<AudioRepresentation> = vec![];
+        let audio_representations: Vec<AudioRepresentation>;
 
         // @lang is optional in DASH (and often omitted on the single
         // audio adaptation of a mono-lingual stream). Treat absence as
@@ -497,17 +517,23 @@ impl Tracks {
 
         let adaptation_block = slice_adaptation_set(raw_mpd, adaptation.id);
 
-        let representations = &adaptation.representations;
-        for representation in representations {
-            let audio_representation = Self::parse_audio_representation(
-                base_url,
-                representation,
-                adaptation_block,
-                http,
-            )
-            .await?;
-            audio_representations.push(audio_representation);
-        }
+        // Concurrent (order-preserving) — see PREPARE_REP_CONCURRENCY.
+        // String errors across the fan-out; see the video note.
+        let rep_futs: Vec<_> = adaptation
+            .representations
+            .iter()
+            .map(|representation| {
+                let fut = Self::parse_audio_representation(
+                    base_url, representation, adaptation_block, http,
+                );
+                async move { fut.await.map_err(|e| e.to_string()) }
+            })
+            .collect();
+        audio_representations = stream::iter(rep_futs)
+        .buffered(PREPARE_REP_CONCURRENCY)
+        .try_collect()
+        .await
+        .map_err(|e| -> Box<dyn Error> { e.into() })?;
 
         let roles = adaptation
             .roles
@@ -529,9 +555,10 @@ impl Tracks {
         adaptation: &AdaptationSet,
         http: &HttpClient,
     ) -> Result<TextAdaptation, Box<dyn Error>> {
-        let mut text_representations: Vec<TextRepresenation> = vec![];
-
-        for representation in &adaptation.representations {
+        // Concurrent (order-preserving) — see PREPARE_REP_CONCURRENCY.
+        // String errors across the fan-out; see the video note.
+        let text_futs: Vec<_> = adaptation.representations.iter().map(|representation| {
+            let fut = async move {
             let url_base = base_url.to_string();
             let file_url = representation.base_url.value.to_string();
 
@@ -591,7 +618,7 @@ impl Tracks {
                 }
             }
 
-            text_representations.push(TextRepresenation {
+            Ok::<TextRepresenation, Box<dyn Error>>(TextRepresenation {
                 id: representation.id,
                 codecs: representation.codecs.clone().unwrap_or_default(),
                 mime_type: representation.mime_type.clone(),
@@ -602,8 +629,15 @@ impl Tracks {
                 segment_range,
                 segments,
                 single_file_url,
-            });
-        }
+            })
+        };
+            async move { fut.await.map_err(|e| e.to_string()) }
+        }).collect();
+        let text_representations: Vec<TextRepresenation> = stream::iter(text_futs)
+        .buffered(PREPARE_REP_CONCURRENCY)
+        .try_collect()
+        .await
+        .map_err(|e| -> Box<dyn Error> { e.into() })?;
 
         let lang = adaptation.lang.clone().unwrap_or_default();
         let roles = adaptation
@@ -634,37 +668,56 @@ impl Tracks {
             }
         };
 
+        // Partition adaptation sets by kind, then run all three kinds
+        // concurrently (each kind bounded, order preserved within a kind).
         // For video: collect (adaptation, switchable_with) so we can merge
-        // switching-equivalent adaptation sets after the loop.
-        let mut video_pairs: Vec<(VideoAdaptation, Vec<u32>)> = vec![];
-        let mut audio_adaptations: Vec<AudioAdaptation> = vec![];
-        let mut text_adaptations: Vec<TextAdaptation> = vec![];
-
-        let adaptation_sets = &period.adaptation_sets;
-        for adaptation in adaptation_sets {
-            let content_type = adaptation.content_type.as_str();
-            match content_type {
-                "video" => {
-                    let pair = Self::parse_video_adaptation(
-                        &base_url, adaptation, raw_mpd, http,
-                    )
-                    .await?;
-                    video_pairs.push(pair);
-                }
-                "audio" => {
-                    let value = Self::parse_audio_adaptation(
-                        &base_url, adaptation, raw_mpd, http,
-                    )
-                    .await?;
-                    audio_adaptations.push(value);
-                }
-                "text" => {
-                    let value = Self::parse_text_adaptation(&base_url, adaptation, http).await?;
-                    text_adaptations.push(value);
-                }
+        // switching-equivalent adaptation sets after the fan-out.
+        let mut video_sets = Vec::new();
+        let mut audio_sets = Vec::new();
+        let mut text_sets = Vec::new();
+        for adaptation in &period.adaptation_sets {
+            match adaptation.content_type.as_str() {
+                "video" => video_sets.push(adaptation),
+                "audio" => audio_sets.push(adaptation),
+                "text" => text_sets.push(adaptation),
                 other => log::warn!("AdaptationSet content_type {} ignored", other),
             }
         }
+
+        let base = &base_url;
+        let video_futs: Vec<_> = video_sets
+            .into_iter()
+            .map(|adaptation| {
+                let fut = Self::parse_video_adaptation(base, adaptation, raw_mpd, http);
+                async move { fut.await.map_err(|e| e.to_string()) }
+            })
+            .collect();
+        let audio_futs: Vec<_> = audio_sets
+            .into_iter()
+            .map(|adaptation| {
+                let fut = Self::parse_audio_adaptation(base, adaptation, raw_mpd, http);
+                async move { fut.await.map_err(|e| e.to_string()) }
+            })
+            .collect();
+        let text_futs: Vec<_> = text_sets
+            .into_iter()
+            .map(|adaptation| {
+                let fut = Self::parse_text_adaptation(base, adaptation, http);
+                async move { fut.await.map_err(|e| e.to_string()) }
+            })
+            .collect();
+        let (video_pairs, audio_adaptations, text_adaptations) = tokio::try_join!(
+            stream::iter(video_futs)
+                .buffered(PREPARE_ADAPTATION_CONCURRENCY)
+                .try_collect::<Vec<_>>(),
+            stream::iter(audio_futs)
+                .buffered(PREPARE_ADAPTATION_CONCURRENCY)
+                .try_collect::<Vec<_>>(),
+            stream::iter(text_futs)
+                .buffered(PREPARE_ADAPTATION_CONCURRENCY)
+                .try_collect::<Vec<_>>(),
+        )
+        .map_err(|e| -> Box<dyn Error> { e.into() })?;
 
         let video_adaptations = merge_switchable_adaptations(video_pairs);
 

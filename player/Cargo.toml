@@ -20,6 +20,7 @@ hex = { version = "0.4" }
 aes = { version = "0.9" }
 ctr = { version = "0.10" }
 async-trait = "0.1"
+futures-util = { version = "0.3", default-features = false, features = ["std", "alloc"] }
 arc-swap = "1.7"
 bytes = "1"
 rand = "0.8"

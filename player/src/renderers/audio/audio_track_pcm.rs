@@ -757,6 +757,20 @@ impl AudioTrackPcmSink {
         // Process-wide: seeks/heals rebuild the sink, the device latency
         // doesn't change. 0 = not learned yet (raw head, today's behavior).
         static PCM_LATENCY_FRAMES: AtomicI64 = AtomicI64::new(0);
+        // Rate limiter for the diagnostic clock log below (ns of last line).
+        static LAST_CLOCK_LOG_NS: AtomicI64 = AtomicI64::new(0);
+        let clock_log = |src: &str, head: i64, presented: i64, lat: i64| {
+            let now = clock_monotonic_ns();
+            let last = LAST_CLOCK_LOG_NS.load(Ordering::Relaxed);
+            if now - last > 5_000_000_000 {
+                LAST_CLOCK_LOG_NS.store(now, Ordering::Relaxed);
+                let rate = self.sample_rate.max(1) as i64;
+                log::info!(
+                    "[audio-pcm] clock src={} head={} presented={} lat={}f/{}ms",
+                    src, head, presented, lat, lat * 1000 / rate
+                );
+            }
+        };
 
         if self.stopped.load(Ordering::Acquire) {
             return None;
@@ -816,17 +830,94 @@ impl AudioTrackPcmSink {
                     if lat < sample_rate * 2 {
                         PCM_LATENCY_FRAMES.store(lat, Ordering::Relaxed);
                     }
+                    clock_log("ts", head, presented, lat);
                     Some(presented.max(0))
                 } else {
                     let lat = PCM_LATENCY_FRAMES.load(Ordering::Relaxed);
+                    clock_log("ts-transient", head, head - lat, lat);
                     Some((head - lat).max(0))
                 }
             }
             Ok((false, head, _)) => {
-                let lat = PCM_LATENCY_FRAMES.load(Ordering::Relaxed);
+                let mut lat = PCM_LATENCY_FRAMES.load(Ordering::Relaxed);
+                if lat == 0 {
+                    // No valid AudioTimestamp yet (some TV outputs never
+                    // deliver one for PCM) and nothing learned — seed the
+                    // latency from the hidden AudioTrack.getLatency(), the
+                    // same fallback ExoPlayer's position tracker uses. That
+                    // value includes the track's own buffer, which the head
+                    // has already consumed through, so subtract it.
+                    if let Some(l) = self.reflected_latency_frames() {
+                        lat = l;
+                        PCM_LATENCY_FRAMES.store(l, Ordering::Relaxed);
+                    }
+                }
+                clock_log("no-ts", head, head - lat, lat);
                 Some((head - lat).max(0))
             }
             Err(_) => None,
+        }
+    }
+
+    /// One-shot `AudioTrack.getLatency()` (hidden API, tolerated the same way
+    /// ExoPlayer uses it) minus the track buffer's own duration, in frames.
+    /// `None` when the method is unavailable or returns nonsense. Only ever
+    /// consulted while no `AudioTimestamp` has validated — a learned/measured
+    /// latency always wins.
+    fn reflected_latency_frames(&self) -> Option<i64> {
+        use std::sync::atomic::{AtomicBool, AtomicI64};
+        // The JNI lookup either works forever or never on a given device —
+        // don't re-attempt a failing hidden-API resolution on every clock read.
+        static ATTEMPTED: AtomicBool = AtomicBool::new(false);
+        static CACHED_FRAMES: AtomicI64 = AtomicI64::new(-1);
+        if ATTEMPTED.swap(true, Ordering::Relaxed) {
+            let f = CACHED_FRAMES.load(Ordering::Relaxed);
+            return (f >= 0).then_some(f);
+        }
+        if self.stopped.load(Ordering::Acquire) {
+            return None;
+        }
+        let sample_rate = self.sample_rate as i64;
+        let vm = android_vm();
+        let track = self.track.lock().unwrap();
+        let res = vm.attach_current_thread(|env| -> Result<i64, jni::errors::Error> {
+            // Hidden API — may throw NoSuchMethodError under hidden-api
+            // enforcement. Clear the pending exception so it can't poison
+            // the next JNI call on this thread.
+            let latency_ms = match env
+                .call_method(track.as_obj(), jni::jni_str!("getLatency"), jni::jni_sig!("()I"), &[])
+                .and_then(|v| v.i())
+            {
+                Ok(v) => v as i64,
+                Err(e) => {
+                    let _ = env.exception_clear();
+                    return Err(e);
+                }
+            };
+            let buffer_frames = env
+                .call_method(
+                    track.as_obj(),
+                    jni::jni_str!("getBufferSizeInFrames"),
+                    jni::jni_sig!("()I"),
+                    &[],
+                )?
+                .i()? as i64;
+            Ok(latency_ms * sample_rate / 1000 - buffer_frames)
+        });
+        match res {
+            Ok(frames) if frames > 0 && frames < sample_rate * 2 => {
+                log::info!(
+                    "[audio-pcm] getLatency() fallback: {}f ({}ms) after buffer subtraction",
+                    frames,
+                    frames * 1000 / sample_rate.max(1)
+                );
+                CACHED_FRAMES.store(frames, Ordering::Relaxed);
+                Some(frames)
+            }
+            _ => {
+                log::info!("[audio-pcm] getLatency() fallback unavailable");
+                None
+            }
         }
     }
 

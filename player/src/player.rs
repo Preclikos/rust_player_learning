@@ -176,6 +176,16 @@ struct StatsState {
     /// instead of draining its cpal queue and showing the user video
     /// frozen with audio still playing.
     video_starving: AtomicBool,
+    /// Deadline of the current planned track-swap "hole": the video
+    /// supervisor arms this right before tearing OLD's decoder down, while
+    /// NEW's first GOP is still being configured/decoded. While unexpired,
+    /// `video_sync_loop`'s 300 ms starvation timeout does NOT flip into
+    /// Buffering — the last frame stays on screen, audio keeps rolling, and
+    /// the LATE drain re-aligns video to the clock once NEW's frames land.
+    /// Without it every ABR switch whose configure+first-GOP exceeded 300 ms
+    /// flashed the buffering spinner and hiccuped audio. Expires on its own
+    /// so a genuinely wedged swap still surfaces as Buffering.
+    swap_grace_deadline: StdMutex<Option<Instant>>,
     /// Symmetric to `video_starving` — set by `audio_sync_loop` when
     /// IT hasn't received a frame for >300 ms. Video parks on its
     /// current frame instead of marching forward over silence.
@@ -717,6 +727,19 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
                     break f;
                 }
                 _ = &mut starvation_wait => {
+                    // Planned ABR/manual track swap: OLD's decoder is torn
+                    // down and NEW's first GOP is still decoding. Not a
+                    // network stall — hold the last frame and keep audio
+                    // rolling instead of flashing the buffering UI; the LATE
+                    // drain below re-aligns video once NEW's frames land.
+                    let in_swap_grace = stats
+                        .swap_grace_deadline
+                        .lock()
+                        .unwrap()
+                        .map_or(false, |d| Instant::now() < d);
+                    if in_swap_grace && !starving {
+                        continue;
+                    }
                     if !starving {
                         starving = true;
                         starvation_started = Some(Instant::now());
@@ -2943,6 +2966,11 @@ async fn video_supervisor(
     // accept (for this one swap) the old freeze rather than stalling forever on
     // a dead/slow segment.
     const PRIME_TIMEOUT: Duration = Duration::from_secs(8);
+    // How long av_sync tolerates the teardown→first-NEW-frame hole before its
+    // starvation detector may flip into Buffering. Configure + first-GOP is
+    // ~0.3–0.8 s (worst on MediaCodec direct); comfortably inside this. A swap
+    // that's genuinely wedged outlives the grace and buffers honestly.
+    const SWAP_GRACE: Duration = Duration::from_secs(3);
 
     loop {
         // Race: play-level stop, the current pipeline finishing on its own
@@ -3208,6 +3236,81 @@ async fn video_supervisor(
             .get(new_start)
             .map(|s| s.start_time().as_millis() as u64)
             .unwrap_or(0);
+
+        // --- step 2.6, renderer-path platforms only: warm handoff. Desktop
+        // hw decoders (D3D11VA/VAAPI/VideoToolbox) can coexist, unlike
+        // Android's single direct-mode MediaCodec slot — so configure NEW and
+        // decode its first GOP NOW, while OLD is still rendering toward the
+        // boundary, parking the decoded frames behind a gate. After OLD's
+        // teardown the gate opens and NEW's frames follow OLD's tail with no
+        // decoder spin-up in between. This *removes* the teardown→first-frame
+        // hole (~0.5 s of frozen picture on every ABR switch) instead of
+        // merely masking it (see swap_grace_deadline, which still covers the
+        // direct-mode path and any warm-up that outlives the boundary wait).
+        let mut new_pf = Some(new_pf);
+        // Never on Android: even the GL (non-direct) path decodes via
+        // MediaCodec, and a second concurrent 4K HEVC instance is not
+        // guaranteed on TV/mobile SoCs — the direct-mode ordering (teardown
+        // first) plus the swap grace window covers that platform instead.
+        let warm_capable = cfg!(not(target_os = "android")) && direct_window == 0;
+        let warm = if warm_capable && boundary_ms != 0 {
+            // Tiny gate on purpose: each held frame pins a surface from the
+            // decoder's fixed hw frame pool (D3D11VA/VAAPI), and holding a
+            // dozen while nothing drains exhausts the pool — send_packet then
+            // fails with ENOMEM and the whole pipeline falls into retry. Two
+            // held frames prove the decoder is configured and producing
+            // (that's all the warm-up needs); the decode task simply blocks on
+            // the gate until release, keeping the pool healthy.
+            let (gate_tx, mut gate_rx) =
+                tokio::sync::mpsc::channel::<DecodedVideoFrame>(2);
+            let release = Arc::new(Notify::new());
+            // Buffer-then-forward pump: holds whatever NEW decodes until the
+            // supervisor opens the gate (post-teardown), then becomes a plain
+            // forwarder into the main frame channel. If NEW's decode dies
+            // before release (stop/error), the gate closes and the pump just
+            // flushes and exits — the supervisor's retry handles the rest.
+            task::spawn({
+                let sender = frame_sender.clone();
+                let release = Arc::clone(&release);
+                async move {
+                    // Do NOT read the gate before release: draining it here
+                    // would defeat its backpressure and let NEW decode ahead
+                    // unboundedly — every decoded frame pins a surface in the
+                    // decoder's FIXED hw frame pool, which exhausts after ~19
+                    // frames and kills the pipeline with send_packet ENOMEM.
+                    // Parked like this, NEW blocks on the full gate with just
+                    // gate+reorder frames outstanding: configured, first GOP
+                    // decoded, pool healthy.
+                    release.notified().await;
+                    while let Some(f) = gate_rx.recv().await {
+                        if sender.send(f).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            });
+            // Splice exactly at the boundary: OLD's download is soft-capped to
+            // this segment index, so everything below the boundary is OLD's
+            // and NEW keeps the boundary frame up (the trim is `<=`, hence -1).
+            let splice_pts_us = boundary_ms as i64 * 1000 - 1;
+            let handle = task::spawn(run_decode(
+                new_pf.take().unwrap(),
+                gate_tx,
+                video_ready.clone(),
+                decoder_factory(),
+                Arc::clone(&stats),
+                new_flag.clone(),
+                Some(SwapSplice {
+                    started: Instant::now(),
+                    skip_below_pts_us: splice_pts_us,
+                }),
+                direct_window,
+                Arc::clone(&hdr_decode_8bit),
+            ));
+            Some((handle, release))
+        } else {
+            None
+        };
         // Begin the swap a touch before the boundary so NEW's first GOP is
         // decoded by the time OLD's buffered tail drains.
         const BOUNDARY_LEAD_MS: u64 = 150;
@@ -3230,6 +3333,12 @@ async fn video_supervisor(
                 _ = stop.notified() => {
                     new_flag.store(true, Ordering::Relaxed);
                     new_stop.notify_waiters();
+                    // Unblock a warm NEW decode parked on its full gate so it
+                    // can observe the flag and drop the HW decoder — otherwise
+                    // it (and the decoder slot) would leak past this stop.
+                    if let Some((_, release)) = warm.as_ref() {
+                        release.notify_one();
+                    }
                     cur_flag.store(true, Ordering::Relaxed);
                     cur_stop.notify_waiters();
                     let _ = cur_handle.await;
@@ -3260,6 +3369,11 @@ async fn video_supervisor(
         // belt-and-braces alongside the flag + notify. `cur_handle` is only
         // awaited if it didn't already finish above (a JoinHandle must not be
         // polled twice).
+        // From here until NEW's first frame reaches av_sync there is a planned
+        // frame hole; arm the grace window so the starvation detector doesn't
+        // flash Buffering + pause audio over it (the "spinner blink on every
+        // ABR switch").
+        *stats.swap_grace_deadline.lock().unwrap() = Some(Instant::now() + SWAP_GRACE);
         if !old_done {
             cur_soft_end.store(new_start, Ordering::Relaxed);
             cur_flag.store(true, Ordering::Relaxed);
@@ -3270,47 +3384,65 @@ async fn video_supervisor(
         } else {
             log::info!("[video gen {}] soft-swap: OLD repr {} already done", gen, current_repr.id);
         }
-        // Splice NEW onto OLD's tail at the last RENDERED pts so NEW resumes on
-        // the very next frame — forward-contiguous, no rewind and no future-PTS
-        // frame to wait on.
-        //
-        // This used to read `stats.last_decoded_pts_ms`, but that is the
-        // DOWNLOAD high-water (set in video_prefetch's segment-done callback),
-        // not the last frame OLD actually showed. On a low-bitrate OLD the
-        // downloader races many seconds ahead of the picture, so trimming NEW to
-        // it discarded every frame between the boundary and the download head —
-        // the renderer then had no frame at the current position and stalled
-        // ("[vsync] no frame → buffering") for seconds on every swap while audio
-        // (own clock) and the downloader kept running (the "everything plays but
-        // no frames reach the screen" freeze, on every platform). The render
-        // position (position_ms + origin, same expression the boundary wait
-        // above uses) is where OLD's picture actually is, so NEW splices there
-        // cleanly.
-        let rendered_abs_ms = position_ms.load(Ordering::Relaxed) + origin.as_millis() as u64;
-        let splice_pts_us = rendered_abs_ms as i64 * 1000;
-        log::info!(
-            "[abr] OLD torn down {}ms after switch; NEW trimmed to pts>{}ms",
-            swap_t0.elapsed().as_millis(),
-            splice_pts_us / 1000
-        );
-
-        // OLD's decoder is dropped now — safe to allocate NEW's.
-        let decode_t0 = Instant::now();
-        let decoder = decoder_factory();
-        cur_handle = task::spawn(run_decode(
-            new_pf,
-            frame_sender.clone(),
-            video_ready.clone(),
-            decoder,
-            Arc::clone(&stats),
-            new_flag.clone(),
-            Some(SwapSplice {
-                started: decode_t0,
-                skip_below_pts_us: splice_pts_us,
-            }),
-            direct_window,
-            Arc::clone(&hdr_decode_8bit),
-        ));
+        cur_handle = match warm {
+            // Warm handoff: NEW is already configured with its first GOP
+            // decoded and parked — just open the gate. Its frames land in the
+            // main channel right behind OLD's tail.
+            Some((handle, release)) => {
+                release.notify_one();
+                log::info!(
+                    "[abr] OLD torn down {}ms after switch; warm handoff gate opened",
+                    swap_t0.elapsed().as_millis()
+                );
+                handle
+            }
+            // Direct-mode path (single MediaCodec slot): NEW's decoder may
+            // only exist now that OLD's is dropped.
+            //
+            // Splice NEW onto OLD's tail at the last RENDERED pts so NEW
+            // resumes on the very next frame — forward-contiguous, no rewind
+            // and no future-PTS frame to wait on.
+            //
+            // This used to read `stats.last_decoded_pts_ms`, but that is the
+            // DOWNLOAD high-water (set in video_prefetch's segment-done
+            // callback), not the last frame OLD actually showed. On a
+            // low-bitrate OLD the downloader races many seconds ahead of the
+            // picture, so trimming NEW to it discarded every frame between the
+            // boundary and the download head — the renderer then had no frame
+            // at the current position and stalled ("[vsync] no frame →
+            // buffering") for seconds on every swap while audio (own clock)
+            // and the downloader kept running (the "everything plays but no
+            // frames reach the screen" freeze, on every platform). The render
+            // position (position_ms + origin, same expression the boundary
+            // wait above uses) is where OLD's picture actually is, so NEW
+            // splices there cleanly.
+            None => {
+                let rendered_abs_ms =
+                    position_ms.load(Ordering::Relaxed) + origin.as_millis() as u64;
+                let splice_pts_us = rendered_abs_ms as i64 * 1000;
+                log::info!(
+                    "[abr] OLD torn down {}ms after switch; NEW trimmed to pts>{}ms",
+                    swap_t0.elapsed().as_millis(),
+                    splice_pts_us / 1000
+                );
+                let decode_t0 = Instant::now();
+                let decoder = decoder_factory();
+                task::spawn(run_decode(
+                    new_pf.take().expect("new_pf unconsumed on non-warm path"),
+                    frame_sender.clone(),
+                    video_ready.clone(),
+                    decoder,
+                    Arc::clone(&stats),
+                    new_flag.clone(),
+                    Some(SwapSplice {
+                        started: decode_t0,
+                        skip_below_pts_us: splice_pts_us,
+                    }),
+                    direct_window,
+                    Arc::clone(&hdr_decode_8bit),
+                ))
+            }
+        };
         cur_stop = new_stop;
         cur_flag = new_flag;
         cur_soft_end = new_soft_end;

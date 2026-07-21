@@ -23,8 +23,8 @@ let package = Package(
         // the zip attached to that tag's GitHub Release.
         .binaryTarget(
             name: "RustPlayerFFI",
-            url: "https://github.com/Preclikos/rust_player_learning/releases/download/ios-v0.1.6/RustPlayerFFI.xcframework.zip",
-            checksum: "a9f305fec95559e91f0ac9a30c2063cdf2e79da93b774bcbcd11c52acb36bfe3"
+            url: "https://github.com/Preclikos/rust_player_learning/releases/download/ios-v0.1.7/RustPlayerFFI.xcframework.zip",
+            checksum: "b7a2218a5c28e0494d40be45c12e4bf954946900d50d98bdd2c5cfc9b16738c9"
         ),
         .target(
             name: "RustPlayer",

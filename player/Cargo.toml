@@ -146,6 +146,8 @@ webpki-roots = "1"
 # wgpu fork compiles it with at runtime — a typo in a .wgsl otherwise only
 # surfaces as a create_shader_module panic on the first rendered frame.
 naga = { git = "https://github.com/Preclikos/wgpu.git", features = ["wgsl-in"] }
+# Conformance soak harness (examples/conformance.rs) log output.
+env_logger = "0.11"
 
 [build-dependencies]
 cc = "1"

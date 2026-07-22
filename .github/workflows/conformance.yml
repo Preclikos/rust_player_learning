@@ -1,0 +1,167 @@
+# Playback conformance soak — Phase 1 of automated A/V validation.
+#
+# Runs examples/conformance.rs on the self-hosted desktop runners (real
+# GPUs: D3D11VA / VAAPI / VideoToolbox) against the CENC beep-flash DASH
+# asset (scripts/conformance/make-asset.ps1, published as the
+# `conformance-asset-v1` release). Fails when any playback-quality
+# threshold is exceeded: player errors, mid-play pipeline retries,
+# unexpected Buffering/EndOfStream, render gaps/bursts, A/V drift.
+#
+# Phase 2 (HDMI-capture lip-sync measurement on real TV hardware) plugs in
+# on top of the same asset — the flash+beep pairs are the measurement marks.
+name: conformance
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths:
+      - "player/**"
+      - ".github/workflows/conformance.yml"
+
+env:
+  ASSET_TAG: conformance-asset-v1
+  CLEARKEY: "00112233445566778899aabbccddeeff:0123456789abcdef0123456789abcdef"
+
+jobs:
+  windows:
+    runs-on: [self-hosted, Windows]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Ensure rust toolchain
+        shell: powershell
+        run: |
+          $cargoBin = "$env:USERPROFILE\.cargo\bin"
+          if (-not (Test-Path "$cargoBin\cargo.exe")) {
+            Invoke-WebRequest https://win.rustup.rs/x86_64 -OutFile "$env:TEMP\rustup-init.exe"
+            & "$env:TEMP\rustup-init.exe" -y --default-toolchain stable
+          }
+          Add-Content -Path $env:GITHUB_PATH -Value $cargoBin
+
+      - name: Fetch conformance asset
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          Remove-Item -Recurse -Force asset -ErrorAction SilentlyContinue
+          gh release download $env:ASSET_TAG -D asset
+          if ($LASTEXITCODE -ne 0) { throw "asset download failed" }
+
+      - name: Soak
+        shell: powershell
+        run: |
+          $srv = Start-Process python -ArgumentList "scripts\conformance\rangesrv.py","8123","asset" -PassThru -NoNewWindow
+          try {
+            Start-Sleep 2
+            cargo run --release --example conformance -p player -- `
+              http://127.0.0.1:8123/manifest.mpd --key $env:CLEARKEY `
+              --secs 90 --switches 3 --seeks 2
+            if ($LASTEXITCODE -ne 0) { throw "conformance FAILED" }
+          } finally {
+            Stop-Process -Id $srv.Id -Force -ErrorAction SilentlyContinue
+          }
+
+  linux:
+    runs-on: [self-hosted, Linux]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Ensure rust toolchain
+        run: |
+          set -e
+          if ! command -v "$HOME/.cargo/bin/cargo" >/dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          fi
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      # Same $HOME cache-clone trick as the desktop pipeline: checkout@v6
+      # cleans untracked files, so the vendored FFmpeg build must live
+      # outside the workspace to survive between runs.
+      - name: Vendored FFmpeg (player toolchain)
+        run: |
+          set -e
+          PLAYER_DIR="$HOME/blackzone-player-ffmpeg"
+          if [ ! -d "$PLAYER_DIR/.git" ]; then
+            git clone --depth 1 https://github.com/Preclikos/rust_player_learning.git "$PLAYER_DIR"
+          fi
+          (cd "$PLAYER_DIR" && bash player/scripts/build-ffmpeg.sh linux) || true
+          PREFIX="$PLAYER_DIR/player/vendor/linux-x64"
+          test -f "$PREFIX/lib/pkgconfig/libavcodec.pc" || { echo "vendored FFmpeg build failed"; exit 1; }
+          {
+            echo "PKG_CONFIG_PATH=$PREFIX/lib/pkgconfig"
+            echo "LD_LIBRARY_PATH=$PREFIX/lib"
+          } >> "$GITHUB_ENV"
+
+      - name: Fetch conformance asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          rm -rf asset
+          gh release download "$ASSET_TAG" -D asset
+
+      - name: Soak
+        run: |
+          set -e
+          python3 scripts/conformance/rangesrv.py 8123 asset &
+          SRV=$!
+          trap "kill $SRV 2>/dev/null || true" EXIT
+          sleep 2
+          cargo run --release --example conformance -p player -- \
+            http://127.0.0.1:8123/manifest.mpd --key "$CLEARKEY" \
+            --secs 90 --switches 3 --seeks 2
+
+  macos:
+    runs-on: [self-hosted, macOS]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Ensure rust toolchain
+        run: |
+          set -e
+          if ! command -v "$HOME/.cargo/bin/cargo" >/dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          fi
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Vendored FFmpeg (player toolchain)
+        run: |
+          set -e
+          case "$(uname -m)" in
+            arm64) ARCH=arm64 ;;
+            *) ARCH=x64 ;;
+          esac
+          PLAYER_DIR="$HOME/blackzone-player-ffmpeg"
+          if [ ! -d "$PLAYER_DIR/.git" ]; then
+            git clone --depth 1 https://github.com/Preclikos/rust_player_learning.git "$PLAYER_DIR"
+          fi
+          (cd "$PLAYER_DIR" && bash player/scripts/build-ffmpeg.sh "macos-$ARCH") || true
+          PREFIX="$PLAYER_DIR/player/vendor/macos-$ARCH"
+          test -f "$PREFIX/lib/pkgconfig/libavcodec.pc" || { echo "vendored FFmpeg build failed"; exit 1; }
+          {
+            echo "PKG_CONFIG_PATH=$PREFIX/lib/pkgconfig"
+            echo "PKG_CONFIG_ALLOW_CROSS=1"
+            echo "DYLD_LIBRARY_PATH=$PREFIX/lib"
+            echo "RUSTFLAGS=-L native=$PREFIX/lib"
+          } >> "$GITHUB_ENV"
+
+      - name: Fetch conformance asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          rm -rf asset
+          gh release download "$ASSET_TAG" -D asset
+
+      - name: Soak
+        run: |
+          set -e
+          python3 scripts/conformance/rangesrv.py 8123 asset &
+          SRV=$!
+          trap "kill $SRV 2>/dev/null || true" EXIT
+          sleep 2
+          cargo run --release --example conformance -p player -- \
+            http://127.0.0.1:8123/manifest.mpd --key "$CLEARKEY" \
+            --secs 90 --switches 3 --seeks 2

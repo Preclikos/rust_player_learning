@@ -111,6 +111,31 @@ const ASSUMED_SEGMENT_SECS: u32 = 2;
 /// Result of a starvation-state update — exposed by the helper so the
 /// caller can react to combined-state transitions (the moment EITHER
 /// side starts stalling, or the moment BOTH have recovered).
+/// Session-cumulative playback-quality gauges. See
+/// [`Player::conformance_summary`]. All counters monotonically accumulate for
+/// the Player's lifetime; thresholds belong to the harness, not here.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ConformanceSummary {
+    /// Buffering{Stall} transitions (either A/V side): user-visible spinners.
+    pub stall_events: u64,
+    /// Total wall ms spent in video-side starvation.
+    pub stall_ms_total: u64,
+    /// Mid-play pipeline rebuilds after failures — >0 means playback died
+    /// and self-healed, a regression even when barely visible.
+    pub pipeline_retries: u64,
+    /// Max wall gap between consecutive rendered frames, ms (pause- and
+    /// accounted-stall-corrected): freeze / swap-hole depth.
+    pub render_gap_max_ms: u64,
+    /// Frames rendered <5 ms apart (catch-up bursts). A few per LATE drain
+    /// are normal; hundreds mean flicker/pacing regressions.
+    pub render_burst_frames: u64,
+    /// Max |A/V drift| observed, ms.
+    pub av_drift_max_ms: i64,
+    pub video_frames_decoded: u64,
+    pub video_frames_dropped: u64,
+    pub audio_underruns: u64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StarvationTransition {
     /// Combined state didn't change — either still healthy or still
@@ -217,6 +242,29 @@ struct StatsState {
     diag_video_seg: AtomicU64,
     /// Video frames rendered by the vsync loop.
     diag_video_ren: AtomicU64,
+
+    // ---- conformance counters (see Player::conformance_summary) -------------
+    // Session-cumulative gauges a soak harness asserts thresholds against.
+    // Everything user-visible that ALSO surfaces as an event (Buffering,
+    // Error, EndOfStream, TrackChanged) is counted by the harness from the
+    // event stream instead — these cover what events can't see.
+    /// Times a Buffering{Stall} transition fired (either A/V side) — each is
+    /// a user-visible spinner + audio pause.
+    stall_events: AtomicU64,
+    /// Total wall ms spent in video-side starvation (stall depth, not count).
+    stall_ms_total: AtomicU64,
+    /// Supervisor mid-play pipeline rebuilds after failures. Anything > 0
+    /// means playback died and self-healed — a red flag even when the user
+    /// barely noticed (e.g. the warm-handoff ENOMEM loop).
+    pipeline_retries: AtomicU64,
+    /// Max wall gap between consecutive rendered frames, ms (pause- and
+    /// accounted-stall-corrected). Freeze / swap-hole detector.
+    render_gap_max_ms: AtomicU64,
+    /// Frames rendered <5 ms after their predecessor — catch-up bursts.
+    /// A handful per LATE drain is normal; hundreds = flicker/pacing bug.
+    render_burst_frames: AtomicU64,
+    /// Max |A/V drift| observed, ms.
+    av_drift_max_ms: std::sync::atomic::AtomicI64,
 }
 
 pub struct Player<V: VideoSink = VideoRenderer, A: AudioSink = AudioRenderer> {
@@ -417,6 +465,7 @@ fn report_starvation(
         };
     let is_buffering = other_starving || starving;
     if !was_buffering && is_buffering {
+        stats.stall_events.fetch_add(1, Ordering::Relaxed);
         StarvationTransition::EnteredBuffering
     } else if was_buffering && !is_buffering {
         StarvationTransition::ExitedBuffering
@@ -703,6 +752,7 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
                             .map(|t| t.elapsed().as_millis() as u64)
                             .unwrap_or(0);
                         log::info!("[vsync] starvation recovered after {}ms", waited);
+                        stats.stall_ms_total.fetch_add(waited, Ordering::Relaxed);
                         // Roll the wall clock back by the time we sat
                         // starving so the recovering frame's pts_ms
                         // isn't declared LATE by however many ms we
@@ -946,6 +996,15 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
         }
         let interval_ms = if last_render_elapsed > 0 { render_start - last_render_elapsed } else { 0 };
         let delta_pts = pts_ms.saturating_sub(last_pts_ms);
+        // Conformance cadence gauges: max render gap = freeze/swap-hole depth,
+        // sub-5ms renders = catch-up bursts (a few per LATE drain are normal,
+        // hundreds mean flicker/pacing regressions).
+        if last_render_elapsed > 0 {
+            stats.render_gap_max_ms.fetch_max(interval_ms, Ordering::Relaxed);
+            if interval_ms < 5 {
+                stats.render_burst_frames.fetch_add(1, Ordering::Relaxed);
+            }
+        }
 
         // DIAG: per-frame pacing. interval_ms = wall ms between renders (~41 at
         // 24fps; jitter here = judder), elapsed = master clock, pts_to_go = the
@@ -1030,6 +1089,7 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
             let mut drift_out: Option<i64> = None;
             if drift_min_window != i64::MAX {
                 stats.av_drift_ms.store(drift_min_window, Ordering::Relaxed);
+                stats.av_drift_max_ms.fetch_max(drift_min_window.abs(), Ordering::Relaxed);
                 drift_out = Some(drift_min_window);
                 if drift_min_window.abs() > 150
                     && last_drift_warn
@@ -3010,6 +3070,7 @@ async fn video_supervisor(
                     }
                     last_fail_pos_ms = pos_now;
                     retry_attempt += 1;
+                    stats.pipeline_retries.fetch_add(1, Ordering::Relaxed);
                     if retry_attempt > MAX_PIPELINE_RETRIES {
                         log::error!(
                             "[video] supervisor: {} consecutive pipeline failures — giving up at {}ms",
@@ -3856,6 +3917,27 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
     ) {
         *self.audio_adaptation.lock().unwrap() = Some(adaptation.clone());
         *self.audio_representation.lock().unwrap() = Some(representation.clone());
+    }
+
+    /// Session-cumulative conformance gauges for automated soak testing (the
+    /// counters run for the Player's lifetime, across seeks and track
+    /// switches). A harness plays a scenario, reads this once at the end and
+    /// asserts thresholds; everything user-visible that surfaces as an event
+    /// (Buffering, Error, EndOfStream, TrackChanged) is expected to be
+    /// counted from the event stream instead.
+    pub fn conformance_summary(&self) -> ConformanceSummary {
+        let s = &self.stats;
+        ConformanceSummary {
+            stall_events: s.stall_events.load(Ordering::Relaxed),
+            stall_ms_total: s.stall_ms_total.load(Ordering::Relaxed),
+            pipeline_retries: s.pipeline_retries.load(Ordering::Relaxed),
+            render_gap_max_ms: s.render_gap_max_ms.load(Ordering::Relaxed),
+            render_burst_frames: s.render_burst_frames.load(Ordering::Relaxed),
+            av_drift_max_ms: s.av_drift_max_ms.load(Ordering::Relaxed),
+            video_frames_decoded: s.video_frames_decoded.load(Ordering::Relaxed),
+            video_frames_dropped: s.video_frames_dropped.load(Ordering::Relaxed),
+            audio_underruns: s.audio_underruns.load(Ordering::Relaxed),
+        }
     }
 
     pub fn current_video_representation(&self) -> Option<VideoRepresenation> {

@@ -161,6 +161,7 @@ struct EventCounters {
     errors: AtomicU64,
     eos: AtomicU64,
     video_track_changes: AtomicU64,
+    first_error: std::sync::Mutex<Option<String>>,
 }
 
 #[tokio::main]
@@ -217,6 +218,11 @@ async fn main() {
                         },
                         PlayerEvent::Error { kind, detail } => {
                             counters.errors.fetch_add(1, Ordering::Relaxed);
+                            counters
+                                .first_error
+                                .lock()
+                                .unwrap()
+                                .get_or_insert_with(|| detail.clone());
                             eprintln!("[conformance] EVENT Error({kind:?}): {detail}");
                         }
                         PlayerEvent::EndOfStream => {
@@ -295,6 +301,18 @@ async fn main() {
     let errors = counters.errors.load(Ordering::Relaxed);
     let eos = counters.eos.load(Ordering::Relaxed);
     let allowed_stalls = args.allowed_stalls.unwrap_or(args.seeks as u64);
+
+    // Environment, not player: a machine without a usable HW decoder (no
+    // /dev/dri render node, missing driver) can't play anything at all —
+    // report a SKIP so the lane is green-but-honest instead of failing on
+    // every run until the machine grows a GPU.
+    if s.video_frames_decoded == 0 {
+        let first = counters.first_error.lock().unwrap().clone().unwrap_or_default();
+        if first.contains("av_hwdevice_ctx_create") {
+            println!("CONFORMANCE_SKIP no-hw-decoder: {first}");
+            std::process::exit(0);
+        }
+    }
 
     println!(
         "CONFORMANCE_JSON {{\"platform\":\"{}\",\"secs\":{},\"stall_events\":{},\"stall_buffering_events\":{},\"stall_ms_total\":{},\"pipeline_retries\":{},\"render_gap_max_ms\":{},\"render_burst_frames\":{},\"av_drift_max_ms\":{},\"frames_decoded\":{},\"frames_dropped\":{},\"audio_underruns\":{},\"errors\":{},\"eos\":{},\"video_track_changes\":{}}}",

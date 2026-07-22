@@ -40,6 +40,7 @@ struct Args {
     max_gap_ms: u64,
     max_drift_ms: i64,
     max_bursts: u64,
+    max_judder_pct: f64,
     allowed_stalls: Option<u64>,
 }
 
@@ -54,6 +55,7 @@ fn parse_args() -> Args {
         max_gap_ms: 700,
         max_drift_ms: 100,
         max_bursts: 200,
+        max_judder_pct: 5.0,
         allowed_stalls: None,
     };
     while let Some(arg) = it.next() {
@@ -70,6 +72,9 @@ fn parse_args() -> Args {
             "--max-gap-ms" => a.max_gap_ms = val("--max-gap-ms").parse().expect("--max-gap-ms"),
             "--max-drift-ms" => a.max_drift_ms = val("--max-drift-ms").parse().expect("--max-drift-ms"),
             "--max-bursts" => a.max_bursts = val("--max-bursts").parse().expect("--max-bursts"),
+            "--max-judder-pct" => {
+                a.max_judder_pct = val("--max-judder-pct").parse().expect("--max-judder-pct")
+            }
             "--allowed-stalls" => {
                 a.allowed_stalls = Some(val("--allowed-stalls").parse().expect("--allowed-stalls"))
             }
@@ -315,7 +320,7 @@ async fn main() {
     }
 
     println!(
-        "CONFORMANCE_JSON {{\"platform\":\"{}\",\"secs\":{},\"stall_events\":{},\"stall_buffering_events\":{},\"stall_ms_total\":{},\"pipeline_retries\":{},\"render_gap_max_ms\":{},\"render_burst_frames\":{},\"av_drift_max_ms\":{},\"frames_decoded\":{},\"frames_dropped\":{},\"audio_underruns\":{},\"errors\":{},\"eos\":{},\"video_track_changes\":{}}}",
+        "CONFORMANCE_JSON {{\"platform\":\"{}\",\"secs\":{},\"stall_events\":{},\"stall_buffering_events\":{},\"stall_ms_total\":{},\"pipeline_retries\":{},\"render_gap_max_ms\":{},\"render_burst_frames\":{},\"judder_frames\":{},\"av_drift_max_ms\":{},\"frames_decoded\":{},\"frames_dropped\":{},\"audio_underruns\":{},\"errors\":{},\"eos\":{},\"video_track_changes\":{}}}",
         std::env::consts::OS,
         args.secs,
         s.stall_events,
@@ -324,6 +329,7 @@ async fn main() {
         s.pipeline_retries,
         s.render_gap_max_ms,
         s.render_burst_frames,
+        s.judder_frames,
         s.av_drift_max_ms,
         s.video_frames_decoded,
         s.video_frames_dropped,
@@ -363,6 +369,19 @@ async fn main() {
         "render-bursts",
         s.render_burst_frames <= args.max_bursts,
         format!("{} sub-5ms renders (limit {})", s.render_burst_frames, args.max_bursts),
+    );
+    let judder_pct = if s.video_frames_decoded > 0 {
+        s.judder_frames as f64 * 100.0 / s.video_frames_decoded as f64
+    } else {
+        0.0
+    };
+    check(
+        "judder",
+        judder_pct <= args.max_judder_pct,
+        format!(
+            "{} frames >±10 ms off cadence = {:.1}% (limit {:.0}%)",
+            s.judder_frames, judder_pct, args.max_judder_pct
+        ),
     );
     check(
         "av-drift",

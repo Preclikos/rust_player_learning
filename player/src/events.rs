@@ -85,6 +85,9 @@ pub enum PlayerEvent {
         pipeline_retries: u64,
         /// Worst frame-to-frame render gap seen this session, ms.
         render_gap_max_ms: u64,
+        /// Frames whose render interval deviated from their media delta by
+        /// >±10 ms this session (micro-stutter detector).
+        judder_frames: u64,
         /// Measured segment-download throughput EWMA, bits per second (the
         /// number the ABR engine decides on).
         bandwidth_bps: u64,

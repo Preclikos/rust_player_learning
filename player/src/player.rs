@@ -131,6 +131,9 @@ pub struct ConformanceSummary {
     pub render_burst_frames: u64,
     /// Max |A/V drift| observed, ms.
     pub av_drift_max_ms: i64,
+    /// Frames whose render interval deviated from their media delta by
+    /// >±10 ms (micro-stutter / judder).
+    pub judder_frames: u64,
     pub video_frames_decoded: u64,
     pub video_frames_dropped: u64,
     pub audio_underruns: u64,
@@ -268,6 +271,11 @@ struct StatsState {
     /// Sequence number of the video segment most recently handed to the
     /// decoder (Stats/debug-HUD "where we are").
     video_segment_id: AtomicU64,
+    /// Frames whose wall render interval deviated from their media delta by
+    /// more than ±10 ms (micro-stutter / judder detector). A 24p frame is due
+    /// every ~42 ms; rendering it at 30 or 55 ms is exactly the "obraz se
+    /// mikrotrhá" a viewer perceives even when nothing is dropped.
+    judder_frames: AtomicU64,
 }
 
 pub struct Player<V: VideoSink = VideoRenderer, A: AudioSink = AudioRenderer> {
@@ -1007,6 +1015,15 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
             if interval_ms < 5 {
                 stats.render_burst_frames.fetch_add(1, Ordering::Relaxed);
             }
+            // Judder: the wall interval should track the media delta. Guard to
+            // steady-state (sane consecutive deltas) so seeks, splices and
+            // segment boundaries don't count as stutter.
+            if delta_pts > 0 && delta_pts < 100 {
+                let jitter = interval_ms as i64 - delta_pts as i64;
+                if jitter.abs() > 10 {
+                    stats.judder_frames.fetch_add(1, Ordering::Relaxed);
+                }
+            }
         }
 
         // DIAG: per-frame pacing. interval_ms = wall ms between renders (~41 at
@@ -1135,6 +1152,7 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
                 stall_events: stats.stall_events.load(Ordering::Relaxed),
                 pipeline_retries: stats.pipeline_retries.load(Ordering::Relaxed),
                 render_gap_max_ms: stats.render_gap_max_ms.load(Ordering::Relaxed),
+                judder_frames: stats.judder_frames.load(Ordering::Relaxed),
                 bandwidth_bps: stats.bandwidth_bps_ewma.load(Ordering::Relaxed),
             });
 
@@ -3600,6 +3618,25 @@ impl Player<VideoRenderer, AudioRenderer> {
         video_renderer: Arc<VideoRenderer>,
         audio_renderer: Arc<AudioRenderer>,
     ) -> Self {
+        // Windows ships a ~15.6 ms default timer resolution and (since Win10
+        // 2004) keeps unfocused/background processes on the coarse timer
+        // unless they opt in. Every pacing sleep in the vsync loop then wakes
+        // up to ~15 ms late — measured as ~11% of frames >±10 ms off their
+        // media cadence (the "obraz se mikrotrhá" report). One process-wide
+        // timeBeginPeriod(1) restores millisecond wakeups for the process
+        // lifetime (the OS releases it at exit).
+        #[cfg(target_os = "windows")]
+        {
+            static TIMER_RES: std::sync::Once = std::sync::Once::new();
+            TIMER_RES.call_once(|| {
+                #[link(name = "winmm")]
+                extern "system" {
+                    fn timeBeginPeriod(u_period: u32) -> u32;
+                }
+                let r = unsafe { timeBeginPeriod(1) };
+                log::info!("[player] timeBeginPeriod(1) -> {}", r);
+            });
+        }
         let start_time = Arc::new(Instant::now());
 
         let video_ready = Arc::new(Notify::new());
@@ -3952,6 +3989,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             render_gap_max_ms: s.render_gap_max_ms.load(Ordering::Relaxed),
             render_burst_frames: s.render_burst_frames.load(Ordering::Relaxed),
             av_drift_max_ms: s.av_drift_max_ms.load(Ordering::Relaxed),
+            judder_frames: s.judder_frames.load(Ordering::Relaxed),
             video_frames_decoded: s.video_frames_decoded.load(Ordering::Relaxed),
             video_frames_dropped: s.video_frames_dropped.load(Ordering::Relaxed),
             audio_underruns: s.audio_underruns.load(Ordering::Relaxed),

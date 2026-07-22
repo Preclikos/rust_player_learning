@@ -69,6 +69,25 @@ pub enum PlayerEvent {
         /// can't report playback position). Expect a slow linear trend
         /// from crystal mismatch; jumps indicate sync bugs.
         av_drift_ms: Option<i64>,
+        /// Media ms buffered ahead of the rendered position on the VIDEO
+        /// side (downloaded counts as buffered — decode is local; same
+        /// semantics as `Position.buffered_ahead_secs`, which carries only
+        /// the min of the two sides). Debug-HUD granularity.
+        video_buffer_ahead_ms: i64,
+        /// Same for the audio pipeline.
+        audio_buffer_ahead_ms: i64,
+        /// Sequence number of the video segment most recently handed to
+        /// the decoder — "where we are" in the stream (debug HUD).
+        video_segment: u64,
+        /// Cumulative Buffering{Stall} transitions this session (spinners).
+        stall_events: u64,
+        /// Cumulative mid-play pipeline rebuilds after failures.
+        pipeline_retries: u64,
+        /// Worst frame-to-frame render gap seen this session, ms.
+        render_gap_max_ms: u64,
+        /// Measured segment-download throughput EWMA, bits per second (the
+        /// number the ABR engine decides on).
+        bandwidth_bps: u64,
     },
     /// End of media reached.
     EndOfStream,

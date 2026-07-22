@@ -265,6 +265,9 @@ struct StatsState {
     render_burst_frames: AtomicU64,
     /// Max |A/V drift| observed, ms.
     av_drift_max_ms: std::sync::atomic::AtomicI64,
+    /// Sequence number of the video segment most recently handed to the
+    /// decoder (Stats/debug-HUD "where we are").
+    video_segment_id: AtomicU64,
 }
 
 pub struct Player<V: VideoSink = VideoRenderer, A: AudioSink = AudioRenderer> {
@@ -1110,6 +1113,13 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
             let decoded_total = stats.video_frames_decoded.load(Ordering::Relaxed);
             let dropped_total = stats.video_frames_dropped.load(Ordering::Relaxed);
             let net_stall = stats.net_stall_ms.swap(0, Ordering::Relaxed);
+            // Per-side buffer depth relative to the frame being rendered
+            // (absolute media pts on both sides). Negative = decoder behind
+            // the picture (imminent starvation).
+            let v_ahead =
+                stats.last_decoded_pts_ms.load(Ordering::Relaxed) - raw_pts_ms as i64;
+            let a_ahead =
+                stats.audio_last_decoded_pts_ms.load(Ordering::Relaxed) - raw_pts_ms as i64;
             let _ = events.send(PlayerEvent::Stats {
                 video_frames_decoded: decoded_total,
                 video_frames_dropped: dropped_total,
@@ -1119,6 +1129,13 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
                 current_resolution: Some((frame_w, frame_h)),
                 audio_peak_db: audio_sink.last_peak_db(),
                 av_drift_ms: drift_out,
+                video_buffer_ahead_ms: v_ahead,
+                audio_buffer_ahead_ms: a_ahead,
+                video_segment: stats.video_segment_id.load(Ordering::Relaxed),
+                stall_events: stats.stall_events.load(Ordering::Relaxed),
+                pipeline_retries: stats.pipeline_retries.load(Ordering::Relaxed),
+                render_gap_max_ms: stats.render_gap_max_ms.load(Ordering::Relaxed),
+                bandwidth_bps: stats.bandwidth_bps_ewma.load(Ordering::Relaxed),
             });
 
             // HEALTH heartbeat: a single warn line per second WHEN something
@@ -1651,6 +1668,7 @@ async fn video_decoder_task(
         }
         log::debug!("[dec] consuming video segment: {}", prepared.id);
         stats.diag_video_seg.fetch_add(1, Ordering::Relaxed);
+        stats.video_segment_id.store(prepared.id as u64, Ordering::Relaxed);
         let data_vec = prepared.data_vec;
         let sample_info = prepared.sample_info;
 

@@ -25,6 +25,15 @@ class RustPlayer(private val context: Context) {
         fun onVideoSize(width: Int, height: Int) {}
         fun onEnded() {}
         fun onError(kind: String, detail: String) {}
+
+        /**
+         * Raw 1 Hz stats JSON (debug-HUD food): decoder, frames
+         * decoded/dropped, av_drift_ms, video/audio_buffer_ahead_ms,
+         * video_segment, stall_events, pipeline_retries, render_gap_max_ms,
+         * net_stall_ms, width/height. Fields are additive across versions -
+         * parse with opt*().
+         */
+        fun onStats(json: String) {}
     }
 
     var listener: Listener? = null
@@ -182,10 +191,16 @@ class RustPlayer(private val context: Context) {
             "paused" -> l.onPaused()
             "buffering" -> l.onBuffering()
             "position" -> l.onPosition(o.optLong("position_ms"), o.optLong("duration_ms"))
-            "video_size", "stats" -> {
+            "video_size" -> {
                 val w = o.optInt("width")
                 val h = o.optInt("height")
                 if (w > 0 && h > 0) l.onVideoSize(w, h)
+            }
+            "stats" -> {
+                val w = o.optInt("width")
+                val h = o.optInt("height")
+                if (w > 0 && h > 0) l.onVideoSize(w, h)
+                l.onStats(json)
             }
             "end_of_stream" -> l.onEnded()
             "error" -> l.onError(o.optString("kind"), o.optString("detail"))

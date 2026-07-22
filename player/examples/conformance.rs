@@ -102,14 +102,24 @@ async fn headless_gpu() -> (wgpu::Device, wgpu::Queue, wgpu::Backend) {
         backend_options: wgpu::BackendOptions::default(),
         display: None,
     });
-    let adapter = instance
+    let adapter = match instance
         .request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: None,
             force_fallback_adapter: false,
         })
         .await
-        .expect("no wgpu adapter");
+    {
+        Ok(a) => a,
+        Err(e) => {
+            // Headless session without GPU access (e.g. a runner service
+            // outside the GUI session — Metal offers no adapter there).
+            // Not a playback failure: report a SKIP so CI stays green but
+            // the gap is visible in the log.
+            println!("CONFORMANCE_SKIP no-gpu-adapter: {e}");
+            std::process::exit(0);
+        }
+    };
     let backend = adapter.get_info().backend;
     let desired = if backend == wgpu::Backend::Metal {
         wgpu::Features::TEXTURE_FORMAT_16BIT_NORM

@@ -203,6 +203,72 @@ async fn start_audio(
     stop.notified().block_on();
 }
 
+/// Device-less audio path: a plain thread drains the sample channel at
+/// real-time pace (48 kHz packed stereo — the resampler's output format for
+/// the rate we report back), honoring pause/flush and counting consumption
+/// exactly like the cpal callback would. Everything downstream behaves as if
+/// a perfect silent device were attached; video plays, nothing is audible.
+fn start_null_sink(
+    mut sample_receiver: Receiver<f32>,
+    mut command_receiver: Receiver<AudioRendererCommand>,
+    stop: Arc<Notify>,
+    flush_flag: Arc<AtomicBool>,
+    paused_flag: Arc<AtomicBool>,
+    samples_consumed: Arc<AtomicU64>,
+) {
+    std::thread::Builder::new()
+        .name("bz-audio-null".into())
+        .spawn(move || {
+            const RATE: f64 = 48_000.0 * 2.0; // samples/sec, packed stereo
+            let tick = std::time::Duration::from_millis(10);
+            let mut credit = 0f64;
+            let mut last = std::time::Instant::now();
+            loop {
+                std::thread::sleep(tick);
+                if flush_flag.swap(false, Ordering::Relaxed) {
+                    while sample_receiver.try_recv().is_ok() {}
+                }
+                let now = std::time::Instant::now();
+                if paused_flag.load(Ordering::Relaxed) {
+                    last = now;
+                    continue;
+                }
+                credit += now.duration_since(last).as_secs_f64() * RATE;
+                last = now;
+                // Cap the backlog so a long descheduled stretch can't trigger
+                // a burst-drain (mirrors a real device's bounded buffer).
+                credit = credit.min(RATE);
+                let mut consumed = 0u64;
+                while credit >= 1.0 {
+                    match sample_receiver.try_recv() {
+                        Ok(_) => {
+                            consumed += 1;
+                            credit -= 1.0;
+                        }
+                        Err(mpsc::error::TryRecvError::Empty) => break,
+                        Err(mpsc::error::TryRecvError::Disconnected) => return,
+                    }
+                }
+                if consumed > 0 {
+                    samples_consumed.fetch_add(consumed, Ordering::Relaxed);
+                }
+            }
+        })
+        .expect("spawn null audio thread");
+
+    tokio::spawn(async move {
+        #[allow(clippy::never_loop)]
+        while let Some(command) = command_receiver.recv().await {
+            match command {
+                AudioRendererCommand::Stop => {
+                    stop.notify_waiters();
+                    break;
+                }
+            }
+        }
+    });
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn start_thread(
     mut command_receiver: Receiver<AudioRendererCommand>,
@@ -215,9 +281,10 @@ pub(super) fn start_thread(
 ) -> (Sender<f32>, u32) {
     let (sample_sender, sample_receiver) = mpsc::channel::<f32>(192_000);
 
-    let device = cpal::default_host()
-        .default_output_device()
-        .expect("No output device");
+    // No usable audio output (headless CI runner, server, unplugged dock):
+    // don't panic the whole player — run a NULL sink that consumes samples at
+    // real-time pace so the pipeline flows and video plays silently.
+    let maybe_device = cpal::default_host().default_output_device();
 
     // Resolve the output rate + channel count.
     //
@@ -232,16 +299,32 @@ pub(super) fn start_thread(
     // headphones / AirPods). The resampler emits packed STEREO, so the
     // callback downmixes (L+R)/2 when the output is mono.
     #[cfg(target_os = "ios")]
-    let (out_rate, out_channels): (u32, u16) = (
-        ios_output_sample_rate().unwrap_or(48_000),
-        ios_output_channels().unwrap_or(2),
-    );
+    let resolved: Option<(Device, u32, u16)> = maybe_device.map(|d| {
+        (
+            d,
+            ios_output_sample_rate().unwrap_or(48_000),
+            ios_output_channels().unwrap_or(2),
+        )
+    });
     #[cfg(not(target_os = "ios"))]
-    let (out_rate, out_channels): (u32, u16) = {
-        let config: SupportedStreamConfig = device
-            .default_output_config()
-            .expect("Failed to get default config");
-        (config.sample_rate(), config.channels().max(1))
+    let resolved: Option<(Device, u32, u16)> = maybe_device.and_then(|d| {
+        let config: SupportedStreamConfig = d.default_output_config().ok()?;
+        let rc = (config.sample_rate(), config.channels().max(1));
+        Some((d, rc.0, rc.1))
+    });
+    let Some((device, out_rate, out_channels)) = resolved else {
+        log::warn!(
+            "[audio] no usable output device — NULL audio sink (silent playback, real-time drain)"
+        );
+        start_null_sink(
+            sample_receiver,
+            command_receiver,
+            stop,
+            flush_flag,
+            paused_flag,
+            samples_consumed,
+        );
+        return (sample_sender, 48_000);
     };
 
     log::info!("[audio] opening output {} Hz / {} ch", out_rate, out_channels);

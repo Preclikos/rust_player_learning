@@ -3248,11 +3248,16 @@ async fn video_supervisor(
         // merely masking it (see swap_grace_deadline, which still covers the
         // direct-mode path and any warm-up that outlives the boundary wait).
         let mut new_pf = Some(new_pf);
-        // Never on Android: even the GL (non-direct) path decodes via
-        // MediaCodec, and a second concurrent 4K HEVC instance is not
-        // guaranteed on TV/mobile SoCs — the direct-mode ordering (teardown
-        // first) plus the swap grace window covers that platform instead.
-        let warm_capable = cfg!(not(target_os = "android")) && direct_window == 0;
+        // Only where two concurrent HW decoder instances are verified safe:
+        // FFmpeg D3D11VA/VAAPI (Windows/Linux). Android is out — even the GL
+        // path decodes via MediaCodec and a second concurrent 4K instance is
+        // not guaranteed on TV/mobile SoCs. Apple (VideoToolbox) is out after
+        // a field report: the ios-v0.1.7 build with warm handoff enabled
+        // flickered — two VT sessions + parked CVPixelBuffers need their own
+        // validation before this can be re-enabled there. Everywhere else the
+        // swap grace window still hides the switch.
+        let warm_capable =
+            cfg!(any(target_os = "windows", target_os = "linux")) && direct_window == 0;
         let warm = if warm_capable && boundary_ms != 0 {
             // Tiny gate on purpose: each held frame pins a surface from the
             // decoder's fixed hw frame pool (D3D11VA/VAAPI), and holding a

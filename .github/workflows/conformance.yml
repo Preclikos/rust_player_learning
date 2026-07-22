@@ -24,45 +24,12 @@ env:
   CLEARKEY: "00112233445566778899aabbccddeeff:0123456789abcdef0123456789abcdef"
 
 jobs:
-  windows:
-    runs-on: [self-hosted, Windows]
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Ensure rust toolchain
-        shell: powershell
-        run: |
-          $cargoBin = "$env:USERPROFILE\.cargo\bin"
-          if (-not (Test-Path "$cargoBin\cargo.exe")) {
-            Invoke-WebRequest https://win.rustup.rs/x86_64 -OutFile "$env:TEMP\rustup-init.exe"
-            & "$env:TEMP\rustup-init.exe" -y --default-toolchain stable
-          }
-          Add-Content -Path $env:GITHUB_PATH -Value $cargoBin
-
-      - name: Fetch conformance asset
-        shell: powershell
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          Remove-Item -Recurse -Force asset -ErrorAction SilentlyContinue
-          gh release download $env:ASSET_TAG -D asset
-          if ($LASTEXITCODE -ne 0) { throw "asset download failed" }
-
-      - name: Soak
-        shell: powershell
-        run: |
-          $srv = Start-Process python -ArgumentList "scripts\conformance\rangesrv.py","8123","asset" -PassThru -NoNewWindow
-          try {
-            Start-Sleep 2
-            cargo run --release --example conformance -p player -- `
-              http://127.0.0.1:8123/manifest.mpd --key $env:CLEARKEY `
-              --secs 90 --switches 3 --seeks 2
-            if ($LASTEXITCODE -ne 0) { throw "conformance FAILED" }
-          } finally {
-            Stop-Process -Id $srv.Id -Force -ErrorAction SilentlyContinue
-          }
-
+  # TODO(runner): a Windows job belongs here (D3D11VA is the most-exercised
+  # path), but the Windows runner (DESKTOP-4I19ED1) is currently registered
+  # only to the BlackZoneDesktop repo — register it to this repo too
+  # (actions-runner config.cmd with a token from Settings → Actions →
+  # Runners → New self-hosted runner), then restore the job from git
+  # history. Until then Windows coverage = local runs of the harness.
   linux:
     runs-on: [self-hosted, Linux]
     timeout-minutes: 60

@@ -134,6 +134,8 @@ pub struct ConformanceSummary {
     /// Frames whose render interval deviated from their media delta by
     /// >±10 ms (micro-stutter / judder).
     pub judder_frames: u64,
+    /// Render-interval histogram, ms: [<25, 25–41, 42–58, >58].
+    pub interval_hist: [u64; 4],
     pub video_frames_decoded: u64,
     pub video_frames_dropped: u64,
     pub audio_underruns: u64,
@@ -276,6 +278,14 @@ struct StatsState {
     /// every ~42 ms; rendering it at 30 or 55 ms is exactly the "obraz se
     /// mikrotrhá" a viewer perceives even when nothing is dropped.
     judder_frames: AtomicU64,
+    /// Render-interval histogram, ms: <25 | 25–41 | 42–58 | >58. For 24p
+    /// content a clean cadence sits in 25–41/42–58; >58 = a skipped slot
+    /// the viewer can see. Same buckets as the desktop HUD's UI-layer
+    /// histogram so the two are comparable.
+    int_lt25: AtomicU64,
+    int_25_41: AtomicU64,
+    int_42_58: AtomicU64,
+    int_gt58: AtomicU64,
 }
 
 pub struct Player<V: VideoSink = VideoRenderer, A: AudioSink = AudioRenderer> {
@@ -1023,6 +1033,16 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
                 if jitter.abs() > 10 {
                     stats.judder_frames.fetch_add(1, Ordering::Relaxed);
                 }
+                let bucket = if interval_ms < 25 {
+                    &stats.int_lt25
+                } else if interval_ms <= 41 {
+                    &stats.int_25_41
+                } else if interval_ms <= 58 {
+                    &stats.int_42_58
+                } else {
+                    &stats.int_gt58
+                };
+                bucket.fetch_add(1, Ordering::Relaxed);
             }
         }
 
@@ -1153,6 +1173,12 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
                 pipeline_retries: stats.pipeline_retries.load(Ordering::Relaxed),
                 render_gap_max_ms: stats.render_gap_max_ms.load(Ordering::Relaxed),
                 judder_frames: stats.judder_frames.load(Ordering::Relaxed),
+                interval_hist: [
+                    stats.int_lt25.load(Ordering::Relaxed),
+                    stats.int_25_41.load(Ordering::Relaxed),
+                    stats.int_42_58.load(Ordering::Relaxed),
+                    stats.int_gt58.load(Ordering::Relaxed),
+                ],
                 bandwidth_bps: stats.bandwidth_bps_ewma.load(Ordering::Relaxed),
             });
 
@@ -3990,6 +4016,12 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             render_burst_frames: s.render_burst_frames.load(Ordering::Relaxed),
             av_drift_max_ms: s.av_drift_max_ms.load(Ordering::Relaxed),
             judder_frames: s.judder_frames.load(Ordering::Relaxed),
+            interval_hist: [
+                s.int_lt25.load(Ordering::Relaxed),
+                s.int_25_41.load(Ordering::Relaxed),
+                s.int_42_58.load(Ordering::Relaxed),
+                s.int_gt58.load(Ordering::Relaxed),
+            ],
             video_frames_decoded: s.video_frames_decoded.load(Ordering::Relaxed),
             video_frames_dropped: s.video_frames_dropped.load(Ordering::Relaxed),
             audio_underruns: s.audio_underruns.load(Ordering::Relaxed),

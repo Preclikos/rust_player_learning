@@ -320,7 +320,7 @@ async fn main() {
     }
 
     println!(
-        "CONFORMANCE_JSON {{\"platform\":\"{}\",\"secs\":{},\"stall_events\":{},\"stall_buffering_events\":{},\"stall_ms_total\":{},\"pipeline_retries\":{},\"render_gap_max_ms\":{},\"render_burst_frames\":{},\"judder_frames\":{},\"av_drift_max_ms\":{},\"frames_decoded\":{},\"frames_dropped\":{},\"audio_underruns\":{},\"errors\":{},\"eos\":{},\"video_track_changes\":{}}}",
+        "CONFORMANCE_JSON {{\"platform\":\"{}\",\"secs\":{},\"stall_events\":{},\"stall_buffering_events\":{},\"stall_ms_total\":{},\"pipeline_retries\":{},\"render_gap_max_ms\":{},\"render_burst_frames\":{},\"judder_frames\":{},\"interval_hist\":[{},{},{},{}],\"av_drift_max_ms\":{},\"frames_decoded\":{},\"frames_dropped\":{},\"audio_underruns\":{},\"errors\":{},\"eos\":{},\"video_track_changes\":{}}}",
         std::env::consts::OS,
         args.secs,
         s.stall_events,
@@ -330,6 +330,10 @@ async fn main() {
         s.render_gap_max_ms,
         s.render_burst_frames,
         s.judder_frames,
+        s.interval_hist[0],
+        s.interval_hist[1],
+        s.interval_hist[2],
+        s.interval_hist[3],
         s.av_drift_max_ms,
         s.video_frames_decoded,
         s.video_frames_dropped,

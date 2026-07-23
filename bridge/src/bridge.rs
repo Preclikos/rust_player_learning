@@ -514,12 +514,13 @@ pub fn event_to_json(ev: &PlayerEvent) -> String {
             pipeline_retries,
             render_gap_max_ms,
             judder_frames,
+            interval_hist,
             bandwidth_bps,
             ..
         } => {
             let (w, h) = current_resolution.unwrap_or((0, 0));
             format!(
-                r#"{{"type":"stats","frames_decoded":{},"frames_dropped":{},"audio_underruns":{},"net_stall_ms":{},"decoder":{},"width":{},"height":{},"av_drift_ms":{},"video_buffer_ahead_ms":{},"audio_buffer_ahead_ms":{},"video_segment":{},"stall_events":{},"pipeline_retries":{},"render_gap_max_ms":{},"judder_frames":{},"bandwidth_bps":{}}}"#,
+                r#"{{"type":"stats","frames_decoded":{},"frames_dropped":{},"audio_underruns":{},"net_stall_ms":{},"decoder":{},"width":{},"height":{},"av_drift_ms":{},"video_buffer_ahead_ms":{},"audio_buffer_ahead_ms":{},"video_segment":{},"stall_events":{},"pipeline_retries":{},"render_gap_max_ms":{},"judder_frames":{},"int_lt25":{},"int_25_41":{},"int_42_58":{},"int_gt58":{},"bandwidth_bps":{}}}"#,
                 video_frames_decoded,
                 video_frames_dropped,
                 audio_underruns,
@@ -535,6 +536,10 @@ pub fn event_to_json(ev: &PlayerEvent) -> String {
                 pipeline_retries,
                 render_gap_max_ms,
                 judder_frames,
+                interval_hist[0],
+                interval_hist[1],
+                interval_hist[2],
+                interval_hist[3],
                 bandwidth_bps
             )
         }

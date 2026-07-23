@@ -88,6 +88,9 @@ pub enum PlayerEvent {
         /// Frames whose render interval deviated from their media delta by
         /// >±10 ms this session (micro-stutter detector).
         judder_frames: u64,
+        /// Render-interval histogram, ms: [<25, 25–41, 42–58, >58]. >58 =
+        /// a skipped presentation slot (visible hitch).
+        interval_hist: [u64; 4],
         /// Measured segment-download throughput EWMA, bits per second (the
         /// number the ABR engine decides on).
         bandwidth_bps: u64,

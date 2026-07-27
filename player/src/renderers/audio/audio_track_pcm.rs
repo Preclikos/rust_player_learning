@@ -819,6 +819,14 @@ impl AudioTrackPcmSink {
                 Ok((false, head, head))
             },
         );
+        // The JNI closure above is the guard's only user. Release it before the
+        // match: the no-timestamp arm calls reflected_latency_frames(), which
+        // locks `track` again, and this mutex is not reentrant — holding on
+        // here deadlocks the clock thread against itself, permanently, while
+        // still holding the guard. Every other track user (the writer's
+        // check_stall → head_frames, set_paused, played_ms) then piles up
+        // behind it and playback wedges with no crash and no ANR.
+        drop(track);
         match res {
             Ok((true, presented, head)) => {
                 // Sanity: presented can never exceed consumed. A post-flush

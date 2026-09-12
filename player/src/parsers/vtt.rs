@@ -142,7 +142,7 @@ fn parse_cue_block(block: &str) -> Option<VttCue> {
         if !text.is_empty() {
             text.push('\n');
         }
-        text.push_str(&strip_inline_tags(line));
+        text.push_str(&clean_cue_line(line));
     }
 
     if text.is_empty() {
@@ -173,6 +173,12 @@ fn parse_timestamp(s: &str) -> Option<i64> {
     Some(((h * 3600 + m * 60 + sec) * 1000) + ms)
 }
 
+/// Turn one WebVTT cue payload line into renderable text: strip inline tags,
+/// decode character references, drop invisible bidi/zero-width controls.
+fn clean_cue_line(line: &str) -> String {
+    strip_bidi_controls(&decode_entities(&strip_inline_tags(line)))
+}
+
 /// Strip simple WebVTT inline tags. Phase 1 doesn't render styling, so
 /// `<b>bold</b>` becomes `bold`, `<c.red>foo</c>` becomes `foo`, etc.
 fn strip_inline_tags(line: &str) -> String {
@@ -187,6 +193,79 @@ fn strip_inline_tags(line: &str) -> String {
         }
     }
     out
+}
+
+/// Decode the character references WebVTT cue text may carry (the spec's
+/// named set — `&amp; &lt; &gt; &lrm; &rlm; &nbsp;` — plus the HTML-common
+/// `&quot; &apos;` and numeric `&#NNN;` / `&#xHHH;`). Browser/ExoPlayer
+/// renderers go through an HTML-ish text pipeline that decodes these; our
+/// rasterizer draws the string verbatim, so without this a `&lrm;` (very
+/// common in Arabic/Hebrew-aware subtitle exports, also sprinkled into
+/// Latin-script files by some tools) showed up as the literal six characters.
+/// Unknown references are left as-is.
+fn decode_entities(text: &str) -> String {
+    if !text.contains('&') {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let after = &rest[amp..];
+        // A reference is `&` + up to ~10 chars + `;` with no whitespace.
+        let decoded = after[1..]
+            .find(';')
+            .filter(|&semi| semi > 0 && semi <= 10)
+            .and_then(|semi| {
+                let name = &after[1..1 + semi];
+                let ch = match name {
+                    "amp" => Some('&'),
+                    "lt" => Some('<'),
+                    "gt" => Some('>'),
+                    "quot" => Some('"'),
+                    "apos" => Some('\''),
+                    "nbsp" => Some('\u{00A0}'),
+                    "lrm" => Some('\u{200E}'),
+                    "rlm" => Some('\u{200F}'),
+                    _ if name.starts_with("#x") || name.starts_with("#X") => {
+                        u32::from_str_radix(&name[2..], 16).ok().and_then(char::from_u32)
+                    }
+                    _ if name.starts_with('#') => {
+                        name[1..].parse::<u32>().ok().and_then(char::from_u32)
+                    }
+                    _ => None,
+                };
+                ch.map(|c| (c, 2 + semi))
+            });
+        match decoded {
+            Some((c, len)) => {
+                out.push(c);
+                rest = &after[len..];
+            }
+            None => {
+                out.push('&');
+                rest = &after[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Remove Unicode bidi / zero-width control characters. They carry no glyph;
+/// fontdue has no bidi engine to act on them and would draw a `.notdef` box
+/// (or nothing, font-dependent) — either way they must not reach the
+/// rasterizer. Covers LRM/RLM/ALM, the LRE…PDF embeddings, the LRI…PDI
+/// isolates, ZWSP/ZWNJ/ZWJ and the BOM.
+fn strip_bidi_controls(text: &str) -> String {
+    text.chars()
+        .filter(|c| {
+            !matches!(
+                *c,
+                '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{061C}' | '\u{FEFF}'
+            )
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -292,7 +371,7 @@ fn parse_vttc(body: &[u8], start_ms: i64, end_ms: i64) -> Option<VttCue> {
                         if !payload.is_empty() {
                             payload.push('\n');
                         }
-                        payload.push_str(&strip_inline_tags(line));
+                        payload.push_str(&clean_cue_line(line));
                     }
                 }
             }
@@ -352,5 +431,38 @@ mod tests {
     #[test]
     fn strips_inline_tags() {
         assert_eq!(strip_inline_tags("<b>bold</b> <c.red>red</c>"), "bold red");
+    }
+
+    #[test]
+    fn decodes_character_references() {
+        assert_eq!(
+            decode_entities("Tom &amp; Jerry &lt;3 &gt; &quot;hi&quot;"),
+            "Tom & Jerry <3 > \"hi\""
+        );
+        assert_eq!(decode_entities("a&nbsp;b"), "a\u{00A0}b");
+        assert_eq!(decode_entities("&#65;&#x42;&#X43;"), "ABC");
+        // Unknown / malformed references are left alone.
+        assert_eq!(decode_entities("&bogus; & &amp"), "&bogus; & &amp");
+        assert_eq!(decode_entities("no refs"), "no refs");
+    }
+
+    #[test]
+    fn lrm_marks_do_not_reach_the_renderer() {
+        // The field report: exports carrying `&lrm;` rendered the literal
+        // six characters. Both the reference form and a raw U+200E vanish.
+        assert_eq!(clean_cue_line("&lrm;- Ahoj.&lrm;"), "- Ahoj.");
+        assert_eq!(clean_cue_line("\u{200E}<i>Ne\u{200F}</i>"), "Ne");
+        assert_eq!(
+            clean_cue_line("\u{202B}x\u{202C} \u{2066}y\u{2069} \u{200B}z"),
+            "x y z"
+        );
+    }
+
+    #[test]
+    fn cue_text_is_cleaned_end_to_end() {
+        let data = b"WEBVTT\n\n00:00:01.000 --> 00:00:02.000\n&lrm;<b>Tom &amp; Jerry</b>\n";
+        let cues = parse_raw_webvtt(data);
+        assert_eq!(cues.len(), 1);
+        assert_eq!(cues[0].text, "Tom & Jerry");
     }
 }

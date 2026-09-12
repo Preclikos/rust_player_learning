@@ -19,7 +19,6 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use bytes::Bytes;
-use rand::Rng;
 use reqwest::{header::RANGE, Client, Method, StatusCode};
 
 pub type BoxError = Box<dyn Error + Send + Sync>;
@@ -397,7 +396,7 @@ fn jittered(base: Duration, jitter: f32) -> Duration {
         return base;
     }
     let j = jitter.clamp(0.0, 1.0) as f64;
-    let factor = 1.0 + (rand::thread_rng().gen::<f64>() * 2.0 - 1.0) * j;
+    let factor = 1.0 + (rand::random::<f64>() * 2.0 - 1.0) * j;
     let ns = (base.as_nanos() as f64 * factor).max(0.0) as u128;
     Duration::from_nanos(ns.min(u64::MAX as u128) as u64)
 }

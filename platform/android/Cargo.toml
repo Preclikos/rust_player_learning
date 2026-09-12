@@ -14,7 +14,7 @@ path = "src/lib.rs"
 [target.'cfg(target_os = "android")'.dependencies]
 player = { path = "../../player" }
 bridge = { path = "../../bridge" }
-android_logger = "0.14"
+android_logger = "0.15"
 log = "0.4"
 tokio = { version = "1.52", features = ["full"] }
 # BridgeHost is an #[async_trait] impl (same macro the player's interceptor uses).

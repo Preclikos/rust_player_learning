@@ -346,7 +346,10 @@ struct TapVideo {
 impl VideoSink for TapVideo {
     fn render_frame(&self, frame: DecodedVideoFrame) -> impl Future<Output = ()> + Send + '_ {
         let pts_ms = (frame.pts_us.max(0) / 1000) as u64;
-        if pts_ms % MARK_PERIOD_MS < FLASH_WINDOW_MS {
+        // Skip the mark at pts 0: the very first frame is painted at once as
+        // the start preview while the audio device is still spinning up, so
+        // it is not a lip-sync sample (every later mark is).
+        if pts_ms % MARK_PERIOD_MS < FLASH_WINDOW_MS && pts_ms >= FLASH_WINDOW_MS {
             // Only the FIRST frame of each mark (the flash onset) — at 24 fps
             // two frames fall inside the window.
             let mark = pts_ms / MARK_PERIOD_MS;

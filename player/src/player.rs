@@ -1033,8 +1033,13 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
         // Sampling the chunky audio-played counter gives a noisy sawtooth;
         // the per-window MIN is the least-stale read = the true video-ahead
         // offset (see the stats emit below).
+        // Baseline only once THIS pipeline's audio is actually running:
+        // before that the wall clock advances while the device (and the
+        // audio-mastered picture) hold, and the whole start delay would read
+        // as a permanent "drift" even though lip-sync is exact.
         if let Some(played) = audio_sink.played_ms() {
             match drift_baseline {
+                None if audio_sink.played_since_flush_ms().unwrap_or(1) == 0 => {}
                 None => drift_baseline = Some((render_start, played)),
                 Some((e0, p0)) => {
                     let d = render_start.saturating_sub(e0) as i64

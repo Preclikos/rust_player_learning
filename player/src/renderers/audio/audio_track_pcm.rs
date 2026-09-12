@@ -8,13 +8,17 @@
 //! `AudioTrack`, not AAudio — so for non-passthrough PCM we use an `AudioTrack`
 //! too, configured `ENCODING_PCM_16BIT` (see the constant for why not FLOAT).
 //!
-//! Clock semantics mirror the cpal sink exactly: `played_ms` is the track's
-//! cumulative `getPlaybackHeadPosition` (frames presented since track creation),
-//! and a seek/rebuild NEVER calls `AudioTrack.flush()` — it only drains the Rust
-//! sample queue, leaving the small device buffer to play out (same tiny tail as
-//! cpal's device buffer). So `MediaClock` baselines it identically. When the
-//! stall heal replaces a wedged track (`recreate_track`) the discarded frames
-//! are added to the clock so the position stays continuous.
+//! Clock semantics mirror the cpal sink: `played_ms` is the track's cumulative
+//! presented position (frames since track creation), and a seek/rebuild NEVER
+//! calls `AudioTrack.flush()` — it only drops the queued Rust chunks, leaving
+//! the track buffer (2× the HW minimum, typically 100–300 ms) to play out. That
+//! tail is OLD content, so the master clock does not baseline on the cumulative
+//! head: the writer marks the written-frame position where the first
+//! post-flush chunk lands (`FlushState`), and `played_since_flush_ms` counts
+//! from there — 0 until the tail has drained and the new pipeline's audio is
+//! really being presented. When the stall heal replaces a wedged track
+//! (`recreate_track`) the discarded frames are added to the clock so the
+//! position stays continuous.
 //!
 //! Raw JNI (jni 0.22), mirroring `audio_passthrough::AudioTrackSink`.
 
@@ -24,6 +28,9 @@ use std::sync::{Arc, Mutex};
 use jni::objects::JObject;
 use jni::refs::GlobalRef;
 use tokio::sync::mpsc::{self, Sender};
+
+use super::QUEUE_CHUNKS;
+use crate::av_sync::{AudioChunk, ChunkCursor, FlushState, Pulled};
 
 /// CLOCK_MONOTONIC now, in ns — the timebase of `AudioTimestamp.nanoTime`
 /// (TIMEBASE_MONOTONIC, the default), so the timestamp's frame position can
@@ -103,6 +110,14 @@ pub struct AudioTrackPcmSink {
     /// silent, instead of starving into a slideshow against a frozen audio
     /// clock), and on expiry a fresh track is tried again.
     surrendered_until: Mutex<Option<std::time::Instant>>,
+    /// Flush generation + post-flush boundary shared with the `AudioRenderer`
+    /// (producer) and the writer thread (consumer). The writer marks the
+    /// boundary — in cumulative written frames — when it reaches the first
+    /// chunk of a new generation; `played_since_flush_ms` measures the clock
+    /// from there, so the OLD pipeline's tail still queued in the track
+    /// buffer (we never `AudioTrack.flush()`, see the module docs) does not
+    /// count as new-pipeline playback.
+    flush_state: Arc<FlushState>,
 }
 
 #[derive(Default)]
@@ -119,13 +134,14 @@ unsafe impl Sync for AudioTrackPcmSink {}
 impl AudioTrackPcmSink {
     /// Create a paused 16-bit PCM `AudioTrack` at `sample_rate` / stereo. Returns
     /// `None` on any failure (caller then has no audio; video uses the wall clock).
-    pub fn new(sample_rate: u32) -> Option<Self> {
+    pub fn new(sample_rate: u32, flush_state: Arc<FlushState>) -> Option<Self> {
         match Self::build_track(sample_rate) {
             Ok(track) => {
                 log::info!("[audio-pcm] AudioTrack PCM_16BIT configured (paused): {}Hz stereo", sample_rate);
                 Some(Self {
                     track: Mutex::new(track),
                     sample_rate,
+                    flush_state,
                     head_base: AtomicU64::new(0),
                     stopped: AtomicBool::new(false),
                     started: AtomicBool::new(false),
@@ -455,10 +471,11 @@ impl AudioTrackPcmSink {
     /// implemented as NON-blocking writes in a retry loop that stays responsive:
     /// a blocking JNI write parked on a paused track wedged the writer thread,
     /// so a flush/rebuild issued during a long pause (the ABR tick fires there)
-    /// was never serviced and resume played nothing. `abort` (the renderer's
-    /// flush flag) abandons the remainder immediately — the caller drains the
-    /// queue right after; teardown (`stopped`) exits too.
-    pub fn write_floats(&self, samples: &[f32], abort: &AtomicBool) {
+    /// was never serviced and resume played nothing. `abort` (true once a flush
+    /// has superseded this chunk's generation) abandons the remainder
+    /// immediately — the writer moves on to the new generation; teardown
+    /// (`stopped`) exits too.
+    pub fn write_floats(&self, samples: &[f32], abort: &dyn Fn() -> bool) {
         let mut off = 0usize;
         // Surrendered: discard at REALTIME pace (keeping the pipeline flowing,
         // the clock accounting intact, and decode from racing ahead of the
@@ -504,7 +521,7 @@ impl AudioTrackPcmSink {
         }
         let mut zero_streak = 0u32;
         while off < pcm.len() {
-            if self.stopped.load(Ordering::Acquire) || abort.load(Ordering::Relaxed) {
+            if self.stopped.load(Ordering::Acquire) || abort() {
                 return;
             }
             // A surrender can be declared by check_stall() mid-batch — bail out
@@ -590,13 +607,13 @@ impl AudioTrackPcmSink {
     /// Discard `sample_count` interleaved samples while surrendered: count them
     /// into the clock accounting and sleep out their realtime duration (in
     /// abort/teardown-responsive slices), mimicking a consuming device.
-    fn discard_paced(&self, sample_count: usize, abort: &AtomicBool) {
+    fn discard_paced(&self, sample_count: usize, abort: &dyn Fn() -> bool) {
         let frames = (sample_count as u64) / 2;
         self.written_frames.fetch_add(frames, Ordering::AcqRel);
         self.dropped_frames.fetch_add(frames, Ordering::AcqRel);
         let mut left_ms = frames * 1000 / self.sample_rate.max(1) as u64;
         while left_ms > 0 {
-            if self.stopped.load(Ordering::Acquire) || abort.load(Ordering::Relaxed) {
+            if self.stopped.load(Ordering::Acquire) || abort() {
                 return;
             }
             let slice = left_ms.min(15);
@@ -942,6 +959,35 @@ impl AudioTrackPcmSink {
             .map(|frames| (base + frames.max(0) as u64 + dropped) * 1000 / self.sample_rate as u64)
     }
 
+    /// Cumulative PRESENTED position in frames (the same quantity `played_ms`
+    /// reports, before the ms conversion): released tracks' final heads +
+    /// the current track's presented frames + heal-discarded frames.
+    fn presented_total_frames(&self) -> Option<u64> {
+        let dropped = self.dropped_frames.load(Ordering::Acquire);
+        let base = self.head_base.load(Ordering::Acquire);
+        self.presented_frames()
+            .map(|frames| base + frames.max(0) as u64 + dropped)
+    }
+
+    /// Media ms of the CURRENT flush generation's PCM that has been presented
+    /// — the master-clock source. `Some(0)` until the writer has handed the
+    /// first post-flush chunk to the track AND the track has played through
+    /// the old tail queued before it; `None` only when the sink is gone. A
+    /// not-yet-primed track reports `Some(0)` too (not `None`): the new
+    /// pipeline's video then holds its first frame until audio really starts
+    /// instead of running ahead on the wall clock and lurching when the
+    /// audio clock takes over.
+    pub fn played_since_flush_ms(&self) -> Option<u64> {
+        if self.sample_rate == 0 || self.stopped.load(Ordering::Acquire) {
+            return None;
+        }
+        if !self.primed.load(Ordering::Acquire) {
+            return Some(0);
+        }
+        let presented = self.presented_total_frames()?;
+        Some(self.flush_state.played_since_flush(presented) * 1000 / self.sample_rate as u64)
+    }
+
     fn call_void(&self, method: &'static jni::strings::JNIStr) {
         if self.stopped.load(Ordering::Acquire) {
             return;
@@ -1030,95 +1076,100 @@ impl Drop for AudioTrackPcmSink {
 }
 
 /// Start the Android PCM output: create the [`AudioTrackPcmSink`] and a dedicated
-/// writer thread that pulls resampled stereo f32 from the channel and writes it
+/// writer thread that pulls chunked stereo f32 from the channel and writes it
 /// to the track. The write paces to the device rate (so the playback head is a
-/// usable clock) but is built from NON-blocking writes internally and aborts on
-/// the flush flag — a blocking write parked on a paused track wedged the writer,
-/// so a flush/rebuild issued during a long pause was never serviced and resume
-/// played nothing. Returns the sink so the renderer can read its clock + drive
-/// pause. `None` sink ⇒ no audio (video falls back to the wall clock).
+/// usable clock) but is built from NON-blocking writes internally and aborts
+/// when a flush supersedes the chunk's generation — a blocking write parked on
+/// a paused track wedged the writer, so a flush/rebuild issued during a long
+/// pause was never serviced and resume played nothing. Returns the sink so the
+/// renderer can read its clock + drive pause. `None` sink ⇒ no audio (video
+/// falls back to the wall clock).
 pub(super) fn start_output(
-    flush_flag: Arc<AtomicBool>,
+    flush_state: Arc<FlushState>,
     host_paused: Arc<AtomicBool>,
     volume: Arc<AtomicU32>,
-) -> (Sender<f32>, u32, Option<Arc<AudioTrackPcmSink>>) {
+) -> (Sender<AudioChunk>, u32, Option<Arc<AudioTrackPcmSink>>) {
     let out_rate = 48_000u32;
-    let (sample_sender, mut sample_receiver) = mpsc::channel::<f32>(192_000);
-    let sink = AudioTrackPcmSink::new(out_rate).map(Arc::new);
+    let (sample_sender, sample_receiver) = mpsc::channel::<AudioChunk>(QUEUE_CHUNKS);
+    let sink = AudioTrackPcmSink::new(out_rate, flush_state.clone()).map(Arc::new);
 
     match sink.clone() {
         Some(sink) => {
             std::thread::Builder::new()
                 .name("bz-audio-pcm-out".into())
                 .spawn(move || {
-                    let mut batch: Vec<f32> = Vec::with_capacity(8192);
-                    // Odd sample held over so every batch is WHOLE FRAMES. The
-                    // channel delivers individual samples, so a batch can end
-                    // mid-frame; `AudioTrack.write` only accepts whole frames,
-                    // and retrying a half-frame chunk returns 0 forever — the
-                    // writer then spins on one batch for good (this WAS the
-                    // probabilistic "audio never starts / wedges" bug). The
-                    // leftover must carry into the next batch, not be dropped:
-                    // dropping one sample swaps L/R for everything after it.
-                    let mut carry: Option<f32> = None;
+                    // The cursor's consumed-sample counter is unused here (this
+                    // path's clock is the track's presented head); the boundary
+                    // is marked below in WRITTEN frames instead.
+                    let mut cursor = ChunkCursor::new(
+                        sample_receiver,
+                        flush_state.clone(),
+                        Arc::new(AtomicU64::new(0)),
+                    );
                     // DIAG heartbeat (sparse): sink/track state while samples flow.
                     let mut last_beat = std::time::Instant::now();
-                    // Blocks until samples arrive; exits when the sender (the
-                    // AudioRenderer) is dropped on teardown.
-                    while let Some(first) = sample_receiver.blocking_recv() {
+                    // Blocks until a chunk of the live generation arrives; chunks
+                    // queued before the last flush are dropped by the cursor.
+                    // Exits when the sender (the AudioRenderer) is dropped.
+                    loop {
+                        let (mut batch, gen, starts_gen) = match cursor.blocking_next_chunk() {
+                            Pulled::Chunk { samples, gen, starts_gen } => (samples, gen, starts_gen),
+                            Pulled::Closed => break,
+                            Pulled::Empty => continue,
+                        };
                         if last_beat.elapsed() >= std::time::Duration::from_secs(5) {
                             last_beat = std::time::Instant::now();
                             log::info!(
-                                "[audio-pcm] writer: host_paused={} sink_paused={} playing={} played_ms={:?}",
+                                "[audio-pcm] writer: host_paused={} sink_paused={} playing={} played_ms={:?} since_flush={:?}",
                                 host_paused.load(Ordering::Relaxed),
                                 sink.paused.load(Ordering::Acquire),
                                 sink.is_playing(),
                                 sink.played_ms(),
+                                sink.played_since_flush_ms(),
                             );
                         }
-                        // Seek/rebuild: drop queued PCM. We deliberately do NOT
-                        // flush the track — keeping its head cumulative so the
-                        // clock baselines exactly like the cpal counter; the
-                        // small device buffer plays out (cpal does the same).
-                        if flush_flag.swap(false, Ordering::Relaxed) {
-                            while sample_receiver.try_recv().is_ok() {}
-                            // The producer restarts at a frame boundary.
-                            carry = None;
-                            continue;
-                        }
-                        // Host pause: hold this sample and don't consume further —
+                        // Host pause: hold this chunk and don't consume further —
                         // queued samples must survive the pause so resume picks up
                         // exactly where it left off (the track itself was paused
                         // by the inherent set_paused). Without this gate the
                         // writer keeps feeding the buffered ~2 s into the track
-                        // (audio bleeding on after the user paused). The flush
-                        // flag stays serviced so a rebuild issued mid-pause (the
-                        // ABR tick fires there) still drains.
+                        // (audio bleeding on after the user paused). A flush
+                        // issued mid-pause (the ABR tick fires there) supersedes
+                        // the chunk's generation — it is dropped and the loop
+                        // moves on to the new pipeline's content.
                         if host_paused.load(Ordering::Relaxed) {
                             while host_paused.load(Ordering::Relaxed)
-                                && !flush_flag.load(Ordering::Relaxed)
+                                && flush_state.current_gen() == gen
                             {
                                 std::thread::sleep(std::time::Duration::from_millis(15));
                             }
-                            if flush_flag.swap(false, Ordering::Relaxed) {
-                                while sample_receiver.try_recv().is_ok() {}
-                                carry = None;
+                            if flush_state.current_gen() != gen {
                                 continue;
                             }
                         }
-                        batch.clear();
-                        if let Some(c) = carry.take() {
-                            batch.push(c);
+                        if starts_gen {
+                            // First chunk of a new pipeline: everything written so
+                            // far is OLD content — some of it still queued in the
+                            // track buffer (we never AudioTrack.flush()). The clock
+                            // for this generation starts where THIS chunk lands.
+                            let written = sink.written_frames.load(Ordering::Acquire);
+                            flush_state.mark_boundary(gen, written);
+                            let tail_ms = sink
+                                .presented_total_frames()
+                                .map(|p| written.saturating_sub(p) * 1000 / out_rate as u64);
+                            log::info!(
+                                "[audio-pcm] flush boundary gen={} at {} frames written; {:?} ms of previous audio still queued in the track",
+                                gen, written, tail_ms
+                            );
                         }
-                        batch.push(first);
-                        while batch.len() < 8192 {
-                            match sample_receiver.try_recv() {
-                                Ok(s) => batch.push(s),
-                                Err(_) => break,
-                            }
-                        }
+                        // Whole frames only — `AudioTrack.write` never accepts a
+                        // trailing half frame and retrying it returns 0 forever.
+                        // Chunks are whole decoded frames so this never trips;
+                        // dropping one sample would swap L/R for the remainder,
+                        // hence the loud warning if it ever does.
                         if batch.len() % 2 == 1 {
-                            carry = batch.pop();
+                            log::warn!("[audio-pcm] odd chunk of {} samples — truncating", batch.len());
+                            batch.pop();
                         }
                         if batch.is_empty() {
                             continue;
@@ -1129,10 +1180,10 @@ pub(super) fn start_output(
                                 *s *= vol;
                             }
                         }
-                        // Paces like a blocking write but aborts on flush (the
-                        // remainder is dropped; the NEXT loop turn swaps the flag
-                        // and drains the queue).
-                        sink.write_floats(&batch, &flush_flag);
+                        // Paces like a blocking write but aborts the remainder as
+                        // soon as a flush supersedes this chunk's generation.
+                        let abort = || flush_state.current_gen() != gen;
+                        sink.write_floats(&batch, &abort);
                     }
                 })
                 .expect("spawn audio pcm output thread");

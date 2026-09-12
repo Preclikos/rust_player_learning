@@ -1,4 +1,5 @@
 mod abr;
+mod av_sync;
 mod capabilities;
 mod crypto;
 mod decoders;
@@ -57,20 +58,24 @@ use crypto::{
     Decryptor, TrackCrypto,
 };
 use decoders::{
-    AudioCodec, AudioDecoder, AudioDecoderParams, DecodedAudioFrame, DecodedVideoFrame,
+    AudioCodec, AudioDecoder, AudioDecoderParams, DecodedAudioFrame,
     HwVideoDecoder, VideoCodec, VideoColorInfo, VideoDecoderParams,
 };
 use parsers::mp4::aac_sampling_frequency_index_to_u32;
 use pollster::FutureExt;
 use re_mp4::Mp4;
-use renderers::audio::AudioRenderer;
-use renderers::video::VideoRenderer;
-use renderers::{AudioSink, VideoSink};
 
 // Additive: re-export the offscreen ring handle + a convenience alias. Offscreen
 // (in-app) video reuses `VideoRenderer` with an offscreen target, so the in-app
 // player is the same concrete type as the windowed desktop player.
 pub use renderers::video_offscreen::OffscreenTarget;
+/// The stock sinks + the sink traits, so a host can wrap them (see
+/// [`Player::with_sinks`]): a decorator that forwards to the real renderer
+/// while observing every frame / sample is how the conformance harness
+/// measures lip-sync independently of the engine clock.
+pub use renderers::{audio::AudioRenderer, video::VideoRenderer, AudioPassthrough, AudioSink, VideoSink};
+pub use decoders::DecodedVideoFrame;
+pub use parsers::vtt::VttCue;
 pub type OffscreenPlayer = Player<VideoRenderer, AudioRenderer>;
 
 use arc_swap::ArcSwap;
@@ -138,6 +143,9 @@ pub struct ConformanceSummary {
     pub interval_hist: [u64; 4],
     pub video_frames_decoded: u64,
     pub video_frames_dropped: u64,
+    /// Frames presented >45 ms after their master-clock time (visible
+    /// per-frame lip-sync error; the LATE drain only drops past 80 ms).
+    pub video_late_frames: u64,
     pub audio_underruns: u64,
 }
 
@@ -168,6 +176,9 @@ enum StallSide {
 struct StatsState {
     video_frames_decoded: AtomicU64,
     video_frames_dropped: AtomicU64,
+    /// Frames presented >45 ms after their master-clock time (shown, not
+    /// dropped — a visible per-frame lip-sync error). Conformance gauge.
+    video_late_frames: AtomicU64,
     audio_underruns: AtomicU64,
     /// Wall-clock ms the download path was blocked waiting on network in
     /// the trailing second.
@@ -511,13 +522,22 @@ fn clock_monotonic_ns() -> i64 { 0 }
 /// Mastered by the audio sink's real playback position so video (and any other
 /// renderer) cannot drift from audio (crystal mismatch / underruns). Between
 /// the sink's coarse position updates it interpolates with the wall clock for
-/// smooth pacing; when the sink reports no position (mocks / not-yet-started)
-/// it falls back to the wall clock. Rebased onto THIS pipeline's 0-based
-/// timeline (media = seek_offset + (played − audio_base)) so the reported
-/// position is absolute, not the audio device's free-running counter.
+/// smooth pacing; when the sink reports no position (mocks / output not open)
+/// it falls back to the wall clock.
+///
+/// The audio position used is `played_since_flush_ms` — how much of THIS
+/// pipeline's audio (queued after the seek/switch flush, trimmed to start
+/// exactly at `seek_offset`) the device has presented. So
+/// `media = seek_offset + played_since_flush − output_latency`, and the clock
+/// reads `seek_offset` (frozen) until the new audio is really audible — not
+/// while the previous pipeline's tail is still draining from the device
+/// buffer. Anchoring to a snapshot of the cumulative counter instead (the
+/// old `audio_base`) ran the clock ahead by that tail on every rebuild:
+/// 100–300 ms of "video leads audio" after each seek / track switch on
+/// Android's AudioTrack.
 ///
 /// The audio sink is the only clock source today and the seam for tomorrow: an
-/// AudioTrack passthrough sink reports `played_ms` via getTimestamp, so the
+/// AudioTrack passthrough sink reports its head via getTimestamp, so the
 /// clock serves bitstream (Dolby/DTS passthrough) and multichannel without
 /// video / subtitles knowing the difference. Shareable (interior-mutable
 /// anchor) so future consumers can pace to the same clock.
@@ -525,35 +545,29 @@ struct MediaClock<A: AudioSink> {
     audio_sink: Arc<A>,
     // Wall anchor (= now − seek_offset): the fallback when the sink has no clock.
     start_time: Arc<Instant>,
-    // seek_offset_us − audio_base_us: rebases the cumulative audio counter onto
-    // this pipeline's 0-based timeline. Constant per pipeline; cancels out of
-    // the frame-pacing delta, so it only affects the *reported* position.
-    rebase_us: i64,
-    // (last observed played_ms, wall instant then) for sub-update interpolation.
+    // Media position the post-flush audio starts at (the seek target).
+    seek_offset_us: i64,
+    // (last observed played ms, wall instant then) for sub-update interpolation.
     anchor: std::sync::Mutex<Option<(u64, Instant)>>,
 }
 
 impl<A: AudioSink> MediaClock<A> {
-    fn new(
-        audio_sink: Arc<A>,
-        start_time: Arc<Instant>,
-        seek_offset: Duration,
-        audio_base_ms: u64,
-    ) -> Self {
+    fn new(audio_sink: Arc<A>, start_time: Arc<Instant>, seek_offset: Duration) -> Self {
         Self {
             audio_sink,
             start_time,
-            rebase_us: seek_offset.as_micros() as i64 - audio_base_ms as i64 * 1_000,
+            seek_offset_us: seek_offset.as_micros() as i64,
             anchor: std::sync::Mutex::new(None),
         }
     }
 
     /// Audio-disciplined position (µs), or None when the sink reports no clock.
-    /// `played_ms` advances at the device rate and freezes on pause/starvation,
-    /// so it already subsumes pause skew; `output_latency_ms` folds in so the
-    /// picture lands when its audio is audible, not merely consumed.
+    /// `played_since_flush_ms` advances at the device rate and freezes on
+    /// pause/starvation, so it already subsumes pause skew; `output_latency_ms`
+    /// folds in so the picture lands when its audio is audible, not merely
+    /// consumed.
     fn audio_now_us(&self) -> Option<i64> {
-        let played = self.audio_sink.played_ms()?;
+        let played = self.audio_sink.played_since_flush_ms()?;
         let lat_us = self.audio_sink.output_latency_ms() as i64 * 1_000;
         let now = Instant::now();
         let mut anchor = self.anchor.lock().unwrap();
@@ -572,7 +586,7 @@ impl<A: AudioSink> MediaClock<A> {
         } else {
             p0 as i64 * 1_000
         };
-        Some((pos_us + self.rebase_us - lat_us).max(0))
+        Some((pos_us + self.seek_offset_us - lat_us).max(0))
     }
 
     /// Current 0-based media time (µs): audio when available, else the wall
@@ -603,11 +617,11 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
     // collapses to play-time-since-(seek/resume) — breaking the seekbar,
     // relative seeks, and the ABR soft-switch's restart-segment pick.
     seek_offset: Duration,
-    // Snapshot of the audio sink's cumulative `played_ms` at this pipeline's
-    // anchor instant. `samples_consumed` is NOT reset on flush(), so played_ms
-    // is session-cumulative; subtracting this baseline yields the per-pipeline
-    // elapsed, to which `seek_offset` is added → absolute media time.
-    audio_base_ms: u64,
+    // Content origin (absolute pts of the first segment, µs). Frames are
+    // scheduled on the 0-based media axis `pts − origin` — the SAME axis the
+    // audio is trimmed on and the clock counts in — instead of being anchored
+    // to whatever the clock happened to read when the first frame arrived.
+    origin_us: i64,
     // Frame-accurate seek: the decoder feeds from the segment-start keyframe,
     // which can be up to a segment before the target. Frames whose absolute
     // pts_us is below this threshold are dropped (codec buffer released) WITHOUT
@@ -680,11 +694,14 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
     // disconnect repro.
     let mut starving = false;
     let mut starvation_started: Option<Instant> = None;
-    // BMDT (base media decode time) offset: DASH content timestamps are absolute
-    // (e.g. ~7979ms for segment 0) while our wall clock starts at 0. Calibrated
-    // on the first frame as (raw_pts - elapsed), making frame 0 render immediately
-    // and all subsequent frames at their correct relative positions.
-    let mut pts_base: Option<u64> = None;
+    // Frames presented more than this far after their clock time — visible as
+    // a per-frame lip-sync error even though nothing was dropped (the LATE
+    // drain only kicks in past 80 ms). Conformance gauge.
+    const LATE_FRAME_MS: u64 = 45;
+    // Startup diagnostics: how long the first frame waited for the audio clock
+    // to start moving, and where it landed relative to the target.
+    let loop_started = Instant::now();
+    let mut logged_first_frame = false;
     // De-judder smoother state: (present_ns, pts_us_rel) of the last frame, so
     // the next frame's present time can be snapped to the smooth media cadence
     // (last + Δpts) instead of inheriting the audio clock's frame-to-frame
@@ -705,13 +722,13 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
     // Playback master clock: audio-disciplined, 0-based, rebased to this
     // pipeline's timeline. Video paces to it; the same seam serves passthrough
     // / multichannel / other renderers (see MediaClock).
-    let clock = MediaClock::new(
-        audio_sink.clone(),
-        start_time.clone(),
-        seek_offset,
-        audio_base_ms,
+    let clock = MediaClock::new(audio_sink.clone(), start_time.clone(), seek_offset);
+    log::info!(
+        "[vsync gen {}] loop start (seek_offset={}ms origin={}ms)",
+        gen,
+        seek_offset.as_millis(),
+        origin_us / 1000
     );
-    log::info!("[vsync gen {}] loop start (seek_offset={}ms)", gen, seek_offset.as_millis());
     loop {
         if stop_flag.load(Ordering::Relaxed) {
             break;
@@ -846,21 +863,28 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
             reached_target = true;
         }
         let raw_pts_ms = (frame.pts_us / 1000) as u64;
-        // Audio output latency (device buffer + DAC): the sink consumes a
-        // sample this many ms before it's audible. Subtract it from the
-        // video clock so a frame reaches the screen exactly when its audio
-        // reaches the speaker — without it video leads audio by the output
-        // latency at every (re)start, which surfaces as "audio delayed"
-        // after seeks/track-switches. Re-read each iteration: it's ~0 until
-        // the first callback, then stabilises, so it applies as a one-time
-        // hold early in playback. `pts_ms` itself stays the frame's true
-        // media time, so subtitles (keyed off pts_ms) and the picture move
-        // together against this same audio-anchored clock.
-        // Master clock — audio-disciplined, wall fallback. See MediaClock.
+        // Master clock — audio-disciplined (already output-latency corrected
+        // so it reads the media time currently AUDIBLE), wall fallback. See
+        // MediaClock.
         let elapsed = (clock.now_us(pause_skew) / 1_000) as u64;
 
-        let base = *pts_base.get_or_insert(raw_pts_ms.saturating_sub(elapsed));
-        let mut pts_ms = raw_pts_ms.saturating_sub(base);
+        // The frame's 0-based media time — the axis the clock counts in and
+        // the audio was trimmed on. No first-frame anchoring: a frame is due
+        // exactly when the clock reads its pts, whatever the clock read when
+        // it happened to arrive.
+        let mut pts_ms = crate::av_sync::media_pts_ms(frame.pts_us, origin_us);
+        if !logged_first_frame {
+            logged_first_frame = true;
+            log::info!(
+                "[vsync gen {}] first frame pts={}ms target={}ms clock={}ms audio_since_flush={:?}ms {}ms after loop start",
+                gen,
+                pts_ms,
+                seek_offset.as_millis(),
+                elapsed,
+                audio_sink.played_since_flush_ms(),
+                loop_started.elapsed().as_millis()
+            );
+        }
 
         if pts_ms < last_pts_ms {
             log::warn!("[vsync] BACKWARD #{} pts={}ms last={}ms Δ=-{}ms elapsed={}ms",
@@ -884,7 +908,7 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
                     match input_rx.try_recv() {
                         Ok(newer) => {
                             frame = newer;
-                            pts_ms = ((frame.pts_us / 1000) as u64).saturating_sub(base);
+                            pts_ms = crate::av_sync::media_pts_ms(frame.pts_us, origin_us);
                             drained += 1;
                         }
                         Err(_) => break,
@@ -948,10 +972,14 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
         // Use microseconds (not ms) to preserve the sub-millisecond fraction —
         // 23.976fps frames are 41.708µs apart, and ms-truncation here would drift
         // across VSync boundaries every ~24 frames, causing irregular pulldown.
-        let raw_pts_us = frame.pts_us;
-        let base_us = base as i64 * 1_000;
-        let pts_us_rel = (raw_pts_us - base_us).max(0);
+        let pts_us_rel = (frame.pts_us - origin_us).max(0);
         let elapsed_us = clock.now_us(pause_skew);
+        // Conformance gauge: presented visibly after its clock time (the
+        // LATE drain above only intervenes past 80 ms; 45–80 ms late frames
+        // are shown late — a per-frame lip-sync error the viewer can see).
+        if elapsed_us / 1_000 > pts_ms as i64 + LATE_FRAME_MS as i64 {
+            stats.video_late_frames.fetch_add(1, Ordering::Relaxed);
+        }
         let pts_to_go_ns = (pts_us_rel - elapsed_us).max(0) * 1_000;
         let raw_present_ns = clock_monotonic_ns() + pts_to_go_ns;
         // De-judder: `raw_present_ns` carries the audio master clock's
@@ -991,9 +1019,9 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
         // present far in the future (buffers stay captive → dequeue_input stall).
         if frame_idx < 3 {
             log::debug!(
-                "[vsync] frame #{} pts_ms={} elapsed_ms={} pts_rel_ms={} pts_to_go_ms={} base={}",
+                "[vsync] frame #{} pts_ms={} elapsed_ms={} pts_rel_ms={} pts_to_go_ms={} origin={}",
                 frame_idx, pts_ms, elapsed_us / 1000, pts_us_rel / 1000,
-                pts_to_go_ns / 1_000_000, base
+                pts_to_go_ns / 1_000_000, origin_us / 1000
             );
         }
 
@@ -1160,6 +1188,7 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
             let _ = events.send(PlayerEvent::Stats {
                 video_frames_decoded: decoded_total,
                 video_frames_dropped: dropped_total,
+                video_late_frames: stats.video_late_frames.load(Ordering::Relaxed),
                 audio_underruns: stats.audio_underruns.load(Ordering::Relaxed),
                 net_stall_ms: net_stall,
                 decoder_name,
@@ -1210,28 +1239,35 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
 async fn audio_sync_loop<A: AudioSink>(
     mut input_rx: mpsc::Receiver<DecodedAudioFrame>,
     sink: Arc<A>,
+    // 0-based seek target (ms) and the content origin (ms) — the first
+    // audible sample must be the one at ABSOLUTE media time
+    // `origin + target`. Decoded audio pts are absolute (composition
+    // timestamps), so the trim compares on that axis; comparing them against
+    // the 0-based target (the old code) padded `origin` ms of silence in
+    // front of every start on content with a non-zero timeline origin —
+    // audio permanently late by the origin.
     target_pts_ms: i64,
+    origin_ms: i64,
     stop: Arc<Notify>,
     stop_flag: Arc<AtomicBool>,
     stats: Arc<StatsState>,
     events: Arc<broadcast::Sender<PlayerEvent>>,
     paused: Arc<AtomicBool>,
 ) {
-    // Align the FIRST audible sample with `target_pts_ms` (= video's
-    // snapped seek offset). DASH audio and video segments rarely share
-    // boundaries: a seek that lands cleanly on a video segment boundary
-    // will pick the audio segment that CONTAINS that PTS — and that
-    // segment typically starts up to ~1 s before. Without correction,
-    // audio_sync_loop would push those pre-target samples to cpal first,
-    // delaying every subsequent sample by that gap and producing
-    // perceptible audio-lag-behind-video for the rest of playback.
-    //
-    // We trim the leading samples here (or pad with silence if the
-    // audio segment instead starts AFTER the target) so cpal's first
-    // emitted sample corresponds to media-time `target_pts_ms`, the
-    // same anchor video_sync_loop uses for its first rendered frame.
-    let sample_rate = sink.sample_rate() as i64;
-    let mut aligned = false;
+    // Keep the PCM handed to the sink continuous on the media axis (see
+    // `av_sync::AudioAligner`):
+    //  * start: DASH audio and video segments rarely share boundaries — the
+    //    audio segment containing the target typically starts up to ~1 s
+    //    before it. The leading samples are trimmed (or silence padded when
+    //    audio starts AFTER the target) so the first sample the sink plays is
+    //    media time `origin + target` — the point the clock starts counting
+    //    from. Without it every later sample is late by that gap.
+    //  * steady state: a gap (a swallowed corrupt AU, an edit-list
+    //    discontinuity) is padded and an overlap trimmed, so a dropped 32 ms
+    //    frame cannot shift all subsequent audio 32 ms early for good.
+    let sample_rate = sink.sample_rate();
+    let mut aligner = crate::av_sync::AudioAligner::new(sample_rate, origin_ms + target_pts_ms);
+    let mut gap_events = 0u32;
     let mut starving = false;
     loop {
         if stop_flag.load(Ordering::Relaxed) {
@@ -1290,46 +1326,44 @@ async fn audio_sync_loop<A: AudioSink>(
         if frame.samples.is_empty() {
             continue;
         }
-        // Build the slice/owned buffer to actually hand off to cpal.
         // Stereo interleaved: samples.len() / 2 = per-channel frames.
-        let trimmed: std::borrow::Cow<'_, [f32]> = if aligned {
-            std::borrow::Cow::Borrowed(&frame.samples)
-        } else {
-            let frames_per_chan = (frame.samples.len() / 2) as i64;
-            let dur_ms = if sample_rate > 0 {
-                frames_per_chan * 1000 / sample_rate
-            } else {
-                0
-            };
-            let frame_end_ms = frame.pts_ms + dur_ms;
-            if frame_end_ms <= target_pts_ms {
-                // Whole frame lies before the target — drop it.
-                continue;
-            } else if frame.pts_ms < target_pts_ms {
-                // Frame straddles the target — trim leading samples.
-                let drop_ms = target_pts_ms - frame.pts_ms;
-                let drop_chan = (drop_ms * sample_rate / 1000) as usize;
-                let drop_idx = (drop_chan * 2).min(frame.samples.len());
-                aligned = true;
-                if drop_idx >= frame.samples.len() {
-                    continue;
-                }
-                std::borrow::Cow::Borrowed(&frame.samples[drop_idx..])
-            } else {
-                // Frame starts at/after target — pad silence so the
-                // first audible sample lands on target.
-                let pad_ms = frame.pts_ms - target_pts_ms;
-                let pad_chan = (pad_ms * sample_rate / 1000) as usize;
-                aligned = true;
-                if pad_chan == 0 {
-                    std::borrow::Cow::Borrowed(&frame.samples)
-                } else {
-                    let mut buf = Vec::with_capacity(pad_chan * 2 + frame.samples.len());
-                    buf.resize(pad_chan * 2, 0.0_f32);
-                    buf.extend_from_slice(&frame.samples);
-                    std::borrow::Cow::Owned(buf)
-                }
+        let frames_per_chan = frame.samples.len() / 2;
+        let was_aligned = aligner.is_aligned();
+        let (skip_frames, pad_frames) = match aligner.plan(frame.pts_ms, frames_per_chan) {
+            crate::av_sync::AlignAction::Drop => continue,
+            crate::av_sync::AlignAction::Emit { skip_frames, pad_frames } => {
+                (skip_frames, pad_frames)
             }
+        };
+        if !was_aligned {
+            log::info!(
+                "[async] aligned first audio: pts={}ms target={}ms skip={}ms pad={}ms",
+                frame.pts_ms,
+                origin_ms + target_pts_ms,
+                skip_frames as u64 * 1000 / sample_rate.max(1) as u64,
+                pad_frames as u64 * 1000 / sample_rate.max(1) as u64
+            );
+        } else if skip_frames > 0 || pad_frames > 0 {
+            gap_events += 1;
+            // Rate-limit: the first few, then every 50th.
+            if gap_events <= 5 || gap_events % 50 == 0 {
+                log::warn!(
+                    "[async] audio discontinuity #{} at pts={}ms: trimmed {}ms / padded {}ms to stay contiguous",
+                    gap_events,
+                    frame.pts_ms,
+                    skip_frames as u64 * 1000 / sample_rate.max(1) as u64,
+                    pad_frames as u64 * 1000 / sample_rate.max(1) as u64
+                );
+            }
+        }
+        let skip_idx = (skip_frames * 2).min(frame.samples.len());
+        let trimmed: std::borrow::Cow<'_, [f32]> = if pad_frames == 0 {
+            std::borrow::Cow::Borrowed(&frame.samples[skip_idx..])
+        } else {
+            let mut buf = Vec::with_capacity(pad_frames * 2 + frame.samples.len() - skip_idx);
+            buf.resize(pad_frames * 2, 0.0_f32);
+            buf.extend_from_slice(&frame.samples[skip_idx..]);
+            std::borrow::Cow::Owned(buf)
         };
         if trimmed.is_empty() {
             continue;
@@ -1347,6 +1381,9 @@ async fn av_sync_handler<V: VideoSink, A: AudioSink>(
     // DIAG: pipeline generation id (see video_sync_loop).
     gen: u64,
     seek_offset: Duration,
+    // Content origin (first segment's absolute presentation time): both sync
+    // loops work on the 0-based axis `pts − origin`.
+    origin: Duration,
     // Absolute pts_us below which video frames are discarded (frame-accurate
     // seek: decode from the segment keyframe, render from the target). 0 = none.
     video_discard_below_us: i64,
@@ -1463,14 +1500,25 @@ async fn av_sync_handler<V: VideoSink, A: AudioSink>(
     // (it breaks as soon as played_ms ticks, so the wait is ~the prime, not the
     // full cap) anchors video to real audio start so it begins in step — no
     // wall-paced slowdown. cpal keeps the 500 ms cap.
-    if !paused.load(Ordering::Relaxed) && audio_sink.played_ms().is_some() {
-        let gate_cap = if audio_sink.is_passthrough() {
-            Duration::from_millis(4000)
-        } else {
-            Duration::from_millis(500)
-        };
-        let gate = Instant::now();
-        while audio_sink.played_ms().unwrap_or(1) == 0 {
+    //
+    // PCM path: no gate at all any more. The PCM sink only receives samples
+    // from `audio_sync_loop`, which is spawned BELOW — so waiting here for its
+    // position to move could only ever time out (500 ms added to every start
+    // and seek). It is also unnecessary: the master clock is
+    // `played_since_flush_ms`, which reads a frozen `seek_offset` until the
+    // new audio is really being presented, so video simply holds its first
+    // frame until then instead of racing ahead on the wall clock.
+    //
+    // Passthrough keeps the gate: its feed writes to the bitstream track
+    // directly (not through the loop below) and the sink reports NO clock
+    // until the head moves — i.e. video would run on the wall fallback
+    // through the ~1–2 s prime and then snap back to the head.
+    let gate = Instant::now();
+    if !paused.load(Ordering::Relaxed) && audio_sink.is_passthrough() {
+        let gate_cap = Duration::from_millis(4000);
+        // `None` = first AU not written yet, `Some(0)` = written, head not
+        // moving yet — wait through both (bounded).
+        while matches!(audio_sink.played_since_flush_ms(), None | Some(0)) {
             if gate.elapsed() > gate_cap {
                 log::debug!("[vsync] audio-start gate timed out ({}ms); anchoring anyway", gate_cap.as_millis());
                 break;
@@ -1486,20 +1534,14 @@ async fn av_sync_handler<V: VideoSink, A: AudioSink>(
     }
     let now = Instant::now();
     let start_time = Arc::new(now.checked_sub(seek_offset).unwrap_or(now));
-    // Baseline the cumulative audio clock at the SAME instant as start_time so
-    // the video sync loop can rebase played_ms onto this pipeline's 0-based
-    // media timeline (position = seek_offset + (played - audio_base)).
-    // Passthrough's AudioTrack played_ms is ALREADY 0-based from this
-    // pipeline's start (fresh track playing seek_offset content from 0), and
-    // it has typically been playing for the video-startup duration by now — so
-    // its base is 0, not the (late, non-zero) anchor snapshot, which would make
-    // the clock lag by that pre-anchor playback (audio running seconds ahead).
-    let audio_base_ms = if audio_sink.is_passthrough() {
-        0
-    } else {
-        audio_sink.played_ms().unwrap_or(0)
-    };
-    log::debug!("[av_sync] spawning sync loops (audio_base={}ms)", audio_base_ms);
+    log::info!(
+        "[av_sync gen {}] spawning sync loops: target={}ms origin={}ms audio_since_flush={:?}ms (audio start waited {}ms)",
+        gen,
+        seek_offset.as_millis(),
+        origin.as_millis(),
+        audio_sink.played_since_flush_ms(),
+        gate.elapsed().as_millis()
+    );
     let stats_audio = Arc::clone(&stats);
     let events_audio = Arc::clone(&events);
     let paused_audio = Arc::clone(&paused);
@@ -1509,7 +1551,7 @@ async fn av_sync_handler<V: VideoSink, A: AudioSink>(
             gen,
             start_time.clone(),
             seek_offset,
-            audio_base_ms,
+            origin.as_micros() as i64,
             video_discard_below_us,
             video_rx,
             video_sink,
@@ -1527,6 +1569,7 @@ async fn av_sync_handler<V: VideoSink, A: AudioSink>(
             audio_rx,
             audio_sink,
             seek_offset.as_millis() as i64,
+            origin.as_millis() as i64,
             stop.clone(),
             stop_flag.clone(),
             stats_audio,
@@ -3644,6 +3687,17 @@ impl Player<VideoRenderer, AudioRenderer> {
         video_renderer: Arc<VideoRenderer>,
         audio_renderer: Arc<AudioRenderer>,
     ) -> Self {
+        Self::with_sinks(video_renderer, audio_renderer)
+    }
+}
+
+impl<V: VideoSink, A: AudioSink> Player<V, A> {
+    /// Build a player over arbitrary sinks. This is how the platform
+    /// constructors assemble the player, exposed so a host (or a test
+    /// harness) can wrap the stock renderers — e.g. tap every presented
+    /// frame / queued sample to measure lip-sync independently of the
+    /// engine's own clock (see `examples/conformance.rs`).
+    pub fn with_sinks(video_renderer: Arc<V>, audio_renderer: Arc<A>) -> Self {
         // Windows ships a ~15.6 ms default timer resolution and (since Win10
         // 2004) keeps unfocused/background processes on the coarse timer
         // unless they opt in. Every pacing sleep in the vsync loop then wakes
@@ -4024,6 +4078,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             ],
             video_frames_decoded: s.video_frames_decoded.load(Ordering::Relaxed),
             video_frames_dropped: s.video_frames_dropped.load(Ordering::Relaxed),
+            video_late_frames: s.video_late_frames.load(Ordering::Relaxed),
             audio_underruns: s.audio_underruns.load(Ordering::Relaxed),
         }
     }
@@ -4975,6 +5030,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                 av_sync_handler(
                     gen,
                     seek_offset,
+                    origin,
                     discard_below_us,
                     video_ready.clone(),
                     frame_receiver,

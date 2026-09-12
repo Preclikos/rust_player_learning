@@ -10,6 +10,14 @@ use tokio::sync::{
     Notify,
 };
 
+use crate::av_sync::{AudioChunk, FlushState};
+
+/// Bound on queued PCM, in chunks (one chunk = one decoded frame: 1024
+/// per-channel frames for AAC ≈ 21 ms, 1536 for (E-)AC-3 ≈ 32 ms). 96 chunks
+/// ≈ 2–3 s — the same depth the old per-sample channel (192 000 f32) gave, so
+/// the decoder's run-ahead / back-pressure behaviour is unchanged.
+const QUEUE_CHUNKS: usize = 96;
+
 // Per-platform output backends, each in its own file (mirrors the `video`
 // module's per-backend split): cpal PCM on desktop/iOS, an AudioTrack PCM sink
 // on Android (cpal/AAudio is stolen on some TV HALs), and an AudioTrack
@@ -23,9 +31,16 @@ mod audio_track_pcm;
 
 pub struct AudioRenderer {
     command_sender: Sender<AudioRendererCommand>,
-    sample_sender: Sender<f32>,
+    /// PCM to the output backend, one `AudioChunk` per decoded frame, tagged
+    /// with the flush generation (see `av_sync::FlushState`).
+    sample_sender: Sender<AudioChunk>,
     sample_rate: u32,
-    flush_flag: Arc<AtomicBool>,
+    /// Flush generation + post-flush playback boundary, shared with the
+    /// backend consumer. `flush()` bumps the generation (stale chunks are
+    /// dropped by the consumer — race-free); the consumer marks where the
+    /// new generation's content begins so `played_since_flush_ms` counts
+    /// only THIS pipeline's audio.
+    flush_state: Arc<FlushState>,
     paused_flag: Arc<AtomicBool>,
     /// Volume gain in 0.0..=1.0, stored as `f32::to_bits` so the cpal
     /// output callback (which runs on a non-tokio audio thread) can read
@@ -83,7 +98,7 @@ enum AudioRendererCommand {
 impl AudioRenderer {
     pub fn new() -> Self {
         let stop = Arc::new(Notify::new());
-        let flush_flag = Arc::new(AtomicBool::new(false));
+        let flush_state = Arc::new(FlushState::new());
         // Start paused so cpal emits silence (without draining the
         // mpsc) until av_sync_handler is ready to start playback. Once
         // the av_sync handler observes both decoders' first frame, it
@@ -115,7 +130,7 @@ impl AudioRenderer {
             let t = audio_cpal::start_thread(
                 command_receiver,
                 stop,
-                flush_flag.clone(),
+                flush_state.clone(),
                 paused_flag.clone(),
                 volume.clone(),
                 samples_consumed.clone(),
@@ -134,7 +149,7 @@ impl AudioRenderer {
             drop(command_receiver);
             drop(stop);
             audio_track_pcm::start_output(
-                flush_flag.clone(),
+                flush_state.clone(),
                 host_paused.clone(),
                 volume.clone(),
             )
@@ -144,7 +159,7 @@ impl AudioRenderer {
             command_sender,
             sample_sender,
             sample_rate,
-            flush_flag,
+            flush_state,
             paused_flag,
             volume,
             peak_l_db: Arc::new(AtomicU32::new(0)),
@@ -189,17 +204,24 @@ impl AudioRenderer {
         let expected_bytes =
             frame.samples() * frame.channels() as usize * std::mem::size_of::<f32>();
         let cpal_sample_data: &[f32] = bytemuck::cast_slice(&frame.data(0)[..expected_bytes]);
-
-        for &sample in cpal_sample_data {
-            let _ = self.sample_sender.send(sample).await;
-        }
+        self.put_samples_raw(cpal_sample_data).await;
     }
 
+    /// Queue one decoded frame's PCM as a single chunk tagged with the
+    /// current flush generation. One channel send per frame (not per
+    /// sample, as before — ~50/s instead of ~96 000/s), and the tag is what
+    /// lets the consumer discard content queued before a flush without any
+    /// producer/consumer race.
     pub async fn put_samples_raw(&self, samples: &[f32]) {
-        self.update_peaks(samples);
-        for &s in samples {
-            let _ = self.sample_sender.send(s).await;
+        if samples.is_empty() {
+            return;
         }
+        self.update_peaks(samples);
+        let chunk = AudioChunk {
+            gen: self.flush_state.current_gen(),
+            samples: samples.to_vec(),
+        };
+        let _ = self.sample_sender.send(chunk).await;
     }
 
     /// Returns the last computed L/R peak in dB, or `None` before the
@@ -227,8 +249,28 @@ impl AudioRenderer {
         _ = self.command_sender.send(AudioRendererCommand::Stop).await;
     }
 
+    /// Discard queued PCM (seek / track switch). Bumps the flush generation:
+    /// the backend consumer drops every chunk tagged with an older one, and
+    /// `played_since_flush_ms` reads 0 until content of the new generation
+    /// is actually being presented. The device's own buffer is NOT flushed —
+    /// its tail plays out (a few ms on cpal, the track buffer on Android),
+    /// which is exactly why the clock waits for the boundary.
     pub fn flush(&self) {
-        self.flush_flag.store(true, Ordering::Relaxed);
+        let gen = self.flush_state.flush();
+        log::debug!("[audio] flush → generation {}", gen);
+    }
+
+    /// Media ms of the current generation's PCM presented so far (0 while
+    /// the previous generation's tail drains). cpal / null-sink path only;
+    /// Android and passthrough delegate to their own sinks.
+    #[cfg(not(target_os = "android"))]
+    fn pcm_played_since_flush_ms(&self) -> Option<u64> {
+        if self.sample_rate == 0 {
+            return None;
+        }
+        let consumed = self.samples_consumed.load(Ordering::Acquire);
+        let since = self.flush_state.played_since_flush(consumed);
+        Some(since / 2 * 1000 / self.sample_rate as u64)
     }
 
     /// HOST pause/unpause. This inherent method is what `Player::pause/resume/
@@ -295,6 +337,22 @@ impl super::AudioSink for AudioRenderer {
             // resampler preserves duration, so output time = media time).
             let frames = self.samples_consumed.load(Ordering::Relaxed) / 2;
             Some(frames * 1000 / self.sample_rate as u64)
+        }
+    }
+
+    fn played_since_flush_ms(&self) -> Option<u64> {
+        // Passthrough: a fresh AudioTrack per pipeline, its head is already
+        // 0-based from this pipeline's first AU.
+        if let Some(pt) = self.passthrough.lock().unwrap().as_ref() {
+            return pt.played_ms();
+        }
+        #[cfg(target_os = "android")]
+        {
+            return self.pcm_sink.as_ref().and_then(|s| s.played_since_flush_ms());
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            self.pcm_played_since_flush_ms()
         }
     }
 

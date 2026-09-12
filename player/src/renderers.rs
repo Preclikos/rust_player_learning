@@ -124,6 +124,18 @@ pub trait AudioSink: Send + Sync + 'static {
     fn played_ms(&self) -> Option<u64> {
         None
     }
+    /// Media ms of THIS pipeline's audio — content queued after the last
+    /// `flush()` — that the device has actually presented. This is the
+    /// master-clock source (`MediaClock`): `Some(0)` while the previous
+    /// pipeline's tail is still draining from the device buffer or nothing
+    /// new has reached the device yet, so video holds its first frame until
+    /// the new audio is really audible instead of running ahead by the
+    /// tail. `None` = the sink has no clock (mocks, output not open) — the
+    /// wall clock is used instead. Default: same as `played_ms` (sinks that
+    /// restart their counter per pipeline, e.g. a fresh passthrough track).
+    fn played_since_flush_ms(&self) -> Option<u64> {
+        self.played_ms()
+    }
     /// Output-path latency in ms (device output buffer + DAC) — how long
     /// after the sink consumes a sample it becomes audible. The video
     /// sync loop subtracts this from its wall clock so a frame reaches the

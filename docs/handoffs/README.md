@@ -6,6 +6,7 @@ device-verified state at a point in time.
 
 | Doc | Téma | Stav |
 |---|---|---|
+| [AV_SYNC_TIMELINE_AND_FLUSH_BOUNDARY.md](AV_SYNC_TIMELINE_AND_FLUSH_BOUNDARY.md) | Rozjeté A/V po seeku/switchi: clock počítal starý AudioTrack tail, video ukotvené na 1. snímek, audio trim na špatné ose; `av_sync.rs` + nezávislý lip-sync check v conformance | ✅ engine opraven + desktop soak zelený; ⚠️ Android device verify pending |
 | [PREBUILT_DISTRIBUTION_AAR_XCFRAMEWORK.md](PREBUILT_DISTRIBUTION_AAR_XCFRAMEWORK.md) | Ship player as prebuilt AAR (GitHub Packages) + XCFramework (SwiftPM) — consumers compile no Rust | ✅ Android AAR verified; ⚠️ iOS + CI written, Mac/CI-verify pending |
 | [UNIFIED_BRIDGE_FOR_PRODUCT_APPS.md](UNIFIED_BRIDGE_FOR_PRODUCT_APPS.md) | `app_shared::bridge` as the product consumer surface (StartConfig, `forced`, `video_size`) | ✅ 3 core gaps resolved; BlackZone app-side migration pending |
 | [IOS_REQUEST_FILTER_HEADERS.md](IOS_REQUEST_FILTER_HEADERS.md) | iOS request filter carries only a URL — add headers/method/body (generic, Android parity) so header-authed consumers can use the package | 🟢 fixed (Rust+ABI build-verified; iOS FFI also de-branded to `rustplayer_`); Mac wire test + `ios-v0.1.1` re-tag pending |

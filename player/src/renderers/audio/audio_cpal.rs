@@ -27,7 +27,8 @@ use tokio::sync::{
     Notify,
 };
 
-use super::AudioRendererCommand;
+use super::{AudioRendererCommand, QUEUE_CHUNKS};
+use crate::av_sync::{AudioChunk, ChunkCursor, FlushState};
 
 /// iOS only: the OS-authoritative output sample rate, read from
 /// `AVAudioSession.sharedInstance().sampleRate`.
@@ -89,7 +90,7 @@ fn ios_output_channels() -> Option<u16> {
 
 #[allow(clippy::too_many_arguments)]
 async fn start_audio(
-    mut sample_receiver: Receiver<f32>,
+    sample_receiver: Receiver<AudioChunk>,
     device: Device,
     // Rate + channel count to open the device at, resolved in `start_thread`
     // (rate from the iOS AVAudioSession; channels prefer stereo so the OS
@@ -98,11 +99,15 @@ async fn start_audio(
     out_channels: u16,
     volume: Arc<AtomicU32>,
     stop: Arc<Notify>,
-    flush_flag: Arc<AtomicBool>,
+    flush_state: Arc<FlushState>,
     paused_flag: Arc<AtomicBool>,
     samples_consumed: Arc<AtomicU64>,
     output_latency_ms: Arc<AtomicU64>,
 ) {
+    // Generation-filtering cursor over the chunk queue: drops PCM queued
+    // before the last flush and records the consumed-sample position at which
+    // each new generation begins (the post-flush clock boundary).
+    let mut cursor = ChunkCursor::new(sample_receiver, flush_state, samples_consumed);
     // The resampler always emits packed STEREO. With a stereo stream
     // (the normal case) the callback copies 1:1; on a mono-only output it
     // downmixes (L+R)/2 — otherwise stereo fed 1:1 into a mono stream plays
@@ -133,11 +138,10 @@ async fn start_audio(
         if ms > 0 && ms <= 1000 {
             output_latency_ms.store(ms, Ordering::Relaxed);
         }
-        if flush_flag.swap(false, Ordering::Relaxed) {
-            while sample_receiver.try_recv().is_ok() {}
-        }
-        // While paused, emit silence WITHOUT draining the receiver —
-        // resume picks up exactly where we left off.
+        // While paused, emit silence WITHOUT consuming — resume picks up
+        // exactly where we left off. (A flush that lands mid-pause is
+        // honoured by the cursor on the next consuming callback: the stale
+        // generation is skipped then.)
         if paused_flag.load(Ordering::Relaxed) {
             for sample in data.iter_mut() {
                 *sample = Sample::EQUILIBRIUM;
@@ -145,42 +149,21 @@ async fn start_audio(
             return;
         }
         let vol = f32::from_bits(volume.load(Ordering::Relaxed));
-        let mut consumed = 0u64;
         if out_ch >= 2 {
             for sample in data.iter_mut() {
-                let asample = match sample_receiver.try_recv() {
-                    Ok(s) => {
-                        consumed += 1;
-                        s
-                    }
-                    Err(_) => Sample::EQUILIBRIUM,
-                };
-                *sample = asample * vol;
+                *sample = cursor.next_sample().unwrap_or(Sample::EQUILIBRIUM) * vol;
             }
         } else {
             // Mono output device: downmix the packed-stereo source (L+R)/2
             // per output sample so playback runs at the correct speed/pitch.
             for sample in data.iter_mut() {
-                let l = match sample_receiver.try_recv() {
-                    Ok(s) => {
-                        consumed += 1;
-                        s
-                    }
-                    Err(_) => Sample::EQUILIBRIUM,
-                };
-                let r = match sample_receiver.try_recv() {
-                    Ok(s) => {
-                        consumed += 1;
-                        s
-                    }
-                    Err(_) => l,
-                };
+                let l = cursor.next_sample().unwrap_or(Sample::EQUILIBRIUM);
+                let r = cursor.next_sample().unwrap_or(l);
                 *sample = (l + r) * 0.5 * vol;
             }
         }
-        if consumed > 0 {
-            samples_consumed.fetch_add(consumed, Ordering::Relaxed);
-        }
+        // Publish the consumed-sample count once per callback (the clock).
+        cursor.commit();
     };
 
     // RealtimeDenied (AAudio couldn't grant the low-latency/realtime
@@ -209,10 +192,10 @@ async fn start_audio(
 /// exactly like the cpal callback would. Everything downstream behaves as if
 /// a perfect silent device were attached; video plays, nothing is audible.
 fn start_null_sink(
-    mut sample_receiver: Receiver<f32>,
+    sample_receiver: Receiver<AudioChunk>,
     mut command_receiver: Receiver<AudioRendererCommand>,
     stop: Arc<Notify>,
-    flush_flag: Arc<AtomicBool>,
+    flush_state: Arc<FlushState>,
     paused_flag: Arc<AtomicBool>,
     samples_consumed: Arc<AtomicU64>,
 ) {
@@ -221,13 +204,11 @@ fn start_null_sink(
         .spawn(move || {
             const RATE: f64 = 48_000.0 * 2.0; // samples/sec, packed stereo
             let tick = std::time::Duration::from_millis(10);
+            let mut cursor = ChunkCursor::new(sample_receiver, flush_state, samples_consumed);
             let mut credit = 0f64;
             let mut last = std::time::Instant::now();
             loop {
                 std::thread::sleep(tick);
-                if flush_flag.swap(false, Ordering::Relaxed) {
-                    while sample_receiver.try_recv().is_ok() {}
-                }
                 let now = std::time::Instant::now();
                 if paused_flag.load(Ordering::Relaxed) {
                     last = now;
@@ -238,20 +219,14 @@ fn start_null_sink(
                 // Cap the backlog so a long descheduled stretch can't trigger
                 // a burst-drain (mirrors a real device's bounded buffer).
                 credit = credit.min(RATE);
-                let mut consumed = 0u64;
                 while credit >= 1.0 {
-                    match sample_receiver.try_recv() {
-                        Ok(_) => {
-                            consumed += 1;
-                            credit -= 1.0;
-                        }
-                        Err(mpsc::error::TryRecvError::Empty) => break,
-                        Err(mpsc::error::TryRecvError::Disconnected) => return,
+                    match cursor.next_sample() {
+                        Some(_) => credit -= 1.0,
+                        None if cursor.is_closed() => return,
+                        None => break,
                     }
                 }
-                if consumed > 0 {
-                    samples_consumed.fetch_add(consumed, Ordering::Relaxed);
-                }
+                cursor.commit();
             }
         })
         .expect("spawn null audio thread");
@@ -273,13 +248,13 @@ fn start_null_sink(
 pub(super) fn start_thread(
     mut command_receiver: Receiver<AudioRendererCommand>,
     stop: Arc<Notify>,
-    flush_flag: Arc<AtomicBool>,
+    flush_state: Arc<FlushState>,
     paused_flag: Arc<AtomicBool>,
     volume: Arc<AtomicU32>,
     samples_consumed: Arc<AtomicU64>,
     output_latency_ms: Arc<AtomicU64>,
-) -> (Sender<f32>, u32) {
-    let (sample_sender, sample_receiver) = mpsc::channel::<f32>(192_000);
+) -> (Sender<AudioChunk>, u32) {
+    let (sample_sender, sample_receiver) = mpsc::channel::<AudioChunk>(QUEUE_CHUNKS);
 
     // No usable audio output (headless CI runner, server, unplugged dock):
     // don't panic the whole player — run a NULL sink that consumes samples at
@@ -320,7 +295,7 @@ pub(super) fn start_thread(
             sample_receiver,
             command_receiver,
             stop,
-            flush_flag,
+            flush_state,
             paused_flag,
             samples_consumed,
         );
@@ -347,7 +322,7 @@ pub(super) fn start_thread(
         out_channels,
         volume,
         stop_cpal,
-        flush_flag,
+        flush_state,
         paused_flag,
         samples_consumed,
         output_latency_ms,

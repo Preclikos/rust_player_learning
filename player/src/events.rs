@@ -50,6 +50,10 @@ pub enum PlayerEvent {
     Stats {
         video_frames_decoded: u64,
         video_frames_dropped: u64,
+        /// Frames presented >45 ms after their master-clock time — shown,
+        /// not dropped, so a visible per-frame lip-sync error (the LATE
+        /// drain only intervenes past 80 ms). Cumulative.
+        video_late_frames: u64,
         audio_underruns: u64,
         /// Wall-clock ms the decoder was blocked waiting on network in
         /// the last second (0 = healthy).

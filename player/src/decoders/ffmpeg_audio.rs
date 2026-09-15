@@ -69,6 +69,19 @@ impl FfmpegAudioDecoder {
     }
 }
 
+/// Per-channel sample frames to allocate for the resampler's output.
+///
+/// Mirrors FFmpeg's own idiom for sizing a `swr_convert` destination —
+/// `av_rescale_rnd(swr_get_delay(s, in_rate) + in_samples, out_rate,
+/// in_rate, AV_ROUND_UP)` — as plain integer maths so it can be tested
+/// without a live resampler. Rounds UP: one frame short and swr keeps the
+/// remainder in its internal FIFO.
+fn out_capacity(pending_in_samples: i64, in_samples: i64, in_rate: u32, out_rate: u32) -> usize {
+    let den = in_rate.max(1) as i64;
+    let num = (pending_in_samples + in_samples).max(0) * out_rate as i64;
+    ((num + den - 1) / den).max(1) as usize
+}
+
 impl AudioDecoder for FfmpegAudioDecoder {
     fn configure(&mut self, params: AudioDecoderParams) -> Result<(), DecoderError> {
         let codec_id = match params.codec {
@@ -192,9 +205,28 @@ impl AudioDecoder for FfmpegAudioDecoder {
                 if needs_rebuild {
                     self.build_resampler(in_rate, in_layout)?;
                 }
+                let out_rate = self.output_sample_rate;
                 let resampler = self.resampler.as_mut().unwrap();
 
-                let mut dst = ffmpeg_next::util::frame::Audio::empty();
+                // Size the destination ourselves. Handing `run()` an EMPTY
+                // frame looks harmless but is not: ffmpeg-next then allocates
+                // the output from the *input* sample count, which is short by
+                // out_rate/in_rate whenever the stream is upsampled — 1024
+                // slots for the ~1115 samples one 44.1 kHz AAC frame becomes
+                // on a 48 kHz device. swr keeps the overflow in its internal
+                // FIFO, so every decoded frame ends ~8 % short of where its
+                // pts says it should, and `AudioAligner` splices ~11 ms of
+                // silence in every sixth frame to stay contiguous — audible
+                // as a rapid flicker. (48 kHz sources were unaffected: no rate
+                // change means in_samples == out_samples, which is why this
+                // only ever showed on 44.1 kHz titles.)
+                let pending = resampler.delay().map_or(0, |d| d.input);
+                let cap = out_capacity(pending, frame.samples() as i64, in_rate, out_rate);
+                let mut dst = ffmpeg_next::util::frame::Audio::new(
+                    ffmpeg_next::util::format::sample::Sample::F32(Type::Packed),
+                    cap,
+                    ChannelLayout::STEREO,
+                );
                 resampler
                     .run(&frame, &mut dst)
                     .map_err(|e| -> DecoderError { format!("resample: {}", e).into() })?;
@@ -297,5 +329,44 @@ mod tests {
             48_000,
         );
         assert!(r.is_ok(), "resampler unavailable: {:?}", r.err());
+    }
+
+    #[test]
+    fn out_capacity_covers_an_upsampled_aac_frame() {
+        // The regression this guards: one 1024-sample AAC frame at 44.1 kHz
+        // becomes 1024 * 48000/44100 = 1114.7 samples at the 48 kHz device
+        // rate. Sizing the destination from the INPUT count (1024) leaves
+        // ~91 samples per frame stuck in swr's FIFO — ~8 % of the stream —
+        // which the aligner then papers over with ~11 ms silence splices
+        // roughly seven times a second.
+        let cap = out_capacity(0, 1024, 44_100, 48_000);
+        assert!(cap >= 1115, "capacity {cap} truncates an upsampled AAC frame");
+        assert!(cap < 1024 * 2, "capacity {cap} is wastefully large");
+    }
+
+    #[test]
+    fn out_capacity_accounts_for_samples_already_buffered() {
+        // `delay().input` is in INPUT samples, so it is added before the
+        // rescale — a frame arriving with 512 input samples pending needs
+        // room for both.
+        let none = out_capacity(0, 1024, 44_100, 48_000);
+        let pending = out_capacity(512, 1024, 44_100, 48_000);
+        assert!(pending > none, "pending samples must widen the destination");
+        assert!(pending >= (1024 + 512) * 48_000 / 44_100);
+    }
+
+    #[test]
+    fn out_capacity_is_identity_when_no_rate_change() {
+        // 48 kHz sources (the common case) must not grow the buffer — this
+        // is why the truncation bug never showed on them.
+        assert_eq!(out_capacity(0, 1536, 48_000, 48_000), 1536);
+    }
+
+    #[test]
+    fn out_capacity_handles_downsampling_and_degenerate_input() {
+        // Downsampling shrinks the output but must never round to zero.
+        assert_eq!(out_capacity(0, 1024, 48_000, 44_100), 941); // ceil(940.8)
+        assert_eq!(out_capacity(0, 0, 44_100, 48_000), 1);
+        assert_eq!(out_capacity(0, 1024, 0, 48_000), 1024 * 48_000); // rate 0 → guarded
     }
 }

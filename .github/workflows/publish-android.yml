@@ -32,8 +32,16 @@ jobs:
           java-version: "21"
           distribution: temurin
 
+      # `packages` is pinned to drop the action's default "tools
+      # platform-tools": the legacy `tools` package no longer resolves in
+      # Google's SDK repository ("Warning: Failed to find package 'tools'"),
+      # which fails the step outright. Nothing here needs it — the NDK comes
+      # from the explicit sdkmanager call below and AGP pulls its own
+      # build-tools/platform.
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
 
       - name: Install NDK
         run: sdkmanager --install "ndk;29.0.13113456"

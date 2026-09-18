@@ -53,6 +53,16 @@ fontdue = "0.9"
 # into the precomposed code points fonts actually carry glyphs for.
 unicode-normalization = "0.1"
 
+# Host-supplied sidecar subtitles (`Player::add_external_subtitle_track`)
+# are whatever the user had on disk. UTF-8 is the spec for WebVTT but real
+# `.srt` files are routinely CP1250 / ISO-8859-2 (Czech, Polish) or
+# CP1252, with no declared charset anywhere in the file. `chardetng` is
+# Firefox's detector, so it guesses the same way the browsers users
+# compare us against do, and `encoding_rs` does the actual transcode (it
+# is already in the tree via reqwest's `charset` feature).
+encoding_rs = "0.8"
+chardetng = "0.1"
+
 # FFmpeg is used on every target except Android (MediaCodec). Win/Linux use it
 # for both video + audio; macOS AND iOS use it for AUDIO only (native
 # VideoToolbox stays for video). AudioToolbox's AAC decoder mis-behaves when fed

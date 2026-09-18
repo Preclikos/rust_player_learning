@@ -60,11 +60,26 @@ pub fn parse_segment(data: &[u8], segment_pts_ms: i64) -> Vec<VttCue> {
 // Raw WebVTT text parser
 // ---------------------------------------------------------------------------
 
-fn parse_raw_webvtt(data: &[u8]) -> Vec<VttCue> {
+pub(crate) fn parse_raw_webvtt(data: &[u8]) -> Vec<VttCue> {
     // UTF-8 lossy — keep going even if the source has a stray invalid
     // byte (some web-scraped subs do). The cue text characters that
     // matter for rendering are virtually always valid UTF-8.
-    let mut text = String::from_utf8_lossy(data).into_owned();
+    //
+    // Host-supplied sidecar files take the `parsers::sidecar` route
+    // instead, which sniffs the charset first; segments off the wire are
+    // UTF-8 per spec, so lossy decoding is the right call here.
+    parse_cue_blocks(&String::from_utf8_lossy(data))
+}
+
+/// Split an already-decoded WebVTT / SubRip body into cues.
+///
+/// Both formats are "blocks separated by a blank line, each block an
+/// optional identifier line, a `-->` timing line, then the text", so one
+/// parser covers them: `parse_timestamp` takes SubRip's comma as readily
+/// as WebVTT's decimal point, and SubRip's sequence number lands on the
+/// identifier line the WebVTT grammar already allows.
+pub(crate) fn parse_cue_blocks(body: &str) -> Vec<VttCue> {
+    let mut text = body.to_string();
 
     // Strip the optional UTF-8 BOM. WebVTT files served from real CDNs
     // often have it.
@@ -106,7 +121,7 @@ fn parse_raw_webvtt(data: &[u8]) -> Vec<VttCue> {
 /// First line of text
 /// Second line
 /// ```
-fn parse_cue_block(block: &str) -> Option<VttCue> {
+pub(crate) fn parse_cue_block(block: &str) -> Option<VttCue> {
     let mut lines = block.lines();
     let mut first = lines.next()?.trim();
     // Optional identifier line — if it doesn't contain "-->" the next
@@ -161,8 +176,14 @@ fn parse_cue_block(block: &str) -> Option<VttCue> {
 }
 
 /// Parse `HH:MM:SS.mmm` or `MM:SS.mmm` to milliseconds.
+///
+/// A comma is accepted in place of the decimal point: SubRip writes
+/// `00:00:01,000`, and sidecar `.srt` files otherwise go through exactly
+/// the same block parser as WebVTT.
 fn parse_timestamp(s: &str) -> Option<i64> {
-    let (time_part, ms_part) = s.split_once('.').unwrap_or((s, "0"));
+    let (time_part, ms_part) = s
+        .split_once(['.', ','])
+        .unwrap_or((s, "0"));
     let parts: Vec<&str> = time_part.split(':').collect();
     let (h, m, sec) = match parts.as_slice() {
         [h, m, s] => (h.parse::<i64>().ok()?, m.parse::<i64>().ok()?, s.parse::<i64>().ok()?),

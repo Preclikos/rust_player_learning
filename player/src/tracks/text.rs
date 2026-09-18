@@ -7,7 +7,10 @@
 //! pipeline that mirrors the audio one. Only WebVTT in ISO BMFF (and
 //! raw WebVTT) is decoded today; TTML is enumerated but won't render.
 
+use std::sync::Arc;
+
 use super::segment::Segment;
+use crate::parsers::vtt::VttCue;
 
 #[derive(Clone)]
 pub struct TextAdaptation {
@@ -80,6 +83,22 @@ pub struct TextRepresenation {
     /// activation time. text_play fetches the full URL and parses the
     /// payload as raw WebVTT.
     pub single_file_url: Option<String>,
+
+    /// Cues the host handed us directly via
+    /// [`crate::Player::add_external_subtitle_track`], already parsed.
+    ///
+    /// When set, this representation has no network side at all: there is
+    /// no URL to fetch and no manifest entry behind it, and selecting it
+    /// pushes these cues straight to the overlay. It exists so a sidecar
+    /// file the user picked in the host's own file dialog is just another
+    /// entry in the same track list, selected through the same
+    /// `set_subtitle_track` — rather than a second, parallel "external
+    /// subtitles" mode every consumer would have to special-case.
+    ///
+    /// `Arc` because `TextRepresenation` is cloned freely (into the track
+    /// list, into the selection cell, into the spawned task) and the cue
+    /// list is the one part of it that isn't cheap to copy.
+    pub external_cues: Option<Arc<Vec<VttCue>>>,
 }
 
 impl TextRepresenation {
@@ -96,6 +115,12 @@ impl TextRepresenation {
         }
     }
 
+    /// True when this is a host-supplied track rather than anything from
+    /// the manifest.
+    pub fn is_external(&self) -> bool {
+        self.external_cues.is_some()
+    }
+
     /// True when the representation looks decodable today (i.e. WebVTT
     /// in ISO BMFF or raw). TTML and sidecar formats return false; the
     /// subtitle pipeline silently no-ops on those.
@@ -105,7 +130,13 @@ impl TextRepresenation {
     }
 
     /// Single-line summary for a track picker, e.g. `"WebVTT · 12 kbps"`.
+    /// An external track has no bitrate to quote, so it reports its cue
+    /// count instead — the one number that tells the user whether the
+    /// file they just picked actually loaded.
     pub fn label(&self) -> String {
+        if let Some(cues) = &self.external_cues {
+            return format!("{} · {} cues", self.codec_short(), cues.len());
+        }
         let kbps = (self.bandwidth as f64 / 1000.0).round() as u64;
         if kbps == 0 {
             self.codec_short().to_string()

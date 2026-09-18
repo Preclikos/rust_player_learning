@@ -29,6 +29,9 @@ pub use events::{
 pub use ffmpeg_log::{set_log_level, LogLevel};
 pub use hdr_tonemap::HdrTonemapParams;
 pub use subtitle_style::SubtitleStyle;
+/// Host-supplied sidecar subtitles — see
+/// [`Player::add_external_subtitle_track`].
+pub use parsers::sidecar::{SidecarError, SubtitleFormat};
 pub use net::{
     tls_client, BoxError, HttpClient, LicenseResolver, NoopInterceptor, PreparedRequest,
     RequestInterceptor, RequestKind, RetryPolicy,
@@ -299,6 +302,39 @@ struct StatsState {
     int_gt58: AtomicU64,
 }
 
+/// How to interpret the bytes handed to
+/// [`Player::add_external_subtitle_track`], and how to present the
+/// resulting track. `Default` means "detect everything, no offset".
+#[derive(Clone, Debug, Default)]
+pub struct ExternalSubtitleOptions {
+    /// BCP-47 language tag (`"cs"`, `"en"`). Surfaces as the track's
+    /// `lang`, which is what a picker groups by; empty when unknown.
+    pub language: Option<String>,
+    /// Human-readable name for a picker, typically the file name. Only
+    /// logged today — the track list has no label field of its own yet,
+    /// so hosts keep their own mapping by representation id.
+    pub label: Option<String>,
+    /// Source format. Leave as `Auto` unless the host knows better than
+    /// the payload does.
+    pub format: crate::parsers::sidecar::SubtitleFormat,
+    /// Force a character encoding by `encoding_rs` label (e.g.
+    /// `"windows-1250"`) instead of detecting one. The escape hatch for
+    /// short files where detection guesses wrong.
+    pub encoding: Option<String>,
+    /// Shift every cue by this many milliseconds — positive makes
+    /// subtitles appear later. The usual "subs are two seconds out" fix
+    /// for a sidecar file cut for a different release.
+    pub time_offset_ms: i64,
+    /// Mark the track as forced subtitles (signs and untranslated
+    /// dialogue only), the same way a manifest `Role` would.
+    pub forced: bool,
+}
+
+/// External subtitle ids count down from here, far above any manifest
+/// `@id`, so a host can tell the two apart at a glance and the ranges can
+/// never collide.
+const EXTERNAL_TEXT_ID_BASE: u32 = u32::MAX;
+
 pub struct Player<V: VideoSink = VideoRenderer, A: AudioSink = AudioRenderer> {
     base_url: Option<String>,
     manifest: Option<Manifest>,
@@ -375,6 +411,19 @@ pub struct Player<V: VideoSink = VideoRenderer, A: AudioSink = AudioRenderer> {
     /// subtitles disabled — text_play won't spawn. Consumer toggles via
     /// `set_subtitle_track` / `clear_subtitle_track`.
     subtitle_representation: Arc<StdMutex<Option<tracks::text::TextRepresenation>>>,
+
+    /// Subtitle tracks the host added from its own bytes via
+    /// `add_external_subtitle_track`, kept beside the manifest's rather
+    /// than merged into `tracks`: they outlive `prepare()` (a host may
+    /// add them before the manifest has even been fetched) and must not
+    /// be wiped when the parsed track tree is replaced. `get_tracks`
+    /// concatenates the two.
+    external_text: Arc<StdMutex<Vec<tracks::text::TextAdaptation>>>,
+    /// Source of ids for external tracks. Manifest `@id`s are small
+    /// integers, so external tracks count down from `u32::MAX` — no
+    /// coordination needed to stay clear of them, and the range is
+    /// obvious in a log line.
+    next_external_id: Arc<AtomicU32>,
 
     /// Android direct mode: the dedicated video-plane `ANativeWindow` the
     /// decoder renders into (0 = classic renderer path). Set by the host before
@@ -457,6 +506,8 @@ impl<V: VideoSink, A: AudioSink> Clone for Player<V, A> {
             video_switch_tx: Arc::clone(&self.video_switch_tx),
             buffer_target_secs: Arc::clone(&self.buffer_target_secs),
             subtitle_representation: Arc::clone(&self.subtitle_representation),
+            external_text: Arc::clone(&self.external_text),
+            next_external_id: Arc::clone(&self.next_external_id),
             video_output_window: Arc::clone(&self.video_output_window),
             adaptive_frame_rate: Arc::clone(&self.adaptive_frame_rate),
             audio_passthrough: Arc::clone(&self.audio_passthrough),
@@ -2852,6 +2903,50 @@ async fn audio_passthrough_task(
 // Subtitle (WebVTT) pipeline
 // ---------------------------------------------------------------------------
 
+/// Turn a parsed sidecar file into the track pair the rest of the player
+/// speaks: one representation carrying the cues, wrapped in its own
+/// adaptation set (a sidecar file has its own language and role, which is
+/// exactly what an adaptation set is for).
+fn external_track(
+    id: u32,
+    parsed: crate::parsers::sidecar::ParsedSidecar,
+    options: &ExternalSubtitleOptions,
+) -> (tracks::text::TextRepresenation, tracks::text::TextAdaptation) {
+    let mime_type = match parsed.format {
+        crate::parsers::sidecar::SubtitleFormat::SubRip => "application/x-subrip",
+        _ => "text/vtt",
+    }
+    .to_string();
+
+    let representation = tracks::text::TextRepresenation {
+        id,
+        // `wvtt` regardless of the source format: by this point the cues
+        // are parsed and everything downstream only sees WebVTT cues.
+        codecs: "wvtt".to_string(),
+        mime_type,
+        bandwidth: 0,
+        base_url: String::new(),
+        file_url: String::new(),
+        segment_init: None,
+        segment_range: None,
+        segments: Vec::new(),
+        single_file_url: None,
+        external_cues: Some(Arc::new(parsed.cues)),
+    };
+
+    let mut roles = vec!["subtitle".to_string()];
+    if options.forced {
+        roles.push("forced-subtitle".to_string());
+    }
+    let adaptation = tracks::text::TextAdaptation {
+        id,
+        lang: options.language.clone().unwrap_or_default(),
+        roles,
+        representations: vec![representation.clone()],
+    };
+    (representation, adaptation)
+}
+
 /// Fetch + parse the selected subtitle representation, push cues into
 /// the video sink so the wgpu overlay can render them.
 ///
@@ -2887,6 +2982,17 @@ async fn text_play<V: VideoSink>(
             .map(|r| r.id == target_id)
             .unwrap_or(false)
     };
+
+    // ---- host-supplied cues: already parsed, nothing to fetch ----
+    if let Some(cues) = &text_representation.external_cues {
+        log::info!(
+            "[subs] external track {} selected: {} cues",
+            text_representation.id,
+            cues.len()
+        );
+        video_sink.queue_subtitle_cues(cues.as_ref().clone());
+        return Ok(());
+    }
 
     if !text_representation.is_webvtt() {
         log::info!(
@@ -3767,6 +3873,8 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             video_switch_tx: Arc::new(StdMutex::new(None)),
             buffer_target_secs: Arc::new(AtomicU32::new(DEFAULT_BUFFER_TARGET_SECS)),
             subtitle_representation: Arc::new(StdMutex::new(None)),
+            external_text: Arc::new(StdMutex::new(Vec::new())),
+            next_external_id: Arc::new(AtomicU32::new(EXTERNAL_TEXT_ID_BASE)),
             video_output_window: Arc::new(DirectWindow::new()),
             adaptive_frame_rate: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             audio_passthrough: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -3881,6 +3989,9 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
     }
 
     pub async fn open_url(&mut self, url: &str) -> Result<(), Box<dyn Error>> {
+        // Sidecar subtitles were picked for the stream being replaced;
+        // carrying them over would show cues timed against other media.
+        self.clear_external_subtitle_tracks();
         let base_url = Self::parse_base_url(url)?;
         self.base_url = Some(base_url);
         let url = url.to_string();
@@ -4032,11 +4143,17 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         self.http.set_callback_timeout(timeout);
     }
 
+    /// The track tree for the current stream, with any host-added
+    /// subtitle tracks appended to `.text` after the manifest's own.
     pub fn get_tracks(&self) -> Result<Tracks, Box<dyn Error>> {
-        match self.tracks.lock().unwrap().as_ref() {
-            Some(t) => Ok(t.clone()),
-            None => Err("No parsed tracks - player not prepared".into()),
-        }
+        let mut tracks = match self.tracks.lock().unwrap().as_ref() {
+            Some(t) => t.clone(),
+            None => return Err("No parsed tracks - player not prepared".into()),
+        };
+        tracks
+            .text
+            .extend(self.external_text.lock().unwrap().iter().cloned());
+        Ok(tracks)
     }
 
     pub fn set_video_track(
@@ -4377,6 +4494,113 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
     /// struct, so styling set here survives that migration.
     pub fn set_subtitle_style(&self, style: SubtitleStyle) {
         self.video_renderer.set_subtitle_style(style.sanitised());
+    }
+
+    /// Add a subtitle track from bytes the host supplies itself — the
+    /// sidecar `.srt` / `.vtt` a desktop user picked next to the movie.
+    ///
+    /// The player does no file picking and no fetching here: the host owns
+    /// that, hands over the bytes, and gets back a representation that
+    /// behaves like any other subtitle track. It shows up in
+    /// [`Player::get_tracks`]`().text` and is activated with the ordinary
+    /// [`Player::set_subtitle_track`] — there is no separate "external
+    /// subtitles" mode to special-case in a UI.
+    ///
+    /// Format (WebVTT / SubRip) and character encoding are detected from
+    /// the payload; see [`ExternalSubtitleOptions`] to override either, to
+    /// label the track, or to nudge its timing.
+    ///
+    /// Can be called before `prepare()`: added tracks are held separately
+    /// from the manifest's and survive it being parsed (they become
+    /// listable through `get_tracks` once it succeeds). They do NOT
+    /// survive [`Player::open_url`], since subtitles for the previous
+    /// stream are meaningless against a new one.
+    ///
+    /// Returns the representation, so the caller can select it right away:
+    ///
+    /// ```no_run
+    /// # use player::{ExternalSubtitleOptions, Player};
+    /// # fn demo(player: &Player, bytes: Vec<u8>) -> Result<(), Box<dyn std::error::Error>> {
+    /// let track = player.add_external_subtitle_track(
+    ///     &bytes,
+    ///     ExternalSubtitleOptions {
+    ///         label: Some("Czech (file)".into()),
+    ///         language: Some("cs".into()),
+    ///         ..Default::default()
+    ///     },
+    /// )?;
+    /// player.set_subtitle_track(&track);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn add_external_subtitle_track(
+        &self,
+        bytes: &[u8],
+        options: ExternalSubtitleOptions,
+    ) -> Result<tracks::text::TextRepresenation, Box<dyn Error>> {
+        let parsed = crate::parsers::sidecar::parse(
+            bytes,
+            options.format,
+            options.encoding.as_deref(),
+            options.time_offset_ms,
+        )?;
+
+        // Counting down keeps external ids clear of manifest ones without
+        // having to look at what the manifest used.
+        let id = self.next_external_id.fetch_sub(1, Ordering::Relaxed);
+        log::info!(
+            "[subs] added external track id={} format={:?} encoding={} cues={} label={:?}",
+            id,
+            parsed.format,
+            parsed.encoding,
+            parsed.cues.len(),
+            options.label,
+        );
+        let (representation, adaptation) = external_track(id, parsed, &options);
+        self.external_text.lock().unwrap().push(adaptation);
+        Ok(representation)
+    }
+
+    /// Drop a previously added external subtitle track. Returns whether
+    /// one with that id was found. If it happens to be the selected
+    /// track, subtitles are turned off too — otherwise the overlay would
+    /// keep showing cues from a track that no longer exists.
+    pub fn remove_external_subtitle_track(&self, id: u32) -> bool {
+        let removed = {
+            let mut external = self.external_text.lock().unwrap();
+            let before = external.len();
+            external.retain(|a| a.id != id);
+            external.len() != before
+        };
+        if removed {
+            let selected = self
+                .subtitle_representation
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|r| r.id == id)
+                .unwrap_or(false);
+            if selected {
+                self.clear_subtitle_track();
+            }
+        }
+        removed
+    }
+
+    /// Drop every external subtitle track. Called automatically by
+    /// `open_url`.
+    pub fn clear_external_subtitle_tracks(&self) {
+        let selected_external = self
+            .subtitle_representation
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|r| r.is_external())
+            .unwrap_or(false);
+        self.external_text.lock().unwrap().clear();
+        if selected_external {
+            self.clear_subtitle_track();
+        }
     }
 
     /// Select a subtitle track. Spawns the text_play pipeline
@@ -5577,6 +5801,87 @@ fn update_bandwidth_ewma(ewma: &AtomicU64, bytes: usize, elapsed: Duration) {
 mod tests {
     use super::*;
     use crate::tracks::segment::Segment;
+    use crate::parsers::sidecar::{self, SubtitleFormat};
+
+    const SRT: &str = "1
+00:00:01,000 --> 00:00:04,000
+První řádek
+
+2
+00:00:05,000 --> 00:00:07,000
+Druhý
+";
+
+    fn parsed(src: &str) -> sidecar::ParsedSidecar {
+        sidecar::parse(src.as_bytes(), SubtitleFormat::Auto, None, 0).unwrap()
+    }
+
+    #[test]
+    fn external_track_carries_its_cues_and_needs_no_network() {
+        let (rep, adaptation) = external_track(
+            EXTERNAL_TEXT_ID_BASE,
+            parsed(SRT),
+            &ExternalSubtitleOptions {
+                language: Some("cs".to_string()),
+                ..Default::default()
+            },
+        );
+
+        // The whole point: selecting this must not hit the network, so
+        // every URL-ish field has to be empty and the cues present.
+        assert!(rep.is_external());
+        assert!(rep.single_file_url.is_none());
+        assert!(rep.segment_init.is_none());
+        assert!(rep.segments.is_empty());
+        assert_eq!(rep.external_cues.as_ref().unwrap().len(), 2);
+
+        // ...and it has to survive the gate text_play applies to
+        // manifest tracks, or it would be skipped as undecodable.
+        assert!(rep.is_webvtt());
+
+        assert_eq!(adaptation.language(), Some("cs"));
+        assert_eq!(adaptation.role(), Some("subtitle"));
+        assert!(!adaptation.is_forced());
+        assert_eq!(adaptation.representations.len(), 1);
+    }
+
+    #[test]
+    fn external_track_label_reports_cue_count_not_bitrate() {
+        let (rep, _) = external_track(1, parsed(SRT), &ExternalSubtitleOptions::default());
+        // bandwidth is 0 for a local file; quoting "0 kbps" would be noise.
+        assert_eq!(rep.label(), "WebVTT · 2 cues");
+    }
+
+    #[test]
+    fn external_track_can_be_marked_forced() {
+        let (_, adaptation) = external_track(
+            1,
+            parsed(SRT),
+            &ExternalSubtitleOptions {
+                forced: true,
+                ..Default::default()
+            },
+        );
+        assert!(adaptation.is_forced());
+    }
+
+    #[test]
+    fn subrip_and_webvtt_get_distinct_mime_types() {
+        let (srt, _) = external_track(1, parsed(SRT), &ExternalSubtitleOptions::default());
+        assert_eq!(srt.mime_type, "application/x-subrip");
+
+        let vtt_src = "WEBVTT
+
+00:00:01.000 --> 00:00:02.000
+hi
+";
+        let (vtt, _) = external_track(2, parsed(vtt_src), &ExternalSubtitleOptions::default());
+        assert_eq!(vtt.mime_type, "text/vtt");
+        // Both normalise to wvtt: downstream only ever sees parsed cues.
+        assert_eq!(srt.codecs, "wvtt");
+        assert_eq!(vtt.codecs, "wvtt");
+    }
+
 
     /// Build a segment whose `start_time` / `end_time` work out to the
     /// passed-in milliseconds — handy because `find_segment_index` only

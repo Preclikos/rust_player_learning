@@ -53,6 +53,7 @@ player.set_video_track(&adaptation, &representation);
 player.set_audio_track(&adaptation, &representation);
 player.set_subtitle_font(font_bytes)?;             // optional, enables subtitles
 player.set_subtitle_track(&text_representation);   // optional
+player.add_external_subtitle_track(&srt_bytes, opts)?; // optional, host-supplied .srt/.vtt
 let handle = player.play()?;                       // spawns the pipeline
 // ... events drive the UI; seek()/pause()/resume()/stop() any time
 ```
@@ -312,6 +313,51 @@ future libass backend slots in at that same boundary.
 
 On Android a system font works fine:
 `std::fs::read("/system/fonts/Roboto-Regular.ttf")`.
+
+Cue rasterization runs on the overlay's own worker thread, which keeps the
+cue under the playhead and the one after it baked ahead of time. The render
+path only looks a finished bitmap up, so a cue appearing never costs a
+frame. After a seek the worker may be a frame or two behind, during which
+no cue is drawn.
+
+### External (sidecar) subtitle tracks
+
+Desktop hosts own the file picker; the player takes the bytes and turns
+them into an ordinary selectable track:
+
+```rust
+let track = player.add_external_subtitle_track(
+    &std::fs::read("movie.cs.srt")?,
+    ExternalSubtitleOptions {
+        language: Some("cs".into()),
+        label: Some("movie.cs.srt".into()),
+        ..Default::default()      // format + encoding auto-detected
+    },
+)?;
+player.set_subtitle_track(&track);        // same call as a manifest track
+```
+
+- Appears in `get_tracks().text` after the manifest's own text
+  adaptations; `TextRepresenation::is_external()` tells them apart, and
+  `label()` reports a cue count instead of a bitrate.
+- SubRip (`.srt`) and WebVTT (`.vtt`) are both accepted, detected from the
+  payload rather than the file name.
+- Character encoding is detected too (`chardetng`): UTF-8 when the bytes
+  are valid UTF-8, otherwise a legacy guess — CP1250 / ISO-8859-2 `.srt`
+  files are the norm for Czech and Polish subs. Override with
+  `options.encoding` (any `encoding_rs` label) when a short file is
+  guessed wrong.
+- `options.time_offset_ms` shifts every cue, for a file cut against a
+  different release. `options.forced` marks the track as forced
+  subtitles.
+- Errors are a [`SidecarError`]: empty file, not-a-subtitle-file, no
+  parseable cues, or an unknown forced encoding — distinct enough for a
+  host to show a useful message.
+- Can be added before `prepare()`; they show up in `get_tracks()` once
+  the manifest is prepared. Dropped by `open_url` (subtitles for the
+  previous stream are meaningless against a new one), by
+  `remove_external_subtitle_track(id)`, or by
+  `clear_external_subtitle_tracks()`.
 
 ## 10. Error semantics
 

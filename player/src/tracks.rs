@@ -629,6 +629,7 @@ impl Tracks {
                 segment_range,
                 segments,
                 single_file_url,
+                external_cues: None,
             })
         };
             async move { fut.await.map_err(|e| e.to_string()) }

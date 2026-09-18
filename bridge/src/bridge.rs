@@ -660,6 +660,7 @@ fn error_kind(k: &player::PlayerErrorKind) -> String {
         player::PlayerErrorKind::LicenseResolver => "license_resolver".to_string(),
         player::PlayerErrorKind::ManifestParse => "manifest_parse".to_string(),
         player::PlayerErrorKind::Decoder => "decoder".to_string(),
+        player::PlayerErrorKind::AudioOutput => "audio_output".to_string(),
         player::PlayerErrorKind::Other => "other".to_string(),
     }
 }

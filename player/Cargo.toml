@@ -158,6 +158,9 @@ webpki-roots = "1"
 naga = { git = "https://github.com/Preclikos/wgpu.git", features = ["wgsl-in"] }
 # Conformance soak harness (examples/conformance.rs) log output.
 env_logger = "0.11"
+# `start_paused` for the audio-output watchdog tests: tokio's virtual clock is
+# what makes second-scale liveness thresholds testable without sleeping for them.
+tokio = { version = "1.52", features = ["test-util", "macros", "rt"] }
 
 [build-dependencies]
 cc = "1"

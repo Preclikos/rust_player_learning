@@ -126,6 +126,11 @@ pub enum PlayerErrorKind {
     ManifestParse,
     /// Decoder pipeline failed unrecoverably.
     Decoder,
+    /// The audio output device stopped and could not be brought back, not
+    /// even by rebuilding the pipeline — e.g. HDMI/ARC went away on TV
+    /// standby and never came back. Playback is not silently continued: a
+    /// movie without sound is a failure, not a degraded success.
+    AudioOutput,
     Other,
 }
 

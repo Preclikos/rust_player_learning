@@ -234,6 +234,10 @@ struct StatsState {
     /// IT hasn't received a frame for >300 ms. Video parks on its
     /// current frame instead of marching forward over silence.
     audio_starving: AtomicBool,
+    /// Pipeline rebuilds spent trying to bring a dead audio output back.
+    /// Lives on the per-Player stats (not the per-generation locals) so the
+    /// budget survives the very rebuild it is counting.
+    audio_output_rebuilds: AtomicU32,
     /// Measured A/V clock drift in ms: how far the video wall clock has
     /// run ahead of the audio device clock since this pipeline started
     /// (negative = audio ahead). Written ~1 Hz by video_sync_loop when
@@ -592,23 +596,95 @@ fn clock_monotonic_ns() -> i64 { 0 }
 /// clock serves bitstream (Dolby/DTS passthrough) and multichannel without
 /// video / subtitles knowing the difference. Shareable (interior-mutable
 /// anchor) so future consumers can pace to the same clock.
+///
+/// # Surviving a dead audio output
+///
+/// The device head can stop for good while the sink still reports a position:
+/// HDMI/ARC dropping on TV standby kills the `IAudioTrack` server-side (the
+/// framework then loops `restoreTrack_l` on every `getTimestamp`), and a
+/// pipeline with no audio at all can prime its track on silence and report a
+/// standing `Some(0)`. Both leave the master clock STANDING while playback is
+/// supposed to run, and a standing clock is worse than no clock: the sync loop
+/// sleeps until each frame's due time, so frame *k* waits one frame period
+/// longer than frame *k−1* and the picture degrades into a slower and slower
+/// crawl (observed: 0.2 fps, media advancing at 0.8 % of real time, for as long
+/// as the stream was left running).
+///
+/// So a position that stands still while we are neither paused nor starving is
+/// treated as a dead output: the wall clock takes over AT THE VALUE the audio
+/// clock last read, which makes the handover continuous (no lurch), and the
+/// picture keeps real time with no sound instead of crawling. If the output
+/// comes back and agrees with where the wall clock got to, the audio master is
+/// re-adopted; if it comes back minutes behind, re-adopting would jerk the
+/// picture backwards by that span, so the wall clock keeps the session.
 struct MediaClock<A: AudioSink> {
     audio_sink: Arc<A>,
     // Wall anchor (= now − seek_offset): the fallback when the sink has no clock.
     start_time: Arc<Instant>,
     // Media position the post-flush audio starts at (the seek target).
     seek_offset_us: i64,
-    // (last observed played ms, wall instant then) for sub-update interpolation.
-    anchor: std::sync::Mutex<Option<(u64, Instant)>>,
+    state: std::sync::Mutex<ClockState>,
+    // Paused by the consumer: the head stops on purpose, so a standing
+    // position is not evidence of a dead output.
+    paused: Arc<AtomicBool>,
+    // Audio starvation (no decoded frame for 300 ms) pauses the sink itself
+    // — again a standing position on purpose. Read from the shared stats.
+    stats: Arc<StatsState>,
+}
+
+/// How long the sink's position may stand still, while playback is neither
+/// paused nor starving, before the clock stops believing it.
+///
+/// This is the LAST RESORT, not the product behaviour. `audio_output_watchdog`
+/// notices a dead output at [`AUDIO_OUTPUT_DEAD_MS`] and parks the picture
+/// behind a `Buffering` event while it rebuilds the pipeline to get sound
+/// back, and parking sets `audio_starving`, which suppresses this guard. So
+/// the guard only ever fires when the watchdog is not running or did not act
+/// — and all it then does is stop the picture from degrading into the crawl.
+/// It is deliberately LATER than the watchdog so the watchdog always wins.
+const AUDIO_CLOCK_STALE_MS: u64 = 3_000;
+
+/// The same, but before the audio clock has EVER advanced — i.e. during
+/// start-up, where a standing `Some(0)` is the documented way the sink says
+/// "not audible yet" and video is meant to hold. A direct/passthrough
+/// AudioTrack needs ~2.5 s of buffered audio before its head moves at all, so
+/// this grace has to clear that comfortably or every passthrough start would
+/// run video ahead of sound.
+const AUDIO_CLOCK_START_GRACE_MS: u64 = 5_000;
+
+/// How far a revived audio clock may be from the wall-extrapolated position
+/// and still be re-adopted as the master.
+const AUDIO_CLOCK_REJOIN_TOL_MS: i64 = 200;
+
+#[derive(Default)]
+struct ClockState {
+    /// (last observed `played_since_flush_ms`, wall instant it was FIRST seen
+    /// at that value) — the interpolation anchor and the staleness timer.
+    seen: Option<(u64, Instant)>,
+    /// True once the sink's position has moved at least once, i.e. audio is
+    /// genuinely audible. Before that a standing position means "still
+    /// starting up", not "dead".
+    ever_advanced: bool,
+    /// Set once the position was declared dead: the media ms the wall-clock
+    /// extrapolation continues from, and the instant it took over.
+    wall_from: Option<(u64, Instant)>,
 }
 
 impl<A: AudioSink> MediaClock<A> {
-    fn new(audio_sink: Arc<A>, start_time: Arc<Instant>, seek_offset: Duration) -> Self {
+    fn new(
+        audio_sink: Arc<A>,
+        start_time: Arc<Instant>,
+        seek_offset: Duration,
+        paused: Arc<AtomicBool>,
+        stats: Arc<StatsState>,
+    ) -> Self {
         Self {
             audio_sink,
             start_time,
             seek_offset_us: seek_offset.as_micros() as i64,
-            anchor: std::sync::Mutex::new(None),
+            state: std::sync::Mutex::new(ClockState::default()),
+            paused,
+            stats,
         }
     }
 
@@ -621,15 +697,64 @@ impl<A: AudioSink> MediaClock<A> {
         let played = self.audio_sink.played_since_flush_ms()?;
         let lat_us = self.audio_sink.output_latency_ms() as i64 * 1_000;
         let now = Instant::now();
-        let mut anchor = self.anchor.lock().unwrap();
-        let (p0, w0) = match *anchor {
-            Some((p0, w0)) if played <= p0 => (p0, w0),
-            _ => {
-                *anchor = Some((played, now));
-                (played, now)
+        let to_media_us =
+            |ms: i64| -> i64 { (ms * 1_000 + self.seek_offset_us - lat_us).max(0) };
+        let mut st = self.state.lock().unwrap();
+
+        if st.seen.map(|(p0, _)| played > p0).unwrap_or(true) {
+            if st.seen.is_some() {
+                st.ever_advanced = true;
             }
-        };
+            if let Some((wp, wt)) = st.wall_from {
+                // The output is alive again. Re-adopt it as the master only if
+                // it agrees with where the wall clock carried us; a device that
+                // was wedged for minutes comes back that far behind, and
+                // re-adopting it would jerk the picture backwards by the span.
+                let wall_ms = wp as i64 + now.duration_since(wt).as_millis() as i64;
+                if (played as i64 - wall_ms).abs() <= AUDIO_CLOCK_REJOIN_TOL_MS {
+                    log::info!(
+                        "[clock] audio position advancing again at {}ms — re-adopting the audio master",
+                        played
+                    );
+                    st.wall_from = None;
+                }
+            }
+            st.seen = Some((played, now));
+        }
+
+        // Already handed over: keep extrapolating at real time.
+        if let Some((wp, wt)) = st.wall_from {
+            let ms = wp as i64 + now.duration_since(wt).as_millis() as i64;
+            return Some(to_media_us(ms));
+        }
+
+        let (p0, w0) = st.seen.expect("set above whenever it was None");
         let since = now.duration_since(w0);
+
+        // Standing position while we are supposed to be playing => dead output
+        // (see the type docs). Hand over to the wall clock at exactly the value
+        // the audio clock last read, so the handover is continuous.
+        let stale_after = if st.ever_advanced {
+            AUDIO_CLOCK_STALE_MS
+        } else {
+            AUDIO_CLOCK_START_GRACE_MS
+        };
+        if since >= Duration::from_millis(stale_after)
+            && !self.paused.load(Ordering::Relaxed)
+            && !self.stats.audio_starving.load(Ordering::Relaxed)
+        {
+            let t0 = w0 + Duration::from_millis(stale_after);
+            st.wall_from = Some((p0, t0));
+            log::warn!(
+                "[clock] audio position frozen at {}ms for {}ms while playing                  (ever_advanced={}) — master clock falls back to the wall;                  the audio output is dead or absent",
+                p0,
+                since.as_millis(),
+                st.ever_advanced
+            );
+            let ms = p0 as i64 + now.duration_since(t0).as_millis() as i64;
+            return Some(to_media_us(ms));
+        }
+
         // Interpolate with wall time between the sink's ~per-callback updates;
         // if it hasn't ticked for >80ms the audio is paused/starving — freeze.
         let pos_us = if since < Duration::from_millis(80) {
@@ -773,7 +898,13 @@ async fn video_sync_loop<V: VideoSink, A: AudioSink>(
     // Playback master clock: audio-disciplined, 0-based, rebased to this
     // pipeline's timeline. Video paces to it; the same seam serves passthrough
     // / multichannel / other renderers (see MediaClock).
-    let clock = MediaClock::new(audio_sink.clone(), start_time.clone(), seek_offset);
+    let clock = MediaClock::new(
+        audio_sink.clone(),
+        start_time.clone(),
+        seek_offset,
+        paused.clone(),
+        stats.clone(),
+    );
     log::info!(
         "[vsync gen {}] loop start (seek_offset={}ms origin={}ms)",
         gen,
@@ -1429,6 +1560,165 @@ async fn audio_sync_loop<A: AudioSink>(
                 stats.diag_audio_sunk.fetch_add(1, Ordering::Relaxed);
             }
             _ = stop.notified() => return,
+        }
+    }
+}
+
+/// The audio output's reported position may stand still this long, while
+/// playback is running and nothing else has declared a stall, before the
+/// watchdog calls the output dead. Above the coarsest device update burst
+/// (~256 ms on Android deep buffer) with room to spare, and deliberately
+/// EARLIER than [`AUDIO_CLOCK_STALE_MS`] so the watchdog — which can actually
+/// fix the problem — always acts before the clock's last-resort guard.
+const AUDIO_OUTPUT_DEAD_MS: u64 = 1_500;
+
+/// Pipeline rebuilds spent trying to bring the output back before the player
+/// reports the failure instead of playing on without sound.
+const AUDIO_OUTPUT_MAX_REBUILDS: u32 = 1;
+
+/// The output must keep advancing this long for the rebuild budget to reset,
+/// so a device that dies again hours later still gets a full ladder.
+const AUDIO_OUTPUT_HEALTHY_MS: u64 = 15_000;
+
+/// Audio-output liveness watchdog — one task per pipeline generation.
+///
+/// The output can die under a running pipeline without anything noticing: on TV
+/// standby the HDMI sink goes away and AudioFlinger kills the `IAudioTrack`
+/// server-side, after which the sink still reports a position — it just never
+/// moves again. The master clock is audio-disciplined, so a standing position
+/// standing means a standing clock, and the sync loop paces each frame against
+/// it: frame k waits one frame period longer than k-1 and the picture decays
+/// into an ever-slower crawl (measured on a Google TV Streamer: 0.2 fps, media
+/// advancing at 0.8 % of real time, for as long as the stream was left up).
+///
+/// What the viewer should get instead is what they would get from any other
+/// player: a moment of loading while the output is brought back, then sound.
+/// So on a standing position this parks the picture behind `Buffering` and
+/// rebuilds the pipeline at the current position — a fresh pipeline builds a
+/// fresh output device, which is what actually recovers HDMI audio. If the
+/// output is still dead after the rebuild budget, the failure is reported
+/// ([`PlayerErrorKind::AudioOutput`]) rather than papered over: a movie
+/// playing silently is a failure, not a degraded success.
+async fn audio_output_watchdog<A: AudioSink>(
+    gen: u64,
+    audio_sink: Arc<A>,
+    stats: Arc<StatsState>,
+    events: Arc<broadcast::Sender<PlayerEvent>>,
+    paused: Arc<AtomicBool>,
+    stop: Arc<Notify>,
+    stop_flag: Arc<AtomicBool>,
+    position_ms: Arc<AtomicU64>,
+    seek_target: Arc<RwLock<Option<Duration>>>,
+) {
+    // (last position seen, wall instant it FIRST read that value).
+    // tokio's clock, not std's: it is the one  can drive,
+    // which is what makes the liveness thresholds testable without sleeping.
+    let mut seen: Option<(u64, tokio::time::Instant)> = None;
+    // When the output started advancing again after a death (budget reset).
+    let mut live_since: Option<tokio::time::Instant> = None;
+
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+            _ = stop.notified() => return,
+        }
+        if stop_flag.load(Ordering::Relaxed) {
+            return;
+        }
+        // Paused: the head stops on purpose.
+        if paused.load(Ordering::Relaxed) {
+            seen = None;
+            live_since = None;
+            continue;
+        }
+        // Someone else already declared a stall (segment starvation pauses the
+        // sink itself) — the consumer is seeing Buffering and the head is
+        // standing for a reason we must not mistake for a dead device.
+        if stats.audio_starving.load(Ordering::Relaxed) {
+            seen = None;
+            live_since = None;
+            continue;
+        }
+        // No clock at all: the MediaClock is already on the wall and there is
+        // no output position to watch.
+        let Some(played) = audio_sink.played_since_flush_ms() else {
+            seen = None;
+            live_since = None;
+            continue;
+        };
+
+        match seen {
+            None => {
+                seen = Some((played, tokio::time::Instant::now()));
+                continue;
+            }
+            Some((p0, _)) if played > p0 => {
+                seen = Some((played, tokio::time::Instant::now()));
+                let since = *live_since.get_or_insert_with(tokio::time::Instant::now);
+                if stats.audio_output_rebuilds.load(Ordering::Relaxed) > 0
+                    && since.elapsed() >= Duration::from_millis(AUDIO_OUTPUT_HEALTHY_MS)
+                {
+                    log::info!(
+                        "[audio-watchdog gen {gen}] output healthy again — resetting the rebuild budget"
+                    );
+                    stats.audio_output_rebuilds.store(0, Ordering::Relaxed);
+                }
+                continue;
+            }
+            Some((_, w0)) if w0.elapsed() < Duration::from_millis(AUDIO_OUTPUT_DEAD_MS) => {
+                continue;
+            }
+            Some((_, w0)) => {
+                // ---- the output is dead ----
+                let stood_ms = w0.elapsed().as_millis();
+                let spent = stats.audio_output_rebuilds.load(Ordering::Relaxed);
+                if spent >= AUDIO_OUTPUT_MAX_REBUILDS {
+                    log::error!(
+                        "[audio-watchdog gen {gen}] audio output still dead at {played}ms after \
+                         {spent} rebuild(s) — giving up rather than playing on without sound"
+                    );
+                    let _ = events.send(PlayerEvent::Error {
+                        kind: PlayerErrorKind::AudioOutput,
+                        detail: format!(
+                            "audio output stopped ({played}ms, standing {stood_ms}ms) and could \
+                             not be restored by a pipeline rebuild"
+                        ),
+                    });
+                    return;
+                }
+                log::warn!(
+                    "[audio-watchdog gen {gen}] audio output position stuck at {played}ms for \
+                     {stood_ms}ms while playing — rebuilding the pipeline to get sound back"
+                );
+                stats.audio_output_rebuilds.fetch_add(1, Ordering::Relaxed);
+
+                // Park the picture behind a spinner first: the user should see
+                // that something is being fixed, not a movie that went mute.
+                // Parking also suppresses MediaClock's last-resort wall-clock
+                // guard, so the two mechanisms never fight over the picture.
+                if let StarvationTransition::EnteredBuffering =
+                    report_starvation(&stats, StallSide::Audio, true)
+                {
+                    let _ = events.send(PlayerEvent::Buffering {
+                        reason: BufferingReason::Stall,
+                    });
+                }
+
+                // Rebuild at the current position. Same handshake as `seek()`:
+                // the play loop sees a seek_target and respawns the pipeline,
+                // which builds a brand-new output device.
+                let target = Duration::from_millis(position_ms.load(Ordering::Relaxed));
+                {
+                    let mut slot = seek_target.write().await;
+                    *slot = Some(target);
+                    stop_flag.store(true, Ordering::Relaxed);
+                }
+                audio_sink.flush();
+                audio_sink.set_paused(true);
+                stop.notify_waiters();
+                // This generation is over; the next one gets a fresh watchdog.
+                return;
+            }
         }
     }
 }
@@ -5256,6 +5546,20 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                 // New pipeline: not "live" until it produces its first frame.
                 // Gates the ABR tick off this fragile startup window.
                 pipeline_live.store(false, Ordering::Relaxed);
+                // Audio-output liveness watch, scoped to this generation: it
+                // rebuilds the pipeline if the output dies under us, so it must
+                // not outlive the generation it is watching.
+                let audio_watchdog = tokio::spawn(audio_output_watchdog(
+                    gen,
+                    audio_sink.clone(),
+                    Arc::clone(&stats),
+                    Arc::clone(&events),
+                    paused.clone(),
+                    stop.clone(),
+                    stop_flag.clone(),
+                    position_ms.clone(),
+                    seek_target.clone(),
+                ));
                 av_sync_handler(
                     gen,
                     seek_offset,
@@ -5278,6 +5582,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                     Arc::clone(&pipeline_live),
                 )
                 .await;
+                audio_watchdog.abort();
 
                 let (play_res, audio_res) = join!(video, audio);
                 log_task_result("video_supervisor", play_res);
@@ -6046,5 +6351,381 @@ hi
             stable,
             after_spike
         );
+    }
+
+    // ---- MediaClock liveness ------------------------------------------------
+    //
+    // Regression cover for the TV-standby crawl: HDMI drops, AudioFlinger kills
+    // the track, the sink keeps reporting a STANDING position, and the master
+    // clock stands with it. Because the sync loop sleeps until each frame's due
+    // time, a standing clock makes frame k wait one frame period longer than
+    // k-1 - playback degrades into an ever-slower crawl (measured on kirkwood:
+    // 0.2 fps, media at 0.8 % of real time, drift growing 1:1 with the wall).
+
+    /// Sink whose reported position is whatever the test puts in it.
+    struct TestSink {
+        played_ms: AtomicU64,
+        /// False makes `played_since_flush_ms` report "no clock at all".
+        has_clock: AtomicBool,
+    }
+
+    impl TestSink {
+        fn new(played_ms: u64) -> Self {
+            Self {
+                played_ms: AtomicU64::new(played_ms),
+                has_clock: AtomicBool::new(true),
+            }
+        }
+    }
+
+    impl crate::renderers::AudioSink for TestSink {
+        fn put_samples<'a>(
+            &'a self,
+            _samples: &'a [f32],
+        ) -> impl std::future::Future<Output = ()> + Send + 'a {
+            async {}
+        }
+        fn sample_rate(&self) -> u32 {
+            48_000
+        }
+        fn played_since_flush_ms(&self) -> Option<u64> {
+            self.has_clock
+                .load(Ordering::Relaxed)
+                .then(|| self.played_ms.load(Ordering::Relaxed))
+        }
+        fn flush(&self) {}
+        fn stop(&self) -> impl std::future::Future<Output = ()> + Send + '_ {
+            async {}
+        }
+        fn set_volume(&self, _volume: f32) {}
+        fn get_volume(&self) -> f32 {
+            1.0
+        }
+        fn set_paused(&self, _paused: bool) {}
+    }
+
+    struct ClockFixture {
+        clock: MediaClock<TestSink>,
+        sink: Arc<TestSink>,
+        paused: Arc<AtomicBool>,
+        stats: Arc<StatsState>,
+    }
+
+    fn fixture(played_ms: u64) -> ClockFixture {
+        let sink = Arc::new(TestSink::new(played_ms));
+        let paused = Arc::new(AtomicBool::new(false));
+        let stats = Arc::new(StatsState::default());
+        let clock = MediaClock::new(
+            sink.clone(),
+            Arc::new(Instant::now()),
+            Duration::ZERO,
+            paused.clone(),
+            stats.clone(),
+        );
+        ClockFixture { clock, sink, paused, stats }
+    }
+
+    /// Backdate the anchor so the position looks like it has been standing for
+    /// `stood_ms`, without the test having to sleep for it.
+    fn stand_still_for(fx: &ClockFixture, played_ms: u64, stood_ms: u64, ever_advanced: bool) {
+        let mut st = fx.clock.state.lock().unwrap();
+        st.seen = Some((played_ms, Instant::now() - Duration::from_millis(stood_ms)));
+        st.ever_advanced = ever_advanced;
+    }
+
+    #[test]
+    fn frozen_audio_clock_hands_over_to_the_wall() {
+        let fx = fixture(500);
+        assert_eq!(
+            fx.clock.audio_now_us(),
+            Some(500_000),
+            "first read is the sink's own position"
+        );
+
+        // Audio had been running and then the output died: 1.5 s standing.
+        stand_still_for(&fx, 500, 3_500, true);
+        let handed = fx.clock.audio_now_us().unwrap();
+        // Continuous at the frozen value, then real time for the 500 ms past
+        // the stale window - NOT a jump to the free-running wall origin.
+        assert!(
+            (990_000..=1_020_000).contains(&handed),
+            "expected a continuous handover around 1000ms, got {handed}us"
+        );
+
+        // And it must keep moving, which is the whole point.
+        std::thread::sleep(Duration::from_millis(60));
+        let later = fx.clock.audio_now_us().unwrap();
+        assert!(
+            later - handed >= 50_000,
+            "clock stalled after handover: {handed}us -> {later}us"
+        );
+    }
+
+    #[test]
+    fn startup_grace_lets_audio_prime_without_running_video_ahead() {
+        // A sink that has never advanced is saying "not audible yet" - video is
+        // MEANT to hold. A passthrough AudioTrack needs ~2.5 s before its head
+        // moves at all, so a 1.5 s standstill must not trip the fallback.
+        let fx = fixture(0);
+        assert_eq!(fx.clock.audio_now_us(), Some(0));
+        stand_still_for(&fx, 0, 1_500, false);
+        assert_eq!(
+            fx.clock.audio_now_us(),
+            Some(0),
+            "held during the start-up grace"
+        );
+
+        // Past the grace, a sink that never came alive is a dead output too.
+        stand_still_for(&fx, 0, 6_000, false);
+        let handed = fx.clock.audio_now_us().unwrap();
+        assert!(
+            handed > 0,
+            "start-up grace must not last forever, got {handed}us"
+        );
+    }
+
+    #[test]
+    fn pause_and_starvation_do_not_look_like_a_dead_output() {
+        // Paused: the head stops on purpose.
+        let fx = fixture(700);
+        fx.paused.store(true, Ordering::Relaxed);
+        stand_still_for(&fx, 700, 30_000, true);
+        assert_eq!(
+            fx.clock.audio_now_us(),
+            Some(700_000),
+            "paused must freeze, not extrapolate"
+        );
+
+        // Starving: audio_sync_loop pauses the sink itself, same deal.
+        let fx = fixture(700);
+        fx.stats.audio_starving.store(true, Ordering::Relaxed);
+        stand_still_for(&fx, 700, 30_000, true);
+        assert_eq!(
+            fx.clock.audio_now_us(),
+            Some(700_000),
+            "starvation must freeze, not extrapolate"
+        );
+    }
+
+    #[test]
+    fn revived_output_is_re_adopted_only_when_it_agrees() {
+        // Wall clock has carried us to ~2000ms.
+        let fx = fixture(1_000);
+        {
+            let mut st = fx.clock.state.lock().unwrap();
+            st.seen = Some((1_000, Instant::now()));
+            st.ever_advanced = true;
+            st.wall_from = Some((1_000, Instant::now() - Duration::from_millis(1_000)));
+        }
+        // Output comes back roughly where we are -> re-adopt.
+        fx.sink.played_ms.store(2_050, Ordering::Relaxed);
+        let _ = fx.clock.audio_now_us();
+        assert!(
+            fx.clock.state.lock().unwrap().wall_from.is_none(),
+            "an agreeing audio clock should take the master back"
+        );
+
+        // Output comes back a long way behind -> keep the wall clock, because
+        // re-adopting would jerk the picture backwards by that span.
+        let fx = fixture(1_000);
+        {
+            let mut st = fx.clock.state.lock().unwrap();
+            st.seen = Some((1_000, Instant::now()));
+            st.ever_advanced = true;
+            st.wall_from = Some((1_000, Instant::now() - Duration::from_millis(1_000)));
+        }
+        fx.sink.played_ms.store(1_200, Ordering::Relaxed);
+        let now = fx.clock.audio_now_us().unwrap();
+        assert!(
+            fx.clock.state.lock().unwrap().wall_from.is_some(),
+            "a clock 800ms behind must not take the master back"
+        );
+        assert!(
+            now >= 2_000_000,
+            "wall extrapolation should continue, got {now}us"
+        );
+    }
+
+    #[test]
+    fn sink_without_a_clock_still_uses_the_wall() {
+        let fx = fixture(0);
+        fx.sink.has_clock.store(false, Ordering::Relaxed);
+        assert_eq!(
+            fx.clock.audio_now_us(),
+            None,
+            "no clock means no audio master"
+        );
+        // now_us falls through to the wall clock and keeps advancing.
+        let a = fx.clock.now_us(Duration::ZERO);
+        std::thread::sleep(Duration::from_millis(40));
+        let b = fx.clock.now_us(Duration::ZERO);
+        assert!(b - a >= 30_000, "wall fallback stalled: {a}us -> {b}us");
+    }
+
+    // ---- audio-output watchdog ----------------------------------------------
+    //
+    // The ladder the viewer should experience when the output dies under a
+    // running pipeline (TV standby kills the HDMI track): loading, a rebuild
+    // that brings sound back, and an honest error if it cannot.
+
+    struct WatchdogRig {
+        sink: Arc<TestSink>,
+        stats: Arc<StatsState>,
+        events: Arc<broadcast::Sender<PlayerEvent>>,
+        rx: broadcast::Receiver<PlayerEvent>,
+        paused: Arc<AtomicBool>,
+        stop: Arc<Notify>,
+        stop_flag: Arc<AtomicBool>,
+        position_ms: Arc<AtomicU64>,
+        seek_target: Arc<RwLock<Option<Duration>>>,
+    }
+
+    fn rig() -> WatchdogRig {
+        let (tx, rx) = broadcast::channel(64);
+        WatchdogRig {
+            sink: Arc::new(TestSink::new(1_000)),
+            stats: Arc::new(StatsState::default()),
+            events: Arc::new(tx),
+            rx,
+            paused: Arc::new(AtomicBool::new(false)),
+            stop: Arc::new(Notify::new()),
+            stop_flag: Arc::new(AtomicBool::new(false)),
+            position_ms: Arc::new(AtomicU64::new(42_000)),
+            seek_target: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    fn spawn_watchdog(r: &WatchdogRig) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(audio_output_watchdog(
+            7,
+            r.sink.clone(),
+            r.stats.clone(),
+            r.events.clone(),
+            r.paused.clone(),
+            r.stop.clone(),
+            r.stop_flag.clone(),
+            r.position_ms.clone(),
+            r.seek_target.clone(),
+        ))
+    }
+
+    fn drain(rx: &mut broadcast::Receiver<PlayerEvent>) -> Vec<PlayerEvent> {
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            out.push(ev);
+        }
+        out
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dead_output_shows_loading_and_rebuilds_the_pipeline() {
+        let mut r = rig();
+        let wd = spawn_watchdog(&r);
+        // The output never moves again. Bounding the wait is what makes the
+        // liveness threshold load-bearing: without it the test would pass even
+        // if the watchdog took a day to notice.
+        let t0 = tokio::time::Instant::now();
+        tokio::time::timeout(Duration::from_secs(5), wd)
+            .await
+            .expect("watchdog did not act on a dead output within 5s")
+            .unwrap();
+        assert!(t0.elapsed() < Duration::from_secs(5), "acted only after {:?}", t0.elapsed());
+
+        assert_eq!(
+            *r.seek_target.read().await,
+            Some(Duration::from_millis(42_000)),
+            "the pipeline must be rebuilt at the current position"
+        );
+        assert!(r.stop_flag.load(Ordering::Relaxed), "the old pipeline must be torn down");
+        assert_eq!(r.stats.audio_output_rebuilds.load(Ordering::Relaxed), 1);
+        assert!(
+            r.stats.audio_starving.load(Ordering::Relaxed),
+            "the picture must be parked, not left ploughing on silently"
+        );
+        let events = drain(&mut r.rx);
+        assert!(
+            events.iter().any(|e| matches!(e, PlayerEvent::Buffering { .. })),
+            "the viewer must see loading; got {events:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn output_that_stays_dead_after_the_rebuild_is_reported_not_papered_over() {
+        let mut r = rig();
+        // Budget already spent by the previous generation.
+        r.stats
+            .audio_output_rebuilds
+            .store(AUDIO_OUTPUT_MAX_REBUILDS, Ordering::Relaxed);
+        let wd = spawn_watchdog(&r);
+        let t0 = tokio::time::Instant::now();
+        tokio::time::timeout(Duration::from_secs(5), wd)
+            .await
+            .expect("watchdog did not report the dead output within 5s")
+            .unwrap();
+        assert!(t0.elapsed() < Duration::from_secs(5), "acted only after {:?}", t0.elapsed());
+
+        assert!(
+            r.seek_target.read().await.is_none(),
+            "must not rebuild forever"
+        );
+        let events = drain(&mut r.rx);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                PlayerEvent::Error { kind: PlayerErrorKind::AudioOutput, .. }
+            )),
+            "a movie that cannot have sound is a failure, not a silent success; got {events:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_live_output_is_left_alone() {
+        let mut r = rig();
+        let wd = spawn_watchdog(&r);
+        // Advance the head at real time for a few seconds.
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            r.sink.played_ms.fetch_add(250, Ordering::Relaxed);
+        }
+        assert!(!wd.is_finished(), "watchdog fired on a healthy output");
+        assert!(r.seek_target.read().await.is_none());
+        assert_eq!(r.stats.audio_output_rebuilds.load(Ordering::Relaxed), 0);
+        assert!(drain(&mut r.rx).is_empty(), "a healthy output needs no events");
+        wd.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pause_and_starvation_are_not_mistaken_for_a_dead_output() {
+        // Paused: the head stops on purpose.
+        let r = rig();
+        r.paused.store(true, Ordering::Relaxed);
+        let wd = spawn_watchdog(&r);
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert!(!wd.is_finished(), "watchdog fired while paused");
+        assert!(r.seek_target.read().await.is_none());
+        wd.abort();
+
+        // Starving: the audio sync loop already declared a stall and paused the
+        // sink; the consumer is looking at a spinner for a different reason.
+        let r = rig();
+        r.stats.audio_starving.store(true, Ordering::Relaxed);
+        let wd = spawn_watchdog(&r);
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert!(!wd.is_finished(), "watchdog fired during ordinary starvation");
+        assert!(r.seek_target.read().await.is_none());
+        wd.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_sink_with_no_clock_is_not_a_dead_output() {
+        // No clock at all means the MediaClock is already on the wall; there is
+        // no output position to watch and nothing to rebuild.
+        let r = rig();
+        r.sink.has_clock.store(false, Ordering::Relaxed);
+        let wd = spawn_watchdog(&r);
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert!(!wd.is_finished());
+        assert!(r.seek_target.read().await.is_none());
+        wd.abort();
     }
 }

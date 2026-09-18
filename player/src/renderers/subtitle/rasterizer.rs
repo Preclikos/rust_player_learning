@@ -98,31 +98,38 @@ pub(super) fn rasterize_cue(
     Some((bitmap_w, bitmap_h, rgba))
 }
 
-fn wrap_line(
-    font: &fontdue::Font,
-    line: &str,
-    px_size: f32,
-    max_w: i32,
-    out: &mut Vec<String>,
-) {
-    if measure_text(font, line, px_size) <= max_w {
+/// Greedy word wrap at `max_w`. Widths accumulate as words are appended:
+/// the previous version rebuilt the candidate line with `format!` and
+/// re-measured it from the first character for every word, so a long cue
+/// measured the same prefix over and over (quadratic in words, plus one
+/// allocation each).
+fn wrap_line(font: &fontdue::Font, line: &str, px_size: f32, max_w: i32, out: &mut Vec<String>) {
+    let max_w = max_w as f32;
+    if measure_width(font, line, px_size) <= max_w {
+        // Common case — one line, kept verbatim so its original spacing
+        // survives (the greedy path below collapses whitespace runs).
         out.push(line.to_string());
         return;
     }
+    let space_w = font.metrics(' ', px_size).advance_width;
     let mut current = String::new();
+    let mut current_w = 0.0f32;
     for word in line.split_whitespace() {
-        let candidate = if current.is_empty() {
-            word.to_string()
+        let word_w = measure_width(font, word, px_size);
+        if current.is_empty() {
+            current.push_str(word);
+            current_w = word_w;
+            continue;
+        }
+        let candidate_w = current_w + space_w + word_w;
+        if candidate_w <= max_w {
+            current.push(' ');
+            current.push_str(word);
+            current_w = candidate_w;
         } else {
-            format!("{} {}", current, word)
-        };
-        if measure_text(font, &candidate, px_size) <= max_w {
-            current = candidate;
-        } else {
-            if !current.is_empty() {
-                out.push(current.clone());
-            }
-            current = word.to_string();
+            out.push(std::mem::take(&mut current));
+            current.push_str(word);
+            current_w = word_w;
         }
     }
     if !current.is_empty() {
@@ -130,13 +137,16 @@ fn wrap_line(
     }
 }
 
+/// Advance width of `line` in pixels. Unrounded — callers that accumulate
+/// widths must not compound a per-word rounding error.
+fn measure_width(font: &fontdue::Font, line: &str, px_size: f32) -> f32 {
+    line.chars()
+        .map(|ch| font.metrics(ch, px_size).advance_width)
+        .sum()
+}
+
 fn measure_text(font: &fontdue::Font, line: &str, px_size: f32) -> i32 {
-    let mut total = 0.0f32;
-    for ch in line.chars() {
-        let metrics = font.metrics(ch, px_size);
-        total += metrics.advance_width;
-    }
-    total.ceil() as i32
+    measure_width(font, line, px_size).ceil() as i32
 }
 
 /// Draw glyphs left-to-right starting at (x, y_baseline-ish). `text_color`

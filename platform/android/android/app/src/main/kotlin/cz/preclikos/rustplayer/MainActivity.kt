@@ -7,6 +7,7 @@ import android.graphics.PixelFormat
 import android.graphics.drawable.ColorDrawable
 import android.os.Build
 import android.os.Bundle
+import android.os.SystemClock
 import android.view.Display
 import android.view.Gravity
 import android.view.Surface
@@ -25,6 +26,9 @@ import org.json.JSONObject
 /** Bundled encrypted DASH test stream (smoke test only; has an AAC audio track
  * so the Android PCM sink is exercised too). */
 private const val TEST_MANIFEST_URL = "https://preclikos.cz/examples/tearsofsteel_enc/manifest.mpd"
+
+/** Logcat tag carrying the switch-quality trace (see [MainActivity.traceEvent]). */
+private const val TRACE_TAG = "rustplayer_trace"
 
 /**
  * Host Activity for the embedded Rust player.
@@ -78,6 +82,13 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private var stormAudioApplied = false
     private var stormSecondSeekDone = false
 
+    // ---- switch-quality trace ------------------------------------------------
+    // Every bridge event, verbatim, plus a MARK line at the instant we issue a
+    // control call — that pairing is what lets the offline analyser open a window
+    // around a switch and decide whether the user saw a spinner. Disable with
+    //   adb shell am start -n .../MainActivity --ez trace false
+    private var traceEnabled = true
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -88,6 +99,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         stormFix = intent.getStringExtra("storm_fix") ?: ""
         stormSecondSeek = intent.getBooleanExtra("storm_second_seek", true)
         stormPassthrough = intent.getBooleanExtra("storm_passthrough", false)
+        traceEnabled = intent.getBooleanExtra("trace", true)
         if (stormMode) {
             android.util.Log.i(
                 "rustplayer_repro",
@@ -151,7 +163,10 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         }
         playPauseButton = Button(this).apply {
             text = "▮▮"
-            setOnClickListener { player.togglePlayPause() }
+            setOnClickListener {
+                traceMark("transport", "action" to if (player.isPaused) "play" else "pause")
+                player.togglePlayPause()
+            }
         }
         seekBar = SeekBar(this).apply {
             max = 0
@@ -160,6 +175,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 override fun onStartTrackingTouch(sb: SeekBar) { userSeeking = true }
                 override fun onStopTrackingTouch(sb: SeekBar) {
                     userSeeking = false
+                    traceMark("seek", "target_ms" to sb.progress.toLong())
                     player.seekTo(sb.progress.toLong())
                 }
             })
@@ -188,22 +204,37 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         val labels = ArrayList<String>()
         val actions = ArrayList<() -> Unit>()
 
-        fun addGroup(prefix: String, key: String, pick: (Int, Int) -> Unit) {
+        fun addGroup(prefix: String, key: String, kind: String, pick: (Int, Int) -> Unit) {
             val arr: JSONArray = root.optJSONArray(key) ?: return
             for (i in 0 until arr.length()) {
                 val t = arr.getJSONObject(i)
-                labels.add("$prefix: ${t.optString("label")}")
+                val label = t.optString("label")
+                labels.add("$prefix: $label")
                 val adapt = t.optInt("adapt")
                 val repr = t.optInt("repr")
-                actions.add { pick(adapt, repr) }
+                actions.add {
+                    traceMark(
+                        "select", "kind" to kind, "mode" to "manual",
+                        "adapt" to adapt, "repr" to repr, "label" to label,
+                    )
+                    pick(adapt, repr)
+                }
             }
         }
 
-        labels.add("Video: Auto (ABR)"); actions.add { player.selectVideoAuto() }
-        addGroup("Video", "video") { a, r -> player.selectVideo(a, r) }
-        addGroup("Audio", "audio") { a, r -> player.selectAudio(a, r) }
-        labels.add("Subtitles: Off"); actions.add { player.clearSubtitles() }
-        addGroup("Subtitle", "text") { a, r -> player.selectSubtitle(a, r) }
+        labels.add("Video: Auto (ABR)")
+        actions.add {
+            traceMark("select", "kind" to "video", "mode" to "auto")
+            player.selectVideoAuto()
+        }
+        addGroup("Video", "video", "video") { a, r -> player.selectVideo(a, r) }
+        addGroup("Audio", "audio", "audio") { a, r -> player.selectAudio(a, r) }
+        labels.add("Subtitles: Off")
+        actions.add {
+            traceMark("select", "kind" to "text", "mode" to "off")
+            player.clearSubtitles()
+        }
+        addGroup("Subtitle", "text", "text") { a, r -> player.selectSubtitle(a, r) }
 
         AlertDialog.Builder(this)
             .setTitle("Tracks")
@@ -212,6 +243,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     }
 
     private inner class PlayerListener : RustPlayer.Listener {
+        override fun onRawEvent(json: String) = traceEvent(json)
         override fun onVideoSize(width: Int, height: Int) = applyVideoAspect(width, height)
         override fun onTracks(json: String) {
             // FIX (a): apply the audio pref BEFORE the first frame. pipeline_live
@@ -236,6 +268,36 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             if (!userSeeking) seekBar.progress = positionMs.toInt()
             timeLabel.text = "${fmt(positionMs)} / ${fmt(durationMs)}"
         }
+    }
+
+    // ---- trace emitters ------------------------------------------------------
+
+    /**
+     * One JSONL line per bridge event, tag [TRACE_TAG]:
+     * `{"t":<elapsedRealtimeMs>,"e":{<event verbatim>}}`.
+     *
+     * `t` is [SystemClock.elapsedRealtime] so event lines and [traceMark] lines
+     * share one monotonic axis that survives across processes and does not jump
+     * with wall-clock or doze.
+     */
+    private fun traceEvent(json: String) {
+        if (!traceEnabled) return
+        android.util.Log.i(TRACE_TAG, """{"t":${SystemClock.elapsedRealtime()},"e":$json}""")
+    }
+
+    /**
+     * `{"t":…,"mark":"<what>","pos":<positionMs>,<fields>}` — emitted at the
+     * instant a control call is issued, BEFORE the call, so the analyser can
+     * anchor its window on the cause rather than on the first visible effect.
+     */
+    private fun traceMark(mark: String, vararg fields: Pair<String, Any?>) {
+        if (!traceEnabled) return
+        val o = JSONObject()
+        o.put("t", SystemClock.elapsedRealtime())
+        o.put("mark", mark)
+        o.put("pos", if (player.isStarted) player.positionMs else -1L)
+        for ((k, v) in fields) o.put(k, v)
+        android.util.Log.i(TRACE_TAG, o.toString())
     }
 
     private fun fmt(ms: Long): String {
@@ -299,6 +361,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         val overlay = overlaySurface ?: return
         val video = videoSurface ?: return
         if (!player.isStarted) {
+            traceMark("start", "url" to TEST_MANIFEST_URL, "storm" to stormMode)
             if (stormMode) {
                 val passthrough = if (stormPassthrough) true else null
                 if (stormFix == "start_param") {
@@ -327,6 +390,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                     )
                 }
                 // Arm ABR immediately after start (BlackZone's selectVideoAuto()).
+                traceMark("select", "kind" to "video", "mode" to "auto", "src" to "storm")
                 player.selectVideoAuto()
             } else {
                 player.start(
@@ -354,6 +418,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         val adapt = t.optInt("adapt")
         val repr = t.optInt("repr")
         android.util.Log.i("rustplayer_repro", "applyStormAudio($where) adapt=$adapt repr=$repr")
+        traceMark("select", "kind" to "audio", "mode" to "manual",
+            "adapt" to adapt, "repr" to repr, "src" to "storm:$where")
         player.selectAudio(adapt, repr)
     }
 
@@ -366,6 +432,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             if (dur > 0) {
                 val target = (dur * stormFraction).toLong()
                 android.util.Log.i("rustplayer_repro", "stormSecondSeek to ${target}ms")
+                traceMark("seek", "target_ms" to target, "src" to "storm")
                 player.seekTo(target)
             }
         }, 450)

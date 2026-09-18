@@ -34,6 +34,18 @@ class RustPlayer(private val context: Context) {
          * parse with opt*().
          */
         fun onStats(json: String) {}
+
+        /**
+         * Every event exactly as the bridge emitted it, before it is decoded
+         * into the typed callbacks above - including event types this
+         * [Listener] has no method for. Delivered on the main thread, in
+         * order, ahead of the typed call for the same event.
+         *
+         * Meant for diagnostics: a host can dump these to a file/logcat and
+         * reconstruct a session offline (that is what the :app switch-quality
+         * harness does). Not needed for normal playback.
+         */
+        fun onRawEvent(json: String) {}
     }
 
     var listener: Listener? = null
@@ -179,6 +191,9 @@ class RustPlayer(private val context: Context) {
 
     private fun dispatch(json: String) {
         val l = listener ?: return
+        // Raw first: a diagnostic sink must see events we have no typed
+        // callback for, and must see them even if the JSON fails to parse.
+        l.onRawEvent(json)
         val o = try {
             JSONObject(json)
         } catch (e: Exception) {

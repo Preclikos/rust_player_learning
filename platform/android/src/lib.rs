@@ -494,6 +494,25 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetVideoT
     }
 }
 
+/// Soft (ABR-style) video switch: the running supervisor swaps the
+/// representation make-before-break, audio and the A/V clock stay up, and no
+/// pipeline is rebuilt. Exposed so the switch-quality harness can trigger the
+/// seamless path deterministically instead of having to provoke the bandwidth
+/// estimator into doing it.
+#[no_mangle]
+pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetVideoTrackSoft(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    adapt: jint,
+    repr: jint,
+) {
+    if let Some(h) = unsafe { handle_ref(handle) } {
+        h.bridge
+            .set_video_track_soft(adapt.max(0) as usize, repr.max(0) as usize);
+    }
+}
+
 #[no_mangle]
 pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetVideoAuto(
     _env: JNIEnv,

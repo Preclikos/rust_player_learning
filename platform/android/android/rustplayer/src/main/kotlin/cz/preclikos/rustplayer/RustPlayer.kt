@@ -140,6 +140,20 @@ class RustPlayer(private val context: Context) {
         if (handle != 0L) NativeBridge.nativeSetVideoTrack(handle, adapt, repr)
     }
 
+    /**
+     * Soft (ABR-style) quality switch: the running pipeline swaps the video
+     * representation make-before-break at the next segment boundary. Audio and
+     * the A/V clock are untouched and no `buffering` is emitted, so the viewer
+     * should see nothing but the picture changing quality.
+     *
+     * This is the seamless path the ABR engine uses. [selectVideo] is
+     * deliberately NOT this: a user who picked a quality should get it now,
+     * which costs a rebuild and a brief spinner.
+     */
+    fun selectVideoSoft(adapt: Int, repr: Int) {
+        if (handle != 0L) NativeBridge.nativeSetVideoTrackSoft(handle, adapt, repr)
+    }
+
     fun selectVideoAuto() {
         if (handle != 0L) NativeBridge.nativeSetVideoAuto(handle)
     }

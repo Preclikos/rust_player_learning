@@ -41,6 +41,7 @@ object NativeBridge {
     external fun nativeSetVolume(handle: Long, volume: Float)
     external fun nativeGetTracksJson(handle: Long): String
     external fun nativeSetVideoTrack(handle: Long, adapt: Int, repr: Int)
+    external fun nativeSetVideoTrackSoft(handle: Long, adapt: Int, repr: Int)
     external fun nativeSetVideoAuto(handle: Long)
     external fun nativeSetAudioTrack(handle: Long, adapt: Int, repr: Int)
     external fun nativeSetSubtitleTrack(handle: Long, adapt: Int, repr: Int)

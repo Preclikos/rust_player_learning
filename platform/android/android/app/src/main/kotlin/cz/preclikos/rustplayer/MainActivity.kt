@@ -89,6 +89,13 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     //   adb shell am start -n .../MainActivity --ez trace false
     private var traceEnabled = true
 
+    // Scripted scenario (see runScenarioStep) - empty = interactive app.
+    private var scenario = ""
+    private var scenarioIterations = 5
+    private var scenarioSettleMs = 12_000L
+    private var scenarioWarmupMs = 12_000L
+    private var scenarioStarted = false
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -100,6 +107,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         stormSecondSeek = intent.getBooleanExtra("storm_second_seek", true)
         stormPassthrough = intent.getBooleanExtra("storm_passthrough", false)
         traceEnabled = intent.getBooleanExtra("trace", true)
+        readScenarioExtras()
         if (stormMode) {
             android.util.Log.i(
                 "rustplayer_repro",
@@ -204,7 +212,13 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         val labels = ArrayList<String>()
         val actions = ArrayList<() -> Unit>()
 
-        fun addGroup(prefix: String, key: String, kind: String, pick: (Int, Int) -> Unit) {
+        fun addGroup(
+            prefix: String,
+            key: String,
+            kind: String,
+            mode: String = "manual",
+            pick: (Int, Int) -> Unit,
+        ) {
             val arr: JSONArray = root.optJSONArray(key) ?: return
             for (i in 0 until arr.length()) {
                 val t = arr.getJSONObject(i)
@@ -214,7 +228,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 val repr = t.optInt("repr")
                 actions.add {
                     traceMark(
-                        "select", "kind" to kind, "mode" to "manual",
+                        "select", "kind" to kind, "mode" to mode,
                         "adapt" to adapt, "repr" to repr, "label" to label,
                     )
                     pick(adapt, repr)
@@ -228,6 +242,11 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             player.selectVideoAuto()
         }
         addGroup("Video", "video", "video") { a, r -> player.selectVideo(a, r) }
+        // Same rungs again through the SEAMLESS path, so the two can be
+        // compared back to back on one device without touching the network.
+        addGroup("Video (soft)", "video", "video", mode = "soft") { a, r ->
+            player.selectVideoSoft(a, r)
+        }
         addGroup("Audio", "audio", "audio") { a, r -> player.selectAudio(a, r) }
         labels.add("Subtitles: Off")
         actions.add {
@@ -253,6 +272,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         }
         override fun onPlaying() {
             playPauseButton.text = "▮▮"
+            maybeStartScenario()
             // BUG path (stormFix==""): apply the audio pref AFTER the first frame,
             // exactly like BlackZone's onPlaying→applyLanguagePreference.
             // pipeline_live is true, so change_audio_track does seek(position()) —
@@ -268,6 +288,130 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             if (!userSeeking) seekBar.progress = positionMs.toInt()
             timeLabel.text = "${fmt(positionMs)} / ${fmt(durationMs)}"
         }
+    }
+
+    // ---- scripted switch-quality scenarios ----------------------------------
+    //
+    // Unattended, repeatable runs of the two switching contracts:
+    //   abr_soft     - the SEAMLESS path. The viewer must see nothing: no
+    //                  spinner, no frame hole, no jump. Driven through
+    //                  selectVideoSoft so it needs no bandwidth games.
+    //   manual_video - a user quality pick. Loading is EXPECTED, and playback
+    //                  must be clean once it clears.
+    //   manual_audio - same contract, audio side.
+    //   manual_sub   - subtitle on/off, cheapest of the rebuilds.
+    //
+    //   adb shell am start -n cz.preclikos.rust_player/cz.preclikos.rustplayer.MainActivity \
+    //     --es scenario abr_soft --ei iterations 5 --ei settle_ms 8000 --ei warmup_ms 12000
+    //
+    // Every step emits a MARK first, so the analyser windows on the cause.
+
+    private fun readScenarioExtras() {
+        scenario = intent.getStringExtra("scenario") ?: ""
+        scenarioIterations = intent.getIntExtra("iterations", 5)
+        scenarioSettleMs = intent.getIntExtra("settle_ms", 8_000).toLong()
+        scenarioWarmupMs = intent.getIntExtra("warmup_ms", 12_000).toLong()
+    }
+
+    private fun maybeStartScenario() {
+        if (scenario.isEmpty() || scenarioStarted) return
+        scenarioStarted = true
+        traceMark(
+            "scenario_begin", "scenario" to scenario,
+            "iterations" to scenarioIterations, "settle_ms" to scenarioSettleMs,
+            "warmup_ms" to scenarioWarmupMs,
+        )
+        // Let the pipeline settle out of its start-up transient first, so the
+        // first switch is measured against steady playback, not against the
+        // tail of the initial buffering.
+        playPauseButton.postDelayed({ runScenarioStep(0) }, scenarioWarmupMs)
+    }
+
+    private fun scenarioAbort(why: String) {
+        traceMark("scenario_abort", "scenario" to scenario, "why" to why)
+    }
+
+    private fun runScenarioStep(step: Int) {
+        if (step >= scenarioIterations) {
+            traceMark("scenario_end", "scenario" to scenario, "steps" to step)
+            return
+        }
+        val tracks = try {
+            JSONObject(player.tracksJson())
+        } catch (e: Exception) {
+            scenarioAbort("tracks json unreadable: $e")
+            return
+        }
+
+        fun pickAlternating(key: String): JSONObject? {
+            val arr = tracks.optJSONArray(key) ?: return null
+            if (arr.length() == 0) return null
+            // Alternate between the two ends so consecutive steps always mean a
+            // real change; with a single entry there is nothing to alternate.
+            val idx = if (arr.length() < 2) 0 else if (step % 2 == 0) arr.length() - 1 else 0
+            return arr.getJSONObject(idx)
+        }
+
+        when (scenario) {
+            "abr_soft", "manual_video" -> {
+                val t = pickAlternating("video")
+                if (t == null) {
+                    scenarioAbort("no video tracks")
+                    return
+                }
+                val soft = scenario == "abr_soft"
+                val adapt = t.optInt("adapt")
+                val repr = t.optInt("repr")
+                traceMark(
+                    "select", "kind" to "video", "mode" to if (soft) "soft" else "manual",
+                    "adapt" to adapt, "repr" to repr, "label" to t.optString("label"),
+                    "src" to "scenario", "step" to step,
+                )
+                if (soft) player.selectVideoSoft(adapt, repr) else player.selectVideo(adapt, repr)
+            }
+            "manual_audio" -> {
+                val t = pickAlternating("audio")
+                if (t == null) {
+                    scenarioAbort("no audio tracks")
+                    return
+                }
+                val adapt = t.optInt("adapt")
+                val repr = t.optInt("repr")
+                traceMark(
+                    "select", "kind" to "audio", "mode" to "manual",
+                    "adapt" to adapt, "repr" to repr, "label" to t.optString("label"),
+                    "src" to "scenario", "step" to step,
+                )
+                player.selectAudio(adapt, repr)
+            }
+            "manual_sub" -> {
+                val arr = tracks.optJSONArray("text")
+                if (arr == null || arr.length() == 0) {
+                    scenarioAbort("no subtitle tracks")
+                    return
+                }
+                if (step % 2 == 0) {
+                    val t = arr.getJSONObject(0)
+                    traceMark(
+                        "select", "kind" to "text", "mode" to "manual",
+                        "adapt" to t.optInt("adapt"), "repr" to t.optInt("repr"),
+                        "label" to t.optString("label"), "src" to "scenario", "step" to step,
+                    )
+                    player.selectSubtitle(t.optInt("adapt"), t.optInt("repr"))
+                } else {
+                    traceMark(
+                        "select", "kind" to "text", "mode" to "off",
+                        "src" to "scenario", "step" to step,
+                    )
+                    player.clearSubtitles()
+                }
+            }
+            else -> {
+                scenarioAbort("unknown scenario")
+                return
+            }
+        }
+        playPauseButton.postDelayed({ runScenarioStep(step + 1) }, scenarioSettleMs)
     }
 
     // ---- trace emitters ------------------------------------------------------

@@ -517,11 +517,25 @@ pub fn event_to_json(ev: &PlayerEvent) -> String {
             judder_frames,
             interval_hist,
             bandwidth_bps,
+            audio_peak_db,
             ..
         } => {
             let (w, h) = current_resolution.unwrap_or((0, 0));
+            // null, not 0: an UNMEASURED drift is not a perfect one, and a
+            // consumer averaging or diffing the series must be able to tell
+            // them apart. Kotlin optLong() still reads null as 0 as before.
+            let drift = av_drift_ms
+                .map(|d| d.to_string())
+                .unwrap_or_else(|| "null".to_string());
+            // Per-channel last-frame peak. This is how a consumer (and the
+            // switch-quality harness) can tell that sound actually came back
+            // after an audio track switch, rather than trusting that a clean
+            // event sequence means audible audio.
+            let peak = audio_peak_db
+                .map(|p| format!("[{:.1},{:.1}]", p[0], p[1]))
+                .unwrap_or_else(|| "null".to_string());
             format!(
-                r#"{{"type":"stats","frames_decoded":{},"frames_dropped":{},"frames_late":{},"audio_underruns":{},"net_stall_ms":{},"decoder":{},"width":{},"height":{},"av_drift_ms":{},"video_buffer_ahead_ms":{},"audio_buffer_ahead_ms":{},"video_segment":{},"stall_events":{},"pipeline_retries":{},"render_gap_max_ms":{},"judder_frames":{},"int_lt25":{},"int_25_41":{},"int_42_58":{},"int_gt58":{},"bandwidth_bps":{}}}"#,
+                r#"{{"type":"stats","frames_decoded":{},"frames_dropped":{},"frames_late":{},"audio_underruns":{},"net_stall_ms":{},"decoder":{},"width":{},"height":{},"av_drift_ms":{},"video_buffer_ahead_ms":{},"audio_buffer_ahead_ms":{},"video_segment":{},"stall_events":{},"pipeline_retries":{},"render_gap_max_ms":{},"judder_frames":{},"int_lt25":{},"int_25_41":{},"int_42_58":{},"int_gt58":{},"bandwidth_bps":{},"audio_peak_db":{}}}"#,
                 video_frames_decoded,
                 video_frames_dropped,
                 video_late_frames,
@@ -530,7 +544,7 @@ pub fn event_to_json(ev: &PlayerEvent) -> String {
                 jstr(decoder_name),
                 w,
                 h,
-                av_drift_ms.unwrap_or(0),
+                drift,
                 video_buffer_ahead_ms,
                 audio_buffer_ahead_ms,
                 video_segment,
@@ -542,7 +556,8 @@ pub fn event_to_json(ev: &PlayerEvent) -> String {
                 interval_hist[1],
                 interval_hist[2],
                 interval_hist[3],
-                bandwidth_bps
+                bandwidth_bps,
+                peak
             )
         }
         PlayerEvent::EndOfStream => obj("end_of_stream"),

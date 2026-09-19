@@ -18,6 +18,83 @@ pub fn kid_short(kid: &[u8; 16]) -> String {
 
 type Aes128Ctr = Ctr128BE<Aes128>;
 
+/// Whether CENC decryption should go through the aws-lc-rs (BoringSSL) cipher
+/// instead of the RustCrypto one.
+///
+/// Only when RustCrypto has no hardware backend for this target, which in
+/// practice means 32-bit ARM: it implements hardware AES for x86/x86_64 and
+/// aarch64 only, so a desktop or a 64-bit phone is already on the silicon and
+/// there is nothing to gain from a second code path.
+#[cfg(target_os = "android")]
+fn use_boringssl_aes() -> bool {
+    use std::sync::OnceLock;
+    static USE: OnceLock<bool> = OnceLock::new();
+    *USE.get_or_init(|| {
+        !aes::hardware_accelerated()
+    })
+}
+
+#[cfg(not(target_os = "android"))]
+fn use_boringssl_aes() -> bool {
+    false
+}
+
+/// Byte ranges of a sample that are actually encrypted, in order.
+///
+/// A CENC subsample is a (clear, encrypted) pair; the clear run comes
+/// first. Bounds are validated here once so neither cipher path has to.
+fn protected_spans(
+    subsamples: &[(u16, u32)],
+    len: usize,
+) -> Result<Vec<(usize, usize)>, Box<dyn Error + Send + Sync>> {
+    let mut spans = Vec::with_capacity(subsamples.len());
+    let mut offset = 0usize;
+    for &(clear, encrypted) in subsamples {
+        offset = offset.saturating_add(clear as usize);
+        let end = offset.saturating_add(encrypted as usize);
+        if end > len {
+            return Err(format!(
+                "Subsample bounds ({offset}..{end}) exceed sample length {len}"
+            )
+            .into());
+        }
+        if encrypted > 0 {
+            spans.push((offset, end));
+        }
+        offset = end;
+    }
+    Ok(spans)
+}
+
+/// AES-128-CTR over `buf`, in place, starting from `iv`.
+#[cfg(target_os = "android")]
+fn boringssl_ctr(
+    key: &[u8; 16],
+    iv: &[u8; 16],
+    buf: &mut [u8],
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    use aws_lc_rs::cipher::{DecryptingKey, DecryptionContext, UnboundCipherKey, AES_128};
+    use aws_lc_rs::iv::{FixedLength, IV_LEN_128_BIT};
+
+    let unbound = UnboundCipherKey::new(&AES_128, key)
+        .map_err(|_| -> Box<dyn Error + Send + Sync> { "aws-lc: bad AES key".into() })?;
+    let dk = DecryptingKey::ctr(unbound)
+        .map_err(|_| -> Box<dyn Error + Send + Sync> { "aws-lc: ctr init".into() })?;
+    let ctx = DecryptionContext::Iv128(FixedLength::<IV_LEN_128_BIT>::from(iv));
+    dk.decrypt(buf, ctx)
+        .map_err(|_| -> Box<dyn Error + Send + Sync> { "aws-lc: ctr decrypt".into() })?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "android"))]
+fn boringssl_ctr(
+    _key: &[u8; 16],
+    _iv: &[u8; 16],
+    _buf: &mut [u8],
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    unreachable!("boringssl_ctr is only reachable where use_boringssl_aes() is true")
+}
+
 /// One-shot AES capability + throughput report, logged the first time a sample
 /// is decrypted.
 ///
@@ -31,17 +108,20 @@ pub fn log_aes_capability() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         if aes::hardware_accelerated() {
-            log::debug!("[crypto] aes: hardware accelerated");
+            log::debug!("[crypto] AES: hardware (RustCrypto, {})", std::env::consts::ARCH);
             return;
         }
-        // Worth a warning, not a debug line: software AES-CTR runs ~40x slower
-        // and CENC decrypt is on the segment-boundary critical path, so this is
-        // the difference between a clean ABR swap and a visible one. On 32-bit
-        // ARM userspace (this is what a Google TV Streamer runs, even though
-        // its CPU advertises the ARMv8 aes/pmull extensions) the RustCrypto
-        // `aes` crate has no hardware backend at all - it implements only
-        // x86/x86_64 and aarch64 - so the target-feature flags in
-        // .cargo/config.toml, which name aarch64-linux-android, never apply.
+        if use_boringssl_aes() {
+            log::debug!(
+                "[crypto] AES: hardware via aws-lc-rs on {} — the `aes` crate has no backend for this arch",
+                std::env::consts::ARCH
+            );
+            return;
+        }
+        // Nothing reaches the silicon here. Worth a warning rather than a
+        // debug line: software AES-CTR is ~40x slower and CENC decrypt sits on
+        // the segment-boundary critical path, so it decides whether an ABR
+        // switch is clean. Verbose logging adds the measured rate.
         let mut detail = String::new();
         if log::log_enabled!(log::Level::Debug) {
             let mut buf = vec![0u8; 4 * 1024 * 1024];
@@ -52,7 +132,7 @@ pub fn log_aes_capability() {
             detail = format!(" ({} MiB/s measured over 4 MiB)", 4 * 1000 / ms);
         }
         log::warn!(
-            "[crypto] AES has NO hardware backend on this target ({}){} — CENC              decrypt will be the slowest step of segment preparation",
+            "[crypto] AES: SOFTWARE on {}{} — CENC decrypt will be the slowest step of              segment preparation",
             std::env::consts::ARCH,
             detail
         );
@@ -192,26 +272,44 @@ impl Decryptor for ClearKeyDecryptor {
                 .get(kid)
                 .ok_or_else(|| format!("ClearKey: no key for KID {} (ensure_key not called?)", kid_short(kid)))?
         };
+        // CENC applies the counter as if every PROTECTED byte of the sample
+        // were contiguous — clear subsample runs do not advance it. The
+        // RustCrypto path gets that for free by keeping one cipher across the
+        // spans; the one-shot BoringSSL call cannot, so it gathers the
+        // protected bytes, decrypts them as one stream and scatters them back.
+        // Most content has a single span per sample (measured: 144 spans for
+        // 144 samples), which takes the copy-free branch below.
+        if use_boringssl_aes() {
+            if subsamples.is_empty() {
+                return boringssl_ctr(&key, iv, data);
+            }
+            let spans = protected_spans(subsamples, data.len())?;
+            if spans.len() == 1 {
+                let (a, b) = spans[0];
+                return boringssl_ctr(&key, iv, &mut data[a..b]);
+            }
+            let total: usize = spans.iter().map(|&(a, b)| b - a).sum();
+            let mut scratch = Vec::with_capacity(total);
+            for &(a, b) in &spans {
+                scratch.extend_from_slice(&data[a..b]);
+            }
+            boringssl_ctr(&key, iv, &mut scratch)?;
+            let mut at = 0usize;
+            for &(a, b) in &spans {
+                let n = b - a;
+                data[a..b].copy_from_slice(&scratch[at..at + n]);
+                at += n;
+            }
+            return Ok(());
+        }
+
         let mut cipher = Aes128Ctr::new(&key.into(), iv.into());
 
         if subsamples.is_empty() {
             cipher.apply_keystream(data);
         } else {
-            let mut offset = 0usize;
-            for &(clear, encrypted) in subsamples {
-                offset = offset.saturating_add(clear as usize);
-                let end = offset.saturating_add(encrypted as usize);
-                if end > data.len() {
-                    return Err(format!(
-                        "Subsample bounds ({}..{}) exceed sample length {}",
-                        offset,
-                        end,
-                        data.len()
-                    )
-                    .into());
-                }
-                cipher.apply_keystream(&mut data[offset..end]);
-                offset = end;
+            for (a, b) in protected_spans(subsamples, data.len())? {
+                cipher.apply_keystream(&mut data[a..b]);
             }
         }
         Ok(())

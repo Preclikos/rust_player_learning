@@ -1655,10 +1655,19 @@ async fn audio_output_watchdog<A: AudioSink>(
             live_since = None;
             continue;
         }
-        // Someone else already declared a stall (segment starvation pauses the
-        // sink itself) — the consumer is seeing Buffering and the head is
-        // standing for a reason we must not mistake for a dead device.
-        if stats.audio_starving.load(Ordering::Relaxed) {
+        // Someone else already declared a stall — the consumer is seeing
+        // Buffering and the head is standing for a reason we must not mistake
+        // for a dead device.
+        //
+        // BOTH sides matter, not just the audio one: when VIDEO starves, the
+        // sync loop pauses the audio sink on purpose so the two stay locked,
+        // and the position then stands still exactly like a dead output. This
+        // watchdog read that as a death and rebuilt the pipeline on top of a
+        // pipeline that was merely waiting for frames — measured once at 18 s
+        // of starvation before it recovered.
+        if stats.audio_starving.load(Ordering::Relaxed)
+            || stats.video_starving.load(Ordering::Relaxed)
+        {
             seen = None;
             live_since = None;
             continue;
@@ -2509,7 +2518,7 @@ impl VideoPrefetch {
         let Ok(segment) = self.download_rx.try_recv() else {
             return;
         };
-        log::info!(
+        log::debug!(
             "[abr] preparing NEW segment {} ahead of the swap ({} KiB)",
             segment.id,
             segment.data.len() / 1024
@@ -4137,11 +4146,18 @@ const PREPARE_READY_BUDGET: Duration = Duration::from_millis(1_200);
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
                 let waited = wait_t0.elapsed();
-                if waited > Duration::from_millis(20) {
-                    log::info!(
-                        "[abr] held OLD {}ms at the boundary for NEW's decrypt ({})",
-                        waited.as_millis(),
-                        if h.is_finished() { "ready" } else { "BUDGET EXPIRED" }
+                // Only worth the operator's attention when the budget ran
+                // out - that means the swap went ahead unprepared and the
+                // viewer may have seen it. A short, successful hold is detail.
+                if !h.is_finished() {
+                    log::warn!(
+                        "[abr] NEW's decrypt did not finish within {}ms at the boundary;                          swapping anyway",
+                        waited.as_millis()
+                    );
+                } else if waited > Duration::from_millis(20) {
+                    log::debug!(
+                        "[abr] held OLD {}ms at the boundary for NEW's decrypt",
+                        waited.as_millis()
                     );
                 }
             }
@@ -6176,6 +6192,121 @@ async fn setup_track_crypto(
     }))
 }
 
+/// Below this, the thread hand-off costs more than the decryption saves.
+const PARALLEL_DECRYPT_MIN_BYTES: usize = 2 * 1024 * 1024;
+
+/// Decrypt one sample, honouring the "clear sample inside an encrypted senc"
+/// cases that CENC allows. Shared by the serial and parallel paths so they can
+/// never disagree about what counts as clear.
+fn decrypt_one_sample(
+    tc: &TrackCrypto,
+    entry: &crate::crypto::SencEntry,
+    sample: &mut [u8],
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    // IV all-zeros with no subsamples, or subsamples that encrypt nothing,
+    // both mean the sample is in the clear. Applying a keystream anyway would
+    // corrupt it — CTR with IV=0 still XORs against a real keystream.
+    let iv_is_zero = entry.iv.iter().all(|&b| b == 0);
+    let no_encrypted_bytes =
+        !entry.subsamples.is_empty() && entry.subsamples.iter().all(|&(_, enc)| enc == 0);
+    if iv_is_zero || no_encrypted_bytes {
+        return Ok(());
+    }
+    tc.decryptor
+        .decrypt_sample(&tc.kid, &entry.iv, sample, &entry.subsamples)
+}
+
+/// Split the segment into `workers` contiguous groups of samples and decrypt
+/// them concurrently.
+///
+/// The split is by BYTES, not by sample count: sample sizes within a GOP vary
+/// by an order of magnitude (an IDR against a B-frame), so an even count would
+/// leave one worker holding most of the work.
+fn decrypt_samples_parallel(
+    data_vec: &mut [u8],
+    tc: &TrackCrypto,
+    sample_ranges: &[(usize, usize)],
+    senc_entries: &[crate::crypto::SencEntry],
+    workers: usize,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let pairs: Vec<(&(usize, usize), &crate::crypto::SencEntry)> =
+        sample_ranges.iter().zip(senc_entries.iter()).collect();
+    let total: usize = pairs.iter().map(|(r, _)| r.1).sum();
+    let per_worker = total / workers + 1;
+
+    // Group boundaries, then turn them into disjoint &mut slices.
+    let mut groups: Vec<&[(&(usize, usize), &crate::crypto::SencEntry)]> = Vec::new();
+    let mut start = 0usize;
+    let mut acc = 0usize;
+    for i in 0..pairs.len() {
+        acc += pairs[i].0 .1;
+        let last = i + 1 == pairs.len();
+        if acc >= per_worker || last {
+            groups.push(&pairs[start..i + 1]);
+            start = i + 1;
+            acc = 0;
+        }
+    }
+
+    // Validate the assumption the split rests on BEFORE splitting anything:
+    // samples ascending, non-overlapping, inside the buffer. If a segment ever
+    // breaks it, say so and let the caller stay serial rather than guess.
+    let mut watermark = 0usize;
+    for (r, _) in &pairs {
+        if r.0 < watermark || r.0 + r.1 > data_vec.len() {
+            return Err("sample offsets are not ascending; cannot split safely".into());
+        }
+        watermark = r.0 + r.1;
+    }
+
+    let mut rest: &mut [u8] = data_vec;
+    let mut consumed = 0usize;
+    let mut chunks: Vec<(&mut [u8], usize, &[(&(usize, usize), &crate::crypto::SencEntry)])> =
+        Vec::with_capacity(groups.len());
+    for (gi, group) in groups.iter().enumerate() {
+        if group.is_empty() {
+            continue;
+        }
+        let group_end = group.last().map(|(r, _)| r.0 + r.1).unwrap_or(consumed);
+        let take_to = if gi + 1 == groups.len() {
+            rest.len()
+        } else {
+            group_end - consumed
+        };
+        let (mine, tail) = rest.split_at_mut(take_to);
+        chunks.push((mine, consumed, group));
+        consumed += take_to;
+        rest = tail;
+    }
+
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = chunks
+            .into_iter()
+            .map(|(buf, base, group)| {
+                scope.spawn(move || -> Result<(), String> {
+                    for ((offset, size), entry) in group.iter().copied() {
+                        let a = offset - base;
+                        let b = a + size;
+                        if b > buf.len() {
+                            return Err(format!("sample {a}..{b} outside its chunk"));
+                        }
+                        decrypt_one_sample(tc, entry, &mut buf[a..b]).map_err(|e| e.to_string())?;
+                    }
+                    Ok(())
+                })
+            })
+            .collect();
+        for h in handles {
+            match h.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => return Err::<(), Box<dyn Error + Send + Sync>>(e.into()),
+                Err(_) => return Err("decrypt worker panicked".into()),
+            }
+        }
+        Ok(())
+    })
+}
+
 fn decrypt_segment_in_place(
     data_vec: &mut [u8],
     track_crypto: Option<&TrackCrypto>,
@@ -6184,6 +6315,7 @@ fn decrypt_segment_in_place(
         Some(t) => t,
         None => return Ok(()),
     };
+    crate::crypto::log_aes_capability();
 
     // No senc box = this segment is clear, even though the track's `tenc`
     // box advertises encryption. Common Encryption explicitly supports
@@ -6219,6 +6351,44 @@ fn decrypt_segment_in_place(
 
     let ranges_ms = t_ranges.elapsed().as_millis();
     let t_aes = Instant::now();
+
+    // Spread the samples across cores when there is enough work to pay for the
+    // threads. Samples are disjoint and in ascending offset order, so the
+    // buffer can be split into per-worker slices with `split_at_mut` — no
+    // unsafe aliasing, each worker owns its bytes outright.
+    //
+    // Worth it mainly where AES has no hardware backend (32-bit ARM, ~10 MiB/s)
+    // and a 4K segment costs ~0.7 s single-threaded; with hardware AES the
+    // whole segment is a few ms and the split simply never triggers.
+    let total_bytes = sample_ranges.iter().map(|&(_, sz)| sz).sum::<usize>();
+    let workers = if total_bytes >= PARALLEL_DECRYPT_MIN_BYTES && sample_ranges.len() > 1 {
+        std::thread::available_parallelism()
+            .map(|n| n.get().min(4))
+            .unwrap_or(1)
+    } else {
+        1
+    };
+    if workers > 1 {
+        match decrypt_samples_parallel(data_vec, tc, &sample_ranges, &senc_entries, workers) {
+            Ok(()) => {
+                log::debug!(
+                    "[crypto] {} samples over {} threads, senc+ranges {}ms, aes {}ms ({} KiB)",
+                    sample_ranges.len(),
+                    workers,
+                    ranges_ms,
+                    t_aes.elapsed().as_millis(),
+                    total_bytes / 1024
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                // Only the layout check refuses; a real cipher failure would
+                // have failed serially too. Fall through rather than fail.
+                log::debug!("[crypto] parallel decrypt declined ({e}); doing it serially");
+            }
+        }
+    }
+
     let mut enc_bytes = 0usize;
     let mut spans = 0usize;
     for ((offset, size), entry) in sample_ranges.iter().zip(senc_entries.iter()) {
@@ -6986,6 +7156,25 @@ hi
         assert!(!wd.is_finished(), "watchdog fired during ordinary starvation");
         assert!(r.seek_target.read().await.is_none());
         wd.abort();
+
+        // VIDEO starving pauses the audio sink too, so the head stands still
+        // for a reason that has nothing to do with the output device. Missing
+        // this rebuilt the pipeline under a merely-waiting one on a real
+        // device, turning a hiccup into 18 s of starvation.
+        //
+        // The output has to have been RUNNING first, or the watchdog would
+        // hold off anyway and the test would pass for the wrong reason.
+        let r = rig();
+        let wd = spawn_watchdog(&r);
+        play_a_while(&r).await;
+        r.stats.video_starving.store(true, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert!(
+            !wd.is_finished(),
+            "watchdog mistook a video stall for a dead audio output"
+        );
+        assert!(r.seek_target.read().await.is_none());
+        wd.abort();
     }
 
     #[tokio::test(start_paused = true)]
@@ -7025,5 +7214,145 @@ hi
         assert!(!wd.is_finished());
         assert!(r.seek_target.read().await.is_none());
         wd.abort();
+    }
+
+    use crate::crypto::SencEntry;
+
+    // ---- parallel CENC decrypt ----------------------------------------------
+    //
+    // The parallel path hands each worker a disjoint `&mut [u8]` carved out of
+    // the segment with split_at_mut, so a mistake in the arithmetic would not
+    // be a compile error - it would be silently mis-decrypted video. These
+    // tests pin it to the serial result, byte for byte.
+
+    fn crypto_fixture() -> (TrackCrypto, [u8; 16]) {
+        let kid = [0x11u8; 16];
+        let key = [0x42u8; 16];
+        let mut keys = std::collections::HashMap::new();
+        keys.insert(kid, key);
+        let tc = TrackCrypto {
+            decryptor: Arc::new(crate::crypto::ClearKeyDecryptor::new(keys)),
+            kid,
+            iv_size: 16,
+        };
+        (tc, kid)
+    }
+
+    /// Samples of deliberately uneven size, laid out back to back after a
+    /// header gap, the way a real fragment carries them.
+    fn sample_layout(sizes: &[usize], header: usize) -> (Vec<(usize, usize)>, Vec<SencEntry>) {
+        let mut ranges = Vec::new();
+        let mut entries = Vec::new();
+        let mut at = header;
+        for (i, &sz) in sizes.iter().enumerate() {
+            ranges.push((at, sz));
+            let mut iv = [0u8; 16];
+            iv[15] = (i as u8) + 1; // never all-zero: that means "clear"
+            entries.push(SencEntry {
+                iv,
+                subsamples: Vec::new(),
+            });
+            at += sz;
+        }
+        (ranges, entries)
+    }
+
+    fn serial_reference(
+        buf: &mut [u8],
+        tc: &TrackCrypto,
+        ranges: &[(usize, usize)],
+        entries: &[SencEntry],
+    ) {
+        for ((offset, size), entry) in ranges.iter().zip(entries.iter()) {
+            decrypt_one_sample(tc, entry, &mut buf[*offset..offset + size]).unwrap();
+        }
+    }
+
+    #[test]
+    fn parallel_decrypt_matches_the_serial_result() {
+        let (tc, _kid) = crypto_fixture();
+        // Uneven sizes, like an IDR followed by B-frames.
+        let sizes = [900_000usize, 40_000, 30_000, 700_000, 25_000, 500_000, 15_000];
+        let header = 2_048;
+        let (ranges, entries) = sample_layout(&sizes, header);
+        let total = header + sizes.iter().sum::<usize>() + 64; // trailing slack
+
+        let mut original = vec![0u8; total];
+        for (i, b) in original.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+
+        let mut expected = original.clone();
+        serial_reference(&mut expected, &tc, &ranges, &entries);
+
+        for workers in [2usize, 3, 4] {
+            let mut got = original.clone();
+            decrypt_samples_parallel(&mut got, &tc, &ranges, &entries, workers)
+                .unwrap_or_else(|e| panic!("{workers} workers refused the split: {e}"));
+            assert_eq!(got, expected, "parallel result differs with {workers} workers");
+        }
+    }
+
+    #[test]
+    fn parallel_decrypt_leaves_bytes_outside_samples_untouched() {
+        let (tc, _kid) = crypto_fixture();
+        let sizes = [600_000usize, 600_000, 600_000, 600_000];
+        let header = 4_096;
+        let (ranges, entries) = sample_layout(&sizes, header);
+        let total = header + sizes.iter().sum::<usize>() + 1_024;
+
+        let mut buf = vec![0xABu8; total];
+        decrypt_samples_parallel(&mut buf, &tc, &ranges, &entries, 4).unwrap();
+
+        assert!(
+            buf[..header].iter().all(|&b| b == 0xAB),
+            "the header was decrypted over"
+        );
+        let tail = header + sizes.iter().sum::<usize>();
+        assert!(
+            buf[tail..].iter().all(|&b| b == 0xAB),
+            "the trailing bytes were decrypted over"
+        );
+    }
+
+    #[test]
+    fn parallel_decrypt_refuses_a_layout_it_cannot_split() {
+        let (tc, _kid) = crypto_fixture();
+        // Overlapping samples: the split would hand two workers the same bytes.
+        let ranges = vec![(0usize, 1_000usize), (500, 1_000), (2_000, 1_000)];
+        let entries: Vec<SencEntry> = (0..3)
+            .map(|i| {
+                let mut iv = [0u8; 16];
+                iv[15] = i + 1;
+                SencEntry {
+                    iv,
+                    subsamples: Vec::new(),
+                }
+            })
+            .collect();
+        let mut buf = vec![0u8; 4_000];
+        assert!(
+            decrypt_samples_parallel(&mut buf, &tc, &ranges, &entries, 2).is_err(),
+            "an overlapping layout must be refused, not silently mis-decrypted"
+        );
+    }
+
+    #[test]
+    fn a_clear_sample_inside_an_encrypted_segment_is_left_alone() {
+        let (tc, _kid) = crypto_fixture();
+        let mut entry = SencEntry {
+            iv: [0u8; 16], // all-zero IV = the sample is in the clear
+            subsamples: Vec::new(),
+        };
+        let mut buf = vec![7u8; 1_024];
+        decrypt_one_sample(&tc, &entry, &mut buf).unwrap();
+        assert!(buf.iter().all(|&b| b == 7), "a clear sample was decrypted");
+
+        // Subsamples that encrypt nothing mean the same thing.
+        entry.iv = [9u8; 16];
+        entry.subsamples = vec![(1_024, 0)];
+        let mut buf2 = vec![7u8; 1_024];
+        decrypt_one_sample(&tc, &entry, &mut buf2).unwrap();
+        assert!(buf2.iter().all(|&b| b == 7), "a zero-encrypted sample was decrypted");
     }
 }

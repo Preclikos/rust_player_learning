@@ -121,6 +121,20 @@ objc2-metal = { version = "0.3.2", default-features = false, features = [
 # and rustls so reqwest doesn't need a cross-compiled OpenSSL. (No winit — the
 # host Activity owns the Surface; see app-android.)
 [target.'cfg(target_os = "android")'.dependencies]
+# CENC decrypt fallback with a hardware AES backend for 32-bit ARM.
+#
+# The RustCrypto `aes` crate implements hardware AES for x86/x86_64 and
+# aarch64 only. Android TV boxes routinely run a 32-bit userspace on ARMv8
+# silicon (a Google TV Streamer reports abilist=armeabi-v7a while /proc/cpuinfo
+# advertises `aes pmull`), and there `aes` falls back to the portable software
+# backend: measured 10 MiB/s, which makes CENC decrypt the slowest step of
+# segment preparation and the dominant cost of an ABR switch.
+#
+# aws-lc-rs is BoringSSL-derived and carries AES assembly for 32-bit ARM gated
+# on HWCAP2_AES, so it reaches the silicon the `aes` crate cannot. It is
+# already in this target's dependency graph via rustls, so it adds no new C
+# build - which is also why this is scoped to Android rather than made global.
+aws-lc-rs = { version = "1.18", default-features = false, features = ["aws-lc-sys", "alloc"] }
 ndk = { version = "0.9", features = ["media", "api-level-29"] }
 ndk-sys = "0.6"
 jni = "0.22"

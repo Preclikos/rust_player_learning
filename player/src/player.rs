@@ -1607,6 +1607,11 @@ const AUDIO_OUTPUT_HEALTHY_MS: u64 = 15_000;
 /// output is still dead after the rebuild budget, the failure is reported
 /// ([`PlayerErrorKind::AudioOutput`]) rather than papered over: a movie
 /// playing silently is a failure, not a degraded success.
+///
+/// It only ever judges an output it has seen working: the death timer arms
+/// after the first observed advance. A position that has never moved means
+/// the pipeline is still starting, which is [`AUDIO_CLOCK_START_GRACE_MS`]'s
+/// business, not a device to rebuild.
 async fn audio_output_watchdog<A: AudioSink>(
     gen: u64,
     audio_sink: Arc<A>,
@@ -1624,6 +1629,17 @@ async fn audio_output_watchdog<A: AudioSink>(
     let mut seen: Option<(u64, tokio::time::Instant)> = None;
     // When the output started advancing again after a death (budget reset).
     let mut live_since: Option<tokio::time::Instant> = None;
+    // True once this generation has actually SEEN the head move. Until then
+    // there is no dead output to diagnose: a position standing at 0 is how a
+    // sink says "not audible yet", and the gap between opening the device and
+    // the first sample reaching it is unbounded — it spans the first
+    // segment's fetch, decrypt and decode, which on desktop after a resume
+    // seek is comfortably several seconds. Arming the death timer before the
+    // first advance turns every start-up into a phantom rebuild and then an
+    // AudioOutput error on a machine whose sound was never broken. Start-up
+    // has its own guard: MediaClock holds the picture for
+    // [`AUDIO_CLOCK_START_GRACE_MS`] while the position has never advanced.
+    let mut ever_advanced = false;
 
     loop {
         tokio::select! {
@@ -1662,6 +1678,7 @@ async fn audio_output_watchdog<A: AudioSink>(
             }
             Some((p0, _)) if played > p0 => {
                 seen = Some((played, tokio::time::Instant::now()));
+                ever_advanced = true;
                 let since = *live_since.get_or_insert_with(tokio::time::Instant::now);
                 if stats.audio_output_rebuilds.load(Ordering::Relaxed) > 0
                     && since.elapsed() >= Duration::from_millis(AUDIO_OUTPUT_HEALTHY_MS)
@@ -1671,6 +1688,10 @@ async fn audio_output_watchdog<A: AudioSink>(
                     );
                     stats.audio_output_rebuilds.store(0, Ordering::Relaxed);
                 }
+                continue;
+            }
+            // Never started: a start-up problem, not a device that died.
+            Some(_) if !ever_advanced => {
                 continue;
             }
             Some((_, w0)) if w0.elapsed() < Duration::from_millis(AUDIO_OUTPUT_DEAD_MS) => {
@@ -6856,11 +6877,22 @@ hi
         out
     }
 
+    /// Play the output for a second so the watchdog sees a live head; the
+    /// death it is meant to catch is a device that stops, and it deliberately
+    /// does not judge one that never started.
+    async fn play_a_while(r: &WatchdogRig) {
+        for _ in 0..4 {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            r.sink.played_ms.fetch_add(250, Ordering::Relaxed);
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn dead_output_shows_loading_and_rebuilds_the_pipeline() {
         let mut r = rig();
         let wd = spawn_watchdog(&r);
-        // The output never moves again. Bounding the wait is what makes the
+        play_a_while(&r).await;
+        // ...and now it never moves again. Bounding the wait is what makes the
         // liveness threshold load-bearing: without it the test would pass even
         // if the watchdog took a day to notice.
         let t0 = tokio::time::Instant::now();
@@ -6896,6 +6928,7 @@ hi
             .audio_output_rebuilds
             .store(AUDIO_OUTPUT_MAX_REBUILDS, Ordering::Relaxed);
         let wd = spawn_watchdog(&r);
+        play_a_while(&r).await;
         let t0 = tokio::time::Instant::now();
         tokio::time::timeout(Duration::from_secs(5), wd)
             .await
@@ -6953,6 +6986,32 @@ hi
         assert!(!wd.is_finished(), "watchdog fired during ordinary starvation");
         assert!(r.seek_target.read().await.is_none());
         wd.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_output_that_never_started_is_not_a_dead_output() {
+        // Desktop (WASAPI) reports a position from the moment the device is
+        // opened, which is long before the first sample arrives: the first
+        // segment still has to be fetched, decrypted and decoded, and after a
+        // resume seek that is several seconds. Treating that standing 0 as a
+        // death rebuilt the pipeline on every start and then reported
+        // AudioOutput on machines whose sound was fine.
+        let mut r = rig();
+        r.sink.played_ms.store(0, Ordering::Relaxed);
+        let wd = spawn_watchdog(&r);
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        assert!(!wd.is_finished(), "watchdog fired before audio ever started");
+        assert!(r.seek_target.read().await.is_none(), "no phantom rebuild");
+        assert_eq!(r.stats.audio_output_rebuilds.load(Ordering::Relaxed), 0);
+        assert!(drain(&mut r.rx).is_empty(), "start-up is not an error");
+
+        // Once it HAS started, a stop is judged as usual.
+        play_a_while(&r).await;
+        tokio::time::timeout(Duration::from_secs(5), wd)
+            .await
+            .expect("watchdog did not act after the output died for real")
+            .unwrap();
+        assert!(r.seek_target.read().await.is_some());
     }
 
     #[tokio::test(start_paused = true)]

@@ -20,7 +20,29 @@ class RustPlayer(private val context: Context) {
         fun onTracks(json: String) {}
         fun onPlaying() {}
         fun onPaused() {}
+        @Deprecated("override onBuffering(reason) - a spinner should not be shown for every cause")
         fun onBuffering() {}
+
+        /**
+         * Playback is waiting for media. [reason] says WHY, which is what
+         * decides whether a spinner belongs on screen:
+         *
+         *  - `"initial"`      first fill after start.
+         *  - `"seek"`         the user scrubbed - they expect to wait.
+         *  - `"track_switch"` the user picked a track - so do they.
+         *  - `"stall"`        ran dry mid-playback; the only unwanted one.
+         *
+         * An automatic (ABR) quality change never gets here at all: it swaps
+         * make-before-break with no buffering event, so a host that shows a
+         * spinner for it is reacting to something else.
+         *
+         * Unknown values may be added later - treat anything unrecognised as
+         * a plain stall.
+         */
+        fun onBuffering(reason: String) {
+            @Suppress("DEPRECATION")
+            onBuffering()
+        }
         fun onPosition(positionMs: Long, durationMs: Long) {}
         fun onVideoSize(width: Int, height: Int) {}
         fun onEnded() {}
@@ -218,7 +240,7 @@ class RustPlayer(private val context: Context) {
             "tracks_ready" -> l.onTracks(tracksJson())
             "playing" -> l.onPlaying()
             "paused" -> l.onPaused()
-            "buffering" -> l.onBuffering()
+            "buffering" -> l.onBuffering(o.optString("reason", "stall"))
             "position" -> l.onPosition(o.optLong("position_ms"), o.optLong("duration_ms"))
             "video_size" -> {
                 val w = o.optInt("width")

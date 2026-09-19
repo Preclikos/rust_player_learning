@@ -373,6 +373,13 @@ pub struct Player<V: VideoSink = VideoRenderer, A: AudioSink = AudioRenderer> {
     stop_flag: Arc<AtomicBool>,
 
     seek_target: Arc<RwLock<Option<Duration>>>,
+    /// Why the NEXT pipeline build is happening, so its opening `Buffering`
+    /// can say so. Every rebuild goes through `seek_target` regardless of
+    /// cause — a user seek, a track switch, a stall recovery — and a consumer
+    /// that cannot tell them apart has to show the same spinner for all of
+    /// them. Set by whoever triggers the rebuild, consumed once by the
+    /// pipeline that results.
+    rebuild_reason: Arc<StdMutex<BufferingReason>>,
     position_ms: Arc<AtomicU64>,
 
     /// ClearKey decryptor — single shared instance so cached keys and
@@ -502,6 +509,7 @@ impl<V: VideoSink, A: AudioSink> Clone for Player<V, A> {
             stop: Arc::clone(&self.stop),
             stop_flag: Arc::clone(&self.stop_flag),
             seek_target: Arc::clone(&self.seek_target),
+            rebuild_reason: Arc::clone(&self.rebuild_reason),
             position_ms: Arc::clone(&self.position_ms),
             decryptor: Arc::clone(&self.decryptor),
             stats: Arc::clone(&self.stats),
@@ -1748,12 +1756,18 @@ async fn av_sync_handler<V: VideoSink, A: AudioSink>(
     pause_notify: Arc<Notify>,
     stats: Arc<StatsState>,
     pipeline_live: Arc<AtomicBool>,
+    rebuild_reason: Arc<StdMutex<BufferingReason>>,
 ) {
-    // Emit Buffering{Initial} immediately so the consumer can show "buffering"
-    // while the first segments download.
-    let _ = events.send(PlayerEvent::Buffering {
-        reason: BufferingReason::Initial,
-    });
+    // Opening Buffering, tagged with WHY this pipeline is being built, so a
+    // consumer can show a spinner for a cold start or a deliberate switch and
+    // stay quiet for churn it did not ask for. Consumed here: the next build
+    // is an ordinary start again unless its trigger says otherwise.
+    let reason = std::mem::replace(
+        &mut *rebuild_reason.lock().unwrap(),
+        BufferingReason::Initial,
+    );
+    log::info!("[pipeline gen {}] opening buffering, reason={:?}", gen, reason);
+    let _ = events.send(PlayerEvent::Buffering { reason });
 
     // Pipeline watchdog: a plain OS thread (immune to any async-runtime state)
     // that logs the per-stage progress counters every 3 s. When playback stalls,
@@ -1960,6 +1974,64 @@ async fn av_sync_handler<V: VideoSink, A: AudioSink>(
 // Decoder tasks (platform-generic, communicate via channels)
 // ---------------------------------------------------------------------------
 
+/// A segment with its init header prepended, CENC-decrypted and mp4-parsed —
+/// everything that has to happen before bytes can be fed to a decoder.
+struct PreparedSegment {
+    id: usize,
+    data_vec: Vec<u8>,
+    sample_info: Vec<(usize, usize, i64, u64)>,
+}
+
+type PrepareHandle =
+    tokio::task::JoinHandle<Result<PreparedSegment, Box<dyn Error + Send + Sync>>>;
+
+/// Init concat + CENC decrypt + mp4 parse, on a BLOCKING thread.
+///
+/// Cost scales with segment SIZE, not frame count: ~17 MB/s of software AES on
+/// a TV SoC, so a 14 Mbps 4K segment is ~0.7 s of pure CPU. In steady state the
+/// decode loop hides that by preparing segment N+1 while it feeds N. The first
+/// segment of a pipeline has nothing to hide behind — which is why an ABR swap
+/// starts it during the prefetch instead, while the OLD rung is still playing.
+fn prepare_segment(
+    init_data: Arc<Vec<u8>>,
+    crypto: Option<TrackCrypto>,
+    segment: DataSegment,
+) -> PrepareHandle {
+    tokio::task::spawn_blocking(
+        move || -> Result<PreparedSegment, Box<dyn Error + Send + Sync>> {
+            let mut data_vec = Vec::with_capacity(init_data.len() + segment.data.len());
+            data_vec.extend_from_slice(&init_data);
+            data_vec.extend_from_slice(&segment.data[..]);
+            decrypt_segment_in_place(&mut data_vec, crypto.as_ref())?;
+            let sample_info: Vec<(usize, usize, i64, u64)> = {
+                let mp4 = Mp4::read_bytes(&data_vec)
+                    .map_err(|e| -> Box<dyn Error + Send + Sync> { format!("mp4: {}", e).into() })?;
+                let (_id, track) = mp4
+                    .tracks()
+                    .first_key_value()
+                    .ok_or_else(|| -> Box<dyn Error + Send + Sync> { "no track".into() })?;
+                track
+                    .samples
+                    .iter()
+                    .map(|s| {
+                        (
+                            s.offset as usize,
+                            s.size as usize,
+                            s.composition_timestamp,
+                            s.timescale,
+                        )
+                    })
+                    .collect()
+            };
+            Ok(PreparedSegment {
+                id: segment.id,
+                data_vec,
+                sample_info,
+            })
+        },
+    )
+}
+
 async fn video_decoder_task(
     mut receiver: Receiver<DataSegment>,
     sender: Sender<DecodedVideoFrame>,
@@ -1981,6 +2053,9 @@ async fn video_decoder_task(
     // (frames at/below `skip_below_pts_us`) so the splice is forward-contiguous,
     // and stamps the first-frame-after-teardown timing log. `None` initially.
     splice: Option<SwapSplice>,
+    // First segment whose decrypt+parse was started ahead of time (see
+    // `prepare_segment`). `None` outside an ABR swap.
+    first_prepared: Option<PrepareHandle>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut first_frame_signaled = false;
 
@@ -2004,58 +2079,18 @@ async fn video_decoder_task(
     // inline (the old shape) that was a guaranteed codec starvation +
     // LATE drain at every segment boundary; overlapped it disappears into
     // the ~6 s feed window of the segment before it.
-    struct PreparedSegment {
-        id: usize,
-        data_vec: Vec<u8>,
-        sample_info: Vec<(usize, usize, i64, u64)>,
-    }
     let init_data = Arc::new(init_data);
     let prepare = {
         let init_data = Arc::clone(&init_data);
         let crypto = track_crypto.clone();
-        move |segment: DataSegment| {
-            let init_data = Arc::clone(&init_data);
-            let crypto = crypto.clone();
-            tokio::task::spawn_blocking(
-                move || -> Result<PreparedSegment, Box<dyn Error + Send + Sync>> {
-                    let mut data_vec =
-                        Vec::with_capacity(init_data.len() + segment.data.len());
-                    data_vec.extend_from_slice(&init_data);
-                    data_vec.extend_from_slice(&segment.data[..]);
-                    decrypt_segment_in_place(&mut data_vec, crypto.as_ref())?;
-                    let sample_info: Vec<(usize, usize, i64, u64)> = {
-                        let mp4 = Mp4::read_bytes(&data_vec).map_err(
-                            |e| -> Box<dyn Error + Send + Sync> { format!("mp4: {}", e).into() },
-                        )?;
-                        let (_id, track) = mp4.tracks().first_key_value().ok_or_else(
-                            || -> Box<dyn Error + Send + Sync> { "no track".into() },
-                        )?;
-                        track
-                            .samples
-                            .iter()
-                            .map(|s| {
-                                (
-                                    s.offset as usize,
-                                    s.size as usize,
-                                    s.composition_timestamp,
-                                    s.timescale,
-                                )
-                            })
-                            .collect()
-                    };
-                    Ok(PreparedSegment {
-                        id: segment.id,
-                        data_vec,
-                        sample_info,
-                    })
-                },
-            )
-        }
+        move |segment: DataSegment| prepare_segment(Arc::clone(&init_data), crypto.clone(), segment)
     };
 
-    let mut pending_prepare: Option<
-        tokio::task::JoinHandle<Result<PreparedSegment, Box<dyn Error + Send + Sync>>>,
-    > = None;
+    // Normally None — but an ABR swap hands over the first segment already
+    // being prepared (started while the OLD rung still played), which is the
+    // difference between the new rung's first frame landing inside OLD's frame
+    // cushion and landing ~0.7 s after it ran dry.
+    let mut pending_prepare: Option<PrepareHandle> = first_prepared;
     loop {
         let boundary_t0 = Instant::now();
         let prepared = match pending_prepare.take() {
@@ -2408,6 +2443,43 @@ struct VideoPrefetch {
     /// Fired (once) when `prime_target` segments have been buffered into
     /// `download_rx`. The supervisor awaits this before tearing OLD down.
     primed: Arc<Notify>,
+    /// First segment already decrypted + parsed, started by
+    /// [`VideoPrefetch::start_first_prepare`] while the OLD rung still played.
+    first_prepared: Option<PrepareHandle>,
+}
+
+impl VideoPrefetch {
+    /// Take the first buffered segment out of the download channel and start
+    /// its decrypt + mp4 parse NOW, on a blocking thread.
+    ///
+    /// The decode loop hides that work in steady state by preparing segment
+    /// N+1 while feeding N, but the FIRST segment of a pipeline has nothing to
+    /// hide behind, and the cost scales with bytes: ~0.7 s for a 14 Mbps 4K
+    /// segment on a TV SoC. On an ABR swap that landed squarely on the
+    /// critical path — teardown, then 0.7 s of AES before a single frame
+    /// existed — which is why switching UP dropped ~10 frames while switching
+    /// down dropped one. Started here instead, it overlaps the seconds the
+    /// supervisor spends waiting for the segment boundary.
+    ///
+    /// No-op when nothing is buffered yet or one is already in flight.
+    fn start_first_prepare(&mut self) {
+        if self.first_prepared.is_some() {
+            return;
+        }
+        let Ok(segment) = self.download_rx.try_recv() else {
+            return;
+        };
+        log::info!(
+            "[abr] preparing NEW segment {} ahead of the swap ({} KiB)",
+            segment.id,
+            segment.data.len() / 1024
+        );
+        self.first_prepared = Some(prepare_segment(
+            Arc::new(self.init_data.clone()),
+            self.track_crypto.clone(),
+            segment,
+        ));
+    }
 }
 
 /// Download half of a video pipeline: fetch + parse the init segment, resolve
@@ -2545,6 +2617,7 @@ async fn video_prefetch(
         download_rx,
         download_handle,
         primed,
+        first_prepared: None,
     })
 }
 
@@ -2742,6 +2815,7 @@ async fn run_decode(
         stats,
         decoder_stop_flag,
         splice,
+        pf.first_prepared,
     ));
 
     let (dl_res, dec_res) = join!(pf.download_handle, decoder_task);
@@ -3721,7 +3795,7 @@ async fn video_supervisor(
         let new_stop = Arc::new(Notify::new());
         let new_flag = Arc::new(AtomicBool::new(false));
         let new_soft_end = Arc::new(AtomicUsize::new(usize::MAX));
-        let new_pf = tokio::select! {
+        let mut new_pf = tokio::select! {
             r = video_prefetch(
                 &new_repr,
                 new_start,
@@ -3766,6 +3840,9 @@ async fn video_supervisor(
         tokio::select! {
             _ = primed.notified() => {
                 log::info!("[abr] NEW primed {}ms after switch", swap_t0.elapsed().as_millis());
+                // Get the decrypt of NEW's first segment off the critical path
+                // while OLD still has seconds to play (see start_first_prepare).
+                new_pf.start_first_prepare();
             }
             _ = tokio::time::sleep(PRIME_TIMEOUT) => {
                 log::warn!(
@@ -3823,6 +3900,13 @@ async fn video_supervisor(
         // flickered — two VT sessions + parked CVPixelBuffers need their own
         // validation before this can be re-enabled there. Everywhere else the
         // swap grace window still hides the switch.
+        // Android direct mode is excluded for a reason that is NOT the SoC
+        // instance limit (kirkwood advertises four): both decoders would have
+        // to produce into the SAME output Surface, and a BufferQueue accepts
+        // one producer. The instance count only becomes the question on the
+        // Android GL path, where each decoder owns its own ImageReader — and
+        // that needs a device on that path to verify before it is turned on,
+        // so it stays off rather than assumed.
         let warm_capable =
             cfg!(any(target_os = "windows", target_os = "linux")) && direct_window == 0;
         let warm = if warm_capable && boundary_ms != 0 {
@@ -4153,6 +4237,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             start_time,
 
             seek_target: Arc::new(RwLock::new(None)),
+            rebuild_reason: Arc::new(StdMutex::new(BufferingReason::Initial)),
             position_ms: Arc::new(AtomicU64::new(0)),
 
             decryptor: Arc::new(StdMutex::new(None)),
@@ -4540,7 +4625,8 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         // before the first frame would clobber a parked start position
         // (pending_resume); the play() loop re-reads this cell on start.
         if self.pipeline_live.load(Ordering::Relaxed) {
-            self.seek(self.position());
+            *self.rebuild_reason.lock().unwrap() = BufferingReason::TrackSwitch;
+            self.seek_internal(self.position());
         }
     }
 
@@ -5071,7 +5157,8 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         // after prepare() (e.g. BlackZone's applyLanguagePreference), i.e.
         // exactly between set_start_position() and the pipeline's first frame.
         if self.pipeline_live.load(Ordering::Relaxed) {
-            self.seek(self.position());
+            *self.rebuild_reason.lock().unwrap() = BufferingReason::TrackSwitch;
+            self.seek_internal(self.position());
         }
     }
 
@@ -5117,6 +5204,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         let video_sink = self.video_renderer.clone();
         let audio_sink = self.audio_renderer.clone();
         let seek_target = self.seek_target.clone();
+        let rebuild_reason = self.rebuild_reason.clone();
         let position_ms = self.position_ms.clone();
         // Cells re-read on every (re)start of the pipeline so a seek /
         // track-switch picks up the latest selection + decryptor without the
@@ -5580,6 +5668,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                     pause_notify.clone(),
                     Arc::clone(&stats),
                     Arc::clone(&pipeline_live),
+                    Arc::clone(&rebuild_reason),
                 )
                 .await;
                 audio_watchdog.abort();
@@ -5606,6 +5695,14 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
     }
 
     pub fn seek(&self, target: Duration) {
+        *self.rebuild_reason.lock().unwrap() = BufferingReason::Seek;
+        self.seek_internal(target)
+    }
+
+    /// `seek()` without claiming the rebuild is a seek — for callers that
+    /// already named a more specific cause (a track switch is a seek only
+    /// mechanically; the consumer must not be told the user scrubbed).
+    fn seek_internal(&self, target: Duration) {
         let seek_target = self.seek_target.clone();
         let stop = self.stop.clone();
         let stop_flag = self.stop_flag.clone();

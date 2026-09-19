@@ -18,6 +18,47 @@ pub fn kid_short(kid: &[u8; 16]) -> String {
 
 type Aes128Ctr = Ctr128BE<Aes128>;
 
+/// One-shot AES capability + throughput report, logged the first time a sample
+/// is decrypted.
+///
+/// CENC decrypt dominates segment preparation (a 14 Mbps segment measured
+/// ~680 ms on a Google TV Streamer, ~16 MiB/s), which is far below what ARMv8
+/// AES instructions should manage. This says, on the machine actually running,
+/// whether the hardware backend was selected and what a contiguous keystream
+/// really costs — so "is it the AES" stops being inferred from cycle counts.
+pub fn log_aes_capability() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        if aes::hardware_accelerated() {
+            log::debug!("[crypto] aes: hardware accelerated");
+            return;
+        }
+        // Worth a warning, not a debug line: software AES-CTR runs ~40x slower
+        // and CENC decrypt is on the segment-boundary critical path, so this is
+        // the difference between a clean ABR swap and a visible one. On 32-bit
+        // ARM userspace (this is what a Google TV Streamer runs, even though
+        // its CPU advertises the ARMv8 aes/pmull extensions) the RustCrypto
+        // `aes` crate has no hardware backend at all - it implements only
+        // x86/x86_64 and aarch64 - so the target-feature flags in
+        // .cargo/config.toml, which name aarch64-linux-android, never apply.
+        let mut detail = String::new();
+        if log::log_enabled!(log::Level::Debug) {
+            let mut buf = vec![0u8; 4 * 1024 * 1024];
+            let mut cipher = Aes128Ctr::new(&[0u8; 16].into(), &[0u8; 16].into());
+            let t0 = std::time::Instant::now();
+            cipher.apply_keystream(&mut buf);
+            let ms = t0.elapsed().as_millis().max(1);
+            detail = format!(" ({} MiB/s measured over 4 MiB)", 4 * 1000 / ms);
+        }
+        log::warn!(
+            "[crypto] AES has NO hardware backend on this target ({}){} — CENC              decrypt will be the slowest step of segment preparation",
+            std::env::consts::ARCH,
+            detail
+        );
+    });
+}
+
 /// Abstraction over CENC sample decryption.
 ///
 /// Today implemented by [`ClearKeyDecryptor`] (software AES-CTR). Platform-backed

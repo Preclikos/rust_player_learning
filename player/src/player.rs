@@ -667,15 +667,48 @@ const AUDIO_CLOCK_REJOIN_TOL_MS: i64 = 200;
 #[derive(Default)]
 struct ClockState {
     /// (last observed `played_since_flush_ms`, wall instant it was FIRST seen
-    /// at that value) — the interpolation anchor and the staleness timer.
-    seen: Option<(u64, Instant)>,
+    /// at that value, `pause_skew` then) — the interpolation anchor and the
+    /// staleness timer.
+    ///
+    /// The skew is carried because staleness must be measured in PLAYED time,
+    /// not wall time. Nothing polls this clock while playback is paused — the
+    /// sync loop is parked — so the first call after a resume sees an anchor
+    /// as old as the pause, with the paused flag already cleared. Measured in
+    /// wall time that reads as an output that died, and the clock hands over
+    /// to the wall having skipped the whole pause: every frame is then late by
+    /// exactly the paused span and the picture races to catch up. Reported
+    /// from the desktop build, reproduced with a 15 s pause.
+    seen: Option<(u64, Instant, Duration)>,
     /// True once the sink's position has moved at least once, i.e. audio is
     /// genuinely audible. Before that a standing position means "still
     /// starting up", not "dead".
     ever_advanced: bool,
     /// Set once the position was declared dead: the media ms the wall-clock
-    /// extrapolation continues from, and the instant it took over.
-    wall_from: Option<(u64, Instant)>,
+    /// extrapolation continues from, the instant it took over, and the
+    /// `pause_skew` at that instant.
+    ///
+    /// The skew baseline is what keeps this honest across a pause. The audio
+    /// clock freezes on its own when the device stops, so the normal path
+    /// needs no pause handling — but a WALL extrapolation runs with real time
+    /// and would happily count a 30 s pause as 30 s of media, leaving every
+    /// frame that far behind on resume and sending the picture racing to catch
+    /// up. Only the pause accrued SINCE the handover may be subtracted, hence
+    /// a baseline rather than the cumulative figure.
+    wall_from: Option<(u64, Instant, Duration)>,
+}
+
+/// Real time between `from` and `now` MINUS the part of it spent paused.
+///
+/// `skew_now`/`skew_at_start` are the cumulative `pause_skew` readings now and
+/// when the window opened; their difference is the pause inside the window.
+fn wall_played(
+    now: Instant,
+    from: Instant,
+    skew_now: Duration,
+    skew_at_start: Duration,
+) -> Duration {
+    now.duration_since(from)
+        .saturating_sub(skew_now.saturating_sub(skew_at_start))
 }
 
 impl<A: AudioSink> MediaClock<A> {
@@ -701,7 +734,7 @@ impl<A: AudioSink> MediaClock<A> {
     /// pause/starvation, so it already subsumes pause skew; `output_latency_ms`
     /// folds in so the picture lands when its audio is audible, not merely
     /// consumed.
-    fn audio_now_us(&self) -> Option<i64> {
+    fn audio_now_us(&self, pause_skew: Duration) -> Option<i64> {
         let played = self.audio_sink.played_since_flush_ms()?;
         let lat_us = self.audio_sink.output_latency_ms() as i64 * 1_000;
         let now = Instant::now();
@@ -709,16 +742,17 @@ impl<A: AudioSink> MediaClock<A> {
             |ms: i64| -> i64 { (ms * 1_000 + self.seek_offset_us - lat_us).max(0) };
         let mut st = self.state.lock().unwrap();
 
-        if st.seen.map(|(p0, _)| played > p0).unwrap_or(true) {
+        if st.seen.map(|(p0, _, _)| played > p0).unwrap_or(true) {
             if st.seen.is_some() {
                 st.ever_advanced = true;
             }
-            if let Some((wp, wt)) = st.wall_from {
+            if let Some((wp, wt, skew0)) = st.wall_from {
                 // The output is alive again. Re-adopt it as the master only if
                 // it agrees with where the wall clock carried us; a device that
                 // was wedged for minutes comes back that far behind, and
                 // re-adopting it would jerk the picture backwards by the span.
-                let wall_ms = wp as i64 + now.duration_since(wt).as_millis() as i64;
+                let wall_ms = wp as i64
+                    + wall_played(now, wt, pause_skew, skew0).as_millis() as i64;
                 if (played as i64 - wall_ms).abs() <= AUDIO_CLOCK_REJOIN_TOL_MS {
                     log::info!(
                         "[clock] audio position advancing again at {}ms — re-adopting the audio master",
@@ -727,17 +761,19 @@ impl<A: AudioSink> MediaClock<A> {
                     st.wall_from = None;
                 }
             }
-            st.seen = Some((played, now));
+            st.seen = Some((played, now, pause_skew));
         }
 
-        // Already handed over: keep extrapolating at real time.
-        if let Some((wp, wt)) = st.wall_from {
-            let ms = wp as i64 + now.duration_since(wt).as_millis() as i64;
+        // Already handed over: keep extrapolating at real time, minus whatever
+        // of it was spent paused.
+        if let Some((wp, wt, skew0)) = st.wall_from {
+            let ms = wp as i64 + wall_played(now, wt, pause_skew, skew0).as_millis() as i64;
             return Some(to_media_us(ms));
         }
 
-        let (p0, w0) = st.seen.expect("set above whenever it was None");
-        let since = now.duration_since(w0);
+        let (p0, w0, skew0) = st.seen.expect("set above whenever it was None");
+        // PLAYED time since the anchor: a pause must not age it (see `seen`).
+        let since = wall_played(now, w0, pause_skew, skew0);
 
         // Standing position while we are supposed to be playing => dead output
         // (see the type docs). Hand over to the wall clock at exactly the value
@@ -751,16 +787,18 @@ impl<A: AudioSink> MediaClock<A> {
             && !self.paused.load(Ordering::Relaxed)
             && !self.stats.audio_starving.load(Ordering::Relaxed)
         {
-            let t0 = w0 + Duration::from_millis(stale_after);
-            st.wall_from = Some((p0, t0));
+            // Hand over at exactly the value the frozen clock last read, so
+            // the transition is continuous, then keep real time from here.
+            let extra = since.as_millis() as u64 - stale_after;
+            let handover = p0 + extra;
+            st.wall_from = Some((handover, now, pause_skew));
             log::warn!(
                 "[clock] audio position frozen at {}ms for {}ms while playing                  (ever_advanced={}) — master clock falls back to the wall;                  the audio output is dead or absent",
                 p0,
                 since.as_millis(),
                 st.ever_advanced
             );
-            let ms = p0 as i64 + now.duration_since(t0).as_millis() as i64;
-            return Some(to_media_us(ms));
+            return Some(to_media_us(handover as i64));
         }
 
         // Interpolate with wall time between the sink's ~per-callback updates;
@@ -777,7 +815,7 @@ impl<A: AudioSink> MediaClock<A> {
     /// clock. Only the wall fallback applies `pause_skew` — the audio clock
     /// freezes during pause on its own.
     fn now_us(&self, pause_skew: Duration) -> i64 {
-        if let Some(us) = self.audio_now_us() {
+        if let Some(us) = self.audio_now_us(pause_skew) {
             return us;
         }
         self.start_time
@@ -6859,7 +6897,7 @@ hi
     /// `stood_ms`, without the test having to sleep for it.
     fn stand_still_for(fx: &ClockFixture, played_ms: u64, stood_ms: u64, ever_advanced: bool) {
         let mut st = fx.clock.state.lock().unwrap();
-        st.seen = Some((played_ms, Instant::now() - Duration::from_millis(stood_ms)));
+        st.seen = Some((played_ms, Instant::now() - Duration::from_millis(stood_ms), Duration::ZERO));
         st.ever_advanced = ever_advanced;
     }
 
@@ -6867,14 +6905,14 @@ hi
     fn frozen_audio_clock_hands_over_to_the_wall() {
         let fx = fixture(500);
         assert_eq!(
-            fx.clock.audio_now_us(),
+            fx.clock.audio_now_us(Duration::ZERO),
             Some(500_000),
             "first read is the sink's own position"
         );
 
         // Audio had been running and then the output died: 1.5 s standing.
         stand_still_for(&fx, 500, 3_500, true);
-        let handed = fx.clock.audio_now_us().unwrap();
+        let handed = fx.clock.audio_now_us(Duration::ZERO).unwrap();
         // Continuous at the frozen value, then real time for the 500 ms past
         // the stale window - NOT a jump to the free-running wall origin.
         assert!(
@@ -6884,7 +6922,7 @@ hi
 
         // And it must keep moving, which is the whole point.
         std::thread::sleep(Duration::from_millis(60));
-        let later = fx.clock.audio_now_us().unwrap();
+        let later = fx.clock.audio_now_us(Duration::ZERO).unwrap();
         assert!(
             later - handed >= 50_000,
             "clock stalled after handover: {handed}us -> {later}us"
@@ -6897,17 +6935,17 @@ hi
         // MEANT to hold. A passthrough AudioTrack needs ~2.5 s before its head
         // moves at all, so a 1.5 s standstill must not trip the fallback.
         let fx = fixture(0);
-        assert_eq!(fx.clock.audio_now_us(), Some(0));
+        assert_eq!(fx.clock.audio_now_us(Duration::ZERO), Some(0));
         stand_still_for(&fx, 0, 1_500, false);
         assert_eq!(
-            fx.clock.audio_now_us(),
+            fx.clock.audio_now_us(Duration::ZERO),
             Some(0),
             "held during the start-up grace"
         );
 
         // Past the grace, a sink that never came alive is a dead output too.
         stand_still_for(&fx, 0, 6_000, false);
-        let handed = fx.clock.audio_now_us().unwrap();
+        let handed = fx.clock.audio_now_us(Duration::ZERO).unwrap();
         assert!(
             handed > 0,
             "start-up grace must not last forever, got {handed}us"
@@ -6921,7 +6959,7 @@ hi
         fx.paused.store(true, Ordering::Relaxed);
         stand_still_for(&fx, 700, 30_000, true);
         assert_eq!(
-            fx.clock.audio_now_us(),
+            fx.clock.audio_now_us(Duration::ZERO),
             Some(700_000),
             "paused must freeze, not extrapolate"
         );
@@ -6931,7 +6969,7 @@ hi
         fx.stats.audio_starving.store(true, Ordering::Relaxed);
         stand_still_for(&fx, 700, 30_000, true);
         assert_eq!(
-            fx.clock.audio_now_us(),
+            fx.clock.audio_now_us(Duration::ZERO),
             Some(700_000),
             "starvation must freeze, not extrapolate"
         );
@@ -6943,13 +6981,13 @@ hi
         let fx = fixture(1_000);
         {
             let mut st = fx.clock.state.lock().unwrap();
-            st.seen = Some((1_000, Instant::now()));
+            st.seen = Some((1_000, Instant::now(), Duration::ZERO));
             st.ever_advanced = true;
-            st.wall_from = Some((1_000, Instant::now() - Duration::from_millis(1_000)));
+            st.wall_from = Some((1_000, Instant::now() - Duration::from_millis(1_000), Duration::ZERO));
         }
         // Output comes back roughly where we are -> re-adopt.
         fx.sink.played_ms.store(2_050, Ordering::Relaxed);
-        let _ = fx.clock.audio_now_us();
+        let _ = fx.clock.audio_now_us(Duration::ZERO);
         assert!(
             fx.clock.state.lock().unwrap().wall_from.is_none(),
             "an agreeing audio clock should take the master back"
@@ -6960,12 +6998,12 @@ hi
         let fx = fixture(1_000);
         {
             let mut st = fx.clock.state.lock().unwrap();
-            st.seen = Some((1_000, Instant::now()));
+            st.seen = Some((1_000, Instant::now(), Duration::ZERO));
             st.ever_advanced = true;
-            st.wall_from = Some((1_000, Instant::now() - Duration::from_millis(1_000)));
+            st.wall_from = Some((1_000, Instant::now() - Duration::from_millis(1_000), Duration::ZERO));
         }
         fx.sink.played_ms.store(1_200, Ordering::Relaxed);
-        let now = fx.clock.audio_now_us().unwrap();
+        let now = fx.clock.audio_now_us(Duration::ZERO).unwrap();
         assert!(
             fx.clock.state.lock().unwrap().wall_from.is_some(),
             "a clock 800ms behind must not take the master back"
@@ -6981,7 +7019,7 @@ hi
         let fx = fixture(0);
         fx.sink.has_clock.store(false, Ordering::Relaxed);
         assert_eq!(
-            fx.clock.audio_now_us(),
+            fx.clock.audio_now_us(Duration::ZERO),
             None,
             "no clock means no audio master"
         );
@@ -7055,6 +7093,61 @@ hi
             tokio::time::sleep(Duration::from_millis(250)).await;
             r.sink.played_ms.fetch_add(250, Ordering::Relaxed);
         }
+    }
+
+    #[test]
+    fn a_pause_is_not_a_dead_audio_output() {
+        // The exact desktop report: pause for a while, resume, and the picture
+        // races to catch up the paused span. Nothing polls this clock while
+        // paused (the sync loop is parked), so the first call after the resume
+        // sees an anchor as old as the pause with the paused flag already
+        // cleared - which is why the `!paused` guard alone cannot catch it and
+        // staleness has to be counted in played time.
+        let fx = fixture(500);
+        assert_eq!(fx.clock.audio_now_us(Duration::ZERO), Some(500_000));
+
+        // 15 s of wall time passed, every millisecond of it paused.
+        let paused_for = Duration::from_millis(15_000);
+        stand_still_for(&fx, 500, 15_000, true);
+        let after = fx.clock.audio_now_us(paused_for).unwrap();
+
+        assert_eq!(
+            after, 500_000,
+            "the clock skipped the pause: 500000us -> {after}us"
+        );
+        assert!(
+            fx.clock.state.lock().unwrap().wall_from.is_none(),
+            "a pause was mistaken for a dead output"
+        );
+    }
+
+    #[test]
+    fn the_wall_fallback_does_not_run_through_a_pause() {
+        // Reported from the desktop build: pause for a while, resume, and the
+        // picture races to catch up the paused span. The audio clock freezes on
+        // its own when the device stops, so the normal path never had to think
+        // about pause - but the wall-clock fallback runs with REAL time, and on
+        // a machine with no working audio output (which is what puts the clock
+        // there) it counted the whole pause as media.
+        let fx = fixture(500);
+        stand_still_for(&fx, 500, 4_000, true);
+        let entered = fx.clock.now_us(Duration::ZERO);
+
+        // 60 ms pass, all of them paused: media time must not move.
+        std::thread::sleep(Duration::from_millis(60));
+        let after_pause = fx.clock.now_us(Duration::from_millis(60));
+        assert!(
+            (after_pause - entered).abs() < 15_000,
+            "clock ran through a pause: {entered}us -> {after_pause}us"
+        );
+
+        // 60 ms more, this time played: media time must move by about that.
+        std::thread::sleep(Duration::from_millis(60));
+        let after_play = fx.clock.now_us(Duration::from_millis(60));
+        assert!(
+            after_play - after_pause >= 40_000,
+            "clock stalled while playing: {after_pause}us -> {after_play}us"
+        );
     }
 
     #[tokio::test(start_paused = true)]

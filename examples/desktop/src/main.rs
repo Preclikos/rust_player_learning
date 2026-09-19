@@ -104,6 +104,14 @@ impl ApplicationHandler for App {
 
                     event_loop.exit();
                 }
+                (PhysicalKey::Code(KeyCode::Space), ElementState::Pressed) => {
+                    if player.is_paused() {
+                        player.resume();
+                    } else {
+                        player.pause();
+                    }
+                    log::info!("space: paused={}", player.is_paused());
+                }
                 (PhysicalKey::Code(KeyCode::KeyF), ElementState::Pressed) => {
                     window.set_fullscreen(Some(Fullscreen::Borderless(None)));
                 }
@@ -264,6 +272,7 @@ async fn run_console(player: Player) {
     println!("  a <i>    — pick audio track");
     println!("  abr on   — enable bandwidth-EWMA ABR (safety_factor=1.25)");
     println!("  abr off  — disable ABR (Manual)");
+    println!("  p        — pause / resume (also: space in the window)");
 
     let stdin = tokio::io::stdin();
     let mut reader = BufReader::new(stdin).lines();
@@ -277,6 +286,15 @@ async fn run_console(player: Player) {
         match cmd {
             "" => {}
             "l" | "list" => print_menu(&player),
+            "p" => {
+                if player.is_paused() {
+                    player.resume();
+                    println!("resumed");
+                } else {
+                    player.pause();
+                    println!("paused");
+                }
+            }
             "v" => match arg.and_then(|s| s.parse::<usize>().ok()) {
                 Some(i) => pick_video(&player, i),
                 None => println!("usage: v <index>"),

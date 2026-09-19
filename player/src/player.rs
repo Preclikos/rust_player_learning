@@ -1999,10 +1999,15 @@ fn prepare_segment(
 ) -> PrepareHandle {
     tokio::task::spawn_blocking(
         move || -> Result<PreparedSegment, Box<dyn Error + Send + Sync>> {
+            let t_copy = Instant::now();
             let mut data_vec = Vec::with_capacity(init_data.len() + segment.data.len());
             data_vec.extend_from_slice(&init_data);
             data_vec.extend_from_slice(&segment.data[..]);
+            let copy_ms = t_copy.elapsed().as_millis();
+            let t_dec = Instant::now();
             decrypt_segment_in_place(&mut data_vec, crypto.as_ref())?;
+            let dec_ms = t_dec.elapsed().as_millis();
+            let t_parse = Instant::now();
             let sample_info: Vec<(usize, usize, i64, u64)> = {
                 let mp4 = Mp4::read_bytes(&data_vec)
                     .map_err(|e| -> Box<dyn Error + Send + Sync> { format!("mp4: {}", e).into() })?;
@@ -2023,6 +2028,20 @@ fn prepare_segment(
                     })
                     .collect()
             };
+            let parse_ms = t_parse.elapsed().as_millis();
+            // DIAG (verbose only): which third of prepare() actually costs,
+            // per segment size. Answers "is this the AES or not" without
+            // guessing - it was the AES, at ~16 MiB/s.
+            if copy_ms + dec_ms + parse_ms > 30 {
+                log::debug!(
+                    "[prep] segment {} {} KiB: copy {}ms decrypt {}ms parse {}ms",
+                    segment.id,
+                    data_vec.len() / 1024,
+                    copy_ms,
+                    dec_ms,
+                    parse_ms
+                );
+            }
             Ok(PreparedSegment {
                 id: segment.id,
                 data_vec,
@@ -3612,6 +3631,23 @@ async fn video_supervisor(
     // that's genuinely wedged outlives the grace and buffers honestly.
     const SWAP_GRACE: Duration = Duration::from_secs(3);
 
+/// Measured CENC decrypt throughput on the slowest hardware we target (a
+/// Google TV Streamer does ~16 MB/s: 11 MiB in ~680 ms). Used only to decide
+/// how much lead a swap needs before a segment boundary, so erring low just
+/// makes the swap pick a later boundary.
+const DECRYPT_BYTES_PER_SEC: f64 = 16.0 * 1024.0 * 1024.0;
+
+/// Download throughput the ABR estimator is currently seeing, in BYTES/s.
+fn measured_download_bps(stats: &StatsState) -> f64 {
+    stats.bandwidth_bps_ewma.load(Ordering::Relaxed) as f64 / 8.0
+}
+
+/// How long the swap may hold the OLD rung at the segment boundary waiting for
+/// NEW's first segment to finish decrypting. Covers a 14 Mbps 4K segment
+/// (~0.65 s at the ~17 MB/s software-AES rate) with headroom; past that
+/// something is wrong and dropping a few frames beats stalling the swap.
+const PREPARE_READY_BUDGET: Duration = Duration::from_millis(1_200);
+
     loop {
         // Race: play-level stop, the current pipeline finishing on its own
         // (natural EOF — must propagate so the keepalive frame_sender drops,
@@ -3783,6 +3819,52 @@ async fn video_supervisor(
         if new_start + 1 < new_repr.segments.len() {
             new_start += 1;
         }
+
+        // The boundary is whatever the MANIFEST says, so we can also CHOOSE
+        // WHICH one. The next boundary can be milliseconds away — the switch
+        // request lands at an arbitrary phase — and getting NEW downloaded and
+        // decrypted in time is not free: a 14 Mbps segment is ~1.5 MB/s of
+        // download plus ~0.7 s of CENC decrypt on a TV SoC. Arriving at the
+        // boundary unprepared is exactly what made an upswitch drop ~10 frames.
+        //
+        // So require real lead, and if the next boundary does not offer it,
+        // take the one after: OLD keeps playing at its current quality, which
+        // is what make-before-break is for. Bounded to one extra segment.
+        //
+        // Only when moving UP. A downswitch is usually the buffer asking for
+        // help, and delaying it by a whole segment is how you turn a quality
+        // drop into a rebuffer.
+        let moving_up = new_repr.bandwidth > current_repr.bandwidth;
+        if moving_up {
+            let boundary_at = new_repr
+                .segments
+                .get(new_start)
+                .map(|seg| seg.start_time())
+                .unwrap_or(pos);
+            let lead = boundary_at.saturating_sub(pos);
+            // Bytes from the manifest (bandwidth x segment duration), turned
+            // into time by the two rates that actually bound us.
+            let seg_secs = new_repr
+                .segments
+                .get(new_start)
+                .map(|seg| (seg.end_time().saturating_sub(seg.start_time())).as_secs_f64())
+                .unwrap_or(0.0);
+            let bytes = new_repr.bandwidth as f64 / 8.0 * seg_secs;
+            let dl_secs = bytes / measured_download_bps(&stats).max(1.0);
+            let prep_secs = bytes / DECRYPT_BYTES_PER_SEC;
+            let needed = Duration::from_secs_f64((dl_secs + prep_secs) * 1.3);
+            if lead < needed && new_start + 1 < new_repr.segments.len() {
+                log::info!(
+                    "[abr] next boundary is only {}ms away, need ~{}ms to have                      seg {} ready ({:.1} MiB) — switching one segment later",
+                    lead.as_millis(),
+                    needed.as_millis(),
+                    new_start,
+                    bytes / (1024.0 * 1024.0)
+                );
+                new_start += 1;
+            }
+        }
+
         log::info!(
             "[abr] soft switch: repr {} -> {} from seg {} (pos {}ms)",
             current_repr.id, new_repr.id, new_start, pos.as_millis()
@@ -4014,6 +4096,35 @@ async fn video_supervisor(
             position_ms.load(Ordering::Relaxed) + origin.as_millis() as u64,
             boundary_ms
         );
+
+        // Reaching the boundary is not the same as being READY at it. The
+        // decrypt of NEW's first segment was started back when the prefetch
+        // primed, but it costs ~0.65 s for a 14 Mbps segment and the switch
+        // request lands at an arbitrary phase — ask for one 1.1 s before the
+        // boundary and it is still running when we get here. Tearing OLD down
+        // on top of that is what turned an upswitch into ~10 dropped frames.
+        //
+        // So wait for it. OLD is still decoding and still has downloaded
+        // content past the boundary (its soft cap is only applied below), so
+        // this costs the viewer nothing — the splice simply lands a few
+        // hundred ms later inside NEW's first segment, which is 6 s long.
+        // Bounded, because a wedged prepare must not hold the swap forever.
+        if let Some(pf) = new_pf.as_mut() {
+            if let Some(h) = pf.first_prepared.as_ref() {
+                let wait_t0 = Instant::now();
+                while !h.is_finished() && wait_t0.elapsed() < PREPARE_READY_BUDGET {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                let waited = wait_t0.elapsed();
+                if waited > Duration::from_millis(20) {
+                    log::info!(
+                        "[abr] held OLD {}ms at the boundary for NEW's decrypt ({})",
+                        waited.as_millis(),
+                        if h.is_finished() { "ready" } else { "BUDGET EXPIRED" }
+                    );
+                }
+            }
+        }
 
         let _ = events.send(PlayerEvent::TrackChanged {
             kind: TrackKind::Video,
@@ -6070,6 +6181,7 @@ fn decrypt_segment_in_place(
         }
     };
 
+    let t_ranges = Instant::now();
     let sample_ranges: Vec<(usize, usize)> = {
         let mp4 = Mp4::read_bytes(&data_vec[..])
             .map_err(|e| format!("Decrypt: mp4 parse error {}", e))?;
@@ -6084,6 +6196,10 @@ fn decrypt_segment_in_place(
             .collect()
     };
 
+    let ranges_ms = t_ranges.elapsed().as_millis();
+    let t_aes = Instant::now();
+    let mut enc_bytes = 0usize;
+    let mut spans = 0usize;
     for ((offset, size), entry) in sample_ranges.iter().zip(senc_entries.iter()) {
         let end = offset + size;
         if end > data_vec.len() {
@@ -6101,8 +6217,34 @@ fn decrypt_segment_in_place(
         if iv_is_zero || no_encrypted_bytes {
             continue;
         }
+        if entry.subsamples.is_empty() {
+            enc_bytes += end - offset;
+            spans += 1;
+        } else {
+            enc_bytes += entry.subsamples.iter().map(|&(_, e)| e as usize).sum::<usize>();
+            spans += entry.subsamples.len();
+        }
         tc.decryptor
             .decrypt_sample(&tc.kid, &entry.iv, &mut data_vec[*offset..end], &entry.subsamples)?;
+    }
+    let aes_ms = t_aes.elapsed().as_millis();
+    // DIAG (verbose only): separates "the cipher is slow" from "we call it badly" — bytes
+    // actually fed to AES, and how many spans they arrived in.
+    if aes_ms + ranges_ms > 30 {
+        log::debug!(
+            "[crypto] {} samples, senc+ranges {}ms, aes {}ms over {} spans / {} KiB encrypted \
+             ({:.0} MiB/s)",
+            sample_ranges.len(),
+            ranges_ms,
+            aes_ms,
+            spans,
+            enc_bytes / 1024,
+            if aes_ms > 0 {
+                enc_bytes as f64 / (aes_ms as f64 / 1000.0) / (1024.0 * 1024.0)
+            } else {
+                0.0
+            }
+        );
     }
     Ok(())
 }

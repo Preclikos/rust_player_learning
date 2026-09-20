@@ -5,7 +5,7 @@ edition = "2021"
 
 [lib]
 name = "player"
-path = "src/player.rs"
+path = "src/lib.rs"
 
 [dependencies]
 # TLS backend is target-specific (see [target.cfg.dependencies] below).

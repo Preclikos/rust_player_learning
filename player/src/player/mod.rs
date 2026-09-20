@@ -1,42 +1,31 @@
-mod abr;
-mod av_sync;
-mod capabilities;
-mod crypto;
-mod decoders;
-mod events;
-mod ffmpeg_log;
-mod hdr_tonemap;
-mod manifest;
-mod net;
-mod parsers;
-mod renderers;
-mod subtitle_style;
-mod tracks;
-mod utils;
+//! The player: its public handle, the pipeline that feeds it, and the tasks
+//! that keep the two in step.
 
-// Public re-exports so downstream consumers (BlackZone Console etc.) can
-// implement RequestInterceptor / LicenseResolver against the player's
-// canonical types — see PLAYER_INTEGRATION.md.
-pub use abr::{AbrStrategy, AbrVideoProfile};
-pub use capabilities::{capabilities, probe_capabilities, PlayerCapabilities};
-/// The track tree returned by [`Player::get_tracks`]. Adaptation/representation
-/// types stay reachable through its public `video`/`audio`/`text` fields — a
-/// consumer reads them via inference (no need to name the inner types).
-pub use tracks::Tracks;
-pub use events::{
-    BufferingReason, Fps, PlayerErrorKind, PlayerEvent, TrackInfo, TrackKind,
+use crate::{
+    AudioRenderer,
+    VideoRenderer,
+    AbrStrategy,
+    AbrVideoProfile,
+    AudioSink,
+    BufferingReason,
+    DecodedVideoFrame,
+    HdrTonemapParams,
+    HttpClient,
+    LicenseResolver,
+    PlayerErrorKind,
+    PlayerEvent,
+    RawDisplayHandle,
+    RawWindowHandle,
+    RequestInterceptor,
+    RequestKind,
+    RetryPolicy,
+    SubtitleStyle,
+    TrackInfo,
+    TrackKind,
+    Tracks,
+    VideoSink,
 };
-pub use ffmpeg_log::{set_log_level, LogLevel};
-pub use hdr_tonemap::HdrTonemapParams;
-pub use subtitle_style::SubtitleStyle;
-/// Host-supplied sidecar subtitles — see
-/// [`Player::add_external_subtitle_track`].
-pub use parsers::sidecar::{SidecarError, SubtitleFormat};
-pub use net::{
-    tls_client, BoxError, HttpClient, LicenseResolver, NoopInterceptor, PreparedRequest,
-    RequestInterceptor, RequestKind, RetryPolicy,
-};
-/// Physical (device-pixel) size of the render target. A tiny owned type so the
+
 /// player crate doesn't depend on winit; mirrors the subset of
 /// `winit::dpi::PhysicalSize` the player uses (`new`, `.width`, `.height`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -51,34 +40,20 @@ impl<P> PhysicalSize<P> {
     }
 }
 
-// Re-exported so hosts can name the handle types they pass to
-// `Player::new_from_raw_handle` without pinning their own raw-window-handle.
-pub use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 
-use crypto::{
+use crate::crypto::{
     kid_short, parse_aac_config, parse_hvcc_bit_depth, parse_hvcc_nalus, parse_senc, parse_tenc,
     ClearKeyDecryptor,
     Decryptor, TrackCrypto,
 };
-use decoders::{
+use crate::decoders::{
     AudioCodec, AudioDecoder, AudioDecoderParams, DecodedAudioFrame,
     HwVideoDecoder, VideoCodec, VideoColorInfo, VideoDecoderParams,
 };
-use parsers::mp4::aac_sampling_frequency_index_to_u32;
+use crate::parsers::mp4::aac_sampling_frequency_index_to_u32;
 use pollster::FutureExt;
 use re_mp4::Mp4;
 
-// Additive: re-export the offscreen ring handle + a convenience alias. Offscreen
-// (in-app) video reuses `VideoRenderer` with an offscreen target, so the in-app
-// player is the same concrete type as the windowed desktop player.
-pub use renderers::video_offscreen::OffscreenTarget;
-/// The stock sinks + the sink traits, so a host can wrap them (see
-/// [`Player::with_sinks`]): a decorator that forwards to the real renderer
-/// while observing every frame / sample is how the conformance harness
-/// measures lip-sync independently of the engine clock.
-pub use renderers::{audio::AudioRenderer, video::VideoRenderer, AudioPassthrough, AudioSink, VideoSink};
-pub use decoders::DecodedVideoFrame;
-pub use parsers::vtt::VttCue;
 pub type OffscreenPlayer = Player<VideoRenderer, AudioRenderer>;
 
 use arc_swap::ArcSwap;
@@ -92,8 +67,8 @@ use std::time::Duration;
 use tokio::sync::{broadcast, Notify, RwLock};
 use tokio::time::Instant;
 use tokio::{join, sync::mpsc::Sender};
-use tracks::audio::{AudioAdaptation, AudioRepresentation};
-use tracks::{
+use crate::tracks::audio::{AudioAdaptation, AudioRepresentation};
+use crate::tracks::{
     segment::Segment,
     video::{VideoAdaptation, VideoRepresenation},
 };
@@ -103,7 +78,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc::{self, Receiver};
 use tokio::task::{self, JoinHandle};
 
-use manifest::Manifest;
+use crate::manifest::Manifest;
 
 /// Default target buffer in seconds — how far ahead the download path is
 /// allowed to run from the renderer. Higher = more resilience against
@@ -176,7 +151,7 @@ enum StallSide {
 /// `Player::new` and cloned into every play() pipeline so the stats keep
 /// accumulating across seek / track-switch boundaries.
 #[derive(Default)]
-struct StatsState {
+pub(crate) struct StatsState {
     video_frames_decoded: AtomicU64,
     video_frames_dropped: AtomicU64,
     /// Frames presented >45 ms after their master-clock time (shown, not
@@ -421,7 +396,7 @@ pub struct Player<V: VideoSink = VideoRenderer, A: AudioSink = AudioRenderer> {
     /// Currently-selected subtitle representation. `None` means
     /// subtitles disabled — text_play won't spawn. Consumer toggles via
     /// `set_subtitle_track` / `clear_subtitle_track`.
-    subtitle_representation: Arc<StdMutex<Option<tracks::text::TextRepresenation>>>,
+    subtitle_representation: Arc<StdMutex<Option<crate::tracks::text::TextRepresenation>>>,
 
     /// Subtitle tracks the host added from its own bytes via
     /// `add_external_subtitle_track`, kept beside the manifest's rather
@@ -429,7 +404,7 @@ pub struct Player<V: VideoSink = VideoRenderer, A: AudioSink = AudioRenderer> {
     /// add them before the manifest has even been fetched) and must not
     /// be wiped when the parsed track tree is replaced. `get_tracks`
     /// concatenates the two.
-    external_text: Arc<StdMutex<Vec<tracks::text::TextAdaptation>>>,
+    external_text: Arc<StdMutex<Vec<crate::tracks::text::TextAdaptation>>>,
     /// Source of ids for external tracks. Manifest `@id`s are small
     /// integers, so external tracks count down from `u32::MAX` — no
     /// coordination needed to stay clear of them, and the range is
@@ -571,8 +546,6 @@ fn report_starvation(
 
 mod audio_watchdog;
 mod clock;
-#[cfg(test)]
-mod test_support;
 pub(crate) use audio_watchdog::audio_output_watchdog;
 pub(crate) use clock::{clock_monotonic_ns, MediaClock};
 
@@ -1239,7 +1212,7 @@ async fn audio_sync_loop<A: AudioSink>(
     paused: Arc<AtomicBool>,
 ) {
     // Keep the PCM handed to the sink continuous on the media axis (see
-    // `av_sync::AudioAligner`):
+    // `crate::av_sync::AudioAligner`):
     //  * start: DASH audio and video segments rarely share boundaries — the
     //    audio segment containing the target typically starts up to ~1 s
     //    before it. The leading samples are trimmed (or silence padded when
@@ -2967,14 +2940,14 @@ fn external_track(
     id: u32,
     parsed: crate::parsers::sidecar::ParsedSidecar,
     options: &ExternalSubtitleOptions,
-) -> (tracks::text::TextRepresenation, tracks::text::TextAdaptation) {
+) -> (crate::tracks::text::TextRepresenation, crate::tracks::text::TextAdaptation) {
     let mime_type = match parsed.format {
         crate::parsers::sidecar::SubtitleFormat::SubRip => "application/x-subrip",
         _ => "text/vtt",
     }
     .to_string();
 
-    let representation = tracks::text::TextRepresenation {
+    let representation = crate::tracks::text::TextRepresenation {
         id,
         // `wvtt` regardless of the source format: by this point the cues
         // are parsed and everything downstream only sees WebVTT cues.
@@ -2994,7 +2967,7 @@ fn external_track(
     if options.forced {
         roles.push("forced-subtitle".to_string());
     }
-    let adaptation = tracks::text::TextAdaptation {
+    let adaptation = crate::tracks::text::TextAdaptation {
         id,
         lang: options.language.clone().unwrap_or_default(),
         roles,
@@ -3021,16 +2994,16 @@ fn external_track(
 /// or set_subtitle_track to a different track) the task notices between
 /// operations and exits so stale downloads stop wasting bandwidth.
 async fn text_play<V: VideoSink>(
-    text_representation: tracks::text::TextRepresenation,
+    text_representation: crate::tracks::text::TextRepresenation,
     stop: Arc<Notify>,
     stop_flag: Arc<AtomicBool>,
     http: Arc<HttpClient>,
     video_sink: Arc<V>,
-    active: Arc<StdMutex<Option<tracks::text::TextRepresenation>>>,
+    active: Arc<StdMutex<Option<crate::tracks::text::TextRepresenation>>>,
     target_id: u32,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     // Helper: did the consumer change subtitle selection out from under us?
-    let still_selected = |active: &Arc<StdMutex<Option<tracks::text::TextRepresenation>>>| -> bool {
+    let still_selected = |active: &Arc<StdMutex<Option<crate::tracks::text::TextRepresenation>>>| -> bool {
         active
             .lock()
             .unwrap()
@@ -4710,7 +4683,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         &self,
         bytes: &[u8],
         options: ExternalSubtitleOptions,
-    ) -> Result<tracks::text::TextRepresenation, Box<dyn Error>> {
+    ) -> Result<crate::tracks::text::TextRepresenation, Box<dyn Error>> {
         let parsed = crate::parsers::sidecar::parse(
             bytes,
             options.format,
@@ -4781,7 +4754,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
     /// running, has finished, or hasn't been called yet. Single-file
     /// VTT downloads once then exits; CMAF streaming runs until the
     /// segment list is exhausted or `clear_subtitle_track` fires.
-    pub fn set_subtitle_track(&self, representation: &tracks::text::TextRepresenation) {
+    pub fn set_subtitle_track(&self, representation: &crate::tracks::text::TextRepresenation) {
         *self.subtitle_representation.lock().unwrap() = Some(representation.clone());
         // Wipe any cues from the previous track so they don't bleed
         // across the switch.
@@ -4817,7 +4790,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         self.video_renderer.clear_subtitles();
     }
 
-    pub fn current_subtitle_representation(&self) -> Option<tracks::text::TextRepresenation> {
+    pub fn current_subtitle_representation(&self) -> Option<crate::tracks::text::TextRepresenation> {
         self.subtitle_representation.lock().unwrap().clone()
     }
 
@@ -4891,7 +4864,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             .iter()
             .map(|&i| adaptation.representations[i].bandwidth)
             .collect();
-        let pick_local = match abr::pick_representation(&bws, ewma_bps, safety) {
+        let pick_local = match crate::abr::pick_representation(&bws, ewma_bps, safety) {
             Some(i) => i,
             None => return,
         };
@@ -5033,11 +5006,11 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                 // compositor, hitching the whole UI for a moment on each switch.
                 // Fall back to a per-decoder device if creation fails.
                 let factory: VideoDecoderFactory =
-                    match decoders::ffmpeg_hw::SharedHwDevice::new() {
+                    match crate::decoders::ffmpeg_hw::SharedHwDevice::new() {
                         Ok(dev) => {
                             log::info!("[video] shared hw-device created; ABR swaps reuse it");
                             Arc::new(move || {
-                                Box::new(decoders::ffmpeg_hw::FfmpegHwDecoder::new_shared(
+                                Box::new(crate::decoders::ffmpeg_hw::FfmpegHwDecoder::new_shared(
                                     dev.clone(),
                                 )) as Box<dyn HwVideoDecoder>
                             })
@@ -5047,7 +5020,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                                 "[video] shared hw-device init failed ({e}); per-decoder device fallback"
                             );
                             Arc::new(|| {
-                                Box::new(decoders::ffmpeg_hw::FfmpegHwDecoder::new())
+                                Box::new(crate::decoders::ffmpeg_hw::FfmpegHwDecoder::new())
                                     as Box<dyn HwVideoDecoder>
                             })
                         }
@@ -5056,12 +5029,12 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             }
             #[cfg(target_os = "android")]
             {
-                Arc::new(|| Box::new(decoders::mediacodec::MediaCodecDecoder::new()))
+                Arc::new(|| Box::new(crate::decoders::mediacodec::MediaCodecDecoder::new()))
             }
             #[cfg(any(target_os = "ios", target_os = "macos"))]
             {
                 Arc::new(|| {
-                    let d = decoders::videotoolbox::VideoToolboxDecoder::new()
+                    let d = crate::decoders::videotoolbox::VideoToolboxDecoder::new()
                         .expect("VideoToolboxDecoder::new");
                     Box::new(d) as Box<dyn HwVideoDecoder>
                 })
@@ -5271,10 +5244,10 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                     target_os = "ios"
                 ))]
                 let audio_decoder: Box<dyn AudioDecoder> =
-                    Box::new(decoders::ffmpeg_audio::FfmpegAudioDecoder::new());
+                    Box::new(crate::decoders::ffmpeg_audio::FfmpegAudioDecoder::new());
                 #[cfg(target_os = "android")]
                 let audio_decoder: Box<dyn AudioDecoder> =
-                    Box::new(decoders::mediacodec_audio::MediaCodecAudioDecoder::new());
+                    Box::new(crate::decoders::mediacodec_audio::MediaCodecAudioDecoder::new());
 
                 // Fresh per-iteration switch channel for ABR soft-swaps.
                 let (switch_tx, switch_rx) =
@@ -5349,11 +5322,11 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                     let pt_sink: Option<Arc<dyn crate::renderers::AudioPassthrough>> =
                         if want_passthrough {
                             let enc = if audio_representation.codecs == "ac-3" {
-                                renderers::audio::audio_passthrough::ENCODING_AC3
+                                crate::renderers::audio::audio_passthrough::ENCODING_AC3
                             } else {
-                                renderers::audio::audio_passthrough::ENCODING_E_AC3
+                                crate::renderers::audio::audio_passthrough::ENCODING_E_AC3
                             };
-                            renderers::audio::audio_passthrough::AudioTrackSink::new(
+                            crate::renderers::audio::audio_passthrough::AudioTrackSink::new(
                                 enc,
                                 audio_representation.audio_sampling_rate,
                                 audio_representation.channels.unwrap_or(6) as u16,

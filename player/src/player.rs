@@ -2533,9 +2533,38 @@ struct VideoPrefetch {
     /// First segment already decrypted + parsed, started by
     /// [`VideoPrefetch::start_first_prepare`] while the OLD rung still played.
     first_prepared: Option<PrepareHandle>,
+    /// THIS prefetch's own download high-water (absolute pts ms of the last
+    /// segment it finished fetching). Always tracked, whether or not this
+    /// pipeline is the one publishing the shared gauge.
+    dl_pts_ms: Arc<std::sync::atomic::AtomicI64>,
+    /// Whether this pipeline's downloads advance the SHARED buffer gauge
+    /// (`stats.last_decoded_pts_ms`). False for a swap prefetch until it
+    /// takes over as the live pipeline — see [`VideoPrefetch::take_over_buffer_gauge`].
+    track_dl: Arc<AtomicBool>,
 }
 
 impl VideoPrefetch {
+    /// Become the pipeline that publishes the buffer-ahead gauge.
+    ///
+    /// Called once the OLD rung is gone and this prefetch's download is the
+    /// only one feeding the picture. The gauge is RESET to this pipeline's own
+    /// high-water rather than left at the maximum: after a swap the content
+    /// that will actually play comes from here, and OLD may have fetched
+    /// seconds further ahead in a representation nobody will see again.
+    ///
+    /// Without this the gauge froze at the swap and then decayed with real
+    /// time - reading ~0.2 s (just the decoded-frame cushion) about half a
+    /// minute later. That is not cosmetic: the ABR engine gates up-switches on
+    /// it (`MIN_UPSWITCH_BUFFER_MS`), so quality got stuck down after the
+    /// first automatic switch, and consumers' buffer indicators read empty.
+    fn take_over_buffer_gauge(&self, stats: &StatsState) {
+        let mine = self.dl_pts_ms.load(Ordering::Relaxed);
+        if mine > 0 {
+            stats.last_decoded_pts_ms.store(mine, Ordering::Relaxed);
+        }
+        self.track_dl.store(true, Ordering::Relaxed);
+    }
+
     /// Take the first buffered segment out of the download channel and start
     /// its decrypt + mp4 parse NOW, on a blocking thread.
     ///
@@ -2665,9 +2694,20 @@ async fn video_prefetch(
     // download-time decoded-PTS high-water. A swap-prefetch must NOT touch it:
     // the supervisor reads last_decoded_pts_ms at OLD teardown as the splice
     // point, and NEW's downloaded-ahead segments would otherwise inflate it.
-    let track_dl_pts = prime_target == usize::MAX;
+    // The INITIAL pipeline publishes the shared gauge from the start; a swap
+    // prefetch must not, or its downloaded-ahead segments would inflate the
+    // figure while OLD is still the one playing. It takes over at teardown
+    // (`take_over_buffer_gauge`) instead of being excluded for good.
+    let track_dl = Arc::new(AtomicBool::new(prime_target == usize::MAX));
+    let dl_pts_ms = Arc::new(std::sync::atomic::AtomicI64::new(0));
+    let cb_track_dl = Arc::clone(&track_dl);
+    let cb_dl_pts = Arc::clone(&dl_pts_ms);
     let on_video_dl: SegmentDoneCallback = Arc::new(move |pts_ms| {
-        if track_dl_pts {
+        // Own high-water first: it is what this pipeline hands over.
+        if pts_ms > cb_dl_pts.load(Ordering::Relaxed) {
+            cb_dl_pts.store(pts_ms, Ordering::Relaxed);
+        }
+        if cb_track_dl.load(Ordering::Relaxed) {
             let prev = dl_stats.last_decoded_pts_ms.load(Ordering::Relaxed);
             if pts_ms > prev {
                 dl_stats.last_decoded_pts_ms.store(pts_ms, Ordering::Relaxed);
@@ -2705,6 +2745,8 @@ async fn video_prefetch(
         download_handle,
         primed,
         first_prepared: None,
+        dl_pts_ms,
+        track_dl,
     })
 }
 
@@ -4226,6 +4268,12 @@ const PREPARE_READY_BUDGET: Duration = Duration::from_millis(1_200);
         } else {
             log::info!("[video gen {}] soft-swap: OLD repr {} already done", gen, current_repr.id);
         }
+        // OLD is gone: NEW's download is now the only thing feeding the
+        // picture, so it becomes the pipeline that publishes buffer-ahead.
+        if let Some(pf) = new_pf.as_ref() {
+            pf.take_over_buffer_gauge(&stats);
+        }
+
         cur_handle = match warm {
             // Warm handoff: NEW is already configured with its first GOP
             // decoded and parked — just open the gate. Its frames land in the
@@ -7111,8 +7159,11 @@ hi
         stand_still_for(&fx, 500, 15_000, true);
         let after = fx.clock.audio_now_us(paused_for).unwrap();
 
-        assert_eq!(
-            after, 500_000,
+        // Tolerance, not equality: the sub-80ms branch interpolates with wall
+        // time and legitimately adds a microsecond or two. The skip this
+        // guards against is 15 SECONDS.
+        assert!(
+            (after - 500_000).abs() < 5_000,
             "the clock skipped the pause: 500000us -> {after}us"
         );
         assert!(
@@ -7310,6 +7361,55 @@ hi
     }
 
     use crate::crypto::SencEntry;
+
+    // ---- buffer-ahead gauge across an ABR swap ------------------------------
+
+    /// A prefetch with nothing behind it but the fields the gauge handover
+    /// touches; the download half is a closed channel and a finished task.
+    fn swap_prefetch(dl_pts_ms: i64) -> VideoPrefetch {
+        let (_tx, rx) = mpsc::channel::<DataSegment>(1);
+        VideoPrefetch {
+            width: 1920,
+            height: 1080,
+            init_data: Vec::new(),
+            hvcc_nalus: Vec::new(),
+            color: Default::default(),
+            dovi_profile: None,
+            track_crypto: None,
+            download_rx: rx,
+            download_handle: tokio::spawn(async { Ok(()) }),
+            primed: Arc::new(Notify::new()),
+            first_prepared: None,
+            dl_pts_ms: Arc::new(std::sync::atomic::AtomicI64::new(dl_pts_ms)),
+            // A swap prefetch starts out NOT publishing the shared gauge.
+            track_dl: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_buffer_gauge_follows_the_rung_that_will_actually_play() {
+        let stats = Arc::new(StatsState::default());
+        // OLD had fetched 40 s ahead in a representation about to be dropped.
+        stats.last_decoded_pts_ms.store(40_000, Ordering::Relaxed);
+
+        let pf = swap_prefetch(12_000);
+        assert!(
+            !pf.track_dl.load(Ordering::Relaxed),
+            "a swap prefetch must not publish the gauge while OLD is still playing"
+        );
+
+        pf.take_over_buffer_gauge(&stats);
+
+        assert_eq!(
+            stats.last_decoded_pts_ms.load(Ordering::Relaxed),
+            12_000,
+            "the gauge must drop to what the NEW rung has, not keep OLD's reach"
+        );
+        assert!(
+            pf.track_dl.load(Ordering::Relaxed),
+            "NEW must keep the gauge moving from here - leaving it false is what              froze buffered_ahead_secs after the first ABR switch and, through              MIN_UPSWITCH_BUFFER_MS, stuck quality down"
+        );
+    }
 
     // ---- parallel CENC decrypt ----------------------------------------------
     //

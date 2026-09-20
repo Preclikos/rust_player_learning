@@ -133,7 +133,38 @@ pub(crate) fn subtitle_style() -> player::SubtitleStyle {
 /// the helper prefers an `mp4a` representation when one is available and
 /// falls back to the last/first one otherwise — matching what each shell
 /// did individually before the unification.
+/// Mirror the event stream into the log, so the desktop shell can be used for
+/// the same basic checks the Android harness does (buffer depth, spinners,
+/// track changes) without attaching a debugger.
+///
+/// `info` for the handful of things that describe what the player is doing;
+/// `debug` for the 4 Hz position and 1 Hz stats firehose.
+fn spawn_event_log(player: &Player) {
+    let mut rx = player.events();
+    tokio::spawn(async move {
+        while let Ok(ev) = rx.recv().await {
+            match ev {
+                player::PlayerEvent::Position {
+                    position,
+                    buffered_ahead_secs,
+                    ..
+                } => log::debug!(
+                    "[ev] position {}ms buffered_ahead={:.2}s",
+                    position.as_millis(),
+                    buffered_ahead_secs
+                ),
+                player::PlayerEvent::Stats { .. } => log::debug!("[ev] {:?}", ev),
+                player::PlayerEvent::Buffering { reason } => {
+                    log::info!("[ev] buffering ({reason:?})")
+                }
+                other => log::info!("[ev] {other:?}"),
+            }
+        }
+    });
+}
+
 pub async fn run_test_playback(mut player: Player) {
+    spawn_event_log(&player);
     if let Err(e) = player.open_url(TEST_MANIFEST_URL).await {
         log::error!("open_url: {}", e);
         return;

@@ -205,14 +205,9 @@ pub(super) async fn video_prefetch(
     let cb_dl_pts = Arc::clone(&dl_pts_ms);
     let on_video_dl: SegmentDoneCallback = Arc::new(move |pts_ms| {
         // Own high-water first: it is what this pipeline hands over.
-        if pts_ms > cb_dl_pts.load(Ordering::Relaxed) {
-            cb_dl_pts.store(pts_ms, Ordering::Relaxed);
-        }
+        cb_dl_pts.fetch_max(pts_ms, Ordering::Relaxed);
         if cb_track_dl.load(Ordering::Relaxed) {
-            let prev = dl_stats.last_decoded_pts_ms.load(Ordering::Relaxed);
-            if pts_ms > prev {
-                dl_stats.last_decoded_pts_ms.store(pts_ms, Ordering::Relaxed);
-            }
+            dl_stats.last_decoded_pts_ms.fetch_max(pts_ms, Ordering::Relaxed);
         }
         // `notify_one` (not `notify_waiters`) so the permit survives even if
         // the supervisor hasn't reached its `.notified()` await yet — avoids a
@@ -729,19 +724,7 @@ pub(super) async fn audio_passthrough_task(
         data_vec.extend_from_slice(&segment.data[..]);
         decrypt_segment_in_place(&mut data_vec, track_crypto.as_ref())?;
 
-        let sample_info: Vec<(usize, usize, i64, u64)> = {
-            let mp4 = Mp4::read_bytes(&data_vec)
-                .map_err(|e| -> Box<dyn Error + Send + Sync> { format!("mp4: {}", e).into() })?;
-            let (_id, track) = mp4
-                .tracks()
-                .first_key_value()
-                .ok_or_else(|| -> Box<dyn Error + Send + Sync> { "no track".into() })?;
-            track
-                .samples
-                .iter()
-                .map(|s| (s.offset as usize, s.size as usize, s.composition_timestamp, s.timescale))
-                .collect()
-        };
+        let sample_info = mp4_sample_table(&data_vec)?;
 
         for (offset, size, ts, ts_scale) in sample_info {
             if stop_flag.load(Ordering::Relaxed) {

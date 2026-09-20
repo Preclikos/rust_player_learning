@@ -18,6 +18,36 @@ pub(super) struct PreparedSegment {
 pub(super) type PrepareHandle =
     tokio::task::JoinHandle<Result<PreparedSegment, Box<dyn Error + Send + Sync>>>;
 
+/// Sample table of a prepared segment: `(offset, size, composition pts,
+/// timescale)` for every sample of its first — and, in a DASH media segment,
+/// only — track.
+///
+/// Three call sites built this identically and a fourth built a subset of it;
+/// one place to get the "no track" and parse errors right is worth more than
+/// the four lines it saves each time.
+pub(super) fn mp4_sample_table(
+    data: &[u8],
+) -> Result<Vec<(usize, usize, i64, u64)>, Box<dyn Error + Send + Sync>> {
+    let mp4 = Mp4::read_bytes(data)
+        .map_err(|e| -> Box<dyn Error + Send + Sync> { format!("mp4: {}", e).into() })?;
+    let (_id, track) = mp4
+        .tracks()
+        .first_key_value()
+        .ok_or_else(|| -> Box<dyn Error + Send + Sync> { "no track".into() })?;
+    Ok(track
+        .samples
+        .iter()
+        .map(|s| {
+            (
+                s.offset as usize,
+                s.size as usize,
+                s.composition_timestamp,
+                s.timescale,
+            )
+        })
+        .collect())
+}
+
 /// Init concat + CENC decrypt + mp4 parse, on a BLOCKING thread.
 ///
 /// Cost scales with segment SIZE, not frame count: ~17 MB/s of software AES on
@@ -41,26 +71,7 @@ pub(super) fn prepare_segment(
             decrypt_segment_in_place(&mut data_vec, crypto.as_ref())?;
             let dec_ms = t_dec.elapsed().as_millis();
             let t_parse = Instant::now();
-            let sample_info: Vec<(usize, usize, i64, u64)> = {
-                let mp4 = Mp4::read_bytes(&data_vec)
-                    .map_err(|e| -> Box<dyn Error + Send + Sync> { format!("mp4: {}", e).into() })?;
-                let (_id, track) = mp4
-                    .tracks()
-                    .first_key_value()
-                    .ok_or_else(|| -> Box<dyn Error + Send + Sync> { "no track".into() })?;
-                track
-                    .samples
-                    .iter()
-                    .map(|s| {
-                        (
-                            s.offset as usize,
-                            s.size as usize,
-                            s.composition_timestamp,
-                            s.timescale,
-                        )
-                    })
-                    .collect()
-            };
+            let sample_info = mp4_sample_table(&data_vec)?;
             let parse_ms = t_parse.elapsed().as_millis();
             // DIAG (verbose only): which third of prepare() actually costs,
             // per segment size. Answers "is this the AES or not" without
@@ -309,10 +320,7 @@ pub(super) async fn drain_video_decoder(
                 // publish `buffered_ahead_secs` (reorder-buffered frames are
                 // already decoded and render shortly).
                 let pts_ms = frame.pts_us / 1000;
-                let prev = stats.last_decoded_pts_ms.load(Ordering::Relaxed);
-                if pts_ms > prev {
-                    stats.last_decoded_pts_ms.store(pts_ms, Ordering::Relaxed);
-                }
+                stats.last_decoded_pts_ms.fetch_max(pts_ms, Ordering::Relaxed);
                 reorder_buf.push(frame);
                 // Startup fast-path: emit the very first frame as soon as it
                 // is decoded instead of waiting for the reorder buffer to fill
@@ -404,27 +412,7 @@ pub(super) async fn audio_decoder_task(
                 data_vec.extend_from_slice(&segment.data[..]);
                 decrypt_segment_in_place(&mut data_vec, track_crypto.as_ref())?;
 
-                let sample_info: Vec<(usize, usize, i64, u64)> = {
-                    let mp4 = Mp4::read_bytes(&data_vec).map_err(
-                        |e| -> Box<dyn Error + Send + Sync> { format!("mp4: {}", e).into() },
-                    )?;
-                    let (_id, track) = mp4
-                        .tracks()
-                        .first_key_value()
-                        .ok_or_else(|| -> Box<dyn Error + Send + Sync> { "no track".into() })?;
-                    track
-                        .samples
-                        .iter()
-                        .map(|s| {
-                            (
-                                s.offset as usize,
-                                s.size as usize,
-                                s.composition_timestamp,
-                                s.timescale,
-                            )
-                        })
-                        .collect()
-                };
+                let sample_info = mp4_sample_table(&data_vec)?;
                 Ok((data_vec, sample_info))
             },
         )?;
@@ -442,14 +430,9 @@ pub(super) async fn audio_decoder_task(
                 match decoder.try_recv()? {
                     Some(frame) => {
                         let pts_ms = frame.pts_ms;
-                        let prev = stats
+                        stats
                             .audio_last_decoded_pts_ms
-                            .load(Ordering::Relaxed);
-                        if pts_ms > prev {
-                            stats
-                                .audio_last_decoded_pts_ms
-                                .store(pts_ms, Ordering::Relaxed);
-                        }
+                            .fetch_max(pts_ms, Ordering::Relaxed);
                         if sender.send(frame).await.is_err() {
                             return Ok(());
                         }

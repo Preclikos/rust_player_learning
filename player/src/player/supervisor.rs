@@ -12,6 +12,17 @@ use super::*;
 /// so the platform-specific decoder type stays out of this module.
 pub(super) type VideoDecoderFactory = Arc<dyn Fn() -> Box<dyn HwVideoDecoder> + Send + Sync>;
 
+/// Signal one half of a pipeline to stop: raise its flag and wake whatever is
+/// parked on its notify.
+///
+/// The two always travel together — raising the flag alone leaves a task
+/// asleep until its next timeout, and notifying alone lets it loop straight
+/// back in. Nine call sites did both by hand.
+fn signal_stop(flag: &AtomicBool, stop: &Notify) {
+    flag.store(true, Ordering::Relaxed);
+    stop.notify_waiters();
+}
+
 /// Long-lived task that owns the video pipeline for a single `play()` call.
 /// It runs one representation's decode at a time and switches on ABR request.
 ///
@@ -159,8 +170,7 @@ const PREPARE_READY_BUDGET: Duration = Duration::from_millis(1_200);
         let new_repr: VideoRepresenation = loop {
             tokio::select! {
                 _ = stop.notified() => {
-                    cur_flag.store(true, Ordering::Relaxed);
-                    cur_stop.notify_waiters();
+                    signal_stop(&cur_flag, &cur_stop);
                     let _ = cur_handle.await;
                     return Ok(());
                 }
@@ -207,8 +217,7 @@ const PREPARE_READY_BUDGET: Duration = Duration::from_millis(1_200);
                             kind: PlayerErrorKind::Decoder,
                             detail,
                         });
-                        stop_flag.store(true, Ordering::Relaxed);
-                        stop.notify_waiters();
+                        signal_stop(&stop_flag, &stop);
                         return Err("video pipeline retries exhausted".into());
                     }
                     log::warn!(
@@ -291,8 +300,7 @@ const PREPARE_READY_BUDGET: Duration = Duration::from_millis(1_200);
                     let _ = switch_rx.changed().await;
                 } => {
                     if stop_flag.load(Ordering::Relaxed) {
-                        cur_flag.store(true, Ordering::Relaxed);
-                        cur_stop.notify_waiters();
+                        signal_stop(&cur_flag, &cur_stop);
                         let _ = cur_handle.await;
                         return Ok(());
                     }
@@ -405,8 +413,7 @@ const PREPARE_READY_BUDGET: Duration = Duration::from_millis(1_200);
                 }
             },
             _ = stop.notified() => {
-                cur_flag.store(true, Ordering::Relaxed);
-                cur_stop.notify_waiters();
+                signal_stop(&cur_flag, &cur_stop);
                 let _ = cur_handle.await;
                 return Ok(());
             }
@@ -439,10 +446,8 @@ const PREPARE_READY_BUDGET: Duration = Duration::from_millis(1_200);
             _ = stop.notified() => {
                 // Tear NEW's prefetch down (the flag makes download_task exit;
                 // dropping new_pf closes its channel too) and OLD, then exit.
-                new_flag.store(true, Ordering::Relaxed);
-                new_stop.notify_waiters();
-                cur_flag.store(true, Ordering::Relaxed);
-                cur_stop.notify_waiters();
+                signal_stop(&new_flag, &new_stop);
+                signal_stop(&cur_flag, &cur_stop);
                 let _ = cur_handle.await;
                 return Ok(());
             }
@@ -573,16 +578,14 @@ const PREPARE_READY_BUDGET: Duration = Duration::from_millis(1_200);
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_millis(remaining.min(120))) => {}
                 _ = stop.notified() => {
-                    new_flag.store(true, Ordering::Relaxed);
-                    new_stop.notify_waiters();
+                    signal_stop(&new_flag, &new_stop);
                     // Unblock a warm NEW decode parked on its full gate so it
                     // can observe the flag and drop the HW decoder — otherwise
                     // it (and the decoder slot) would leak past this stop.
                     if let Some((_, release)) = warm.as_ref() {
                         release.notify_one();
                     }
-                    cur_flag.store(true, Ordering::Relaxed);
-                    cur_stop.notify_waiters();
+                    signal_stop(&cur_flag, &cur_stop);
                     let _ = cur_handle.await;
                     return Ok(());
                 }
@@ -654,8 +657,7 @@ const PREPARE_READY_BUDGET: Duration = Duration::from_millis(1_200);
         *stats.swap_grace_deadline.lock().unwrap() = Some(Instant::now() + SWAP_GRACE);
         if !old_done {
             cur_soft_end.store(new_start, Ordering::Relaxed);
-            cur_flag.store(true, Ordering::Relaxed);
-            cur_stop.notify_waiters();
+            signal_stop(&cur_flag, &cur_stop);
             log::info!("[video gen {}] soft-swap: awaiting OLD repr {} decode teardown", gen, current_repr.id);
             let _ = cur_handle.await;
             log::info!("[video gen {}] soft-swap: OLD repr {} decode joined", gen, current_repr.id);

@@ -80,6 +80,25 @@ fn is_dxva_guid_dump(msg: &str) -> bool {
 }
 
 #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+/// FFmpeg's `AV_LOG_*` severity as a `log` level.
+///
+/// Both forwarders mapped this by hand; they have to agree, or the same
+/// ffmpeg message lands at a different level depending on which one saw it.
+fn rust_level_for(level: std::ffi::c_int) -> log::Level {
+    use ffmpeg_next::ffi as sys;
+    if level <= sys::AV_LOG_ERROR {
+        log::Level::Error
+    } else if level <= sys::AV_LOG_WARNING {
+        log::Level::Warn
+    } else if level <= sys::AV_LOG_INFO {
+        log::Level::Info
+    } else if level <= sys::AV_LOG_VERBOSE {
+        log::Level::Debug
+    } else {
+        log::Level::Trace
+    }
+}
+
 mod imp {
     use super::LogLevel;
     use ffmpeg_sys_next as sys;
@@ -153,17 +172,7 @@ mod linux_forwarder {
         if msg.is_empty() {
             return;
         }
-        let mut rust_lvl = if level <= sys::AV_LOG_ERROR {
-            log::Level::Error
-        } else if level <= sys::AV_LOG_WARNING {
-            log::Level::Warn
-        } else if level <= sys::AV_LOG_INFO {
-            log::Level::Info
-        } else if level <= sys::AV_LOG_VERBOSE {
-            log::Level::Debug
-        } else {
-            log::Level::Trace
-        };
+        let mut rust_lvl = super::rust_level_for(level);
         if super::is_dxva_guid_dump(msg) {
             rust_lvl = log::Level::Trace;
         }
@@ -173,7 +182,6 @@ mod linux_forwarder {
 
 #[cfg(target_os = "windows")]
 mod windows_forwarder {
-    use ffmpeg_sys_next as sys;
     use std::ffi::{c_char, c_int};
     use std::sync::Once;
 
@@ -192,17 +200,7 @@ mod windows_forwarder {
             Ok(s) => s,
             Err(_) => return,
         };
-        let mut rust_lvl = if level <= sys::AV_LOG_ERROR {
-            log::Level::Error
-        } else if level <= sys::AV_LOG_WARNING {
-            log::Level::Warn
-        } else if level <= sys::AV_LOG_INFO {
-            log::Level::Info
-        } else if level <= sys::AV_LOG_VERBOSE {
-            log::Level::Debug
-        } else {
-            log::Level::Trace
-        };
+        let mut rust_lvl = super::rust_level_for(level);
         if super::is_dxva_guid_dump(s) {
             rust_lvl = log::Level::Trace;
         }

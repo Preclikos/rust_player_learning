@@ -378,19 +378,10 @@ pub(super) fn decrypt_segment_in_place(
     };
 
     let t_ranges = Instant::now();
-    let sample_ranges: Vec<(usize, usize)> = {
-        let mp4 = Mp4::read_bytes(&data_vec[..])
-            .map_err(|e| format!("Decrypt: mp4 parse error {}", e))?;
-        let (_id, track) = mp4
-            .tracks()
-            .first_key_value()
-            .ok_or("Decrypt: no track in segment")?;
-        track
-            .samples
-            .iter()
-            .map(|s| (s.offset as usize, s.size as usize))
-            .collect()
-    };
+    let sample_ranges: Vec<(usize, usize)> = mp4_sample_table(&data_vec[..])?
+        .into_iter()
+        .map(|(offset, size, _pts, _timescale)| (offset, size))
+        .collect();
 
     let ranges_ms = t_ranges.elapsed().as_millis();
     let t_aes = Instant::now();

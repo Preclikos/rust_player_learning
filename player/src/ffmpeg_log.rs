@@ -79,11 +79,11 @@ fn is_dxva_guid_dump(msg: &str) -> bool {
     false
 }
 
-#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
 /// FFmpeg's `AV_LOG_*` severity as a `log` level.
 ///
 /// Both forwarders mapped this by hand; they have to agree, or the same
 /// ffmpeg message lands at a different level depending on which one saw it.
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
 fn rust_level_for(level: std::ffi::c_int) -> log::Level {
     use ffmpeg_next::ffi as sys;
     if level <= sys::AV_LOG_ERROR {
@@ -99,6 +99,7 @@ fn rust_level_for(level: std::ffi::c_int) -> log::Level {
     }
 }
 
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
 mod imp {
     use super::LogLevel;
     use ffmpeg_sys_next as sys;

@@ -1,0 +1,22 @@
+# The Rust version this workspace is built with — everywhere.
+#
+# Until now the version was whatever happened to be installed: no pin here, no
+# `rust-version` in any manifest, and CI that installs rustup and takes what it
+# finds. Developer machines and the self-hosted runners drifted apart from each
+# other and from what anyone had tested, which is not a difference you want to
+# discover from a build failure on a release tag.
+#
+# rustup reads this file for any cargo invocation inside the workspace, so
+# pinning it here is enough — no CI change needed, and no need to touch anyone's
+# global default.
+#
+# 1.98.1 specifically: verified against ffmpeg-sys-next 8.1 (whose bindgen is
+# the one that survives current libclang — see the 7.1 note in player/Cargo.toml)
+# and against the pinned wgpu fork, with the full test suite and the Android
+# armeabi-v7a / arm64-v8a cross-builds green.
+#
+# Cross-compilation targets are NOT listed here on purpose: rustup would fetch
+# all of them on every fresh checkout, including for people who only ever build
+# the desktop shell. The platform build scripts add the ones they need.
+[toolchain]
+channel = "1.98.1"

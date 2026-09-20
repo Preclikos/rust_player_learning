@@ -20,6 +20,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Make the toolchain the build actually used visible in the log, and fail
+      # loudly if rustup is not in charge: rust-toolchain.toml only binds the
+      # version when cargo comes from rustup, so a system rust on a runner would
+      # silently build with whatever it happens to be.
+      - name: Report rust toolchain
+        run: |
+          set -e
+          rustup show active-toolchain
+          rustc --version
+
       - name: Ensure Rust iOS targets
         run: rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
 

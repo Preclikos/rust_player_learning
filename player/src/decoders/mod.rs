@@ -204,7 +204,50 @@ pub enum PlatformFrame {
     /// shaders and the HDR tonemap run unchanged.
     #[cfg(target_arch = "wasm32")]
     CpuPlanes(CpuPlanarFrame),
+    /// Browser, the default path: the decoded frame stays on the GPU as the
+    /// WebCodecs `VideoFrame`; the renderer copies it GPU→GPU with
+    /// `copyExternalImageToTexture` (the browser does Y'CbCr → R'G'B' on the
+    /// GPU) and samples an RGBA texture. No CPU byte per pixel. Used for SDR;
+    /// HDR representations take [`CpuPlanes`](Self::CpuPlanes) so the
+    /// engine's own 10-bit tonemap shader runs instead of the browser's
+    /// conversion.
+    #[cfg(target_arch = "wasm32")]
+    WebVideoFrame(WebVideoFrame),
 }
+
+/// Owned WebCodecs `VideoFrame`. Closed on drop — a frame not closed keeps
+/// one slot of the browser decoder's output pool, and a full pool stalls
+/// decoding. Single thread (see `rt/web.rs`), hence the `Send`/`Sync`.
+#[cfg(target_arch = "wasm32")]
+pub struct WebVideoFrame {
+    frame: web_sys::VideoFrame,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl WebVideoFrame {
+    pub fn new(frame: web_sys::VideoFrame) -> Self {
+        let (width, height) = (frame.display_width(), frame.display_height());
+        Self { frame, width, height }
+    }
+
+    pub fn inner(&self) -> &web_sys::VideoFrame {
+        &self.frame
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl Drop for WebVideoFrame {
+    fn drop(&mut self) {
+        self.frame.close();
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+unsafe impl Send for WebVideoFrame {}
+#[cfg(target_arch = "wasm32")]
+unsafe impl Sync for WebVideoFrame {}
 
 /// A decoded frame in CPU memory, NV12 / P010 layout with no row padding.
 #[cfg(target_arch = "wasm32")]

@@ -6,13 +6,23 @@
 //! results out with `try_recv`, so the `HwVideoDecoder` / `AudioDecoder`
 //! contracts stay the pull-based shape every other platform implements.
 //!
-//! Video output is copied OUT of the `VideoFrame` into CPU memory
-//! ([`CpuPlanarFrame`]: tightly packed Y + interleaved UV) the moment it is
-//! delivered, and the `VideoFrame` is closed. Holding decoder frames would
-//! stall the browser's decoder pool; copying keeps every frame downstream a
-//! plain `Send` Rust value that the renderer uploads as two textures — the
-//! same two-plane shape the Apple path samples, so the NV12 / P010 shaders
-//! and the HDR tonemap are shared.
+//! Video output stays on the GPU: the `VideoFrame` is handed downstream as
+//! [`WebVideoFrame`] and the renderer copies it GPU→GPU with
+//! `copyExternalImageToTexture` — the browser converts Y'CbCr → R'G'B' on
+//! the GPU, no CPU byte per pixel. Frames are closed when the renderer (or a
+//! LATE drop) is done with them; the in-flight pacing below keeps the
+//! browser's decoder pool from filling up.
+//!
+//! HDR frames take the same GPU path; the renderer copies them into an
+//! `rgba16float` texture, where WebGPU preserves the extended range, and
+//! runs the engine's tonemap curve on the result (shader_rgba_hdr.wgsl).
+//! Hardware-decoded frames are opaque anyway (`format` null) — their planes
+//! could not be read out even if we wanted to.
+//!
+//! The CPU copy-out path ([`CpuPlanarFrame`]) is kept as an opt-in for
+//! software-decoded frames with a readable format: it feeds the P010 planes
+//! to the very same shader chain desktop and Apple use, which is the one
+//! way to A/B the browser's colour conversion against the engine's.
 //!
 //! `unsafe impl Send`: wasm32-unknown-unknown without `atomics` is a single
 //! thread, so the `Send` bounds on the decoder traits can never be exercised.
@@ -31,7 +41,7 @@ use super::pcm::{downmix_to_stereo, interleave, LinearResampler};
 use super::{
     AudioCodec, AudioDecoder, AudioDecoderParams, CpuPlanarFrame, DecodedAudioFrame,
     DecodedVideoFrame, DecoderError, HwVideoDecoder, PlatformFrame, VideoColorInfo,
-    VideoDecoderParams,
+    VideoDecoderParams, WebVideoFrame,
 };
 use crate::parsers::hevc::nal_unit_type;
 
@@ -141,6 +151,11 @@ fn start_flush<P: Into<JsValue>>(flush: Option<P>) -> Rc<Cell<bool>> {
     done
 }
 
+/// Opt-in: copy frames OUT to CPU planes (when the browser exposes their
+/// pixel format) instead of the GPU path. For A/B-ing colour conversions,
+/// not for playback — the copy is ~3 MB per 1080p frame on the main thread.
+const WEB_CPU_PLANES_OPT_IN: bool = false;
+
 /// In-flight bound (samples submitted minus outputs delivered) past which
 /// the decode loop yields to the event loop. See `wants_event_loop` on the
 /// two decoders. Each turn of the event loop costs ~10 ms of other queued
@@ -168,6 +183,8 @@ struct VideoShared {
     /// `submit` / `try_recv` so the pipeline restarts.
     error: RefCell<Option<String>>,
     color: Cell<VideoColorInfo>,
+    /// True = copy out to CPU planes (HDR); false = hand the GPU frame on.
+    cpu_planes: Cell<bool>,
     /// Log an unsupported pixel format once, not per frame.
     warned_format: Cell<bool>,
     /// Frames the browser has handed to the output callback (before copy-out).
@@ -219,6 +236,7 @@ impl WebCodecsVideoDecoder {
                 pump_active: Cell::new(false),
                 error: RefCell::new(None),
                 color: Cell::new(VideoColorInfo::default()),
+                cpu_planes: Cell::new(false),
                 warned_format: Cell::new(false),
                 delivered: Cell::new(0),
                 frames_out: Cell::new(0),
@@ -246,9 +264,33 @@ impl Default for WebCodecsVideoDecoder {
     }
 }
 
-/// Output callback: queue the frame and make sure the copy-out pump runs.
+/// Output callback. GPU path: wrap and queue the frame as-is. CPU path
+/// (HDR): queue it for the copy-out pump.
 fn on_video_output(shared: &Rc<VideoShared>, frame: web_sys::VideoFrame) {
     shared.delivered.set(shared.delivered.get() + 1);
+    // The CPU-planes opt-in needs a readable pixel format. Hardware-decoded
+    // frames are often OPAQUE (`format` null — Chrome's D3D11 10-bit output,
+    // for one): `copyTo` cannot read them, so they take the GPU path.
+    let readable = frame.format().is_some();
+    if shared.cpu_planes.get() && !readable && !shared.warned_format.replace(true) {
+        log::info!("[webcodecs] frames are opaque (no readable pixel format) — GPU path");
+    }
+    if !(shared.cpu_planes.get() && readable) {
+        let pts_us = frame.timestamp() as i64;
+        let wrapped = WebVideoFrame::new(frame);
+        let (width, height) = (wrapped.width, wrapped.height);
+        shared.frames_out.set(shared.frames_out.get() + 1);
+        shared.ready.borrow_mut().push_back(DecodedVideoFrame {
+            pts_us,
+            width,
+            height,
+            native: PlatformFrame::WebVideoFrame(wrapped),
+            desired_present_ns: 0,
+            color: shared.color.get(),
+            hdr_meta: None,
+        });
+        return;
+    }
     shared.pending.borrow_mut().push_back(frame);
     if shared.pump_active.replace(true) {
         return;
@@ -463,6 +505,9 @@ impl HwVideoDecoder for WebCodecsVideoDecoder {
             .ok_or_else(|| -> DecoderError { "webcodecs: no hvcC record in init segment".into() })?;
         self.nal_len_size = nal_length_size(record);
         self.shared.color.set(params.color);
+        // GPU path for every representation (see the module docs); the CPU
+        // copy-out stays an explicit opt-in for A/B work.
+        self.shared.cpu_planes.set(WEB_CPU_PLANES_OPT_IN);
 
         let shared = Rc::clone(&self.shared);
         let output_cb = Closure::<dyn FnMut(web_sys::VideoFrame)>::new(move |frame| {
@@ -490,12 +535,13 @@ impl HwVideoDecoder for WebCodecsVideoDecoder {
             .configure(&config)
             .map_err(|e| js_err(&format!("VideoDecoder::configure({codec})"), e))?;
         log::info!(
-            "[webcodecs] video configured: {} {}x{} {}-bit {:?}",
+            "[webcodecs] video configured: {} {}x{} {}-bit {:?} → {}",
             codec,
             params.width,
             params.height,
             params.color.bit_depth,
-            params.color.transfer
+            params.color.transfer,
+            if WEB_CPU_PLANES_OPT_IN { "CPU planes" } else { "GPU frame (copyExternalImageToTexture)" }
         );
 
         self.decoder = Some(decoder);

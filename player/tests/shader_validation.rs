@@ -31,3 +31,9 @@ fn hdr_detect_shader_validates() {
         include_str!("../src/renderers/shader_hdr_detect.wgsl"),
     );
 }
+
+// Browser GPU-path quad over the browser-converted `VideoFrame` copy.
+#[test]
+fn web_rgba_shader_validates() {
+    validate("shader_rgba.wgsl", include_str!("../src/renderers/shader_rgba.wgsl"));
+}

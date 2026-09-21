@@ -9,7 +9,7 @@ use video_frame::VideoFrame;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 use video_metal::{MetalNV12Frame, MetalTextureCache};
 #[cfg(target_arch = "wasm32")]
-use crate::decoders::CpuPlanarFrame;
+use crate::decoders::{CpuPlanarFrame, WebVideoFrame};
 use wgpu::{Backends, Buffer};
 use wgpu::{Device, SurfaceConfiguration};
 // Additive: alternate offscreen output for in-app video (shared-device).
@@ -265,6 +265,14 @@ pub struct VideoRenderer {
     /// path, never held across an await.
     #[cfg(target_arch = "wasm32")]
     cpu_planes: std::sync::Mutex<Option<CpuPlaneTextures>>,
+    /// Browser: the RGBA8 destination of `copyExternalImageToTexture` for
+    /// [`PlatformFrame::WebVideoFrame`], reused while the frame size holds.
+    #[cfg(target_arch = "wasm32")]
+    web_rgba: std::sync::Mutex<Option<(u32, u32, wgpu::Texture)>>,
+    /// Browser: textured-quad pipeline over the browser-converted frame
+    /// (shader_rgba.wgsl), same bind-group layout as the NV12 pipelines.
+    #[cfg(target_arch = "wasm32")]
+    render_pipeline_rgba: Option<RenderPipeline>,
     frame_size: Arc<RwLock<PhysicalSize<u32>>>,
     // Crop factor for the texture axes: content / buffer size.
     // Always 1.0 on desktop; set to <1.0 on Android when the hardware codec
@@ -972,6 +980,57 @@ impl VideoRenderer {
             (None, None, None, None, None, None)
         };
 
+        // Browser GPU path: a textured quad over the frame the browser
+        // converted for us. Shares the NV12 bind-group layout (binding 1 is
+        // bound to the same view and unused).
+        //
+        // HDR is the browser's conversion too. Measured (Chrome 140, D3D11
+        // frames): `copyExternalImageToTexture` into `rgba16float` yields no
+        // component above 1.0 — the PQ → sRGB step tone-maps to SDR before
+        // we see a pixel, only out-of-gamut negatives survive — so running
+        // the engine's tonemap on top double-maps (washed-out picture). The
+        // engine's own curve on the web needs `importExternalTexture` with
+        // untone-mapped output, which wgpu does not expose yet.
+        #[cfg(target_arch = "wasm32")]
+        let web_quad_pipeline = |label: &'static str, module: wgpu::ShaderModule| {
+            let layout = texture_bind_group_layout.as_ref()?;
+            let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Pipeline Layout (RGBA)"),
+                bind_group_layouts: &[Some(layout)],
+                immediate_size: 0,
+            });
+            Some(device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&pl),
+                vertex: wgpu::VertexState {
+                    module: &module,
+                    entry_point: Some("vs_main"),
+                    buffers: &[Vertex::desc()],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &module,
+                    entry_point: Some("fs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: surface_format,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            }))
+        };
+        #[cfg(target_arch = "wasm32")]
+        let render_pipeline_rgba = web_quad_pipeline(
+            "Render Pipeline (RGBA / VideoFrame)",
+            device.create_shader_module(wgpu::include_wgsl!("shader_rgba.wgsl")),
+        );
+
         // Capacity sized for drag-resize bursts: Win32 generates many WM_SIZE
         // events per second while the user drags a window edge. The consumer
         // coalesces backlogged commands (see spawn_command_thread) so a deep
@@ -1097,6 +1156,10 @@ impl VideoRenderer {
             subtitle_overlay: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(target_arch = "wasm32")]
             cpu_planes: std::sync::Mutex::new(None),
+            #[cfg(target_arch = "wasm32")]
+            web_rgba: std::sync::Mutex::new(None),
+            #[cfg(target_arch = "wasm32")]
+            render_pipeline_rgba,
             #[cfg(target_os = "android")]
             gles_oes_renderer,
             #[cfg(target_os = "android")]
@@ -1452,6 +1515,10 @@ impl VideoRenderer {
             subtitle_overlay: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(target_arch = "wasm32")]
             cpu_planes: std::sync::Mutex::new(None),
+            #[cfg(target_arch = "wasm32")]
+            web_rgba: std::sync::Mutex::new(None),
+            #[cfg(target_arch = "wasm32")]
+            render_pipeline_rgba: None,
             #[cfg(target_os = "android")]
             gles_oes_renderer: None,
             #[cfg(target_os = "android")]
@@ -1831,9 +1898,81 @@ impl VideoRenderer {
             PlatformFrame::CpuPlanes(planes) => {
                 self.render_cpu_planes(planes, frame_color).await;
             }
+            #[cfg(target_arch = "wasm32")]
+            PlatformFrame::WebVideoFrame(vf) => {
+                self.render_web_video_frame(vf, frame_color).await;
+            }
             #[allow(unreachable_patterns)]
             _ => {}
         }
+    }
+
+    /// Browser GPU path: `copyExternalImageToTexture` from the WebCodecs
+    /// `VideoFrame` into an RGBA8 texture (the browser converts colour — and
+    /// tone-maps HDR — on the GPU), then one textured-quad draw. The
+    /// `VideoFrame` is closed when `frame` drops at the end of this call —
+    /// the copy is recorded on the queue synchronously, so the browser has
+    /// captured the pixels by then.
+    #[cfg(target_arch = "wasm32")]
+    async fn render_web_video_frame(&self, frame: WebVideoFrame, color: crate::decoders::VideoColorInfo) {
+        let Some(pipeline) = self.render_pipeline_rgba.as_ref() else {
+            return;
+        };
+        let (w, h) = (frame.width.max(1), frame.height.max(1));
+        let texture = {
+            let mut slot = self.web_rgba.lock().unwrap();
+            let stale = slot.as_ref().map(|(tw, th, _)| *tw != w || *th != h).unwrap_or(true);
+            if stale {
+                log::info!(
+                    "[renderer] web frame texture {}x{} Rgba8Unorm ({}, browser conversion)",
+                    w,
+                    h,
+                    if color.is_hdr() { "HDR" } else { "SDR" }
+                );
+                let tex = self.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("web VideoFrame"),
+                    size: wgpu::Extent3d {
+                        width: w,
+                        height: h,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: TextureFormat::Rgba8Unorm,
+                    // copyExternalImageToTexture requires RENDER_ATTACHMENT on
+                    // the destination in addition to COPY_DST.
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING
+                        | wgpu::TextureUsages::COPY_DST
+                        | wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    view_formats: &[],
+                });
+                *slot = Some((w, h, tex));
+            }
+            slot.as_ref().unwrap().2.clone()
+        };
+        self.queue.copy_external_image_to_texture(
+            &wgpu::CopyExternalImageSourceInfo {
+                source: wgpu::ExternalImageSource::VideoFrame(Clone::clone(frame.inner())),
+                origin: wgpu::Origin2d::ZERO,
+                flip_y: false,
+            },
+            wgpu::CopyExternalImageDestInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+                color_space: wgpu::PredefinedColorSpace::Srgb,
+                premultiplied_alpha: false,
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        let view = texture.create_view(&Default::default());
+        self.draw_planes(&view, &view, w, h, false, Some(pipeline)).await;
     }
 
     /// Browser: upload a CPU NV12 / P010 frame as two plane textures and draw
@@ -1945,7 +2084,7 @@ impl VideoRenderer {
 
         let y_view = y_tex.create_view(&Default::default());
         let uv_view = uv_tex.create_view(&Default::default());
-        self.draw_planes(&y_view, &uv_view, w, h, color.is_hdr()).await;
+        self.draw_planes(&y_view, &uv_view, w, h, color.is_hdr(), None).await;
     }
 
     /// Windows / Linux FFmpeg → wgpu native-import draw path. macOS / iOS
@@ -2281,7 +2420,7 @@ impl VideoRenderer {
             metal_frame.y_texture.width(),
             metal_frame.y_texture.height(),
         );
-        self.draw_planes(&y_plane_view, &uv_plane_view, frame_w, frame_h, is_hdr)
+        self.draw_planes(&y_plane_view, &uv_plane_view, frame_w, frame_h, is_hdr, None)
             .await;
     }
 
@@ -2290,7 +2429,8 @@ impl VideoRenderer {
     /// path: pipeline selection (SDR vs HDR tonemap + detection passes), the
     /// bind groups, the surface acquire / present. `is_hdr` follows the
     /// frame's signalled transfer; it draws through the SDR pipeline when the
-    /// device has no HDR pipeline (WebGL2).
+    /// device has no HDR pipeline (WebGL2). `pipeline_override` swaps in a
+    /// pipeline over the same bind-group layout (the browser's RGBA quad).
     #[cfg(any(target_os = "macos", target_os = "ios", target_arch = "wasm32"))]
     async fn draw_planes(
         &self,
@@ -2299,8 +2439,9 @@ impl VideoRenderer {
         frame_w: u32,
         frame_h: u32,
         is_hdr: bool,
+        pipeline_override: Option<&wgpu::RenderPipeline>,
     ) {
-        let is_hdr = is_hdr && self.render_pipeline_hdr.is_some();
+        let is_hdr = is_hdr && self.render_pipeline_hdr.is_some() && pipeline_override.is_none();
         let (uv_w, uv_h) = (frame_w.div_ceil(2), frame_h.div_ceil(2));
         let (wg_x, wg_y) = (uv_w.div_ceil(16), uv_h.div_ceil(16));
 
@@ -2388,12 +2529,13 @@ impl VideoRenderer {
 
         let vb_arc = self.vertex_buffer.as_ref().expect("no vertex buffer");
         let vertex_buffer = vb_arc.read().await;
-        let render_pipeline = if is_hdr {
-            self.render_pipeline_hdr
+        let render_pipeline = match pipeline_override {
+            Some(p) => p,
+            None if is_hdr => self
+                .render_pipeline_hdr
                 .as_ref()
-                .expect("no HDR render pipeline")
-        } else {
-            self.render_pipeline.as_ref().expect("no render pipeline")
+                .expect("no HDR render pipeline"),
+            None => self.render_pipeline.as_ref().expect("no render pipeline"),
         };
         let overlay_snapshot = self.subtitle_overlay.lock().unwrap().clone();
 

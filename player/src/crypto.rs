@@ -43,7 +43,7 @@ fn use_boringssl_aes() -> bool {
 ///
 /// A CENC subsample is a (clear, encrypted) pair; the clear run comes
 /// first. Bounds are validated here once so neither cipher path has to.
-fn protected_spans(
+pub(crate) fn protected_spans(
     subsamples: &[(u16, u32)],
     len: usize,
 ) -> Result<Vec<(usize, usize)>, Box<dyn Error + Send + Sync>> {
@@ -166,6 +166,15 @@ pub trait Decryptor: Send + Sync {
         data: &mut [u8],
         subsamples: &[(u16, u32)],
     ) -> Result<(), Box<dyn Error + Send + Sync>>;
+
+    /// The raw 16-byte content key for `kid`, when this decryptor holds it
+    /// in the clear (ClearKey). Lets a platform hand the AES to its own
+    /// engine — the browser build uses WebCrypto, off the main thread.
+    /// `None` (the default) for key stores that never expose material; the
+    /// caller then decrypts through [`decrypt_sample`](Self::decrypt_sample).
+    fn raw_key(&self, _kid: &[u8; 16]) -> Option<[u8; 16]> {
+        None
+    }
 }
 
 /// Software AES-128-CTR ClearKey decryptor. Holds a `(kid → key)` cache
@@ -313,6 +322,10 @@ impl Decryptor for ClearKeyDecryptor {
             }
         }
         Ok(())
+    }
+
+    fn raw_key(&self, kid: &[u8; 16]) -> Option<[u8; 16]> {
+        self.keys.lock().unwrap().get(kid).copied()
     }
 }
 

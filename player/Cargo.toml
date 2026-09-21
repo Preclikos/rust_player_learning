@@ -109,6 +109,8 @@ web-sys = { version = "0.3", features = [
     "Window", "WorkerGlobalScope", "Performance", "console",
     "HtmlCanvasElement", "MessageChannel", "MessagePort", "MessageEvent",
     "DomException",
+    # WebCrypto (CENC AES-CTR off the main thread)
+    "Crypto", "SubtleCrypto", "CryptoKey", "AesCtrParams",
     # WebCodecs (unstable — see above)
     "VideoDecoder", "VideoDecoderConfig", "VideoDecoderInit", "VideoDecoderSupport",
     "EncodedVideoChunk", "EncodedVideoChunkInit", "EncodedVideoChunkType",

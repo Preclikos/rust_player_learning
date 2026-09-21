@@ -60,25 +60,31 @@ pub(super) fn prepare_segment(
     crypto: Option<TrackCrypto>,
     segment: DataSegment,
 ) -> PrepareHandle {
-    crate::rt::spawn_blocking(
-        move || -> Result<PreparedSegment, Box<dyn Error + Send + Sync>> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        crate::rt::spawn_blocking(move || prepare_blocking(&init_data, crypto.as_ref(), segment))
+    }
+    // Browser: no blocking pool, one thread. Same steps as a task that yields
+    // to the event loop between AES slices (see
+    // `decrypt_segment_in_place_cooperative`), so audio callbacks and decoder
+    // output keep flowing while a segment is prepared.
+    #[cfg(target_arch = "wasm32")]
+    {
+        crate::rt::spawn(async move {
             let t_copy = Instant::now();
             let mut data_vec = Vec::with_capacity(init_data.len() + segment.data.len());
             data_vec.extend_from_slice(&init_data);
             data_vec.extend_from_slice(&segment.data[..]);
             let copy_ms = t_copy.elapsed().as_millis();
             let t_dec = Instant::now();
-            decrypt_segment_in_place(&mut data_vec, crypto.as_ref())?;
+            decrypt_segment_in_place_cooperative(&mut data_vec, crypto.as_ref()).await?;
             let dec_ms = t_dec.elapsed().as_millis();
             let t_parse = Instant::now();
             let sample_info = mp4_sample_table(&data_vec)?;
             let parse_ms = t_parse.elapsed().as_millis();
-            // DIAG (verbose only): which third of prepare() actually costs,
-            // per segment size. Answers "is this the AES or not" without
-            // guessing - it was the AES, at ~16 MiB/s.
             if copy_ms + dec_ms + parse_ms > 30 {
                 log::debug!(
-                    "[prep] segment {} {} KiB: copy {}ms decrypt {}ms parse {}ms",
+                    "[prep] segment {} {} KiB: copy {}ms decrypt {}ms (cooperative) parse {}ms",
                     segment.id,
                     data_vec.len() / 1024,
                     copy_ms,
@@ -91,8 +97,77 @@ pub(super) fn prepare_segment(
                 data_vec,
                 sample_info,
             })
-        },
-    )
+        })
+    }
+}
+
+/// The blocking-thread body of [`prepare_segment`] (native).
+#[cfg(not(target_arch = "wasm32"))]
+fn prepare_blocking(
+    init_data: &[u8],
+    crypto: Option<&TrackCrypto>,
+    segment: DataSegment,
+) -> Result<PreparedSegment, Box<dyn Error + Send + Sync>> {
+    let t_copy = Instant::now();
+    let mut data_vec = Vec::with_capacity(init_data.len() + segment.data.len());
+    data_vec.extend_from_slice(init_data);
+    data_vec.extend_from_slice(&segment.data[..]);
+    let copy_ms = t_copy.elapsed().as_millis();
+    let t_dec = Instant::now();
+    decrypt_segment_in_place(&mut data_vec, crypto)?;
+    let dec_ms = t_dec.elapsed().as_millis();
+    let t_parse = Instant::now();
+    let sample_info = mp4_sample_table(&data_vec)?;
+    let parse_ms = t_parse.elapsed().as_millis();
+    // DIAG (verbose only): which third of prepare() actually costs,
+    // per segment size. Answers "is this the AES or not" without
+    // guessing - it was the AES, at ~16 MiB/s.
+    if copy_ms + dec_ms + parse_ms > 30 {
+        log::debug!(
+            "[prep] segment {} {} KiB: copy {}ms decrypt {}ms parse {}ms",
+            segment.id,
+            data_vec.len() / 1024,
+            copy_ms,
+            dec_ms,
+            parse_ms
+        );
+    }
+    Ok(PreparedSegment {
+        id: segment.id,
+        data_vec,
+        sample_info,
+    })
+}
+
+/// Upper bound on event-loop turns the decode loops spend waiting for a
+/// callback-driven decoder to catch up (see `breathe!`): a few hundred ms
+/// even on a busy loop, so a decoder that produces nothing for a stretch
+/// of input (codec priming, a dropped frame) cannot wedge the loop.
+const MAX_BREATHE_TURNS: u32 = 200;
+
+/// Backpressure for callback-driven decoders (WebCodecs): while the decoder
+/// reports more input in flight than it wants, give the host event loop
+/// turns — that is when it delivers output. Native decoders never ask
+/// (output is pulled from the codec synchronously), so this costs them one
+/// boolean per sample.
+///
+/// Only a real wait fixes the browser: a single turn per sample let the loop
+/// run ~1000 AUs/s ahead of the decoder, and a WebCodecs decoder flooded like
+/// that stops delivering output. A macro (not an async fn taking `&decoder`)
+/// so no borrow of the `dyn` decoder is held across the await — the
+/// decoder traits are `Send`, not `Sync`.
+macro_rules! breathe {
+    ($decoder:expr, $stop_flag:expr) => {{
+        let mut turns = 0u32;
+        while $decoder.wants_event_loop() && !$stop_flag.load(Ordering::Relaxed) {
+            if turns >= MAX_BREATHE_TURNS {
+                log::debug!("[dec] decoder still busy after {} event-loop turns; feeding anyway", turns);
+                break;
+            }
+            crate::rt::cooperative_yield().await;
+            turns += 1;
+        }
+    }};
 }
 
 pub(super) async fn video_decoder_task(
@@ -251,10 +326,7 @@ pub(super) async fn video_decoder_task(
             }
 
             decoder.submit(sample_data, pts_us)?;
-            // Callback-driven decoders (WebCodecs) deliver output only when
-            // the host event loop runs; give it a turn per sample. No-op on
-            // native, where output is pulled from the codec synchronously.
-            crate::rt::cooperative_yield().await;
+            breathe!(decoder, stop_flag);
         }
         if let Some(first) = first_pts_us {
             log::info!("[dec] seg done: pts {}..{}ms", first / 1000, last_pts_us / 1000);
@@ -399,6 +471,9 @@ pub(super) async fn audio_decoder_task(
     // started hearing real samples 20-200 ms after video began
     // rendering — perceived as constant audio lag.
     let mut first_audio_signaled = false;
+    // The audio task has no local stop signal (it ends when its input
+    // channel closes); the breathing wait only needs something to poll.
+    let stop_flag = Arc::new(AtomicBool::new(false));
     while let Some(segment) = receiver.recv().await {
         log::debug!("[dec] consuming audio segment: {}", segment.id);
         stats.diag_audio_seg.fetch_add(1, Ordering::Relaxed);
@@ -429,10 +504,7 @@ pub(super) async fn audio_decoder_task(
             let pts_us = if ts_scale > 0 { ts * 1_000_000 / ts_scale as i64 } else { 0 };
 
             decoder.submit(sample_data, pts_us)?;
-            // Callback-driven decoders (WebCodecs) deliver output only when
-            // the host event loop runs; give it a turn per sample. No-op on
-            // native, where output is pulled from the codec synchronously.
-            crate::rt::cooperative_yield().await;
+            breathe!(decoder, stop_flag);
 
             loop {
                 match decoder.try_recv()? {

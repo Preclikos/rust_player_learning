@@ -40,7 +40,7 @@
 </footer>
 
 <script type="module">
-import init, { RustPlayer, testStream } from './pkg/rustplayer.js';
+import init, { RustPlayer, testStream, setLogLevel } from './pkg/rustplayer.js';
 
 const $ = (id) => document.getElementById(id);
 const canvas = $('canvas');
@@ -189,6 +189,9 @@ window.addEventListener('keydown', (e) => {
 });
 
 await init();
+// ?log=debug for the engine's verbose diagnostics in the console.
+const logLevel = new URLSearchParams(location.search).get('log');
+if (logLevel) setLogLevel(logLevel);
 $('url').value = testStream().url;
 log('module ready — WebGPU: ' + (navigator.gpu ? 'yes' : 'no (WebGL2 fallback)') +
     ', WebCodecs: ' + (typeof VideoDecoder !== 'undefined' ? 'yes' : 'NO'));

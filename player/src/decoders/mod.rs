@@ -395,6 +395,14 @@ pub trait HwVideoDecoder: Send {
     /// pipeline can hold freely. The decode pipeline then keeps far fewer
     /// frames in flight — every queued frame pins one of the codec's
     /// scarce output buffers and over-holding stalls the decoder.
+    /// Whether the caller should yield to the host event loop before feeding
+    /// the next sample. Callback-driven decoders (WebCodecs) only deliver
+    /// output while the browser's event loop runs, so they ask for a turn
+    /// every few samples; pull-based native decoders never do. Default false.
+    fn wants_event_loop(&self) -> bool {
+        false
+    }
+
     fn is_direct(&self) -> bool {
         false
     }
@@ -407,6 +415,10 @@ pub trait HwVideoDecoder: Send {
 }
 
 pub trait AudioDecoder: Send {
+    /// See [`HwVideoDecoder::wants_event_loop`].
+    fn wants_event_loop(&self) -> bool {
+        false
+    }
     /// Install codec parameters. Called once before the first `submit`.
     fn configure(&mut self, params: AudioDecoderParams) -> Result<(), DecoderError>;
 

@@ -474,6 +474,103 @@ pub(super) fn decrypt_segment_in_place(
     Ok(())
 }
 
+/// Browser twin of [`decrypt_segment_in_place`]: same senc / sample-table
+/// walk, but yields to the event loop every [`COOP_DECRYPT_CHUNK`] bytes of
+/// ciphertext. There is no blocking thread to hide the AES on — software
+/// AES in wasm runs ~30 MiB/s, so a 5 MiB segment decrypted in one go would
+/// block the main thread (audio callbacks, WebCodecs output, rendering) for
+/// ~170 ms at every segment boundary. Chunked, each slice is a few ms.
+#[cfg(target_arch = "wasm32")]
+pub(super) async fn decrypt_segment_in_place_cooperative(
+    data_vec: &mut [u8],
+    track_crypto: Option<&TrackCrypto>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let tc = match track_crypto {
+        Some(t) => t,
+        None => return Ok(()),
+    };
+    crate::crypto::log_aes_capability();
+    let senc_entries = match parse_senc(data_vec, tc.iv_size) {
+        Some(e) => e,
+        None => {
+            log::debug!(
+                "[crypto] no senc in segment — treating as clear (track kid={})",
+                kid_short(&tc.kid)
+            );
+            return Ok(());
+        }
+    };
+    let sample_ranges: Vec<(usize, usize)> = mp4_sample_table(&data_vec[..])?
+        .into_iter()
+        .map(|(offset, size, _pts, _timescale)| (offset, size))
+        .collect();
+
+    // WebCrypto when the key material is ours to hand over (ClearKey) and
+    // the segment is big enough for the promise round-trips to pay off:
+    // the AES then runs on the browser's crypto pool with hardware
+    // acceleration and the main thread only gathers/scatters bytes.
+    let total_bytes: usize = sample_ranges.iter().map(|&(_, sz)| sz).sum();
+    if total_bytes >= WEBCRYPTO_MIN_BYTES {
+        if let Some(key) = tc.decryptor.raw_key(&tc.kid) {
+            let t_wc = Instant::now();
+            match crate::crypto_web::decrypt_samples(data_vec, &tc.kid, &key, &sample_ranges, &senc_entries).await {
+                Ok(()) => {
+                    log::debug!(
+                        "[crypto] {} samples via WebCrypto in {}ms ({} KiB)",
+                        sample_ranges.len(),
+                        t_wc.elapsed().as_millis(),
+                        total_bytes / 1024
+                    );
+                    return Ok(());
+                }
+                Err(e) => {
+                    // Not a secure context, or the browser refused: software
+                    // AES below still gets the segment out.
+                    log::warn!("[crypto] WebCrypto decrypt failed ({e}); falling back to software AES");
+                }
+            }
+        }
+    }
+
+    let t_aes = Instant::now();
+    let mut since_yield = 0usize;
+    let mut slices = 0usize;
+    for ((offset, size), entry) in sample_ranges.iter().zip(senc_entries.iter()) {
+        let end = offset + size;
+        if end > data_vec.len() {
+            continue;
+        }
+        decrypt_one_sample(tc, entry, &mut data_vec[*offset..end])?;
+        since_yield += size;
+        if since_yield >= COOP_DECRYPT_CHUNK {
+            since_yield = 0;
+            slices += 1;
+            crate::rt::cooperative_yield().await;
+        }
+    }
+    let aes_ms = t_aes.elapsed().as_millis();
+    if aes_ms > 30 {
+        log::debug!(
+            "[crypto] {} samples, aes {}ms in {} cooperative slices ({} KiB)",
+            sample_ranges.len(),
+            aes_ms,
+            slices + 1,
+            data_vec.len() / 1024
+        );
+    }
+    Ok(())
+}
+
+/// Ciphertext per event-loop turn in the cooperative decrypt: ~8 ms of
+/// software AES on wasm, well under one audio callback period.
+#[cfg(target_arch = "wasm32")]
+const COOP_DECRYPT_CHUNK: usize = 256 * 1024;
+
+/// Below this, a segment (audio: ~130 KiB per 5 s) is cheaper to decrypt
+/// in software than through one WebCrypto promise per sample.
+#[cfg(target_arch = "wasm32")]
+const WEBCRYPTO_MIN_BYTES: usize = 512 * 1024;
+
 /// Build a `TrackInfo` snapshot from a video representation. Used by
 /// `TrackChanged` events on both user-driven and ABR-driven switches.
 pub(super) fn video_track_info(repr: &VideoRepresenation) -> TrackInfo {

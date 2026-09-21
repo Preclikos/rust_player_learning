@@ -107,6 +107,109 @@ pub fn resample_linear(input: &[f32], channels: usize, from_rate: u32, to_rate: 
     out
 }
 
+/// Linear resampler that keeps its phase across chunks, so a stream of
+/// short chunks (10–30 ms AUs) comes out with exactly `in / ratio` frames
+/// overall. [`resample_linear`] rounds each chunk UP on its own: at
+/// 96 → 44.1 kHz a 1024-frame AU gives 471 frames instead of 470.4, a
+/// +0.13 % speed error that made the A/V aligner trim 10 ms every ~8 s.
+pub struct LinearResampler {
+    channels: usize,
+    /// Input frames per output frame.
+    ratio: f64,
+    /// Position of the next output frame in input frames, relative to frame 0
+    /// of the chunk about to be processed. Negative (≥ −1) means it falls
+    /// between the previous chunk's last frame (`tail`) and this chunk's
+    /// first.
+    pos: f64,
+    /// Last input frame of the previous chunk.
+    tail: Vec<f32>,
+}
+
+impl LinearResampler {
+    pub fn new(channels: usize, from_rate: u32, to_rate: u32) -> Self {
+        Self {
+            channels: channels.max(1),
+            ratio: from_rate.max(1) as f64 / to_rate.max(1) as f64,
+            pos: 0.0,
+            tail: Vec::new(),
+        }
+    }
+
+    pub fn is_identity(&self) -> bool {
+        (self.ratio - 1.0).abs() < 1e-9
+    }
+
+    pub fn process(&mut self, input: &[f32]) -> Vec<f32> {
+        if self.is_identity() || input.is_empty() {
+            return input.to_vec();
+        }
+        let ch = self.channels;
+        let in_frames = input.len() / ch;
+        if in_frames == 0 {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity((in_frames as f64 / self.ratio) as usize * ch + ch);
+        let mut pos = self.pos;
+        let last = (in_frames - 1) as f64;
+        while pos <= last {
+            let idx0 = pos.floor() as i64;
+            let frac = (pos - idx0 as f64) as f32;
+            let i1 = ((idx0 + 1).max(0) as usize).min(in_frames - 1);
+            for c in 0..ch {
+                let s0 = if idx0 < 0 {
+                    self.tail.get(c).copied().unwrap_or(input[c])
+                } else {
+                    input[idx0 as usize * ch + c]
+                };
+                let s1 = input[i1 * ch + c];
+                out.push(s0 + (s1 - s0) * frac);
+            }
+            pos += self.ratio;
+        }
+        // Carry the position into the next chunk's frame of reference.
+        self.pos = pos - in_frames as f64;
+        self.tail.clear();
+        self.tail.extend_from_slice(&input[(in_frames - 1) * ch..]);
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stateful_resampler_output_count_is_exact_over_many_chunks() {
+        // 96 kHz → 44.1 kHz, 1024-frame AUs: 470.4 frames each on average.
+        let mut rs = LinearResampler::new(2, 96_000, 44_100);
+        let chunk = vec![0.5f32; 1024 * 2];
+        let mut total = 0usize;
+        for _ in 0..1000 {
+            total += rs.process(&chunk).len() / 2;
+        }
+        let expected = 1000.0 * 1024.0 * 44_100.0 / 96_000.0;
+        assert!((total as f64 - expected).abs() <= 1.0, "total {total} vs {expected}");
+    }
+
+    #[test]
+    fn per_chunk_resampler_rounds_each_chunk_up() {
+        // Documents the drift the stateful version exists to remove.
+        let chunk = vec![0.5f32; 1024 * 2];
+        assert_eq!(resample_linear(&chunk, 2, 96_000, 44_100).len() / 2, 471);
+    }
+
+    #[test]
+    fn stateful_resampler_identity_and_interpolation() {
+        let mut id = LinearResampler::new(1, 48_000, 48_000);
+        assert_eq!(id.process(&[1.0, 2.0, 3.0]), vec![1.0, 2.0, 3.0]);
+        // 2:1 decimation of a ramp lands on every other input sample.
+        let mut half = LinearResampler::new(1, 48_000, 24_000);
+        assert_eq!(half.process(&[0.0, 1.0, 2.0, 3.0]), vec![0.0, 2.0]);
+        // The carried position continues the ramp across the chunk border.
+        assert_eq!(half.process(&[4.0, 5.0, 6.0, 7.0]), vec![4.0, 6.0]);
+    }
+}
+
 /// Planar → interleaved: `planes[c][i]` → `out[i * channels + c]`.
 pub fn interleave(planes: &[Vec<f32>]) -> Vec<f32> {
     let channels = planes.len();

@@ -10,6 +10,8 @@ mod test_support;
 mod av_sync;
 mod capabilities;
 mod crypto;
+#[cfg(target_arch = "wasm32")]
+mod crypto_web;
 mod decoders;
 mod events;
 mod ffmpeg_log;

@@ -40,7 +40,8 @@ fn init() {
     console_error_panic_hook::set_once();
     // `RUST_LOG`-less: info by default, the `stats`/`position` firehose is
     // debug-level in the engine already.
-    let _ = console_log::init_with_level(log::Level::Info);
+    let _ = console_log::init_with_level(log::Level::Trace);
+    log::set_max_level(log::LevelFilter::Info);
     log::info!("[web] rustplayer module loaded");
 }
 
@@ -342,6 +343,22 @@ impl RustPlayer {
     pub fn shutdown(&self) {
         self.handle.shutdown();
     }
+}
+
+/// Runtime log threshold for the engine's `log::` output on the console:
+/// `"error" | "warn" | "info" | "debug" | "trace"`. Default `info`; `debug`
+/// adds the per-second stats, the audio callback diagnostics and the
+/// segment-preparation timings.
+#[wasm_bindgen(js_name = setLogLevel)]
+pub fn set_log_level(level: &str) {
+    let lvl = match level {
+        "error" => log::LevelFilter::Error,
+        "warn" => log::LevelFilter::Warn,
+        "debug" => log::LevelFilter::Debug,
+        "trace" => log::LevelFilter::Trace,
+        _ => log::LevelFilter::Info,
+    };
+    log::set_max_level(lvl);
 }
 
 /// The bundled test stream + its ClearKeys (JSON `{kidHex: keyHex}`), for

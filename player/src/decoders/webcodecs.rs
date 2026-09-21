@@ -27,7 +27,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 
-use super::pcm::{downmix_to_stereo, interleave, resample_linear};
+use super::pcm::{downmix_to_stereo, interleave, LinearResampler};
 use super::{
     AudioCodec, AudioDecoder, AudioDecoderParams, CpuPlanarFrame, DecodedAudioFrame,
     DecodedVideoFrame, DecoderError, HwVideoDecoder, PlatformFrame, VideoColorInfo,
@@ -119,6 +119,16 @@ fn is_irap_sample(sample: &[u8], len_size: usize) -> bool {
     false
 }
 
+/// In-flight bound (samples submitted minus outputs delivered) past which
+/// the decode loop yields to the event loop. See `wants_event_loop` on the
+/// two decoders. Each turn of the event loop costs ~10 ms of other queued
+/// work and delivers whatever the codec finished meanwhile, so the bound is
+/// the depth that lets a turn carry several outputs: a hardware video
+/// decoder pipelines a handful of frames; 48 audio AUs are ~0.5 s of media
+/// (measured: 8 gave ~90 % of real time, still starving the output).
+const VIDEO_IN_FLIGHT: u64 = 6;
+const AUDIO_IN_FLIGHT: u64 = 96;
+
 // ---------------------------------------------------------------------------
 // Video
 // ---------------------------------------------------------------------------
@@ -138,6 +148,8 @@ struct VideoShared {
     color: Cell<VideoColorInfo>,
     /// Log an unsupported pixel format once, not per frame.
     warned_format: Cell<bool>,
+    /// Frames the browser has handed to the output callback (before copy-out).
+    delivered: Cell<u64>,
     frames_out: Cell<u64>,
 }
 
@@ -158,6 +170,9 @@ pub struct WebCodecsVideoDecoder {
     /// WebCodecs needs a key frame first (after configure and after flush);
     /// delta chunks before that are dropped instead of erroring the codec.
     await_key: bool,
+    /// Chunks handed to `decode()`; with `shared.delivered` gives the
+    /// in-flight count that paces the decode loop.
+    submitted: Cell<u64>,
     /// Closures must outlive the decoder they are registered on.
     _output_cb: Option<Closure<dyn FnMut(web_sys::VideoFrame)>>,
     _error_cb: Option<Closure<dyn FnMut(JsValue)>>,
@@ -177,10 +192,12 @@ impl WebCodecsVideoDecoder {
                 error: RefCell::new(None),
                 color: Cell::new(VideoColorInfo::default()),
                 warned_format: Cell::new(false),
+                delivered: Cell::new(0),
                 frames_out: Cell::new(0),
             }),
             nal_len_size: 4,
             await_key: true,
+            submitted: Cell::new(0),
             _output_cb: None,
             _error_cb: None,
         }
@@ -202,6 +219,7 @@ impl Default for WebCodecsVideoDecoder {
 
 /// Output callback: queue the frame and make sure the copy-out pump runs.
 fn on_video_output(shared: &Rc<VideoShared>, frame: web_sys::VideoFrame) {
+    shared.delivered.set(shared.delivered.get() + 1);
     shared.pending.borrow_mut().push_back(frame);
     if shared.pump_active.replace(true) {
         return;
@@ -480,7 +498,18 @@ impl HwVideoDecoder for WebCodecsVideoDecoder {
         init.set_timestamp_f64(pts_us as f64);
         let chunk = web_sys::EncodedVideoChunk::new(&init).map_err(|e| js_err("EncodedVideoChunk", e))?;
         decoder.decode(&chunk).map_err(|e| js_err("VideoDecoder::decode", e))?;
+        self.submitted.set(self.submitted.get() + 1);
         Ok(())
+    }
+
+    /// Yield once the decoder holds more than a pipeline's worth of frames
+    /// we have not been handed back. Output is only delivered while the
+    /// event loop runs, so this both bounds the in-flight queue (a flooded
+    /// WebCodecs decoder stops delivering) and gives the copy-out pump its
+    /// turn. Never wedges: a yield always returns, and an AU that produces
+    /// no output just costs one extra turn.
+    fn wants_event_loop(&self) -> bool {
+        self.submitted.get().saturating_sub(self.shared.delivered.get()) >= VIDEO_IN_FLIGHT
     }
 
     fn try_recv(&mut self) -> Result<Option<DecodedVideoFrame>, DecoderError> {
@@ -521,6 +550,10 @@ struct AudioShared {
     ready: RefCell<VecDeque<DecodedAudioFrame>>,
     error: RefCell<Option<String>>,
     output_rate: Cell<u32>,
+    frames_out: Cell<u64>,
+    /// Built on the first output (that is when the real input rate is
+    /// known); keeps its phase across AUs so the output frame count is exact.
+    resampler: RefCell<Option<LinearResampler>>,
 }
 
 impl AudioShared {
@@ -536,6 +569,9 @@ impl AudioShared {
 pub struct WebCodecsAudioDecoder {
     decoder: Option<web_sys::AudioDecoder>,
     shared: Rc<AudioShared>,
+    /// Chunks handed to `decode()`; with `shared.frames_out` (outputs
+    /// delivered) gives the in-flight count that paces the decode loop.
+    submitted: Cell<u64>,
     _output_cb: Option<Closure<dyn FnMut(web_sys::AudioData)>>,
     _error_cb: Option<Closure<dyn FnMut(JsValue)>>,
 }
@@ -551,7 +587,10 @@ impl WebCodecsAudioDecoder {
                 ready: RefCell::new(VecDeque::new()),
                 error: RefCell::new(None),
                 output_rate: Cell::new(48_000),
+                frames_out: Cell::new(0),
+                resampler: RefCell::new(None),
             }),
+            submitted: Cell::new(0),
             _output_cb: None,
             _error_cb: None,
         }
@@ -590,6 +629,15 @@ fn on_audio_output(shared: &AudioShared, data: web_sys::AudioData) {
     let frames = data.number_of_frames() as usize;
     let rate = data.sample_rate().round() as u32;
     let pts_ms = (data.timestamp() / 1000.0) as i64;
+    let n = shared.frames_out.get();
+    shared.frames_out.set(n + 1);
+    if n < 3 || n % 200 == 0 {
+        log::debug!(
+            "[webcodecs] audio out #{n}: {frames} frames {channels}ch {rate}Hz ts={pts_ms}ms dur={:.2}ms fmt={:?}",
+            data.duration() / 1000.0,
+            data.format()
+        );
+    }
     let mut planes: Vec<Vec<f32>> = Vec::with_capacity(channels);
     for c in 0..channels {
         // Ask for f32-planar explicitly: every implementation must support
@@ -609,7 +657,9 @@ fn on_audio_output(shared: &AudioShared, data: web_sys::AudioData) {
     data.close();
     let interleaved = interleave(&planes);
     let stereo = downmix_to_stereo(&interleaved, channels);
-    let samples = resample_linear(&stereo, 2, rate, shared.output_rate.get());
+    let mut rs = shared.resampler.borrow_mut();
+    let resampler = rs.get_or_insert_with(|| LinearResampler::new(2, rate, shared.output_rate.get()));
+    let samples = resampler.process(&stereo);
     shared.ready.borrow_mut().push_back(DecodedAudioFrame { pts_ms, samples });
 }
 
@@ -617,6 +667,7 @@ impl AudioDecoder for WebCodecsAudioDecoder {
     fn configure(&mut self, params: AudioDecoderParams) -> Result<(), DecoderError> {
         let codec = audio_codec_string(params.codec, &params.codec_specific_data);
         self.shared.output_rate.set(params.output_sample_rate.max(1));
+        *self.shared.resampler.borrow_mut() = None;
 
         let shared = Rc::clone(&self.shared);
         let output_cb = Closure::<dyn FnMut(web_sys::AudioData)>::new(move |data| {
@@ -668,7 +719,18 @@ impl AudioDecoder for WebCodecsAudioDecoder {
         init.set_timestamp_f64(pts_us as f64);
         let chunk = web_sys::EncodedAudioChunk::new(&init).map_err(|e| js_err("EncodedAudioChunk", e))?;
         decoder.decode(&chunk).map_err(|e| js_err("AudioDecoder::decode", e))?;
+        self.submitted.set(self.submitted.get() + 1);
         Ok(())
+    }
+
+    /// Yield when more than [`AUDIO_IN_FLIGHT`] AUs are submitted but not
+    /// yet delivered back. Measured failure modes this rules out: a turn per
+    /// AU cannot keep up with ~100 AUs/s when each turn costs 5–15 ms of
+    /// other queued work (~75 % throughput, starving the output); and
+    /// feeding thousands of AUs without a turn makes the decoder stop
+    /// delivering output altogether.
+    fn wants_event_loop(&self) -> bool {
+        self.submitted.get().saturating_sub(self.shared.frames_out.get()) >= AUDIO_IN_FLIGHT
     }
 
     fn try_recv(&mut self) -> Result<Option<DecodedAudioFrame>, DecoderError> {

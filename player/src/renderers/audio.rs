@@ -16,7 +16,7 @@ use crate::av_sync::{AudioChunk, FlushState};
 /// per-channel frames for AAC ≈ 21 ms, 1536 for (E-)AC-3 ≈ 32 ms). 96 chunks
 /// ≈ 2–3 s — the same depth the old per-sample channel (192 000 f32) gave, so
 /// the decoder's run-ahead / back-pressure behaviour is unchanged.
-const QUEUE_CHUNKS: usize = 96;
+const QUEUE_CHUNKS: usize = if cfg!(target_arch = "wasm32") { 384 } else { 96 };
 
 // Per-platform output backends, each in its own file (mirrors the `video`
 // module's per-backend split): cpal PCM on desktop/iOS, an AudioTrack PCM sink

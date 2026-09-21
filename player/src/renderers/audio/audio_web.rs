@@ -182,6 +182,17 @@ pub(super) fn start_thread(
     let ctx_for_cb = context.clone();
     let mut left: Vec<f32> = vec![0.0; BUFFER_FRAMES as usize];
     let mut right: Vec<f32> = vec![0.0; BUFFER_FRAMES as usize];
+    // Diagnostics only. `expected_playback` is where the next buffer would
+    // play if buffers were scheduled back to back; Chrome's ScriptProcessor
+    // jitters `playbackTime` by up to a buffer without dropping anything
+    // (109 callbacks per 5 s is exactly nominal), so a gap here is NOT
+    // evidence of missed output and must not be acted on — an earlier
+    // version skipped media to "catch up" and threw away ~20 % of the audio.
+    let mut expected_playback: Option<f64> = None;
+    let mut diag_callbacks = 0u32;
+    let mut diag_starved = 0u64;
+    let mut diag_gap_frames = 0i64;
+    let mut diag_last = 0f64;
     let onaudioprocess = Closure::<dyn FnMut(web_sys::AudioProcessingEvent)>::new(
         move |ev: web_sys::AudioProcessingEvent| {
             let Ok(out) = ev.output_buffer() else { return };
@@ -190,27 +201,59 @@ pub(super) fn start_thread(
                 left.resize(frames, 0.0);
                 right.resize(frames, 0.0);
             }
+            let playback = ev.playback_time();
+            let now = ctx_for_cb.current_time();
+            let rate = out_rate as f64;
             // How long until this buffer is audible — the device-side
             // latency the video sync loop compensates for.
-            let ahead = ev.playback_time() - ctx_for_cb.current_time();
-            let ms = (ahead * 1000.0) as i64;
+            let ms = ((playback - now) * 1000.0) as i64;
             if ms > 0 && ms <= 1000 {
                 output_latency_ms.store(ms as u64, Ordering::Relaxed);
             }
-            if paused_flag.load(Ordering::Relaxed) {
+            let paused = paused_flag.load(Ordering::Relaxed);
+            if let Some(exp) = expected_playback {
+                diag_gap_frames += ((playback - exp) * rate).round() as i64;
+            }
+            expected_playback = Some(playback + frames as f64 / rate);
+
+            if paused {
                 // Silence WITHOUT consuming — resume picks up exactly here.
                 left.iter_mut().for_each(|s| *s = 0.0);
                 right.iter_mut().for_each(|s| *s = 0.0);
             } else {
                 let vol = f32::from_bits(volume.load(Ordering::Relaxed));
                 for i in 0..frames {
-                    left[i] = cursor.next_sample().unwrap_or(0.0) * vol;
-                    right[i] = cursor.next_sample().unwrap_or(0.0) * vol;
+                    let l = cursor.next_sample();
+                    let r = cursor.next_sample();
+                    if l.is_none() {
+                        diag_starved += 1;
+                    }
+                    left[i] = l.unwrap_or(0.0) * vol;
+                    right[i] = r.unwrap_or(0.0) * vol;
                 }
-                cursor.commit();
             }
+            cursor.commit();
             let _ = out.copy_to_channel(&mut left, 0);
             let _ = out.copy_to_channel(&mut right, 1);
+
+            diag_callbacks += 1;
+            if now - diag_last >= 5.0 {
+                if diag_last > 0.0 {
+                    log::debug!(
+                        "[audio] web: {} callbacks/{:.1}s starved_frames={} playback_gap_frames={} latency={}ms state={:?}",
+                        diag_callbacks,
+                        now - diag_last,
+                        diag_starved,
+                        diag_gap_frames,
+                        ms,
+                        ctx_for_cb.state()
+                    );
+                }
+                diag_last = now;
+                diag_callbacks = 0;
+                diag_starved = 0;
+                diag_gap_frames = 0;
+            }
         },
     );
     node.set_onaudioprocess(Some(onaudioprocess.as_ref().unchecked_ref()));

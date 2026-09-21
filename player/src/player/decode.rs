@@ -139,11 +139,19 @@ fn prepare_blocking(
     })
 }
 
-/// Upper bound on event-loop turns the decode loops spend waiting for a
-/// callback-driven decoder to catch up (see `breathe!`): a few hundred ms
-/// even on a busy loop, so a decoder that produces nothing for a stretch
-/// of input (codec priming, a dropped frame) cannot wedge the loop.
-const MAX_BREATHE_TURNS: u32 = 200;
+/// Upper bound on the time the decode loops spend waiting for a
+/// callback-driven decoder to catch up (see `breathe!`), so a decoder that
+/// produces nothing for a stretch of input (codec priming, a dropped frame)
+/// cannot wedge the loop. Wall time, not turns: an idle event loop turns in
+/// well under a millisecond, and a WebCodecs decoder's first output after
+/// configure takes longer than a few hundred of those.
+const MAX_BREATHE: Duration = Duration::from_millis(1500);
+
+/// Cap on the end-of-stream drain wait. Kept under the sync loops' 300 ms
+/// "no frame" starvation heuristic: a codec flush normally completes in a
+/// few ms, and a tail that takes longer than this is not worth a spurious
+/// Buffering(Stall) (which also parks the audio sink) right before EndOfStream.
+const MAX_DRAIN: Duration = Duration::from_millis(250);
 
 /// Backpressure for callback-driven decoders (WebCodecs): while the decoder
 /// reports more input in flight than it wants, give the host event loop
@@ -157,11 +165,19 @@ const MAX_BREATHE_TURNS: u32 = 200;
 /// so no borrow of the `dyn` decoder is held across the await — the
 /// decoder traits are `Send`, not `Sync`.
 macro_rules! breathe {
-    ($decoder:expr, $stop_flag:expr) => {{
+    ($decoder:expr, $stop_flag:expr) => {
+        breathe!($decoder, $stop_flag, MAX_BREATHE)
+    };
+    ($decoder:expr, $stop_flag:expr, $cap:expr) => {{
+        let started = Instant::now();
         let mut turns = 0u32;
         while $decoder.wants_event_loop() && !$stop_flag.load(Ordering::Relaxed) {
-            if turns >= MAX_BREATHE_TURNS {
-                log::debug!("[dec] decoder still busy after {} event-loop turns; feeding anyway", turns);
+            if started.elapsed() >= $cap {
+                log::debug!(
+                    "[dec] decoder still busy after {} event-loop turns / {}ms; feeding anyway",
+                    turns,
+                    started.elapsed().as_millis()
+                );
                 break;
             }
             crate::rt::cooperative_yield().await;
@@ -332,6 +348,11 @@ pub(super) async fn video_decoder_task(
             log::info!("[dec] seg done: pts {}..{}ms", first / 1000, last_pts_us / 1000);
         }
     }
+
+    // End of input: let the codec emit what it still holds. A callback-driven
+    // decoder needs event-loop turns for that (native ones are pulled below).
+    decoder.signal_end_of_stream();
+    breathe!(decoder, stop_flag, MAX_DRAIN);
 
     // Final drain: with drain-before-submit, the last submitted sample's output
     // is still inside the codec — pull it before the reorder flush so the tail
@@ -527,6 +548,18 @@ pub(super) async fn audio_decoder_task(
             }
         }
     }
+
+    // End of input: emit the tail the decoder still holds (see the video task).
+    decoder.signal_end_of_stream();
+    breathe!(decoder, stop_flag, MAX_DRAIN);
+    while let Some(frame) = decoder.try_recv()? {
+        stats
+            .audio_last_decoded_pts_ms
+            .fetch_max(frame.pts_ms, Ordering::Relaxed);
+        if sender.send(frame).await.is_err() {
+            return Ok(());
+        }
+        stats.diag_audio_dec.fetch_add(1, Ordering::Relaxed);
+    }
     Ok(())
 }
-

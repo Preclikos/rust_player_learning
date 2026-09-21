@@ -403,6 +403,15 @@ pub trait HwVideoDecoder: Send {
         false
     }
 
+    /// No more input will follow: emit everything still held. Distinct from
+    /// [`flush`](Self::flush) (which some platforms implement as DISCARD —
+    /// MediaCodec) and a no-op by default, so native decoders keep their
+    /// end-of-stream behaviour. WebCodecs calls its `flush()` here and then
+    /// reports `wants_event_loop` until every queued output has arrived, so
+    /// the tail of the stream — up to a second of audio with the in-flight
+    /// depth the browser needs — is not lost at end of stream.
+    fn signal_end_of_stream(&mut self) {}
+
     fn is_direct(&self) -> bool {
         false
     }
@@ -419,6 +428,9 @@ pub trait AudioDecoder: Send {
     fn wants_event_loop(&self) -> bool {
         false
     }
+
+    /// See [`HwVideoDecoder::signal_end_of_stream`].
+    fn signal_end_of_stream(&mut self) {}
     /// Install codec parameters. Called once before the first `submit`.
     fn configure(&mut self, params: AudioDecoderParams) -> Result<(), DecoderError>;
 

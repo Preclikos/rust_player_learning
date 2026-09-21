@@ -119,6 +119,28 @@ fn is_irap_sample(sample: &[u8], len_size: usize) -> bool {
     false
 }
 
+/// Kick off a codec `flush()` and hand back the flag its promise flips when
+/// every pending output has been emitted (also on rejection — a closed
+/// codec has nothing left to deliver). `None` (no decoder) is done already.
+fn start_flush<P: Into<JsValue>>(flush: Option<P>) -> Rc<Cell<bool>> {
+    let done = Rc::new(Cell::new(flush.is_none()));
+    if let Some(promise) = flush {
+        let flag = Rc::clone(&done);
+        let promise: js_sys::Promise = promise.into().unchecked_into();
+        let started = crate::rt::Instant::now();
+        wasm_bindgen_futures::spawn_local(async move {
+            let r = JsFuture::from(promise).await;
+            log::debug!(
+                "[webcodecs] flush {} after {}ms",
+                if r.is_ok() { "resolved" } else { "rejected" },
+                started.elapsed().as_millis()
+            );
+            flag.set(true);
+        });
+    }
+    done
+}
+
 /// In-flight bound (samples submitted minus outputs delivered) past which
 /// the decode loop yields to the event loop. See `wants_event_loop` on the
 /// two decoders. Each turn of the event loop costs ~10 ms of other queued
@@ -173,6 +195,12 @@ pub struct WebCodecsVideoDecoder {
     /// Chunks handed to `decode()`; with `shared.delivered` gives the
     /// in-flight count that paces the decode loop.
     submitted: Cell<u64>,
+    /// End of input signalled: `Some(done)` where `done` flips once the
+    /// codec's `flush()` promise resolved — every queued output has been
+    /// delivered. While draining, `wants_event_loop` follows this instead
+    /// of the in-flight bound (an AU the codec swallowed, e.g. priming,
+    /// would otherwise keep the count above zero forever).
+    draining: Option<Rc<Cell<bool>>>,
     /// Closures must outlive the decoder they are registered on.
     _output_cb: Option<Closure<dyn FnMut(web_sys::VideoFrame)>>,
     _error_cb: Option<Closure<dyn FnMut(JsValue)>>,
@@ -198,6 +226,7 @@ impl WebCodecsVideoDecoder {
             nal_len_size: 4,
             await_key: true,
             submitted: Cell::new(0),
+            draining: None,
             _output_cb: None,
             _error_cb: None,
         }
@@ -509,7 +538,17 @@ impl HwVideoDecoder for WebCodecsVideoDecoder {
     /// turn. Never wedges: a yield always returns, and an AU that produces
     /// no output just costs one extra turn.
     fn wants_event_loop(&self) -> bool {
+        if let Some(done) = &self.draining {
+            return !done.get();
+        }
         self.submitted.get().saturating_sub(self.shared.delivered.get()) >= VIDEO_IN_FLIGHT
+    }
+
+    fn signal_end_of_stream(&mut self) {
+        if self.draining.is_some() {
+            return;
+        }
+        self.draining = Some(start_flush(self.decoder.as_ref().map(|d| d.flush())));
     }
 
     fn try_recv(&mut self) -> Result<Option<DecodedVideoFrame>, DecoderError> {
@@ -572,6 +611,8 @@ pub struct WebCodecsAudioDecoder {
     /// Chunks handed to `decode()`; with `shared.frames_out` (outputs
     /// delivered) gives the in-flight count that paces the decode loop.
     submitted: Cell<u64>,
+    /// See the video decoder's `draining`.
+    draining: Option<Rc<Cell<bool>>>,
     _output_cb: Option<Closure<dyn FnMut(web_sys::AudioData)>>,
     _error_cb: Option<Closure<dyn FnMut(JsValue)>>,
 }
@@ -591,6 +632,7 @@ impl WebCodecsAudioDecoder {
                 resampler: RefCell::new(None),
             }),
             submitted: Cell::new(0),
+            draining: None,
             _output_cb: None,
             _error_cb: None,
         }
@@ -730,7 +772,17 @@ impl AudioDecoder for WebCodecsAudioDecoder {
     /// feeding thousands of AUs without a turn makes the decoder stop
     /// delivering output altogether.
     fn wants_event_loop(&self) -> bool {
+        if let Some(done) = &self.draining {
+            return !done.get();
+        }
         self.submitted.get().saturating_sub(self.shared.frames_out.get()) >= AUDIO_IN_FLIGHT
+    }
+
+    fn signal_end_of_stream(&mut self) {
+        if self.draining.is_some() {
+            return;
+        }
+        self.draining = Some(start_flush(self.decoder.as_ref().map(|d| d.flush())));
     }
 
     fn try_recv(&mut self) -> Result<Option<DecodedAudioFrame>, DecoderError> {

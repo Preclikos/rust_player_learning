@@ -13,16 +13,12 @@
 //! LATE drop) is done with them; the in-flight pacing below keeps the
 //! browser's decoder pool from filling up.
 //!
-//! HDR frames take the same GPU path; the renderer copies them into an
-//! `rgba16float` texture, where WebGPU preserves the extended range, and
-//! runs the engine's tonemap curve on the result (shader_rgba_hdr.wgsl).
-//! Hardware-decoded frames are opaque anyway (`format` null) — their planes
-//! could not be read out even if we wanted to.
-//!
-//! The CPU copy-out path ([`CpuPlanarFrame`]) is kept as an opt-in for
-//! software-decoded frames with a readable format: it feeds the P010 planes
-//! to the very same shader chain desktop and Apple use, which is the one
-//! way to A/B the browser's colour conversion against the engine's.
+//! HDR frames take the same path and get the BROWSER's tone-map: measured in
+//! Chrome, both `copyExternalImageToTexture` and `importExternalTexture`
+//! hand over already tone-mapped values whatever the canvas mode, and
+//! hardware-decoded frames are opaque (`format` null) so their planes can't
+//! be read out either. The web shell therefore plays the SDR ladder by
+//! default (see platform/web).
 //!
 //! `unsafe impl Send`: wasm32-unknown-unknown without `atomics` is a single
 //! thread, so the `Send` bounds on the decoder traits can never be exercised.
@@ -39,11 +35,11 @@ use wasm_bindgen_futures::JsFuture;
 
 use super::pcm::{downmix_to_stereo, interleave, LinearResampler};
 use super::{
-    AudioCodec, AudioDecoder, AudioDecoderParams, CpuPlanarFrame, DecodedAudioFrame,
-    DecodedVideoFrame, DecoderError, HwVideoDecoder, PlatformFrame, VideoColorInfo,
-    VideoDecoderParams, WebVideoFrame,
+    AudioCodec, AudioDecoder, AudioDecoderParams, DecodedAudioFrame, DecodedVideoFrame,
+    DecoderError, HwVideoDecoder, PlatformFrame, VideoColorInfo, VideoDecoderParams,
+    WebVideoFrame,
 };
-use crate::parsers::hevc::nal_unit_type;
+use crate::parsers::hevc::{hevc_codec_string, hvcc_nal_length_size, is_irap_sample};
 
 fn describe(e: &JsValue) -> String {
     if let Some(ex) = e.dyn_ref::<web_sys::DomException>() {
@@ -57,76 +53,6 @@ fn describe(e: &JsValue) -> String {
 
 fn js_err(prefix: &str, e: JsValue) -> DecoderError {
     format!("{prefix}: {}", describe(&e)).into()
-}
-
-// ---------------------------------------------------------------------------
-// hvcC helpers
-// ---------------------------------------------------------------------------
-
-/// Codec parameter string (ISO/IEC 14496-15 Annex E.3) from an
-/// HEVCDecoderConfigurationRecord: `hvc1.<profile>.<compat>.<tier><level>[.<constraints>]`,
-/// e.g. `hvc1.1.6.L120.B0` for Main@L4.0 or `hvc1.2.4.L153.B0` for Main 10@L5.1.
-pub fn hevc_codec_string(hvcc: &[u8]) -> Option<String> {
-    if hvcc.len() < 23 {
-        return None;
-    }
-    let profile_space = hvcc[1] >> 6;
-    let tier = (hvcc[1] >> 5) & 1;
-    let profile_idc = hvcc[1] & 0x1f;
-    // The 32 compatibility flags are written in REVERSE bit order, as hex.
-    let compat = u32::from_be_bytes([hvcc[2], hvcc[3], hvcc[4], hvcc[5]]).reverse_bits();
-    let constraints = &hvcc[6..12];
-    let level_idc = hvcc[12];
-
-    let mut s = String::from("hvc1.");
-    match profile_space {
-        1 => s.push('A'),
-        2 => s.push('B'),
-        3 => s.push('C'),
-        _ => {}
-    }
-    s.push_str(&profile_idc.to_string());
-    s.push_str(&format!(".{:X}", compat));
-    s.push_str(&format!(".{}{}", if tier == 1 { 'H' } else { 'L' }, level_idc));
-    // Constraint bytes with trailing zero bytes omitted.
-    let mut end = constraints.len();
-    while end > 0 && constraints[end - 1] == 0 {
-        end -= 1;
-    }
-    for b in &constraints[..end] {
-        s.push_str(&format!(".{:X}", b));
-    }
-    Some(s)
-}
-
-/// `lengthSizeMinusOne + 1` from the record: the byte width of the NAL
-/// length prefixes in the samples (4 for every stream we have seen).
-fn nal_length_size(hvcc: &[u8]) -> usize {
-    hvcc.get(21).map(|b| (b & 0x03) as usize + 1).unwrap_or(4)
-}
-
-/// Whether a length-prefixed HEVC sample contains an IRAP picture (BLA /
-/// IDR / CRA, nal_unit_type 16..=23). WebCodecs must be told which chunks
-/// are key frames and refuses a delta chunk right after `configure`.
-fn is_irap_sample(sample: &[u8], len_size: usize) -> bool {
-    let mut i = 0usize;
-    while i + len_size <= sample.len() {
-        let mut n = 0usize;
-        for k in 0..len_size {
-            n = (n << 8) | sample[i + k] as usize;
-        }
-        i += len_size;
-        if n == 0 || i + n > sample.len() {
-            break;
-        }
-        if let Some(t) = nal_unit_type(&sample[i..i + n]) {
-            if (16..=23).contains(&t) {
-                return true;
-            }
-        }
-        i += n;
-    }
-    false
 }
 
 /// Kick off a codec `flush()` and hand back the flag its promise flips when
@@ -151,11 +77,6 @@ fn start_flush<P: Into<JsValue>>(flush: Option<P>) -> Rc<Cell<bool>> {
     done
 }
 
-/// Opt-in: copy frames OUT to CPU planes (when the browser exposes their
-/// pixel format) instead of the GPU path. For A/B-ing colour conversions,
-/// not for playback — the copy is ~3 MB per 1080p frame on the main thread.
-const WEB_CPU_PLANES_OPT_IN: bool = false;
-
 /// In-flight bound (samples submitted minus outputs delivered) past which
 /// the decode loop yields to the event loop. See `wants_event_loop` on the
 /// two decoders. Each turn of the event loop costs ~10 ms of other queued
@@ -173,23 +94,14 @@ const AUDIO_IN_FLIGHT: u64 = 96;
 /// State shared between the decoder object and the JS output / error
 /// callbacks (which own `Rc` clones).
 struct VideoShared {
-    /// Frames copied out and ready for `try_recv`, in output order.
+    /// Frames ready for `try_recv`, in output order.
     ready: RefCell<VecDeque<DecodedVideoFrame>>,
-    /// Frames delivered by WebCodecs, awaiting the (async) copy-out. Drained
-    /// sequentially by one pump task so output order is preserved.
-    pending: RefCell<VecDeque<web_sys::VideoFrame>>,
-    pump_active: Cell<bool>,
     /// First error reported by the decoder; surfaced on the next
     /// `submit` / `try_recv` so the pipeline restarts.
     error: RefCell<Option<String>>,
     color: Cell<VideoColorInfo>,
-    /// True = copy out to CPU planes (HDR); false = hand the GPU frame on.
-    cpu_planes: Cell<bool>,
-    /// Log an unsupported pixel format once, not per frame.
-    warned_format: Cell<bool>,
-    /// Frames the browser has handed to the output callback (before copy-out).
+    /// Frames the browser has handed to the output callback.
     delivered: Cell<u64>,
-    frames_out: Cell<u64>,
 }
 
 impl VideoShared {
@@ -232,14 +144,9 @@ impl WebCodecsVideoDecoder {
             decoder: None,
             shared: Rc::new(VideoShared {
                 ready: RefCell::new(VecDeque::new()),
-                pending: RefCell::new(VecDeque::new()),
-                pump_active: Cell::new(false),
                 error: RefCell::new(None),
                 color: Cell::new(VideoColorInfo::default()),
-                cpu_planes: Cell::new(false),
-                warned_format: Cell::new(false),
                 delivered: Cell::new(0),
-                frames_out: Cell::new(0),
             }),
             nal_len_size: 4,
             await_key: true,
@@ -264,234 +171,21 @@ impl Default for WebCodecsVideoDecoder {
     }
 }
 
-/// Output callback. GPU path: wrap and queue the frame as-is. CPU path
-/// (HDR): queue it for the copy-out pump.
+/// Output callback: wrap the GPU-resident frame and queue it for `try_recv`.
 fn on_video_output(shared: &Rc<VideoShared>, frame: web_sys::VideoFrame) {
     shared.delivered.set(shared.delivered.get() + 1);
-    // The CPU-planes opt-in needs a readable pixel format. Hardware-decoded
-    // frames are often OPAQUE (`format` null — Chrome's D3D11 10-bit output,
-    // for one): `copyTo` cannot read them, so they take the GPU path.
-    let readable = frame.format().is_some();
-    if shared.cpu_planes.get() && !readable && !shared.warned_format.replace(true) {
-        log::info!("[webcodecs] frames are opaque (no readable pixel format) — GPU path");
-    }
-    if !(shared.cpu_planes.get() && readable) {
-        let pts_us = frame.timestamp() as i64;
-        let wrapped = WebVideoFrame::new(frame);
-        let (width, height) = (wrapped.width, wrapped.height);
-        shared.frames_out.set(shared.frames_out.get() + 1);
-        shared.ready.borrow_mut().push_back(DecodedVideoFrame {
-            pts_us,
-            width,
-            height,
-            native: PlatformFrame::WebVideoFrame(wrapped),
-            desired_present_ns: 0,
-            color: shared.color.get(),
-            hdr_meta: None,
-        });
-        return;
-    }
-    shared.pending.borrow_mut().push_back(frame);
-    if shared.pump_active.replace(true) {
-        return;
-    }
-    let s = Rc::clone(shared);
-    wasm_bindgen_futures::spawn_local(async move {
-        loop {
-            let next = s.pending.borrow_mut().pop_front();
-            let Some(frame) = next else { break };
-            let pts_us = frame.timestamp() as i64;
-            match copy_out(&frame, &s).await {
-                Ok(Some(planes)) => {
-                    let (width, height) = (planes.width, planes.height);
-                    s.frames_out.set(s.frames_out.get() + 1);
-                    s.ready.borrow_mut().push_back(DecodedVideoFrame {
-                        pts_us,
-                        width,
-                        height,
-                        native: PlatformFrame::CpuPlanes(planes),
-                        desired_present_ns: 0,
-                        color: s.color.get(),
-                        hdr_meta: None,
-                    });
-                }
-                Ok(None) => {}
-                Err(e) => s.fail(format!("copy-out: {e}")),
-            }
-            frame.close();
-        }
-        s.pump_active.set(false);
+    let pts_us = frame.timestamp() as i64;
+    let wrapped = WebVideoFrame::new(frame);
+    let (width, height) = (wrapped.width, wrapped.height);
+    shared.ready.borrow_mut().push_back(DecodedVideoFrame {
+        pts_us,
+        width,
+        height,
+        native: PlatformFrame::WebVideoFrame(wrapped),
+        desired_present_ns: 0,
+        color: shared.color.get(),
+        hdr_meta: None,
     });
-}
-
-/// Read the `PlaneLayout[]` a `copyTo` resolved with.
-fn plane_layouts(v: JsValue) -> Result<Vec<(usize, usize)>, String> {
-    let arr: js_sys::Array = v.dyn_into().map_err(|_| "copyTo did not return an array")?;
-    Ok(arr
-        .iter()
-        .map(|p| {
-            let p: web_sys::PlaneLayout = p.unchecked_into();
-            (p.get_offset() as usize, p.get_stride() as usize)
-        })
-        .collect())
-}
-
-/// Copy one row-padded plane into a tightly packed one.
-fn pack_plane(src: &[u8], offset: usize, stride: usize, row_bytes: usize, rows: usize) -> Vec<u8> {
-    let mut out = Vec::with_capacity(row_bytes * rows);
-    for r in 0..rows {
-        let start = offset + r * stride;
-        let end = (start + row_bytes).min(src.len());
-        if start >= end {
-            out.resize(out.len() + row_bytes, 0);
-            continue;
-        }
-        out.extend_from_slice(&src[start..end]);
-        if end - start < row_bytes {
-            out.resize(out.len() + (row_bytes - (end - start)), 0);
-        }
-    }
-    out
-}
-
-/// Interleave separate 8-bit U and V planes into NV12's UV plane.
-fn interleave_uv8(src: &[u8], u: (usize, usize), v: (usize, usize), w: usize, h: usize) -> Vec<u8> {
-    let mut out = vec![0u8; w * h * 2];
-    for r in 0..h {
-        for c in 0..w {
-            let iu = u.0 + r * u.1 + c;
-            let iv = v.0 + r * v.1 + c;
-            out[(r * w + c) * 2] = src.get(iu).copied().unwrap_or(128);
-            out[(r * w + c) * 2 + 1] = src.get(iv).copied().unwrap_or(128);
-        }
-    }
-    out
-}
-
-/// 16-bit little-endian planar samples, low-aligned (`I420P10` stores a
-/// 10-bit code in the low bits) → MSB-aligned like P010 (`code << shift`),
-/// tightly packed. `shift` = 16 − bit depth.
-fn pack_plane16_msb(src: &[u8], offset: usize, stride: usize, w: usize, h: usize, shift: u32) -> Vec<u8> {
-    let mut out = Vec::with_capacity(w * h * 2);
-    for r in 0..h {
-        let row = offset + r * stride;
-        for c in 0..w {
-            let i = row + c * 2;
-            let v = if i + 1 < src.len() {
-                u16::from_le_bytes([src[i], src[i + 1]])
-            } else {
-                0
-            };
-            out.extend_from_slice(&(v << shift).to_le_bytes());
-        }
-    }
-    out
-}
-
-fn interleave_uv16_msb(src: &[u8], u: (usize, usize), v: (usize, usize), w: usize, h: usize, shift: u32) -> Vec<u8> {
-    let mut out = Vec::with_capacity(w * h * 4);
-    let rd = |off: usize| -> u16 {
-        if off + 1 < src.len() {
-            u16::from_le_bytes([src[off], src[off + 1]]) << shift
-        } else {
-            0
-        }
-    };
-    for r in 0..h {
-        for c in 0..w {
-            out.extend_from_slice(&rd(u.0 + r * u.1 + c * 2).to_le_bytes());
-            out.extend_from_slice(&rd(v.0 + r * v.1 + c * 2).to_le_bytes());
-        }
-    }
-    out
-}
-
-/// Copy the frame's visible rectangle out of the browser into a
-/// [`CpuPlanarFrame`]. `Ok(None)` = a pixel format we don't handle (logged
-/// once; the frame is dropped).
-async fn copy_out(frame: &web_sys::VideoFrame, shared: &VideoShared) -> Result<Option<CpuPlanarFrame>, String> {
-    use web_sys::VideoPixelFormat as F;
-    let Some(format) = frame.format() else {
-        return Err("frame has no pixel format".into());
-    };
-    let (w, h) = match frame.visible_rect() {
-        Some(r) => (r.width() as u32, r.height() as u32),
-        None => (frame.coded_width(), frame.coded_height()),
-    };
-    if w == 0 || h == 0 {
-        return Err("zero-sized frame".into());
-    }
-    let (bit_depth, shift) = match format {
-        F::Nv12 | F::I420 => (8u8, 0u32),
-        F::I420p10 => (10, 6),
-        F::I420p12 => (12, 4),
-        other => {
-            if !shared.warned_format.replace(true) {
-                log::warn!(
-                    "[webcodecs] unsupported VideoFrame format {:?} — frames dropped (only NV12 / I420 / I420P10 / I420P12 are handled)",
-                    other
-                );
-            }
-            return Ok(None);
-        }
-    };
-
-    // Copy into a JS-owned buffer (not a view of wasm memory: the copy is
-    // async and wasm memory may move under a view while it's in flight),
-    // then pull it into Rust.
-    let size = frame.allocation_size().map_err(|e| describe(&e))? as usize;
-    let js_buf = Uint8Array::new_with_length(size as u32);
-    let layouts = JsFuture::from(frame.copy_to_with_buffer_source(&js_buf))
-        .await
-        .map_err(|e| describe(&e))?;
-    let layouts = plane_layouts(JsValue::from(layouts))?;
-    let mut raw = vec![0u8; size];
-    js_buf.copy_to(&mut raw);
-
-    let (wu, hu) = ((w as usize).div_ceil(2), (h as usize).div_ceil(2));
-    let (w, h) = (w as usize, h as usize);
-    let planes = match format {
-        F::Nv12 => {
-            let (y, uv) = (layouts.first().copied().ok_or("NV12: no Y layout")?, layouts.get(1).copied().ok_or("NV12: no UV layout")?);
-            CpuPlanarFrame {
-                width: w as u32,
-                height: h as u32,
-                bit_depth: 8,
-                y: pack_plane(&raw, y.0, y.1, w, h),
-                uv: pack_plane(&raw, uv.0, uv.1, wu * 2, hu),
-            }
-        }
-        F::I420 => {
-            let (y, u, v) = (
-                layouts.first().copied().ok_or("I420: no Y layout")?,
-                layouts.get(1).copied().ok_or("I420: no U layout")?,
-                layouts.get(2).copied().ok_or("I420: no V layout")?,
-            );
-            CpuPlanarFrame {
-                width: w as u32,
-                height: h as u32,
-                bit_depth: 8,
-                y: pack_plane(&raw, y.0, y.1, w, h),
-                uv: interleave_uv8(&raw, u, v, wu, hu),
-            }
-        }
-        _ => {
-            // I420P10 / I420P12: 16-bit LE planar, low-aligned.
-            let (y, u, v) = (
-                layouts.first().copied().ok_or("I420Pxx: no Y layout")?,
-                layouts.get(1).copied().ok_or("I420Pxx: no U layout")?,
-                layouts.get(2).copied().ok_or("I420Pxx: no V layout")?,
-            );
-            CpuPlanarFrame {
-                width: w as u32,
-                height: h as u32,
-                bit_depth,
-                y: pack_plane16_msb(&raw, y.0, y.1, w, h, shift),
-                uv: interleave_uv16_msb(&raw, u, v, wu, hu, shift),
-            }
-        }
-    };
-    Ok(Some(planes))
 }
 
 impl HwVideoDecoder for WebCodecsVideoDecoder {
@@ -503,11 +197,8 @@ impl HwVideoDecoder for WebCodecsVideoDecoder {
         let record = &params.decoder_config_record;
         let codec = hevc_codec_string(record)
             .ok_or_else(|| -> DecoderError { "webcodecs: no hvcC record in init segment".into() })?;
-        self.nal_len_size = nal_length_size(record);
+        self.nal_len_size = hvcc_nal_length_size(record);
         self.shared.color.set(params.color);
-        // GPU path for every representation (see the module docs); the CPU
-        // copy-out stays an explicit opt-in for A/B work.
-        self.shared.cpu_planes.set(WEB_CPU_PLANES_OPT_IN);
 
         let shared = Rc::clone(&self.shared);
         let output_cb = Closure::<dyn FnMut(web_sys::VideoFrame)>::new(move |frame| {
@@ -535,13 +226,12 @@ impl HwVideoDecoder for WebCodecsVideoDecoder {
             .configure(&config)
             .map_err(|e| js_err(&format!("VideoDecoder::configure({codec})"), e))?;
         log::info!(
-            "[webcodecs] video configured: {} {}x{} {}-bit {:?} → {}",
+            "[webcodecs] video configured: {} {}x{} {}-bit {:?}",
             codec,
             params.width,
             params.height,
             params.color.bit_depth,
-            params.color.transfer,
-            if WEB_CPU_PLANES_OPT_IN { "CPU planes" } else { "GPU frame (copyExternalImageToTexture)" }
+            params.color.transfer
         );
 
         self.decoder = Some(decoder);
@@ -620,10 +310,7 @@ impl Drop for WebCodecsVideoDecoder {
                 let _ = d.close();
             }
         }
-        for f in self.shared.pending.borrow_mut().drain(..) {
-            f.close();
-        }
-        log::debug!("[webcodecs] video decoder closed after {} frames", self.shared.frames_out.get());
+        log::debug!("[webcodecs] video decoder closed after {} frames", self.shared.delivered.get());
     }
 }
 
@@ -851,32 +538,5 @@ impl Drop for WebCodecsAudioDecoder {
                 let _ = d.close();
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn codec_string_main_profile() {
-        // configurationVersion=1, profile_space=0 tier=0 profile_idc=1,
-        // compat flags 0x60000000, constraints 90 00 00 00 00 00, level 120.
-        let mut hvcc = vec![1u8, 0x01, 0x60, 0, 0, 0, 0x90, 0, 0, 0, 0, 0, 120];
-        hvcc.resize(23, 0);
-        hvcc[21] = 0x0f; // lengthSizeMinusOne = 3
-        assert_eq!(hevc_codec_string(&hvcc).as_deref(), Some("hvc1.1.6.L120.90"));
-        assert_eq!(nal_length_size(&hvcc), 4);
-    }
-
-    #[test]
-    fn irap_detection_walks_length_prefixed_nals() {
-        // 4-byte length, one AUD (type 35) then one IDR_W_RADL (type 19).
-        let aud = [0u8, 0, 0, 2, 35 << 1, 0x01];
-        let idr = [0u8, 0, 0, 3, 19 << 1, 0x01, 0xAF];
-        let mut sample = aud.to_vec();
-        assert!(!is_irap_sample(&sample, 4));
-        sample.extend_from_slice(&idr);
-        assert!(is_irap_sample(&sample, 4));
     }
 }

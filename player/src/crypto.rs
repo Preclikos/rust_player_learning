@@ -172,6 +172,7 @@ pub trait Decryptor: Send + Sync {
     /// engine — the browser build uses WebCrypto, off the main thread.
     /// `None` (the default) for key stores that never expose material; the
     /// caller then decrypts through [`decrypt_sample`](Self::decrypt_sample).
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
     fn raw_key(&self, _kid: &[u8; 16]) -> Option<[u8; 16]> {
         None
     }

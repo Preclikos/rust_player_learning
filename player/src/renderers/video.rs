@@ -9,7 +9,7 @@ use video_frame::VideoFrame;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 use video_metal::{MetalNV12Frame, MetalTextureCache};
 #[cfg(target_arch = "wasm32")]
-use crate::decoders::{CpuPlanarFrame, WebVideoFrame};
+use crate::decoders::WebVideoFrame;
 use wgpu::{Backends, Buffer};
 use wgpu::{Device, SurfaceConfiguration};
 // Additive: alternate offscreen output for in-app video (shared-device).
@@ -107,18 +107,6 @@ enum SurfaceSource {
     /// Browser: a host-provided `<canvas>` element.
     #[cfg(target_arch = "wasm32")]
     Canvas(web_sys::HtmlCanvasElement),
-}
-
-/// Browser: the two plane textures the CPU-frame path uploads into. Reused
-/// across frames while the size / bit depth stay the same (one allocation
-/// per representation, not per frame).
-#[cfg(target_arch = "wasm32")]
-struct CpuPlaneTextures {
-    width: u32,
-    height: u32,
-    sixteen_bit: bool,
-    y: wgpu::Texture,
-    uv: wgpu::Texture,
 }
 
 #[repr(C)]
@@ -260,13 +248,10 @@ pub struct VideoRenderer {
     /// the main video quad. Android's GLES OES path doesn't call it
     /// yet — subtitle rendering there is a separate follow-up.
     subtitle_overlay: Arc<std::sync::Mutex<Option<Arc<super::subtitle::SubtitleOverlay>>>>,
-    /// Browser: plane textures for [`PlatformFrame::CpuPlanes`] uploads.
-    /// `std::sync::Mutex` — touched only inside the (single-threaded) render
-    /// path, never held across an await.
-    #[cfg(target_arch = "wasm32")]
-    cpu_planes: std::sync::Mutex<Option<CpuPlaneTextures>>,
     /// Browser: the RGBA8 destination of `copyExternalImageToTexture` for
     /// [`PlatformFrame::WebVideoFrame`], reused while the frame size holds.
+    /// `std::sync::Mutex` — touched only inside the (single-threaded) render
+    /// path, never held across an await.
     #[cfg(target_arch = "wasm32")]
     web_rgba: std::sync::Mutex<Option<(u32, u32, wgpu::Texture)>>,
     /// Browser: textured-quad pipeline over the browser-converted frame
@@ -1155,8 +1140,6 @@ impl VideoRenderer {
             command_sender,
             subtitle_overlay: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(target_arch = "wasm32")]
-            cpu_planes: std::sync::Mutex::new(None),
-            #[cfg(target_arch = "wasm32")]
             web_rgba: std::sync::Mutex::new(None),
             #[cfg(target_arch = "wasm32")]
             render_pipeline_rgba,
@@ -1513,8 +1496,6 @@ impl VideoRenderer {
             )),
             command_sender,
             subtitle_overlay: Arc::new(std::sync::Mutex::new(None)),
-            #[cfg(target_arch = "wasm32")]
-            cpu_planes: std::sync::Mutex::new(None),
             #[cfg(target_arch = "wasm32")]
             web_rgba: std::sync::Mutex::new(None),
             #[cfg(target_arch = "wasm32")]
@@ -1895,10 +1876,6 @@ impl VideoRenderer {
                 self.render_cv_pixel_buffer(cv_buf, frame_color).await;
             }
             #[cfg(target_arch = "wasm32")]
-            PlatformFrame::CpuPlanes(planes) => {
-                self.render_cpu_planes(planes, frame_color).await;
-            }
-            #[cfg(target_arch = "wasm32")]
             PlatformFrame::WebVideoFrame(vf) => {
                 self.render_web_video_frame(vf, frame_color).await;
             }
@@ -1973,118 +1950,6 @@ impl VideoRenderer {
         );
         let view = texture.create_view(&Default::default());
         self.draw_planes(&view, &view, w, h, false, Some(pipeline)).await;
-    }
-
-    /// Browser: upload a CPU NV12 / P010 frame as two plane textures and draw
-    /// it through the shared two-plane path. 10-bit content falls back to
-    /// 8-bit planes (top byte of each MSB-aligned sample) when the device has
-    /// no 16-bit-norm textures — the tonemap still runs, at 8-bit quantization.
-    #[cfg(target_arch = "wasm32")]
-    async fn render_cpu_planes(&self, frame: CpuPlanarFrame, color: crate::decoders::VideoColorInfo) {
-        if self.texture_bind_group_layout.is_none() {
-            return;
-        }
-        let device_16bit = self
-            .device
-            .features()
-            .contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM);
-        let sixteen_bit = frame.bit_depth > 8 && device_16bit;
-        let (y_data, uv_data): (std::borrow::Cow<[u8]>, std::borrow::Cow<[u8]>) =
-            if frame.bit_depth > 8 && !device_16bit {
-                // MSB-aligned 16-bit LE → high byte is the top 8 bits.
-                let hi = |v: &[u8]| v.chunks_exact(2).map(|p| p[1]).collect::<Vec<u8>>();
-                (hi(&frame.y).into(), hi(&frame.uv).into())
-            } else {
-                ((&frame.y[..]).into(), (&frame.uv[..]).into())
-            };
-        let bpp: u32 = if sixteen_bit { 2 } else { 1 };
-        let (w, h) = (frame.width.max(1), frame.height.max(1));
-        let (uv_w, uv_h) = (w.div_ceil(2), h.div_ceil(2));
-
-        let (y_tex, uv_tex) = {
-            let mut slot = self.cpu_planes.lock().unwrap();
-            let stale = match slot.as_ref() {
-                Some(t) => t.width != w || t.height != h || t.sixteen_bit != sixteen_bit,
-                None => true,
-            };
-            if stale {
-                let (y_fmt, uv_fmt) = if sixteen_bit {
-                    (TextureFormat::R16Unorm, TextureFormat::Rg16Unorm)
-                } else {
-                    (TextureFormat::R8Unorm, TextureFormat::Rg8Unorm)
-                };
-                let make = |label: &str, tw: u32, th: u32, format: TextureFormat| {
-                    self.device.create_texture(&wgpu::TextureDescriptor {
-                        label: Some(label),
-                        size: wgpu::Extent3d {
-                            width: tw,
-                            height: th,
-                            depth_or_array_layers: 1,
-                        },
-                        mip_level_count: 1,
-                        sample_count: 1,
-                        dimension: wgpu::TextureDimension::D2,
-                        format,
-                        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                        view_formats: &[],
-                    })
-                };
-                log::info!(
-                    "[renderer] web plane textures {}x{} {}-bit ({:?}/{:?})",
-                    w,
-                    h,
-                    if sixteen_bit { 16 } else { 8 },
-                    y_fmt,
-                    uv_fmt
-                );
-                *slot = Some(CpuPlaneTextures {
-                    width: w,
-                    height: h,
-                    sixteen_bit,
-                    y: make("web Y plane", w, h, y_fmt),
-                    uv: make("web UV plane", uv_w, uv_h, uv_fmt),
-                });
-            }
-            let t = slot.as_ref().unwrap();
-            (t.y.clone(), t.uv.clone())
-        };
-
-        let upload = |tex: &wgpu::Texture, data: &[u8], tw: u32, th: u32, row_bytes: u32| {
-            if data.len() < (row_bytes * th) as usize {
-                log::warn!(
-                    "[renderer] short plane: {} < {}x{} bytes",
-                    data.len(),
-                    row_bytes,
-                    th
-                );
-                return;
-            }
-            self.queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: tex,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                &data[..(row_bytes * th) as usize],
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(row_bytes),
-                    rows_per_image: Some(th),
-                },
-                wgpu::Extent3d {
-                    width: tw,
-                    height: th,
-                    depth_or_array_layers: 1,
-                },
-            );
-        };
-        upload(&y_tex, &y_data, w, h, w * bpp);
-        upload(&uv_tex, &uv_data, uv_w, uv_h, uv_w * 2 * bpp);
-
-        let y_view = y_tex.create_view(&Default::default());
-        let uv_view = uv_tex.create_view(&Default::default());
-        self.draw_planes(&y_view, &uv_view, w, h, color.is_hdr(), None).await;
     }
 
     /// Windows / Linux FFmpeg → wgpu native-import draw path. macOS / iOS
@@ -2425,7 +2290,7 @@ impl VideoRenderer {
     }
 
     /// Draw one frame given its two plane views (Y, interleaved UV) — the
-    /// shared tail of the Apple zero-copy path and the browser CPU-upload
+    /// shared tail of the Apple zero-copy path and the browser GPU-frame
     /// path: pipeline selection (SDR vs HDR tonemap + detection passes), the
     /// bind groups, the surface acquire / present. `is_hdr` follows the
     /// frame's signalled transfer; it draws through the SDR pipeline when the

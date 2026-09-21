@@ -684,3 +684,115 @@ mod tests {
         assert_eq!(info.matrix_coeffs, 9);
     }
 }
+
+// ---------------------------------------------------------------------------
+// hvcC (HEVCDecoderConfigurationRecord) helpers — shared by the decoders that
+// take the record whole (WebCodecs) and testable on every host.
+// ---------------------------------------------------------------------------
+
+/// Codec parameter string (ISO/IEC 14496-15 Annex E.3) from an
+/// HEVCDecoderConfigurationRecord: `hvc1.<profile>.<compat>.<tier><level>[.<constraints>]`,
+/// e.g. `hvc1.1.6.L120.90` for Main@L4.0 or `hvc1.2.4.L153.90` for Main 10@L5.1.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+pub fn hevc_codec_string(hvcc: &[u8]) -> Option<String> {
+    if hvcc.len() < 23 {
+        return None;
+    }
+    let profile_space = hvcc[1] >> 6;
+    let tier = (hvcc[1] >> 5) & 1;
+    let profile_idc = hvcc[1] & 0x1f;
+    // The 32 compatibility flags are written in REVERSE bit order, as hex.
+    let compat = u32::from_be_bytes([hvcc[2], hvcc[3], hvcc[4], hvcc[5]]).reverse_bits();
+    let constraints = &hvcc[6..12];
+    let level_idc = hvcc[12];
+
+    let mut s = String::from("hvc1.");
+    match profile_space {
+        1 => s.push('A'),
+        2 => s.push('B'),
+        3 => s.push('C'),
+        _ => {}
+    }
+    s.push_str(&profile_idc.to_string());
+    s.push_str(&format!(".{:X}", compat));
+    s.push_str(&format!(".{}{}", if tier == 1 { 'H' } else { 'L' }, level_idc));
+    // Constraint bytes with trailing zero bytes omitted.
+    let mut end = constraints.len();
+    while end > 0 && constraints[end - 1] == 0 {
+        end -= 1;
+    }
+    for b in &constraints[..end] {
+        s.push_str(&format!(".{:X}", b));
+    }
+    Some(s)
+}
+
+/// `lengthSizeMinusOne + 1` from the record: the byte width of the NAL
+/// length prefixes in the samples (4 for every stream we have seen).
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+pub fn hvcc_nal_length_size(hvcc: &[u8]) -> usize {
+    hvcc.get(21).map(|b| (b & 0x03) as usize + 1).unwrap_or(4)
+}
+
+/// Whether a length-prefixed HEVC sample contains an IRAP picture (BLA /
+/// IDR / CRA, nal_unit_type 16..=23) — what a decoder that must be told
+/// about key frames (WebCodecs) needs to know per sample.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+pub fn is_irap_sample(sample: &[u8], len_size: usize) -> bool {
+    let mut i = 0usize;
+    while i + len_size <= sample.len() {
+        let mut n = 0usize;
+        for k in 0..len_size {
+            n = (n << 8) | sample[i + k] as usize;
+        }
+        i += len_size;
+        if n == 0 || i + n > sample.len() {
+            break;
+        }
+        if let Some(t) = nal_unit_type(&sample[i..i + n]) {
+            if (16..=23).contains(&t) {
+                return true;
+            }
+        }
+        i += n;
+    }
+    false
+}
+
+#[cfg(test)]
+mod hvcc_tests {
+    use super::*;
+
+    #[test]
+    fn codec_string_main_profile() {
+        // configurationVersion=1, profile_space=0 tier=0 profile_idc=1,
+        // compat flags 0x60000000, constraints 90 00 00 00 00 00, level 120.
+        let mut hvcc = vec![1u8, 0x01, 0x60, 0, 0, 0, 0x90, 0, 0, 0, 0, 0, 120];
+        hvcc.resize(23, 0);
+        hvcc[21] = 0x0f; // lengthSizeMinusOne = 3
+        assert_eq!(hevc_codec_string(&hvcc).as_deref(), Some("hvc1.1.6.L120.90"));
+        assert_eq!(hvcc_nal_length_size(&hvcc), 4);
+    }
+
+    #[test]
+    fn codec_string_main10_high_tier_with_profile_space() {
+        // profile_space=2 (B), tier=1 (H), profile_idc=2 (Main 10),
+        // compat 0x20000000 → reversed 0x4, level 153, constraints 90 00….
+        let mut hvcc = vec![1u8, 0b10_1_00010, 0x20, 0, 0, 0, 0x90, 0, 0, 0, 0, 0, 153];
+        hvcc.resize(23, 0);
+        assert_eq!(hevc_codec_string(&hvcc).as_deref(), Some("hvc1.B2.4.H153.90"));
+    }
+
+    #[test]
+    fn irap_detection_walks_length_prefixed_nals() {
+        // 4-byte length, one AUD (type 35) then one IDR_W_RADL (type 19).
+        let aud = [0u8, 0, 0, 2, 35 << 1, 0x01];
+        let idr = [0u8, 0, 0, 3, 19 << 1, 0x01, 0xAF];
+        let mut sample = aud.to_vec();
+        assert!(!is_irap_sample(&sample, 4));
+        sample.extend_from_slice(&idr);
+        assert!(is_irap_sample(&sample, 4));
+        // A truncated length prefix stops the walk instead of panicking.
+        assert!(!is_irap_sample(&[0, 0, 0, 9, 19 << 1], 4));
+    }
+}

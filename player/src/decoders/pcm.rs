@@ -10,6 +10,7 @@
 /// 1/2/3/6 channels respectively. ITU-R BS.775 coefficients for 5.1 and a
 /// simple average for unusual counts so the result is always audible rather
 /// than mis-routed silence.
+#[cfg_attr(not(any(target_os = "android", target_arch = "wasm32")), allow(dead_code))]
 pub fn downmix_to_stereo(input: &[f32], channels: usize) -> Vec<f32> {
     if channels <= 1 {
         let mut out = Vec::with_capacity(input.len() * 2);
@@ -85,6 +86,7 @@ pub fn downmix_to_stereo(input: &[f32], channels: usize) -> Vec<f32> {
 /// Linear-interpolation resample of interleaved PCM. Good enough for the
 /// 44.1 ↔ 48 kHz device-rate mismatch it exists for; a proper windowed-sinc
 /// resampler would be the upgrade if aliasing ever becomes audible.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
 pub fn resample_linear(input: &[f32], channels: usize, from_rate: u32, to_rate: u32) -> Vec<f32> {
     if from_rate == to_rate || input.is_empty() {
         return input.to_vec();
@@ -112,6 +114,7 @@ pub fn resample_linear(input: &[f32], channels: usize, from_rate: u32, to_rate: 
 /// overall. [`resample_linear`] rounds each chunk UP on its own: at
 /// 96 → 44.1 kHz a 1024-frame AU gives 471 frames instead of 470.4, a
 /// +0.13 % speed error that made the A/V aligner trim 10 ms every ~8 s.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 pub struct LinearResampler {
     channels: usize,
     /// Input frames per output frame.
@@ -125,6 +128,7 @@ pub struct LinearResampler {
     tail: Vec<f32>,
 }
 
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 impl LinearResampler {
     pub fn new(channels: usize, from_rate: u32, to_rate: u32) -> Self {
         Self {
@@ -211,6 +215,7 @@ mod tests {
 }
 
 /// Planar → interleaved: `planes[c][i]` → `out[i * channels + c]`.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 pub fn interleave(planes: &[Vec<f32>]) -> Vec<f32> {
     let channels = planes.len();
     let frames = planes.first().map(|p| p.len()).unwrap_or(0);

@@ -197,20 +197,11 @@ pub enum PlatformFrame {
     /// the video renderer imports via CVMetalTextureCache zero-copy.
     #[cfg(any(target_os = "ios", target_os = "macos"))]
     CvPixelBuffer(CvPixelBufferOwned),
-    /// Browser: the decoded frame copied out of the WebCodecs `VideoFrame`
-    /// into CPU memory as two tightly packed planes (Y, interleaved UV). The
-    /// renderer uploads them as R8/RG8 (or R16/RG16 for 10-bit) textures —
-    /// the same two-plane shape the Apple path samples, so the NV12 / P010
-    /// shaders and the HDR tonemap run unchanged.
-    #[cfg(target_arch = "wasm32")]
-    CpuPlanes(CpuPlanarFrame),
-    /// Browser, the default path: the decoded frame stays on the GPU as the
-    /// WebCodecs `VideoFrame`; the renderer copies it GPU→GPU with
-    /// `copyExternalImageToTexture` (the browser does Y'CbCr → R'G'B' on the
-    /// GPU) and samples an RGBA texture. No CPU byte per pixel. Used for SDR;
-    /// HDR representations take [`CpuPlanes`](Self::CpuPlanes) so the
-    /// engine's own 10-bit tonemap shader runs instead of the browser's
-    /// conversion.
+    /// Browser: the decoded frame stays on the GPU as the WebCodecs
+    /// `VideoFrame`; the renderer copies it GPU→GPU with
+    /// `copyExternalImageToTexture` (the browser does Y'CbCr → R'G'B' — and
+    /// any HDR tone-map — on the GPU) and samples an RGBA texture. No CPU
+    /// byte per pixel.
     #[cfg(target_arch = "wasm32")]
     WebVideoFrame(WebVideoFrame),
 }
@@ -248,22 +239,6 @@ impl Drop for WebVideoFrame {
 unsafe impl Send for WebVideoFrame {}
 #[cfg(target_arch = "wasm32")]
 unsafe impl Sync for WebVideoFrame {}
-
-/// A decoded frame in CPU memory, NV12 / P010 layout with no row padding.
-#[cfg(target_arch = "wasm32")]
-pub struct CpuPlanarFrame {
-    pub width: u32,
-    pub height: u32,
-    /// 8 → `y`/`uv` hold one byte per sample. 10 or 12 → two bytes per
-    /// sample, little-endian, MSB-aligned like P010 (a 10-bit code `c` is
-    /// stored as `c << 6`), so an `R16Unorm` view normalises it exactly as
-    /// the desktop P010 import does.
-    pub bit_depth: u8,
-    /// `width × height` luma samples, row-major.
-    pub y: Vec<u8>,
-    /// `ceil(width/2) × ceil(height/2)` interleaved Cb,Cr pairs, row-major.
-    pub uv: Vec<u8>,
-}
 
 /// Reference-counted wrapper around a CVPixelBufferRef. CFRetain on
 /// construction, CFRelease on Drop — so an owned `CvPixelBufferOwned`

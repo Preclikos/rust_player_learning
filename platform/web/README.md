@@ -30,6 +30,32 @@ Open the page in a browser with WebCodecs HEVC support (Chrome / Edge,
 Safari 16.4+; Firefox has no HEVC in WebCodecs) and press **Start**. The URL
 box is pre-filled with the bundled test stream and its ClearKeys.
 
+## Consuming the published package
+
+Published like the Android AAR and the iOS XCFramework: a tag `web-vX.Y.Z`
+runs `.github/workflows/publish-web.yml`, which publishes
+`@preclikos/rustplayer@X.Y.Z` to GitHub Packages (npm) and attaches the same
+tarball to the release. Consumers compile no Rust:
+
+```
+# .npmrc — GitHub Packages needs a token with read:packages
+@preclikos:registry=https://npm.pkg.github.com
+//npm.pkg.github.com/:_authToken=${GITHUB_TOKEN}
+```
+```
+npm install @preclikos/rustplayer
+```
+```js
+import init, { RustPlayer } from '@preclikos/rustplayer';
+await init();                 // fetches rustplayer_bg.wasm next to the module
+```
+
+The package is the wasm-pack `--target web` output (`rustplayer.js` +
+`rustplayer_bg.wasm` + `.d.ts`), so it works from a plain `<script
+type="module">` and from bundlers that resolve `new URL(..., import.meta.url)`
+assets (Vite, webpack 5). The page must be served with the wasm as
+`application/wasm` and, for WebCodecs/WebGPU, over HTTPS or localhost.
+
 ## Embedding
 
 ```html

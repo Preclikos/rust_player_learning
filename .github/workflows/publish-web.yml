@@ -1,0 +1,107 @@
+# Build the browser bundle and publish it as the npm package
+# `@preclikos/rustplayer` to GitHub Packages; a tag `web-v1.2.3` also attaches
+# the npm tarball to the release. Consumers add the package like any other npm
+# dependency — no Rust, no wasm-pack on their side (see platform/web/README.md).
+#
+# Same conventions as the Android AAR / iOS XCFramework publishes: the version
+# comes from the TAG (nothing to bump in a file), the job runs on the
+# self-hosted Linux runner, rustup owns the toolchain. The wasm32 build needs no
+# FFmpeg, NDK or GPU.
+name: Publish Web npm package
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "package version (e.g. 0.1.0). Publishes to GitHub Packages; no release asset."
+        required: true
+  push:
+    tags: ["web-v*"]
+
+jobs:
+  publish:
+    runs-on: [self-hosted, Linux]
+    timeout-minutes: 45
+    permissions:
+      contents: write   # attach the tarball to the release
+      packages: write   # publish to GitHub Packages (npm)
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ensure rust toolchain
+        run: |
+          set -e
+          if ! command -v "$HOME/.cargo/bin/cargo" >/dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          fi
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      # Make the toolchain the build actually used visible in the log, and fail
+      # loudly if rustup is not in charge (rust-toolchain.toml only binds the
+      # version when cargo comes from rustup).
+      - name: Report rust toolchain
+        run: |
+          set -e
+          rustup show active-toolchain
+          rustc --version
+          rustup target add wasm32-unknown-unknown
+
+      - name: Ensure wasm-pack
+        run: command -v wasm-pack >/dev/null || cargo install wasm-pack --locked
+
+      # setup-node writes the .npmrc that points the @preclikos scope at GitHub
+      # Packages and reads the token from NODE_AUTH_TOKEN at publish time.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://npm.pkg.github.com"
+          scope: "@preclikos"
+
+      - name: Resolve version
+        id: ver
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            echo "version=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${GITHUB_REF_NAME#web-v}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build (wasm-pack, release)
+        working-directory: platform/web
+        run: wasm-pack build --target web --release --out-dir pkg --out-name rustplayer
+
+      - name: Package as @preclikos/rustplayer
+        working-directory: platform/web
+        run: node scripts/package.mjs pkg "${{ steps.ver.outputs.version }}"
+
+      - name: Publish to GitHub Packages
+        working-directory: platform/web/pkg
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npm publish
+
+      - name: Tarball for the release
+        id: tgz
+        working-directory: platform/web/pkg
+        run: |
+          set -e
+          FILE=$(npm pack --json | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s)[0].filename))')
+          echo "file=platform/web/pkg/$FILE" >> "$GITHUB_OUTPUT"
+          ls -la "$FILE"
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.tgz.outputs.file }}
+          body: |
+            `@preclikos/rustplayer@${{ steps.ver.outputs.version }}` — published to GitHub Packages (npm).
+            ```
+            # .npmrc
+            @preclikos:registry=https://npm.pkg.github.com
+            //npm.pkg.github.com/:_authToken=${GITHUB_TOKEN}
+            ```
+            ```
+            npm install @preclikos/rustplayer@${{ steps.ver.outputs.version }}
+            ```
+            The attached tarball is the same package for `npm install ./<file>.tgz` without a registry.

@@ -78,7 +78,10 @@ the SwiftPM package or the wasm-pack `pkg/` — **and compiles no Rust**.
   off-target). The engine never names an executor directly: `player::rt` is
   Tokio on native and wasm-bindgen-futures + `setTimeout` in the browser (the
   engine's `tokio::sync` channels and `select!` are runtime-agnostic and shared).
-- Web: `platform/web/build.ps1` (wasm-pack → `platform/web/www/pkg/`); `cargo check
+- Web: `platform/web/build.ps1` (wasm-pack → `platform/web/www/pkg/`);
+  `.github/workflows/publish-web.yml` publishes `@preclikos/rustplayer` to GitHub
+  Packages (npm) on a `web-vX.Y.Z` tag (version from the tag, like the others);
+  `cargo check
   -p bridge-web --target wasm32-unknown-unknown` needs no FFmpeg. WebCodecs is
   behind web-sys's unstable gate, set in `.cargo/config.toml` for the wasm32
   target. Browser backends inside the engine: `decoders/webcodecs.rs`,

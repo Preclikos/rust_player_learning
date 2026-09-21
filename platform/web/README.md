@@ -9,7 +9,7 @@ wasm-bindgen as the `RustPlayer` class. What the platform provides:
 | video decode       | WebCodecs `VideoDecoder` (`player/src/decoders/webcodecs.rs`)   |
 | audio decode       | WebCodecs `AudioDecoder` (same file)                            |
 | video render       | wgpu on WebGPU (WebGL2 fallback, SDR only) into a `<canvas>`   |
-| audio output       | Web Audio `ScriptProcessorNode` (`renderers/audio/audio_web.rs`)|
+| audio output       | Web Audio `AudioWorkletNode` (`renderers/audio/audio_web.rs`; processor embedded, Blob URL) |
 | network            | reqwest over `fetch` (CORS applies — the CDN must allow the page origin and the `Range` header) |
 | async runtime      | `player::rt` over wasm-bindgen-futures + `setTimeout` (`player/src/rt/web.rs`) |
 
@@ -68,7 +68,9 @@ const player = await RustPlayer.create(canvas, manifestUrl, {
   async intercept(url, kind) { return { url, headers: [['Authorization', '…']] }; }, // optional
 }, { clearKeys: { kidHex: keyHex }, startPositionMs: 0, autoSelectSubtitle: false });
 player.play(); player.pause(); player.seekMs(ms); player.setVolume(0.5);
-JSON.parse(player.tracksJson()); player.setVideoTrackSoft(adapt, repr); player.setVideoAuto();
+JSON.parse(player.tracksJson()); player.setVideoTrack(adapt, repr); player.setVideoAuto();
+// setVideoTrack is the manual switch: immediate, locks ABR to manual. setVideoTrackSoft
+// is the ABR-style seamless swap (next segment boundary) — a test hook, not a UI control.
 player.setAudioTrack(adapt, repr); player.setSubtitleTrack(adapt, repr); player.clearSubtitles();
 player.resize(w, h);   // drawing-buffer size in device pixels
 player.shutdown(); player.free();
@@ -99,6 +101,7 @@ tone-map (different look, higher resolution ceiling on the test fixture).
 - Frames go GPU→GPU (`copyExternalImageToTexture`), one copy per frame on
   the GPU; `importExternalTexture` (no copy) would need the wgpu webgpu
   backend's external-texture path, which is `unimplemented!` upstream.
-- `ScriptProcessorNode` output; an `AudioWorklet` would lower latency and
-  survive a busy main thread better.
+- Representations the browser reports as undecodable (WebCodecs
+  `isConfigSupported`) are removed from the track tree before selection; the
+  probe is the browser's own answer, so a codec it mis-reports stays hidden.
 - No DRM beyond ClearKey (EME requires MSE, a different architecture).

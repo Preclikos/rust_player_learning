@@ -234,13 +234,20 @@ impl BridgeHandle {
         self.tracks_json.lock().unwrap().clone()
     }
 
-    /// Manual hard switch (resets ABR to Manual). Indices are into the
-    /// `video` array of [`tracks_json`](Self::tracks_json): `adapt` =
+    /// Manual quality switch — the one a UI wires to its quality menu. Hard
+    /// and immediate: the pipeline restarts on the chosen representation at
+    /// the current position and ABR drops to Manual, so the user sees what
+    /// they picked now, not at the next segment boundary. Indices are into
+    /// the `video` array of [`tracks_json`](Self::tracks_json): `adapt` =
     /// adaptation index, `repr` = representation index within it.
     pub fn set_video_track(&self, adapt: usize, repr: usize) {
         let _ = self.cmd_tx.send(Cmd::Video { adapt, repr, soft: false });
     }
-    /// Soft switch via the ABR supervisor swap path (no pipeline restart).
+    /// Seamless swap through the ABR supervisor path (make-before-break at
+    /// the next segment boundary, ABR strategy untouched). This is the
+    /// route ABR itself takes; it exists on the handle only to exercise
+    /// that path from a test shell. Not for user-driven switches — use
+    /// [`set_video_track`](Self::set_video_track) for those.
     pub fn set_video_track_soft(&self, adapt: usize, repr: usize) {
         let _ = self.cmd_tx.send(Cmd::Video { adapt, repr, soft: true });
     }

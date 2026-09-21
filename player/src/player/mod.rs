@@ -866,13 +866,21 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             Some(u) => u.to_string(),
             None => return Err("BaseUrl not loaded!".into()),
         };
-        let tracks = match Tracks::new(base_url, &manifest.mpd, &manifest.content, &self.http).await {
+        let mut tracks = match Tracks::new(base_url, &manifest.mpd, &manifest.content, &self.http).await {
             Ok(t) => t,
             Err(e) => {
                 self.emit_error(PlayerErrorKind::ManifestParse, format!("tracks: {}", e));
                 return Err(e);
             }
         };
+        // Drop what this platform's decoders cannot play before anything
+        // selects from the tree (no-op where the platform has no probe).
+        crate::decoders::support::prune_unsupported(&mut tracks).await;
+        if tracks.video.is_empty() {
+            let msg = "no video representation this platform can decode".to_string();
+            self.emit_error(PlayerErrorKind::ManifestParse, msg.clone());
+            return Err(msg.into());
+        }
         *self.tracks.lock().unwrap() = Some(tracks);
         let _ = self.events.send(PlayerEvent::Prepared);
         Ok(())

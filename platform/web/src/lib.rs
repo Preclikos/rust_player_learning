@@ -343,10 +343,15 @@ impl RustPlayer {
     pub fn tracks_json(&self) -> String {
         self.handle.tracks_json()
     }
+    /// Manual quality switch: immediate (pipeline restart at the current
+    /// position) and locks ABR to manual. Wire the quality menu to this.
     #[wasm_bindgen(js_name = setVideoTrack)]
     pub fn set_video_track(&self, adapt: u32, repr: u32) {
         self.handle.set_video_track(adapt as usize, repr as usize);
     }
+    /// Seamless swap via the ABR path (takes effect at the next segment
+    /// boundary, ABR stays armed). A test hook for that path, like the
+    /// Android/iOS shells expose — not for user-driven switches.
     #[wasm_bindgen(js_name = setVideoTrackSoft)]
     pub fn set_video_track_soft(&self, adapt: u32, repr: u32) {
         self.handle.set_video_track_soft(adapt as usize, repr as usize);

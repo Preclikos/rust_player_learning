@@ -118,6 +118,16 @@ pub fn log_aes_capability() {
             );
             return;
         }
+        // Browser: WebCrypto (hardware, off the main thread) carries the
+        // video segments — see crypto_web.rs; the RustCrypto path here is the
+        // deliberate fallback for small audio segments and non-secure
+        // contexts. Not a warning.
+        if cfg!(target_arch = "wasm32") {
+            log::debug!(
+                "[crypto] AES: WebCrypto for video segments; software RustCrypto fallback for small segments / non-secure contexts"
+            );
+            return;
+        }
         // Nothing reaches the silicon here. Worth a warning rather than a
         // debug line: software AES-CTR is ~40x slower and CENC decrypt sits on
         // the segment-boundary critical path, so it decides whether an ABR

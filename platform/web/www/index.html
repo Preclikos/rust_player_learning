@@ -173,7 +173,7 @@ $('vol').oninput = () => { if (player) player.setVolume($('vol').value / 100); }
 $('video').onchange = (e) => {
   if (!player) return;
   if (e.target.value === 'auto') player.setVideoAuto();
-  else { const [a, r] = e.target.value.split(':').map(Number); player.setVideoTrackSoft(a, r); }
+  else { const [a, r] = e.target.value.split(':').map(Number); player.setVideoTrack(a, r); }
 };
 $('audio').onchange = (e) => {
   if (!player) return;

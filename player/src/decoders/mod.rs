@@ -34,6 +34,8 @@ pub mod webcodecs;
 // us PCM in the source layout (MediaCodec, WebCodecs) rather than through a
 // resampling library (FFmpeg's swresample).
 pub mod pcm;
+// Platform decoder-support probe applied to the track tree in `prepare()`.
+pub(crate) mod support;
 
 // ---------------------------------------------------------------------------
 // Video decoder types

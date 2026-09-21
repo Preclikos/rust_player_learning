@@ -119,10 +119,10 @@ web-sys = { version = "0.3", features = [
     "AudioDecoder", "AudioDecoderConfig", "AudioDecoderInit", "AudioDecoderSupport",
     "EncodedAudioChunk", "EncodedAudioChunkInit", "EncodedAudioChunkType",
     "AudioData", "AudioDataCopyToOptions", "AudioSampleFormat",
-    # Web Audio output
+    # Web Audio output (AudioWorklet; the processor module is served from a Blob URL)
     "AudioContext", "AudioContextOptions", "AudioContextState", "BaseAudioContext",
-    "AudioDestinationNode", "AudioNode", "ScriptProcessorNode", "AudioProcessingEvent",
-    "AudioBuffer",
+    "AudioDestinationNode", "AudioNode", "AudioWorklet", "AudioWorkletNode",
+    "AudioWorkletNodeOptions", "Blob", "BlobPropertyBag", "Url",
 ] }
 
 # FFmpeg is used on every target except Android (MediaCodec). Win/Linux use it

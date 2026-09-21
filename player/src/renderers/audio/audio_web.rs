@@ -133,6 +133,10 @@ pub(super) fn start_thread(
     volume: Arc<AtomicU32>,
     samples_consumed: Arc<AtomicU64>,
     output_latency_ms: Arc<AtomicU64>,
+    // Flipped by the first `audioprocess` callback: the output is really
+    // running (an `AudioContext` created outside a user gesture stays
+    // suspended and never calls back). See `AudioRenderer::output_running`.
+    output_running: Arc<AtomicBool>,
 ) -> (Sender<AudioChunk>, u32) {
     let (sample_sender, sample_receiver) = mpsc::channel::<AudioChunk>(QUEUE_CHUNKS);
 
@@ -143,6 +147,8 @@ pub(super) fn start_thread(
                 "[audio] AudioContext unavailable ({:?}) — NULL audio sink (silent playback, real-time drain)",
                 e
             );
+            // The null sink drains at real-time pace from the start: it IS the clock.
+            output_running.store(true, Ordering::Relaxed);
             start_null_sink(
                 sample_receiver,
                 command_receiver,
@@ -165,6 +171,7 @@ pub(super) fn start_thread(
         Err(e) => {
             log::warn!("[audio] createScriptProcessor failed ({:?}) — NULL audio sink", e);
             let _ = context.close();
+            output_running.store(true, Ordering::Relaxed);
             start_null_sink(
                 sample_receiver,
                 command_receiver,
@@ -196,6 +203,9 @@ pub(super) fn start_thread(
     let onaudioprocess = Closure::<dyn FnMut(web_sys::AudioProcessingEvent)>::new(
         move |ev: web_sys::AudioProcessingEvent| {
             let Ok(out) = ev.output_buffer() else { return };
+            if !output_running.swap(true, Ordering::Relaxed) {
+                log::info!("[audio] Web Audio output running (first callback)");
+            }
             let frames = out.length() as usize;
             if left.len() != frames {
                 left.resize(frames, 0.0);
@@ -261,8 +271,15 @@ pub(super) fn start_thread(
         log::warn!("[audio] connect to destination failed: {:?}", e);
     }
     // Autoplay policy: a context created outside a user gesture starts
-    // suspended. Ask; the host's un-pause asks again.
+    // suspended. Ask; the host's un-pause asks again. Until the first
+    // callback the sink reports no clock (see `output_running`), so playback
+    // starts on the wall clock, silent, instead of holding for 5 s.
     let _ = context.resume();
+    if context.state() == web_sys::AudioContextState::Suspended {
+        log::warn!(
+            "[audio] AudioContext is suspended (no user gesture yet) — video runs on the wall clock, audio joins when the browser lets it"
+        );
+    }
 
     let output = Rc::new(WebAudioOutput {
         context,

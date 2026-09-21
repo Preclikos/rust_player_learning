@@ -83,6 +83,14 @@ pub struct AudioRenderer {
     /// `set_paused` delegate to it. `None` if the track couldn't be created.
     #[cfg(target_os = "android")]
     pcm_sink: Option<Arc<audio_track_pcm::AudioTrackPcmSink>>,
+    /// Browser only: set by the first Web Audio callback. Until then the
+    /// output is not running — typically an `AudioContext` the browser keeps
+    /// suspended because the page created the player outside a user gesture —
+    /// and the sink reports NO clock, so the master clock runs on the wall at
+    /// once instead of holding the first frame for the 5 s dead-output
+    /// detection. When the context resumes later the clock re-adopts audio.
+    #[cfg(target_arch = "wasm32")]
+    output_running: Arc<AtomicBool>,
     /// Android only: HOST pause state. `Player::pause/resume` land on the
     /// INHERENT `set_paused` (concrete-type calls in player.rs), which sets this
     /// so the writer stops consuming — a user pause must go silent immediately
@@ -143,6 +151,8 @@ impl AudioRenderer {
             (t.0, t.1)
         };
         #[cfg(target_arch = "wasm32")]
+        let output_running = Arc::new(AtomicBool::new(false));
+        #[cfg(target_arch = "wasm32")]
         let (sample_sender, sample_rate) = audio_web::start_thread(
             command_receiver,
             stop,
@@ -151,6 +161,7 @@ impl AudioRenderer {
             volume.clone(),
             samples_consumed.clone(),
             output_latency_ms.clone(),
+            output_running.clone(),
         );
         // Android outputs PCM through an AudioTrack (cpal/AAudio is stolen on some
         // TV HALs); the cpal stop/command machinery is unused on this path. The
@@ -186,6 +197,8 @@ impl AudioRenderer {
             pcm_sink,
             #[cfg(target_os = "android")]
             host_paused,
+            #[cfg(target_arch = "wasm32")]
+            output_running,
         }
     }
 
@@ -282,6 +295,10 @@ impl AudioRenderer {
         if self.sample_rate == 0 {
             return None;
         }
+        #[cfg(target_arch = "wasm32")]
+        if !self.output_running.load(Ordering::Relaxed) {
+            return None;
+        }
         let consumed = self.samples_consumed.load(Ordering::Acquire);
         let since = self.flush_state.played_since_flush(consumed);
         Some(since / 2 * 1000 / self.sample_rate as u64)
@@ -351,6 +368,10 @@ impl super::AudioSink for AudioRenderer {
         #[cfg(not(target_os = "android"))]
         {
             if self.sample_rate == 0 {
+                return None;
+            }
+            #[cfg(target_arch = "wasm32")]
+            if !self.output_running.load(Ordering::Relaxed) {
                 return None;
             }
             // Interleaved stereo: 2 f32s per frame at the OUTPUT rate (the

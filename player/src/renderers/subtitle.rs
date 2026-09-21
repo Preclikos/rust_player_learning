@@ -410,7 +410,16 @@ impl SubtitleOverlay {
             std::thread::Builder::new()
                 .name("subtitle-raster".to_string())
                 .spawn(move || raster_worker(shared))
-                .map_err(|e| log::error!("[subs] rasterizer thread failed to spawn: {}", e))
+                .map_err(|e| {
+                    // No threads on wasm32: expected, the render path
+                    // rasterizes inline (`rasterize_inline`). Anywhere else
+                    // a failed spawn is a real problem worth shouting about.
+                    if cfg!(target_arch = "wasm32") {
+                        log::debug!("[subs] no rasterizer thread ({}); rasterizing inline", e);
+                    } else {
+                        log::error!("[subs] rasterizer thread failed to spawn: {}", e);
+                    }
+                })
                 .ok()
         };
 

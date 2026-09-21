@@ -764,6 +764,10 @@ impl SubtitleOverlay {
         inner.generation += 1;
         let generation = inner.generation;
         let (width, height, rgba) = rasterized.unwrap_or((0, 0, Vec::new()));
+        log::debug!(
+            "[subs] rasterized cue inline gen={} {}x{} at {}x{}",
+            generation, width, height, tw, th
+        );
         inner.ready.push(std::sync::Arc::new(SubtitleBitmap {
             rgba,
             width,

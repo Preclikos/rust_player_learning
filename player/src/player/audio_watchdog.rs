@@ -69,9 +69,9 @@ pub(crate) async fn audio_output_watchdog<A: AudioSink>(
     // (last position seen, wall instant it FIRST read that value).
     // tokio's clock, not std's: it is the one  can drive,
     // which is what makes the liveness thresholds testable without sleeping.
-    let mut seen: Option<(u64, tokio::time::Instant)> = None;
+    let mut seen: Option<(u64, crate::rt::Instant)> = None;
     // When the output started advancing again after a death (budget reset).
-    let mut live_since: Option<tokio::time::Instant> = None;
+    let mut live_since: Option<crate::rt::Instant> = None;
     // True once this generation has actually SEEN the head move. Until then
     // there is no dead output to diagnose: a position standing at 0 is how a
     // sink says "not audible yet", and the gap between opening the device and
@@ -86,7 +86,7 @@ pub(crate) async fn audio_output_watchdog<A: AudioSink>(
 
     loop {
         tokio::select! {
-            _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+            _ = crate::rt::sleep(Duration::from_millis(250)) => {}
             _ = stop.notified() => return,
         }
         if stop_flag.load(Ordering::Relaxed) {
@@ -125,13 +125,13 @@ pub(crate) async fn audio_output_watchdog<A: AudioSink>(
 
         match seen {
             None => {
-                seen = Some((played, tokio::time::Instant::now()));
+                seen = Some((played, crate::rt::Instant::now()));
                 continue;
             }
             Some((p0, _)) if played > p0 => {
-                seen = Some((played, tokio::time::Instant::now()));
+                seen = Some((played, crate::rt::Instant::now()));
                 ever_advanced = true;
-                let since = *live_since.get_or_insert_with(tokio::time::Instant::now);
+                let since = *live_since.get_or_insert_with(crate::rt::Instant::now);
                 if stats.audio_output_rebuilds.load(Ordering::Relaxed) > 0
                     && since.elapsed() >= Duration::from_millis(AUDIO_OUTPUT_HEALTHY_MS)
                 {
@@ -242,8 +242,8 @@ mod tests {
         }
     }
 
-    fn spawn_watchdog(r: &WatchdogRig) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(audio_output_watchdog(
+    fn spawn_watchdog(r: &WatchdogRig) -> crate::rt::JoinHandle<()> {
+        crate::rt::spawn(audio_output_watchdog(
             7,
             r.sink.clone(),
             r.stats.clone(),
@@ -269,7 +269,7 @@ mod tests {
     /// does not judge one that never started.
     async fn play_a_while(r: &WatchdogRig) {
         for _ in 0..4 {
-            tokio::time::sleep(Duration::from_millis(250)).await;
+            crate::rt::sleep(Duration::from_millis(250)).await;
             r.sink.played_ms.fetch_add(250, Ordering::Relaxed);
         }
     }
@@ -282,8 +282,8 @@ mod tests {
         // ...and now it never moves again. Bounding the wait is what makes the
         // liveness threshold load-bearing: without it the test would pass even
         // if the watchdog took a day to notice.
-        let t0 = tokio::time::Instant::now();
-        tokio::time::timeout(Duration::from_secs(5), wd)
+        let t0 = crate::rt::Instant::now();
+        crate::rt::timeout(Duration::from_secs(5), wd)
             .await
             .expect("watchdog did not act on a dead output within 5s")
             .unwrap();
@@ -316,8 +316,8 @@ mod tests {
             .store(AUDIO_OUTPUT_MAX_REBUILDS, Ordering::Relaxed);
         let wd = spawn_watchdog(&r);
         play_a_while(&r).await;
-        let t0 = tokio::time::Instant::now();
-        tokio::time::timeout(Duration::from_secs(5), wd)
+        let t0 = crate::rt::Instant::now();
+        crate::rt::timeout(Duration::from_secs(5), wd)
             .await
             .expect("watchdog did not report the dead output within 5s")
             .unwrap();
@@ -343,7 +343,7 @@ mod tests {
         let wd = spawn_watchdog(&r);
         // Advance the head at real time for a few seconds.
         for _ in 0..20 {
-            tokio::time::sleep(Duration::from_millis(250)).await;
+            crate::rt::sleep(Duration::from_millis(250)).await;
             r.sink.played_ms.fetch_add(250, Ordering::Relaxed);
         }
         assert!(!wd.is_finished(), "watchdog fired on a healthy output");
@@ -359,7 +359,7 @@ mod tests {
         let r = rig();
         r.paused.store(true, Ordering::Relaxed);
         let wd = spawn_watchdog(&r);
-        tokio::time::sleep(Duration::from_secs(10)).await;
+        crate::rt::sleep(Duration::from_secs(10)).await;
         assert!(!wd.is_finished(), "watchdog fired while paused");
         assert!(r.seek_target.read().await.is_none());
         wd.abort();
@@ -369,7 +369,7 @@ mod tests {
         let r = rig();
         r.stats.audio_starving.store(true, Ordering::Relaxed);
         let wd = spawn_watchdog(&r);
-        tokio::time::sleep(Duration::from_secs(10)).await;
+        crate::rt::sleep(Duration::from_secs(10)).await;
         assert!(!wd.is_finished(), "watchdog fired during ordinary starvation");
         assert!(r.seek_target.read().await.is_none());
         wd.abort();
@@ -385,7 +385,7 @@ mod tests {
         let wd = spawn_watchdog(&r);
         play_a_while(&r).await;
         r.stats.video_starving.store(true, Ordering::Relaxed);
-        tokio::time::sleep(Duration::from_secs(10)).await;
+        crate::rt::sleep(Duration::from_secs(10)).await;
         assert!(
             !wd.is_finished(),
             "watchdog mistook a video stall for a dead audio output"
@@ -405,7 +405,7 @@ mod tests {
         let mut r = rig();
         r.sink.played_ms.store(0, Ordering::Relaxed);
         let wd = spawn_watchdog(&r);
-        tokio::time::sleep(Duration::from_secs(30)).await;
+        crate::rt::sleep(Duration::from_secs(30)).await;
         assert!(!wd.is_finished(), "watchdog fired before audio ever started");
         assert!(r.seek_target.read().await.is_none(), "no phantom rebuild");
         assert_eq!(r.stats.audio_output_rebuilds.load(Ordering::Relaxed), 0);
@@ -413,7 +413,7 @@ mod tests {
 
         // Once it HAS started, a stop is judged as usual.
         play_a_while(&r).await;
-        tokio::time::timeout(Duration::from_secs(5), wd)
+        crate::rt::timeout(Duration::from_secs(5), wd)
             .await
             .expect("watchdog did not act after the output died for real")
             .unwrap();
@@ -427,7 +427,7 @@ mod tests {
         let r = rig();
         r.sink.has_clock.store(false, Ordering::Relaxed);
         let wd = spawn_watchdog(&r);
-        tokio::time::sleep(Duration::from_secs(10)).await;
+        crate::rt::sleep(Duration::from_secs(10)).await;
         assert!(!wd.is_finished());
         assert!(r.seek_target.read().await.is_none());
         wd.abort();

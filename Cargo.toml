@@ -4,6 +4,7 @@ members = [
     "bridge",           # platform-agnostic bridge core (events, provider hooks, orchestration)
     "platform/android", # JNI cdylib → librustplayer.so (consumed by the :rustplayer AAR)
     "platform/ios",     # FFI staticlib → RustPlayerFFI.xcframework
+    "platform/web",     # wasm-bindgen cdylib → rustplayer.js + rustplayer_bg.wasm (npm/web)
     "examples/desktop", # winit desktop smoke test / reference consumer
 ]
 exclude = ["vendor"]

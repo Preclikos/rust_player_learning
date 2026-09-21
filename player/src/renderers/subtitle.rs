@@ -583,6 +583,13 @@ impl SubtitleOverlay {
         if target_w == 0 || target_h == 0 {
             return;
         }
+        // No rasterizer thread (the browser build, or a spawn failure):
+        // bake the wanted cue right here. Cue changes are rare (seconds
+        // apart) and one rasterization is a few ms, so paying it on the
+        // render path beats having no subtitles at all.
+        if self.worker.is_none() {
+            self.rasterize_inline(target_w, target_h);
+        }
         let (bitmap, resized) = {
             let mut inner = self.shared.inner.lock().unwrap();
             let resized = inner.note_target(target_w, target_h);
@@ -725,6 +732,39 @@ impl SubtitleOverlay {
             view,
             bind_group,
             transform: [f32::NAN; 4],
+        }
+    }
+}
+
+impl SubtitleOverlay {
+    /// One `raster_worker` iteration, run synchronously by the render path
+    /// when there is no worker thread. Bakes at most one cue per call — the
+    /// active one first, the prefetch on the next frame.
+    fn rasterize_inline(&self, target_w: u32, target_h: u32) {
+        let job = {
+            let mut inner = self.shared.inner.lock().unwrap();
+            inner.note_target(target_w, target_h);
+            next_job(&inner)
+        };
+        let Some((font, text, style, tw, th)) = job else { return };
+        let rasterized = rasterizer::rasterize_cue(&font, &text, tw, th, &style);
+        let mut inner = self.shared.inner.lock().unwrap();
+        if inner.target_w != tw || inner.target_h != th {
+            return;
+        }
+        inner.generation += 1;
+        let generation = inner.generation;
+        let (width, height, rgba) = rasterized.unwrap_or((0, 0, Vec::new()));
+        inner.ready.push(std::sync::Arc::new(SubtitleBitmap {
+            rgba,
+            width,
+            height,
+            generation,
+            text,
+            target_w: tw,
+        }));
+        if inner.ready.len() > READY_SLOTS {
+            inner.ready.remove(0);
         }
     }
 }
@@ -980,7 +1020,7 @@ mod tests {
         label: &str,
         done: impl Fn(&Inner) -> bool,
     ) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = crate::rt::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             {
                 let inner = shared.inner.lock().unwrap();
@@ -989,7 +1029,7 @@ mod tests {
                 }
             }
             assert!(
-                std::time::Instant::now() < deadline,
+                crate::rt::Instant::now() < deadline,
                 "worker never reached: {label}"
             );
             std::thread::sleep(std::time::Duration::from_millis(5));

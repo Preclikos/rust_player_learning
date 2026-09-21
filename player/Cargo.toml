@@ -9,12 +9,21 @@ path = "src/lib.rs"
 
 [dependencies]
 # TLS backend is target-specific (see [target.cfg.dependencies] below).
-reqwest = { version = "0.13", default-features = false, features = ["blocking", "http2", "charset"] }
+# Base dep on every target (the browser build included — reqwest speaks
+# `fetch` there). Native-only features (HTTP/2, TLS backends) live in the
+# per-target blocks below.
+reqwest = { version = "0.13", default-features = false, features = ["charset"] }
 quick-xml = { version = "0.42", features = ["serialize"] }
 serde = { version = "1.0", features = ["derive"] }
 iso8601-duration = { version = "0.2" }
 url = { version = "2.5.4" }
-tokio = { version = "1.52", features = ["full"] }
+# Only the runtime-agnostic pieces here (channels, Notify, RwLock,
+# select!/join!) — these are what the engine uses everywhere, and they are
+# what Tokio supports on wasm32-unknown-unknown. The runtime itself
+# (`rt-multi-thread`, timers, blocking pool) is native-only and enabled in
+# the `cfg(not(target_arch = "wasm32"))` block below; engine code reaches it
+# through the `rt` facade (src/rt.rs), never `tokio::spawn` directly.
+tokio = { version = "1.52", features = ["sync", "macros"] }
 re_mp4 = { version = "0.5.0" }
 hex = { version = "0.4" }
 aes = { version = "0.9" }
@@ -31,7 +40,6 @@ rand = "0.10"
 # 0.18 also folds hardware latency into the CoreAudio/WASAPI playback
 # timestamps, so the renderer's output-latency compensation is accurate
 # on desktop + Apple too.
-cpal = { version = "0.18", features = ["realtime"] }
 bytemuck ={ version =  "1.13.1" }
 pollster = "0.4.0"
 wgpu = { git = "https://github.com/Preclikos/wgpu.git" }
@@ -39,7 +47,6 @@ wgpu = { git = "https://github.com/Preclikos/wgpu.git" }
 # host-provided window/layer. The player is winit-free — hosts pass handles in.
 # Pinned to the same major as the wgpu fork so the handle types unify.
 raw-window-handle = "0.6"
-ash = "0.38.0"
 log = "0.4"
 # Subtitle font rasterization. Pure-Rust, no system deps. Used by the
 # wgpu-based subtitle overlay to bake cue text into RGBA bitmaps that
@@ -62,6 +69,59 @@ unicode-normalization = "0.1"
 # is already in the tree via reqwest's `charset` feature).
 encoding_rs = "0.8"
 chardetng = "0.1"
+
+# Native (everything but the browser): the Tokio runtime the engine runs
+# on, HTTP/2 for the CDN fetches, cpal for PCM output, and the Vulkan
+# bindings behind the D3D11/VAAPI/AHardwareBuffer zero-copy imports.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { version = "1.52", features = ["full"] }
+reqwest = { version = "0.13", default-features = false, features = ["http2"] }
+# 0.18 AAudio: requests PERFORMANCE_MODE_LOW_LATENCY under the `realtime`
+# feature (collapses Android output latency to ~one burst — fixes video
+# leading audio with no per-device tuning; degrades gracefully to normal
+# mode, emitting RealtimeDenied via the error callback, if not granted).
+# 0.18 also folds hardware latency into the CoreAudio/WASAPI playback
+# timestamps, so the renderer's output-latency compensation is accurate
+# on desktop + Apple too.
+cpal = { version = "0.18", features = ["realtime"] }
+ash = "0.38.0"
+
+# Browser (wasm32-unknown-unknown): WebCodecs decode, Web Audio output,
+# wgpu on WebGPU (WebGL2 fallback) into a host canvas, fetch via reqwest.
+#
+# `fragile-send-sync-non-atomic-wasm`: wgpu's handles wrap JS objects and are
+# `!Send` by default; this feature marks them Send/Sync on the single-threaded
+# wasm target so the engine's native `Send` bounds compile unchanged. The
+# same contract is applied to our own JS-holding wrappers (see rt/web.rs).
+#
+# WebCodecs (`VideoDecoder`, `AudioDecoder`, …) is behind web-sys's unstable
+# gate: `.cargo/config.toml` passes `--cfg=web_sys_unstable_apis` for this
+# target.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wgpu = { git = "https://github.com/Preclikos/wgpu.git", features = ["fragile-send-sync-non-atomic-wasm", "webgl"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-time = "1"
+# rand → getrandom needs to be told to use `crypto.getRandomValues`.
+getrandom = { version = "0.4", features = ["wasm_js"] }
+web-sys = { version = "0.3", features = [
+    "Window", "WorkerGlobalScope", "Performance", "console",
+    "HtmlCanvasElement", "MessageChannel", "MessagePort", "MessageEvent",
+    "DomException",
+    # WebCodecs (unstable — see above)
+    "VideoDecoder", "VideoDecoderConfig", "VideoDecoderInit", "VideoDecoderSupport",
+    "EncodedVideoChunk", "EncodedVideoChunkInit", "EncodedVideoChunkType",
+    "VideoFrame", "VideoFrameCopyToOptions", "PlaneLayout", "VideoPixelFormat",
+    "DomRectInit", "DomRectReadOnly", "HardwareAcceleration", "CodecState",
+    "AudioDecoder", "AudioDecoderConfig", "AudioDecoderInit", "AudioDecoderSupport",
+    "EncodedAudioChunk", "EncodedAudioChunkInit", "EncodedAudioChunkType",
+    "AudioData", "AudioDataCopyToOptions", "AudioSampleFormat",
+    # Web Audio output
+    "AudioContext", "AudioContextOptions", "AudioContextState", "BaseAudioContext",
+    "AudioDestinationNode", "AudioNode", "ScriptProcessorNode", "AudioProcessingEvent",
+    "AudioBuffer",
+] }
 
 # FFmpeg is used on every target except Android (MediaCodec). Win/Linux use it
 # for both video + audio; macOS AND iOS use it for AUDIO only (native

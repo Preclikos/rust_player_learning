@@ -126,7 +126,7 @@ pub fn log_aes_capability() {
         if log::log_enabled!(log::Level::Debug) {
             let mut buf = vec![0u8; 4 * 1024 * 1024];
             let mut cipher = Aes128Ctr::new(&[0u8; 16].into(), &[0u8; 16].into());
-            let t0 = std::time::Instant::now();
+            let t0 = crate::rt::Instant::now();
             cipher.apply_keystream(&mut buf);
             let ms = t0.elapsed().as_millis().max(1);
             detail = format!(" ({} MiB/s measured over 4 MiB)", 4 * 1000 / ms);
@@ -503,6 +503,16 @@ pub fn parse_dovi_config(init_data: &[u8]) -> Option<DoviConfig> {
 }
 
 /// Extract VPS/SPS/PPS NALUs from the `hvcC` box (HEVC decoder configuration record).
+/// The raw `hvcC` box payload (HEVCDecoderConfigurationRecord, ISO/IEC
+/// 14496-15 §8.3.3.1) from the init segment. Decoders that take the record
+/// whole — WebCodecs' `VideoDecoderConfig.description` — consume this; the
+/// NAL-array walkers above take it apart.
+pub fn parse_hvcc_record(init_data: &[u8]) -> Option<Vec<u8>> {
+    let moov = find_top_box(init_data, b"moov")?;
+    let hvcc = find_descendant(moov, b"hvcC")?;
+    (hvcc.len() >= 23).then(|| hvcc.to_vec())
+}
+
 pub fn parse_hvcc_nalus(init_data: &[u8]) -> Option<Vec<Vec<u8>>> {
     let moov = find_top_box(init_data, b"moov")?;
     let hvcc = find_descendant(moov, b"hvcC")?;

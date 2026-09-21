@@ -16,7 +16,7 @@ pub(super) struct PreparedSegment {
 }
 
 pub(super) type PrepareHandle =
-    tokio::task::JoinHandle<Result<PreparedSegment, Box<dyn Error + Send + Sync>>>;
+    crate::rt::JoinHandle<Result<PreparedSegment, Box<dyn Error + Send + Sync>>>;
 
 /// Sample table of a prepared segment: `(offset, size, composition pts,
 /// timescale)` for every sample of its first — and, in a DASH media segment,
@@ -60,7 +60,7 @@ pub(super) fn prepare_segment(
     crypto: Option<TrackCrypto>,
     segment: DataSegment,
 ) -> PrepareHandle {
-    tokio::task::spawn_blocking(
+    crate::rt::spawn_blocking(
         move || -> Result<PreparedSegment, Box<dyn Error + Send + Sync>> {
             let t_copy = Instant::now();
             let mut data_vec = Vec::with_capacity(init_data.len() + segment.data.len());
@@ -251,6 +251,10 @@ pub(super) async fn video_decoder_task(
             }
 
             decoder.submit(sample_data, pts_us)?;
+            // Callback-driven decoders (WebCodecs) deliver output only when
+            // the host event loop runs; give it a turn per sample. No-op on
+            // native, where output is pulled from the codec synchronously.
+            crate::rt::cooperative_yield().await;
         }
         if let Some(first) = first_pts_us {
             log::info!("[dec] seg done: pts {}..{}ms", first / 1000, last_pts_us / 1000);
@@ -406,7 +410,7 @@ pub(super) async fn audio_decoder_task(
         // MediaCodec calls below: BLOCKING WORK MUST NOT OCCUPY A RUNTIME
         // WORKER, or the reactive tasks (vsync pacing, audio feed, timers)
         // starve and playback degrades to a ~1 fps convoy.
-        let (data_vec, sample_info) = tokio::task::block_in_place(
+        let (data_vec, sample_info) = crate::rt::block_in_place(
             || -> Result<(Vec<u8>, Vec<(usize, usize, i64, u64)>), Box<dyn Error + Send + Sync>> {
                 let mut data_vec = init_data.clone();
                 data_vec.extend_from_slice(&segment.data[..]);
@@ -425,6 +429,10 @@ pub(super) async fn audio_decoder_task(
             let pts_us = if ts_scale > 0 { ts * 1_000_000 / ts_scale as i64 } else { 0 };
 
             decoder.submit(sample_data, pts_us)?;
+            // Callback-driven decoders (WebCodecs) deliver output only when
+            // the host event loop runs; give it a turn per sample. No-op on
+            // native, where output is pulled from the codec synchronously.
+            crate::rt::cooperative_yield().await;
 
             loop {
                 match decoder.try_recv()? {

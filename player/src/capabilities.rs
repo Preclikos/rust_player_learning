@@ -131,7 +131,14 @@ pub async fn probe_capabilities() -> PlayerCapabilities {
     let backends = wgpu::Backends::VULKAN;
     #[cfg(target_os = "macos")]
     let backends = wgpu::Backends::METAL;
-    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+    #[cfg(target_arch = "wasm32")]
+    let backends = wgpu::Backends::BROWSER_WEBGPU | wgpu::Backends::GL;
+    #[cfg(not(any(
+        target_os = "windows",
+        target_os = "linux",
+        target_os = "macos",
+        target_arch = "wasm32"
+    )))]
     let backends = wgpu::Backends::PRIMARY;
 
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {

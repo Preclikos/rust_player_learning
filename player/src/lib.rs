@@ -18,6 +18,7 @@ mod manifest;
 mod net;
 mod parsers;
 mod renderers;
+pub mod rt;
 mod subtitle_style;
 mod tracks;
 mod utils;

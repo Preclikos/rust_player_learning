@@ -65,7 +65,7 @@ use libc;
 use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 use tokio::sync::{broadcast, Notify, RwLock};
-use tokio::time::Instant;
+use crate::rt::Instant;
 use tokio::{join, sync::mpsc::Sender};
 use crate::tracks::audio::{AudioAdaptation, AudioRepresentation};
 use crate::tracks::{
@@ -76,7 +76,7 @@ use url::Url;
 
 use std::sync::Arc;
 use tokio::sync::mpsc::{self, Receiver};
-use tokio::task::{self, JoinHandle};
+use crate::rt::JoinHandle;
 
 use crate::manifest::Manifest;
 
@@ -461,7 +461,7 @@ pub struct Player<V: VideoSink = VideoRenderer, A: AudioSink = AudioRenderer> {
     /// call from a host thread that isn't itself inside the runtime — e.g. the
     /// iOS UIKit layout callback or the Android JNI thread. Captured via
     /// `Handle::current()` at construction (every ctor runs inside a runtime).
-    rt: tokio::runtime::Handle,
+    rt: crate::rt::Handle,
 }
 
 impl<V: VideoSink, A: AudioSink> Clone for Player<V, A> {
@@ -573,6 +573,20 @@ impl Player<VideoRenderer, AudioRenderer> {
         Self::from_renderers(video_renderer, audio_renderer)
     }
 
+    /// Browser: render into a host-provided `<canvas>` (WebGPU, WebGL2
+    /// fallback) and play audio through Web Audio. Async because a WebGPU
+    /// adapter/device can only be obtained asynchronously — there is no
+    /// `block_on` in the browser. The host keeps the canvas in the DOM for the
+    /// player's lifetime and forwards size changes through `Player::resize`.
+    /// Construct from a user gesture (a click handler) so the `AudioContext`
+    /// is allowed to start.
+    #[cfg(target_arch = "wasm32")]
+    pub async fn new_from_canvas(canvas: web_sys::HtmlCanvasElement, width: u32, height: u32) -> Self {
+        let video_renderer = Arc::new(VideoRenderer::new_from_canvas(canvas, width, height).await);
+        let audio_renderer = Arc::new(AudioRenderer::new());
+        Self::from_renderers(video_renderer, audio_renderer)
+    }
+
     /// Assemble a `Player` from already-built renderers. Shared tail of every
     /// constructor above — the only difference between the winit and embedded
     /// paths is how the `VideoRenderer` obtained its surface.
@@ -674,7 +688,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             // `#[tokio::main]`; iOS/Android: the host enters the runtime before
             // calling in), so a current handle is always available here. Storing
             // it lets `resize`/`seek`/track-switch spawn from any thread later.
-            rt: tokio::runtime::Handle::current(),
+            rt: crate::rt::Handle::current(),
         }
     }
 }
@@ -1677,6 +1691,13 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                     Box::new(d) as Box<dyn HwVideoDecoder>
                 })
             }
+            #[cfg(target_arch = "wasm32")]
+            {
+                Arc::new(|| {
+                    Box::new(crate::decoders::webcodecs::WebCodecsVideoDecoder::new())
+                        as Box<dyn HwVideoDecoder>
+                })
+            }
         };
 
         // Capture the decoder name once per play() cycle. The first
@@ -1726,18 +1747,18 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         let pipeline_live = Arc::clone(&self.pipeline_live);
         let audio_passthrough = Arc::clone(&self.audio_passthrough);
         let hdr_decode_8bit = Arc::clone(&self.hdr_decode_8bit);
-        let play = tokio::spawn(async move {
+        let play = crate::rt::spawn(async move {
             // ABR tick runs once for the whole play() lifetime (survives
             // every seek/track-switch restart below). On Manual it's a
             // no-op each tick.
-            tokio::spawn(async move {
-                let mut ticker = tokio::time::interval(Duration::from_secs(1));
-                ticker.set_missed_tick_behavior(
-                    tokio::time::MissedTickBehavior::Skip,
-                );
+            crate::rt::spawn(async move {
+                // A plain sleep-then-tick loop (not `tokio::time::interval`):
+                // ticks that fall behind are skipped rather than burst, which
+                // is exactly `MissedTickBehavior::Skip`, and it runs on the
+                // runtime facade so the browser build has it too.
                 loop {
                     tokio::select! {
-                        _ = ticker.tick() => {
+                        _ = crate::rt::sleep(Duration::from_secs(1)) => {
                             abr_player.abr_tick();
                         }
                         _ = &mut abr_kill_rx => break,
@@ -1886,6 +1907,9 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                 #[cfg(target_os = "android")]
                 let audio_decoder: Box<dyn AudioDecoder> =
                     Box::new(crate::decoders::mediacodec_audio::MediaCodecAudioDecoder::new());
+                #[cfg(target_arch = "wasm32")]
+                let audio_decoder: Box<dyn AudioDecoder> =
+                    Box::new(crate::decoders::webcodecs::WebCodecsAudioDecoder::new());
 
                 // Fresh per-iteration switch channel for ABR soft-swaps.
                 let (switch_tx, switch_rx) =
@@ -1924,7 +1948,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                 // if a superseded generation keeps running (orphaned pipeline).
                 static PIPELINE_GEN: AtomicU64 = AtomicU64::new(0);
                 let gen = PIPELINE_GEN.fetch_add(1, Ordering::Relaxed);
-                let video = tokio::spawn(video_supervisor(
+                let video = crate::rt::spawn(video_supervisor(
                     gen,
                     video_representation,
                     video_start_index,
@@ -1989,7 +2013,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                     audio = if let Some(sink) = pt_sink {
                         drop(sample_sender);
                         log::info!("[audio] passthrough engaged ({})", audio_representation.codecs);
-                        tokio::spawn(audio_passthrough_play(
+                        crate::rt::spawn(audio_passthrough_play(
                             audio_representation,
                             audio_start_index,
                             sink,
@@ -2004,7 +2028,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                             Arc::clone(&pipeline_live),
                         ))
                     } else {
-                        tokio::spawn(audio_play(
+                        crate::rt::spawn(audio_play(
                             audio_representation,
                             audio_start_index,
                             audio_ready.clone(),
@@ -2023,7 +2047,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                 #[cfg(not(target_os = "android"))]
                 {
                     let _ = want_passthrough;
-                    audio = tokio::spawn(audio_play(
+                    audio = crate::rt::spawn(audio_play(
                         audio_representation,
                         audio_start_index,
                         audio_ready.clone(),
@@ -2045,7 +2069,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                 // Audio-output liveness watch, scoped to this generation: it
                 // rebuilds the pipeline if the output dies under us, so it must
                 // not outlive the generation it is watching.
-                let audio_watchdog = tokio::spawn(audio_output_watchdog(
+                let audio_watchdog = crate::rt::spawn(audio_output_watchdog(
                     gen,
                     audio_sink.clone(),
                     Arc::clone(&stats),
@@ -2497,11 +2521,12 @@ hi
             height: 1080,
             init_data: Vec::new(),
             hvcc_nalus: Vec::new(),
+            decoder_config_record: Vec::new(),
             color: Default::default(),
             dovi_profile: None,
             track_crypto: None,
             download_rx: rx,
-            download_handle: tokio::spawn(async { Ok(()) }),
+            download_handle: crate::rt::spawn(async { Ok(()) }),
             primed: Arc::new(Notify::new()),
             first_prepared: None,
             dl_pts_ms: Arc::new(std::sync::atomic::AtomicI64::new(dl_pts_ms)),

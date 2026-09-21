@@ -23,6 +23,7 @@ pub(super) struct VideoPrefetch {
     pub(super) height: u32,
     pub(super) init_data: Vec<u8>,
     pub(super) hvcc_nalus: Vec<Vec<u8>>,
+    pub(super) decoder_config_record: Vec<u8>,
     pub(super) color: VideoColorInfo,
     pub(super) dovi_profile: Option<u8>,
     pub(super) track_crypto: Option<TrackCrypto>,
@@ -130,6 +131,8 @@ pub(super) async fn video_prefetch(
 
     let hvcc_nalus = parse_hvcc_nalus(&init_data)
         .ok_or_else(|| -> Box<dyn Error + Send + Sync> { "no hvcC in init segment".into() })?;
+    let decoder_config_record =
+        crate::crypto::parse_hvcc_record(&init_data).unwrap_or_default();
 
     // Dolby Vision policy: profiles 7/8 carry a decodable HEVC base layer
     // (HDR10/SDR/HLG-compatible, correctly signalled in the SPS VUI), so
@@ -217,7 +220,7 @@ pub(super) async fn video_prefetch(
             cb_primed.notify_one();
         }
     });
-    let download_handle = task::spawn(download_task(
+    let download_handle = crate::rt::spawn(download_task(
         segments,
         start_index,
         download_tx,
@@ -234,6 +237,7 @@ pub(super) async fn video_prefetch(
         height: repr.height,
         init_data,
         hvcc_nalus,
+        decoder_config_record,
         color,
         dovi_profile,
         track_crypto,
@@ -420,6 +424,7 @@ pub(super) async fn run_decode(
         width: pf.width,
         height: pf.height,
         hvcc_nalus: pf.hvcc_nalus,
+        decoder_config_record: pf.decoder_config_record,
         color: pf.color,
         direct_window,
         dovi_profile: pf.dovi_profile,
@@ -430,7 +435,7 @@ pub(super) async fn run_decode(
     // mediacodec submit_direct).
     decoder.set_stop_signal(decoder_stop_flag.clone());
 
-    let decoder_task = task::spawn(video_decoder_task(
+    let decoder_task = crate::rt::spawn(video_decoder_task(
         pf.download_rx,
         sender,
         decoder,
@@ -460,7 +465,7 @@ pub(super) async fn run_decode(
 /// task itself failed (panic/abort) or it returned `Err`.
 pub(super) fn flatten_task_result<T>(
     name: &str,
-    result: Result<Result<T, Box<dyn Error + Send + Sync>>, tokio::task::JoinError>,
+    result: Result<Result<T, Box<dyn Error + Send + Sync>>, crate::rt::JoinError>,
 ) -> Option<Box<dyn Error + Send + Sync>> {
     match result {
         Ok(Ok(_)) => None,
@@ -608,7 +613,7 @@ pub(super) async fn audio_play(
                 .store(pts_ms, Ordering::Relaxed);
         }
     });
-    let download_task = task::spawn(download_task(
+    let download_task = crate::rt::spawn(download_task(
         segments,
         start_index,
         download_tx,
@@ -622,7 +627,7 @@ pub(super) async fn audio_play(
         // disables the early break.
         Arc::new(AtomicUsize::new(usize::MAX)),
     ));
-    let decoder_task = task::spawn(audio_decoder_task(
+    let decoder_task = crate::rt::spawn(audio_decoder_task(
         download_rx,
         sender,
         decoder,
@@ -675,7 +680,7 @@ pub(super) async fn audio_passthrough_play(
     let track_crypto = setup_track_crypto(&init_data, decryptor, "audio").await?;
 
     let segments = audio_representation.segments.clone();
-    let download = task::spawn(download_task(
+    let download = crate::rt::spawn(download_task(
         segments,
         start_index,
         download_tx,
@@ -686,7 +691,7 @@ pub(super) async fn audio_passthrough_play(
         None,
         Arc::new(AtomicUsize::new(usize::MAX)),
     ));
-    let feed = task::spawn(audio_passthrough_task(
+    let feed = crate::rt::spawn(audio_passthrough_task(
         download_rx,
         sink,
         init_data,
@@ -748,7 +753,7 @@ pub(super) async fn audio_passthrough_task(
                     if stop_flag.load(Ordering::Relaxed) {
                         return Ok(());
                     }
-                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    crate::rt::sleep(Duration::from_millis(5)).await;
                 }
                 base_pts_ms = au_ms;
             }
@@ -813,7 +818,7 @@ pub(super) async fn audio_passthrough_task(
                     // prompt resume, then wait — do NOT abandon.
                     if sink.is_paused() {
                         if au_ms - base_pts_ms >= PRIME_PAUSED_TARGET_MS {
-                            tokio::time::sleep(Duration::from_millis(20)).await;
+                            crate::rt::sleep(Duration::from_millis(20)).await;
                             continue;
                         }
                         break;
@@ -852,12 +857,12 @@ pub(super) async fn audio_passthrough_task(
                     chk_played = played;
                     chk_wall = Instant::now();
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                crate::rt::sleep(Duration::from_millis(10)).await;
             }
             // `block_in_place`: hand this worker's other tasks (the video decode
             // pipeline!) to a sibling worker while the JNI write runs.
             let au = &data_vec[offset..offset + size];
-            tokio::task::block_in_place(|| sink.write(au));
+            crate::rt::block_in_place(|| sink.write(au));
             au_count += 1;
             if !first_au_written {
                 log::debug!("[audio-pt] first AU written (au_ms={}), play() armed", au_ms);

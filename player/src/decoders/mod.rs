@@ -27,6 +27,13 @@ pub mod mediacodec;
 pub mod mediacodec_audio;
 #[cfg(any(target_os = "ios", target_os = "macos"))]
 pub mod videotoolbox;
+// Browser: WebCodecs for both video and audio.
+#[cfg(target_arch = "wasm32")]
+pub mod webcodecs;
+// Interleave / downmix / resample helpers shared by the decoders that hand
+// us PCM in the source layout (MediaCodec, WebCodecs) rather than through a
+// resampling library (FFmpeg's swresample).
+pub mod pcm;
 
 // ---------------------------------------------------------------------------
 // Video decoder types
@@ -52,6 +59,12 @@ pub struct VideoDecoderParams {
     /// Raw NALU bytes (no length prefix, no start code) — VPS/SPS/PPS for HEVC,
     /// extracted from the hvcC box in the init segment.
     pub hvcc_nalus: Vec<Vec<u8>>,
+    /// The whole decoder configuration record (`hvcC` payload) the NALUs above
+    /// were taken from. WebCodecs wants the record itself (it derives the
+    /// codec string and the NAL length size from it); the native decoders
+    /// ignore it.
+    #[allow(dead_code)]
+    pub decoder_config_record: Vec<u8>,
     /// Colour information for the representation, parsed from the SPS VUI
     /// (authoritative — the MPD often mis-signals BT.709 on PQ content).
     /// Drives 10-bit surface allocation and the HDR tonemap path selection;
@@ -184,6 +197,29 @@ pub enum PlatformFrame {
     /// the video renderer imports via CVMetalTextureCache zero-copy.
     #[cfg(any(target_os = "ios", target_os = "macos"))]
     CvPixelBuffer(CvPixelBufferOwned),
+    /// Browser: the decoded frame copied out of the WebCodecs `VideoFrame`
+    /// into CPU memory as two tightly packed planes (Y, interleaved UV). The
+    /// renderer uploads them as R8/RG8 (or R16/RG16 for 10-bit) textures —
+    /// the same two-plane shape the Apple path samples, so the NV12 / P010
+    /// shaders and the HDR tonemap run unchanged.
+    #[cfg(target_arch = "wasm32")]
+    CpuPlanes(CpuPlanarFrame),
+}
+
+/// A decoded frame in CPU memory, NV12 / P010 layout with no row padding.
+#[cfg(target_arch = "wasm32")]
+pub struct CpuPlanarFrame {
+    pub width: u32,
+    pub height: u32,
+    /// 8 → `y`/`uv` hold one byte per sample. 10 or 12 → two bytes per
+    /// sample, little-endian, MSB-aligned like P010 (a 10-bit code `c` is
+    /// stored as `c << 6`), so an `R16Unorm` view normalises it exactly as
+    /// the desktop P010 import does.
+    pub bit_depth: u8,
+    /// `width × height` luma samples, row-major.
+    pub y: Vec<u8>,
+    /// `ceil(width/2) × ceil(height/2)` interleaved Cb,Cr pairs, row-major.
+    pub uv: Vec<u8>,
 }
 
 /// Reference-counted wrapper around a CVPixelBufferRef. CFRetain on

@@ -1,0 +1,35 @@
+[package]
+name = "bridge-web"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+# rustplayer.js + rustplayer_bg.wasm (wasm-pack), loaded from a `<script type="module">`.
+name = "rustplayer"
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
+# Dependencies are wasm-only so this crate is a no-op on native builds
+# (`cargo check --workspace` on the host still passes), exactly like the
+# Android and iOS shells are no-ops off-target.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+player = { path = "../../player" }
+bridge = { path = "../../bridge" }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["HtmlCanvasElement", "Window", "console"] }
+# BridgeHost is an #[async_trait] impl; the JS provider hooks are awaited as
+# promises.
+async-trait = "0.1"
+log = "0.4"
+# `log` → browser console, and panics → console.error with a backtrace-ish
+# message instead of a bare "unreachable executed".
+console_log = "1"
+console_error_panic_hook = "0.1"
+hex = "0.4"
+
+# wasm-opt runs for minutes on a debug-info-laden module and its output is not
+# what we are testing here. Enable when sizing a release artifact.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false

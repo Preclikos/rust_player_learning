@@ -214,13 +214,13 @@ pub(super) async fn video_sync_loop<V: VideoSink, A: AudioSink>(
             if stats.audio_starving.load(Ordering::Relaxed) {
                 let park_started = Instant::now();
                 tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                    _ = crate::rt::sleep(Duration::from_millis(100)) => {}
                     _ = stop.notified() => return,
                 }
                 pause_skew += park_started.elapsed();
                 continue;
             }
-            let starvation_wait = tokio::time::sleep(Duration::from_millis(300));
+            let starvation_wait = crate::rt::sleep(Duration::from_millis(300));
             tokio::pin!(starvation_wait);
             tokio::select! {
                 maybe = input_rx.recv() => {
@@ -399,7 +399,7 @@ pub(super) async fn video_sync_loop<V: VideoSink, A: AudioSink>(
             let target_wake_ms = pts_ms.saturating_sub(render_budget_ms);
             if target_wake_ms > elapsed {
                 tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_millis(target_wake_ms - elapsed)) => {}
+                    _ = crate::rt::sleep(Duration::from_millis(target_wake_ms - elapsed)) => {}
                     _ = stop.notified() => break,
                 }
                 if stop_flag.load(Ordering::Relaxed) {
@@ -731,7 +731,7 @@ pub(super) async fn audio_sync_loop<A: AudioSink>(
         // — preventing the asymmetric "audio silent but video keeps
         // playing" state.
         let frame = loop {
-            let starvation_wait = tokio::time::sleep(Duration::from_millis(300));
+            let starvation_wait = crate::rt::sleep(Duration::from_millis(300));
             tokio::pin!(starvation_wait);
             tokio::select! {
                 maybe = input_rx.recv() => {
@@ -920,7 +920,7 @@ pub(super) async fn av_sync_handler<V: VideoSink, A: AudioSink>(
     // dequeue_input forever. A/V sync self-aligns once audio starts flowing.
     tokio::select! {
         _ = audio_ready.notified() => {}
-        _ = tokio::time::sleep(Duration::from_secs(3)) => {
+        _ = crate::rt::sleep(Duration::from_secs(3)) => {
             log::warn!("[vsync] audio not ready after 3s — starting playback without waiting (guards the direct-mode video codec against a backpressure stall)");
         }
         _ = stop.notified() => {
@@ -979,7 +979,7 @@ pub(super) async fn av_sync_handler<V: VideoSink, A: AudioSink>(
                 break;
             }
             tokio::select! {
-                _ = tokio::time::sleep(Duration::from_millis(4)) => {}
+                _ = crate::rt::sleep(Duration::from_millis(4)) => {}
                 _ = stop.notified() => {
                     stop.notify_waiters();
                     return;
@@ -1002,7 +1002,7 @@ pub(super) async fn av_sync_handler<V: VideoSink, A: AudioSink>(
     let paused_audio = Arc::clone(&paused);
     let end_position = Arc::clone(&position_ms);
     let (_, _) = tokio::join!(
-        tokio::spawn(video_sync_loop(
+        crate::rt::spawn(video_sync_loop(
             gen,
             start_time.clone(),
             seek_offset,
@@ -1020,7 +1020,7 @@ pub(super) async fn av_sync_handler<V: VideoSink, A: AudioSink>(
             pause_notify,
             stats,
         )),
-        tokio::spawn(audio_sync_loop(
+        crate::rt::spawn(audio_sync_loop(
             audio_rx,
             audio_sink,
             seek_offset.as_millis() as i64,

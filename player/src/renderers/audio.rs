@@ -22,8 +22,12 @@ const QUEUE_CHUNKS: usize = 96;
 // module's per-backend split): cpal PCM on desktop/iOS, an AudioTrack PCM sink
 // on Android (cpal/AAudio is stolen on some TV HALs), and an AudioTrack
 // bitstream sink for compressed passthrough.
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_arch = "wasm32")))]
 mod audio_cpal;
+// Browser: Web Audio (ScriptProcessorNode) with the same `start_thread`
+// contract as the cpal backend, so `AudioRenderer` is otherwise unchanged.
+#[cfg(target_arch = "wasm32")]
+mod audio_web;
 #[cfg(target_os = "android")]
 pub mod audio_passthrough;
 #[cfg(target_os = "android")]
@@ -125,7 +129,7 @@ impl AudioRenderer {
         let output_latency_ms = Arc::new(AtomicU64::new(0));
         let (command_sender, command_receiver) = mpsc::channel(4);
 
-        #[cfg(not(target_os = "android"))]
+        #[cfg(not(any(target_os = "android", target_arch = "wasm32")))]
         let (sample_sender, sample_rate) = {
             let t = audio_cpal::start_thread(
                 command_receiver,
@@ -138,6 +142,16 @@ impl AudioRenderer {
             );
             (t.0, t.1)
         };
+        #[cfg(target_arch = "wasm32")]
+        let (sample_sender, sample_rate) = audio_web::start_thread(
+            command_receiver,
+            stop,
+            flush_state.clone(),
+            paused_flag.clone(),
+            volume.clone(),
+            samples_consumed.clone(),
+            output_latency_ms.clone(),
+        );
         // Android outputs PCM through an AudioTrack (cpal/AAudio is stolen on some
         // TV HALs); the cpal stop/command machinery is unused on this path. The
         // writer's consumption gates on HOST pause only, which starts false (like
@@ -283,6 +297,12 @@ impl AudioRenderer {
     /// nothing else unparks after resume.
     pub fn set_paused(&self, paused: bool) {
         self.paused_flag.store(paused, Ordering::Relaxed);
+        // Browser autoplay policy can suspend the AudioContext behind our
+        // back; an un-pause is a user gesture, the right moment to resume it.
+        #[cfg(target_arch = "wasm32")]
+        if !paused {
+            audio_web::resume_if_suspended();
+        }
         #[cfg(target_os = "android")]
         {
             self.host_paused.store(paused, Ordering::Relaxed);

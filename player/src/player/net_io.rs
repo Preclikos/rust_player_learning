@@ -140,7 +140,7 @@ pub(super) async fn download_task(
                     );
                     last_err = Some(e);
                     tokio::select! {
-                        _ = tokio::time::sleep(backoff) => {}
+                        _ = crate::rt::sleep(backoff) => {}
                         _ = stop.notified() => {
                             should_break = true;
                             break;
@@ -182,7 +182,7 @@ pub(super) struct DataSegment {
 
 pub(super) fn log_task_result<T, E: std::fmt::Display>(
     name: &str,
-    result: Result<Result<T, E>, tokio::task::JoinError>,
+    result: Result<Result<T, E>, crate::rt::JoinError>,
 ) {
     match result {
         Ok(Ok(_)) => {}

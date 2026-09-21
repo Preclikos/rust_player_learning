@@ -8,6 +8,8 @@ use tokio::sync::{
 use video_frame::VideoFrame;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 use video_metal::{MetalNV12Frame, MetalTextureCache};
+#[cfg(target_arch = "wasm32")]
+use crate::decoders::CpuPlanarFrame;
 use wgpu::{Backends, Buffer};
 use wgpu::{Device, SurfaceConfiguration};
 // Additive: alternate offscreen output for in-app video (shared-device).
@@ -102,6 +104,21 @@ enum SurfaceSource {
     /// Embedded Apple: a host-provided `CAMetalLayer*`.
     #[cfg(any(target_os = "ios", target_os = "macos"))]
     MetalLayer(*mut std::ffi::c_void),
+    /// Browser: a host-provided `<canvas>` element.
+    #[cfg(target_arch = "wasm32")]
+    Canvas(web_sys::HtmlCanvasElement),
+}
+
+/// Browser: the two plane textures the CPU-frame path uploads into. Reused
+/// across frames while the size / bit depth stay the same (one allocation
+/// per representation, not per frame).
+#[cfg(target_arch = "wasm32")]
+struct CpuPlaneTextures {
+    width: u32,
+    height: u32,
+    sixteen_bit: bool,
+    y: wgpu::Texture,
+    uv: wgpu::Texture,
 }
 
 #[repr(C)]
@@ -243,6 +260,11 @@ pub struct VideoRenderer {
     /// the main video quad. Android's GLES OES path doesn't call it
     /// yet — subtitle rendering there is a separate follow-up.
     subtitle_overlay: Arc<std::sync::Mutex<Option<Arc<super::subtitle::SubtitleOverlay>>>>,
+    /// Browser: plane textures for [`PlatformFrame::CpuPlanes`] uploads.
+    /// `std::sync::Mutex` — touched only inside the (single-threaded) render
+    /// path, never held across an await.
+    #[cfg(target_arch = "wasm32")]
+    cpu_planes: std::sync::Mutex<Option<CpuPlaneTextures>>,
     frame_size: Arc<RwLock<PhysicalSize<u32>>>,
     // Crop factor for the texture axes: content / buffer size.
     // Always 1.0 on desktop; set to <1.0 on Android when the hardware codec
@@ -451,10 +473,22 @@ impl VideoRenderer {
         renderer
     }
 
+    /// Browser: build the wgpu surface on a host-provided `<canvas>`. WebGPU
+    /// when the browser has it, WebGL2 otherwise (SDR only there — no compute,
+    /// no storage buffers for the HDR detect / tonemap path). The host keeps
+    /// the canvas in the DOM for the renderer's lifetime.
+    #[cfg(target_arch = "wasm32")]
+    pub async fn new_from_canvas(canvas: web_sys::HtmlCanvasElement, width: u32, height: u32) -> Self {
+        let size = PhysicalSize::new(width.max(1), height.max(1));
+        Self::new_with_surface(size, SurfaceSource::Canvas(canvas)).await
+    }
+
     /// Shared constructor body. Differs from the old `new` only in how the
     /// wgpu surface is created and where the initial size comes from — both are
     /// parameters now.
     async fn new_with_surface(size: PhysicalSize<u32>, surface_source: SurfaceSource) -> Self {
+        #[cfg(target_arch = "wasm32")]
+        let backend = Backends::BROWSER_WEBGPU | Backends::GL;
         #[cfg(target_os = "windows")]
         let backend = Backends::DX12;
         #[cfg(target_os = "linux")]
@@ -494,6 +528,10 @@ impl VideoRenderer {
                     .create_surface_unsafe(wgpu::SurfaceTargetUnsafe::CoreAnimationLayer(layer))
                     .unwrap()
             },
+            #[cfg(target_arch = "wasm32")]
+            SurfaceSource::Canvas(canvas) => instance
+                .create_surface(wgpu::SurfaceTarget::Canvas(canvas))
+                .expect("wgpu surface on canvas"),
         };
 
         #[cfg(target_os = "android")]
@@ -532,11 +570,17 @@ impl VideoRenderer {
         // below so the macOS path gets a working RenderPipeline.
         let is_hw_backend = backend == wgpu::Backend::Vulkan
             || backend == wgpu::Backend::Dx12
-            || backend == wgpu::Backend::Metal;
+            || backend == wgpu::Backend::Metal
+            || backend == wgpu::Backend::BrowserWebGpu;
         // P010 (HEVC Main 10) goes through TextureFormat::P010, which wgpu gates
         // behind a separate feature from NV12 — without enabling it the imported
         // texture errors with "P010 cannot be used due to missing features".
-        let required_features = if is_hw_backend && backend != wgpu::Backend::Metal {
+        let required_features = if backend == wgpu::Backend::BrowserWebGpu {
+            // The browser path uploads two CPU planes (R8/RG8, or R16/RG16 for
+            // 10-bit when the adapter has 16-bit-norm textures); it never
+            // imports NV12/P010 surfaces.
+            adapter.features() & wgpu::Features::TEXTURE_FORMAT_16BIT_NORM
+        } else if is_hw_backend && backend != wgpu::Backend::Metal {
             let desired = wgpu::Features::TEXTURE_FORMAT_NV12
                 | wgpu::Features::TEXTURE_FORMAT_P010
                 | wgpu::Features::TEXTURE_FORMAT_16BIT_NORM;
@@ -594,8 +638,15 @@ impl VideoRenderer {
         // CVPixelBuffer planes, so no NV12 feature is needed — but the
         // pipeline + vertex buffer still need to be created.
         let needs_pipeline = required_features.contains(wgpu::Features::TEXTURE_FORMAT_NV12)
-            || backend == wgpu::Backend::Metal;
+            || backend == wgpu::Backend::Metal
+            || cfg!(target_arch = "wasm32");
         let has_nv12_feature = needs_pipeline;
+        // The HDR path (detect compute passes + a storage-buffer bind group)
+        // needs compute shaders and storage buffers. WebGL2 has neither, so
+        // on that fallback only the SDR pipeline is built and PQ content
+        // draws through it (washed out, but drawn). Every native backend and
+        // WebGPU have both.
+        let hdr_capable = !cfg!(target_arch = "wasm32") || backend == wgpu::Backend::BrowserWebGpu;
         log::info!(
             "[renderer] backend={:?} nv12={} adapter={}",
             backend,
@@ -712,7 +763,7 @@ impl VideoRenderer {
             // the SDR / Apple Metal pipelines on the untouched group-0
             // layout — no storage-buffer requirement leaks into paths that
             // never run the HDR shader.
-            let hdr_detect_frag_layout =
+            let hdr_detect_frag_layout = hdr_capable.then(|| {
                 device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                     entries: &[wgpu::BindGroupLayoutEntry {
                         binding: 0,
@@ -727,12 +778,15 @@ impl VideoRenderer {
                         count: None,
                     }],
                     label: Some("hdr_detect_frag_layout"),
-                });
+                })
+            });
 
             let shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
-            let shader_hdr = device.create_shader_module(wgpu::include_wgsl!("shader_hdr.wgsl"));
-            let shader_hdr_detect =
-                device.create_shader_module(wgpu::include_wgsl!("shader_hdr_detect.wgsl"));
+            let shader_hdr = hdr_capable
+                .then(|| device.create_shader_module(wgpu::include_wgsl!("shader_hdr.wgsl")));
+            let shader_hdr_detect = hdr_capable.then(|| {
+                device.create_shader_module(wgpu::include_wgsl!("shader_hdr_detect.wgsl"))
+            });
 
             let pipeline_layout =
                 device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -740,12 +794,13 @@ impl VideoRenderer {
                     bind_group_layouts: &[Some(&layout)],
                     immediate_size: 0,
                 });
-            let pipeline_layout_hdr =
+            let pipeline_layout_hdr = hdr_detect_frag_layout.as_ref().map(|frag| {
                 device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                     label: Some("Pipeline Layout (HDR)"),
-                    bind_group_layouts: &[Some(&layout), Some(&hdr_detect_frag_layout)],
+                    bind_group_layouts: &[Some(&layout), Some(frag)],
                     immediate_size: 0,
-                });
+                })
+            });
 
             let make_pipeline = |label: &'static str,
                                  module: &wgpu::ShaderModule,
@@ -778,8 +833,12 @@ impl VideoRenderer {
             };
 
             let pipeline = make_pipeline("Render Pipeline (SDR/NV12)", &shader, &pipeline_layout);
-            let pipeline_hdr =
-                make_pipeline("Render Pipeline (HDR/P010)", &shader_hdr, &pipeline_layout_hdr);
+            let pipeline_hdr = match (&shader_hdr, &pipeline_layout_hdr) {
+                (Some(module), Some(pl)) => {
+                    Some(make_pipeline("Render Pipeline (HDR/P010)", module, pl))
+                }
+                _ => None,
+            };
 
             let vertices = generate_verticles(1., 1., 1.);
             let vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -801,6 +860,8 @@ impl VideoRenderer {
             // Frame peak/average detection state. Plain STORAGE usage — the
             // statistics accumulate and are consumed entirely on the GPU
             // (zero-copy: no readback, no CPU staging).
+            let hdr_detect = match (&hdr_detect_frag_layout, &shader_hdr_detect) {
+                (Some(hdr_detect_frag_layout), Some(shader_hdr_detect)) => {
             let detect_buffer = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("HDR Detect Buffer"),
                 size: HDR_DETECT_BUFFER_SIZE,
@@ -809,7 +870,7 @@ impl VideoRenderer {
             });
 
             let detect_frag_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                layout: &hdr_detect_frag_layout,
+                layout: hdr_detect_frag_layout,
                 entries: &[wgpu::BindGroupEntry {
                     binding: 0,
                     resource: detect_buffer.as_entire_binding(),
@@ -880,29 +941,32 @@ impl VideoRenderer {
                 device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                     label: Some(label),
                     layout: Some(&detect_pipeline_layout),
-                    module: &shader_hdr_detect,
+                    module: shader_hdr_detect,
                     entry_point: Some(entry),
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
                     cache: None,
                 })
             };
 
-            let hdr_detect = HdrDetect {
+            Some(HdrDetect {
                 buffer: detect_buffer,
                 frag_bind_group: detect_frag_bind_group,
                 compute_layout: detect_compute_layout,
                 publish: make_detect_pipeline("HDR Detect (publish)", "cs_publish"),
                 accumulate: make_detect_pipeline("HDR Detect (accumulate)", "cs_accumulate"),
                 finalize: make_detect_pipeline("HDR Detect (finalize)", "cs_finalize"),
+            })
+                }
+                _ => None,
             };
 
             (
                 Some(layout),
                 Some(pipeline),
-                Some(pipeline_hdr),
+                pipeline_hdr,
                 Some(Arc::new(RwLock::new(vb))),
                 Some(tonemap_uniform),
-                Some(hdr_detect),
+                hdr_detect,
             )
         } else {
             (None, None, None, None, None, None)
@@ -1031,6 +1095,8 @@ impl VideoRenderer {
             )),
             command_sender,
             subtitle_overlay: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(target_arch = "wasm32")]
+            cpu_planes: std::sync::Mutex::new(None),
             #[cfg(target_os = "android")]
             gles_oes_renderer,
             #[cfg(target_os = "android")]
@@ -1384,6 +1450,8 @@ impl VideoRenderer {
             )),
             command_sender,
             subtitle_overlay: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(target_arch = "wasm32")]
+            cpu_planes: std::sync::Mutex::new(None),
             #[cfg(target_os = "android")]
             gles_oes_renderer: None,
             #[cfg(target_os = "android")]
@@ -1612,7 +1680,7 @@ impl VideoRenderer {
         let vertex_buffer = self.vertex_buffer.clone(); // Option<Arc<...>>
         let device = self.device.clone();
         let surface_size = Arc::clone(&self.surface_size);
-        tokio::spawn(async move {
+        crate::rt::spawn(async move {
             while let Some(initial) = command_receiver.recv().await {
                 // Drain the channel and keep only the latest of each command
                 // kind. During a drag-resize the producer floods us with
@@ -1727,7 +1795,12 @@ impl VideoRenderer {
         // offset (commonly several seconds in real DASH streams).
         #[cfg(target_os = "android")]
         let desired_present_ns = frame.desired_present_ns;
-        #[cfg(any(target_os = "android", target_os = "ios", target_os = "macos"))]
+        #[cfg(any(
+            target_os = "android",
+            target_os = "ios",
+            target_os = "macos",
+            target_arch = "wasm32"
+        ))]
         let frame_color = frame.color;
         #[cfg(target_os = "android")]
         let frame_hdr_meta = frame.hdr_meta;
@@ -1754,9 +1827,125 @@ impl VideoRenderer {
             PlatformFrame::CvPixelBuffer(cv_buf) => {
                 self.render_cv_pixel_buffer(cv_buf, frame_color).await;
             }
+            #[cfg(target_arch = "wasm32")]
+            PlatformFrame::CpuPlanes(planes) => {
+                self.render_cpu_planes(planes, frame_color).await;
+            }
             #[allow(unreachable_patterns)]
             _ => {}
         }
+    }
+
+    /// Browser: upload a CPU NV12 / P010 frame as two plane textures and draw
+    /// it through the shared two-plane path. 10-bit content falls back to
+    /// 8-bit planes (top byte of each MSB-aligned sample) when the device has
+    /// no 16-bit-norm textures — the tonemap still runs, at 8-bit quantization.
+    #[cfg(target_arch = "wasm32")]
+    async fn render_cpu_planes(&self, frame: CpuPlanarFrame, color: crate::decoders::VideoColorInfo) {
+        if self.texture_bind_group_layout.is_none() {
+            return;
+        }
+        let device_16bit = self
+            .device
+            .features()
+            .contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM);
+        let sixteen_bit = frame.bit_depth > 8 && device_16bit;
+        let (y_data, uv_data): (std::borrow::Cow<[u8]>, std::borrow::Cow<[u8]>) =
+            if frame.bit_depth > 8 && !device_16bit {
+                // MSB-aligned 16-bit LE → high byte is the top 8 bits.
+                let hi = |v: &[u8]| v.chunks_exact(2).map(|p| p[1]).collect::<Vec<u8>>();
+                (hi(&frame.y).into(), hi(&frame.uv).into())
+            } else {
+                ((&frame.y[..]).into(), (&frame.uv[..]).into())
+            };
+        let bpp: u32 = if sixteen_bit { 2 } else { 1 };
+        let (w, h) = (frame.width.max(1), frame.height.max(1));
+        let (uv_w, uv_h) = (w.div_ceil(2), h.div_ceil(2));
+
+        let (y_tex, uv_tex) = {
+            let mut slot = self.cpu_planes.lock().unwrap();
+            let stale = match slot.as_ref() {
+                Some(t) => t.width != w || t.height != h || t.sixteen_bit != sixteen_bit,
+                None => true,
+            };
+            if stale {
+                let (y_fmt, uv_fmt) = if sixteen_bit {
+                    (TextureFormat::R16Unorm, TextureFormat::Rg16Unorm)
+                } else {
+                    (TextureFormat::R8Unorm, TextureFormat::Rg8Unorm)
+                };
+                let make = |label: &str, tw: u32, th: u32, format: TextureFormat| {
+                    self.device.create_texture(&wgpu::TextureDescriptor {
+                        label: Some(label),
+                        size: wgpu::Extent3d {
+                            width: tw,
+                            height: th,
+                            depth_or_array_layers: 1,
+                        },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format,
+                        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                        view_formats: &[],
+                    })
+                };
+                log::info!(
+                    "[renderer] web plane textures {}x{} {}-bit ({:?}/{:?})",
+                    w,
+                    h,
+                    if sixteen_bit { 16 } else { 8 },
+                    y_fmt,
+                    uv_fmt
+                );
+                *slot = Some(CpuPlaneTextures {
+                    width: w,
+                    height: h,
+                    sixteen_bit,
+                    y: make("web Y plane", w, h, y_fmt),
+                    uv: make("web UV plane", uv_w, uv_h, uv_fmt),
+                });
+            }
+            let t = slot.as_ref().unwrap();
+            (t.y.clone(), t.uv.clone())
+        };
+
+        let upload = |tex: &wgpu::Texture, data: &[u8], tw: u32, th: u32, row_bytes: u32| {
+            if data.len() < (row_bytes * th) as usize {
+                log::warn!(
+                    "[renderer] short plane: {} < {}x{} bytes",
+                    data.len(),
+                    row_bytes,
+                    th
+                );
+                return;
+            }
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &data[..(row_bytes * th) as usize],
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(row_bytes),
+                    rows_per_image: Some(th),
+                },
+                wgpu::Extent3d {
+                    width: tw,
+                    height: th,
+                    depth_or_array_layers: 1,
+                },
+            );
+        };
+        upload(&y_tex, &y_data, w, h, w * bpp);
+        upload(&uv_tex, &uv_data, uv_w, uv_h, uv_w * 2 * bpp);
+
+        let y_view = y_tex.create_view(&Default::default());
+        let uv_view = uv_tex.create_view(&Default::default());
+        self.draw_planes(&y_view, &uv_view, w, h, color.is_hdr()).await;
     }
 
     /// Windows / Linux FFmpeg → wgpu native-import draw path. macOS / iOS
@@ -2092,6 +2281,26 @@ impl VideoRenderer {
             metal_frame.y_texture.width(),
             metal_frame.y_texture.height(),
         );
+        self.draw_planes(&y_plane_view, &uv_plane_view, frame_w, frame_h, is_hdr)
+            .await;
+    }
+
+    /// Draw one frame given its two plane views (Y, interleaved UV) — the
+    /// shared tail of the Apple zero-copy path and the browser CPU-upload
+    /// path: pipeline selection (SDR vs HDR tonemap + detection passes), the
+    /// bind groups, the surface acquire / present. `is_hdr` follows the
+    /// frame's signalled transfer; it draws through the SDR pipeline when the
+    /// device has no HDR pipeline (WebGL2).
+    #[cfg(any(target_os = "macos", target_os = "ios", target_arch = "wasm32"))]
+    async fn draw_planes(
+        &self,
+        y_plane_view: &wgpu::TextureView,
+        uv_plane_view: &wgpu::TextureView,
+        frame_w: u32,
+        frame_h: u32,
+        is_hdr: bool,
+    ) {
+        let is_hdr = is_hdr && self.render_pipeline_hdr.is_some();
         let (uv_w, uv_h) = (frame_w.div_ceil(2), frame_h.div_ceil(2));
         let (wg_x, wg_y) = (uv_w.div_ceil(16), uv_h.div_ceil(16));
 
@@ -2128,11 +2337,11 @@ impl VideoRenderer {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&y_plane_view),
+                    resource: wgpu::BindingResource::TextureView(y_plane_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&uv_plane_view),
+                    resource: wgpu::BindingResource::TextureView(uv_plane_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
@@ -2155,11 +2364,11 @@ impl VideoRenderer {
                     entries: &[
                         wgpu::BindGroupEntry {
                             binding: 0,
-                            resource: wgpu::BindingResource::TextureView(&y_plane_view),
+                            resource: wgpu::BindingResource::TextureView(y_plane_view),
                         },
                         wgpu::BindGroupEntry {
                             binding: 1,
-                            resource: wgpu::BindingResource::TextureView(&uv_plane_view),
+                            resource: wgpu::BindingResource::TextureView(uv_plane_view),
                         },
                         wgpu::BindGroupEntry {
                             binding: 2,

@@ -90,11 +90,11 @@ pub(super) async fn video_supervisor(
                           local_stop: Arc<Notify>,
                           local_stop_flag: Arc<AtomicBool>|
      -> (
-        tokio::task::JoinHandle<Result<(), Box<dyn Error + Send + Sync>>>,
+        crate::rt::JoinHandle<Result<(), Box<dyn Error + Send + Sync>>>,
         Arc<AtomicUsize>,
     ) {
         let soft_end = Arc::new(AtomicUsize::new(usize::MAX));
-        let handle = task::spawn(video_play(
+        let handle = crate::rt::spawn(video_play(
             repr,
             start_index,
             video_ready.clone(),
@@ -229,7 +229,7 @@ const PREPARE_READY_BUDGET: Duration = Duration::from_millis(1_200);
                     // Backoff, abortable by stop. av_sync's starvation
                     // detection keeps the consumer in Buffering meanwhile.
                     tokio::select! {
-                        _ = tokio::time::sleep(Duration::from_secs(retry_attempt as u64)) => {}
+                        _ = crate::rt::sleep(Duration::from_secs(retry_attempt as u64)) => {}
                         _ = stop.notified() => return Ok(()),
                     }
                     if stop_flag.load(Ordering::Relaxed) {
@@ -247,7 +247,7 @@ const PREPARE_READY_BUDGET: Duration = Duration::from_millis(1_200);
                     cur_stop = Arc::new(Notify::new());
                     cur_flag = Arc::new(AtomicBool::new(false));
                     cur_soft_end = Arc::new(AtomicUsize::new(usize::MAX));
-                    cur_handle = task::spawn({
+                    cur_handle = crate::rt::spawn({
                         let repr = current_repr.clone();
                         let stop = cur_stop.clone();
                         let flag = cur_flag.clone();
@@ -437,7 +437,7 @@ const PREPARE_READY_BUDGET: Duration = Duration::from_millis(1_200);
                 // while OLD still has seconds to play (see start_first_prepare).
                 new_pf.start_first_prepare();
             }
-            _ = tokio::time::sleep(PRIME_TIMEOUT) => {
+            _ = crate::rt::sleep(PRIME_TIMEOUT) => {
                 log::warn!(
                     "[abr] prefetch prime timed out after {}ms; swapping anyway",
                     swap_t0.elapsed().as_millis()
@@ -516,7 +516,7 @@ const PREPARE_READY_BUDGET: Duration = Duration::from_millis(1_200);
             // forwarder into the main frame channel. If NEW's decode dies
             // before release (stop/error), the gate closes and the pump just
             // flushes and exits — the supervisor's retry handles the rest.
-            task::spawn({
+            crate::rt::spawn({
                 let sender = frame_sender.clone();
                 let release = Arc::clone(&release);
                 async move {
@@ -540,7 +540,7 @@ const PREPARE_READY_BUDGET: Duration = Duration::from_millis(1_200);
             // this segment index, so everything below the boundary is OLD's
             // and NEW keeps the boundary frame up (the trim is `<=`, hence -1).
             let splice_pts_us = boundary_ms as i64 * 1000 - 1;
-            let handle = task::spawn(run_decode(
+            let handle = crate::rt::spawn(run_decode(
                 new_pf.take().unwrap(),
                 gate_tx,
                 video_ready.clone(),
@@ -576,7 +576,7 @@ const PREPARE_READY_BUDGET: Duration = Duration::from_millis(1_200);
             }
             let remaining = boundary_ms - (rendered_abs + BOUNDARY_LEAD_MS);
             tokio::select! {
-                _ = tokio::time::sleep(Duration::from_millis(remaining.min(120))) => {}
+                _ = crate::rt::sleep(Duration::from_millis(remaining.min(120))) => {}
                 _ = stop.notified() => {
                     signal_stop(&new_flag, &new_stop);
                     // Unblock a warm NEW decode parked on its full gate so it
@@ -620,7 +620,7 @@ const PREPARE_READY_BUDGET: Duration = Duration::from_millis(1_200);
             if let Some(h) = pf.first_prepared.as_ref() {
                 let wait_t0 = Instant::now();
                 while !h.is_finished() && wait_t0.elapsed() < PREPARE_READY_BUDGET {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    crate::rt::sleep(Duration::from_millis(10)).await;
                 }
                 let waited = wait_t0.elapsed();
                 // Only worth the operator's attention when the budget ran
@@ -713,7 +713,7 @@ const PREPARE_READY_BUDGET: Duration = Duration::from_millis(1_200);
                 );
                 let decode_t0 = Instant::now();
                 let decoder = decoder_factory();
-                task::spawn(run_decode(
+                crate::rt::spawn(run_decode(
                     new_pf.take().expect("new_pf unconsumed on non-warm path"),
                     frame_sender.clone(),
                     video_ready.clone(),

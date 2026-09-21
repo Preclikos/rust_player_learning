@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>rustplayer web smoke test</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root { color-scheme: dark; font: 14px/1.4 system-ui, sans-serif; }
+  body { margin: 0; background: #111; color: #ddd; display: grid; grid-template-rows: auto 1fr auto; height: 100vh; }
+  header, footer { padding: 8px 12px; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; background: #1a1a1a; }
+  #stage { position: relative; background: #000; min-height: 0; }
+  canvas { width: 100%; height: 100%; display: block; }
+  input[type=text] { flex: 1 1 320px; min-width: 200px; background: #222; color: #eee; border: 1px solid #444; padding: 4px 6px; }
+  button, select { background: #2a2a2a; color: #eee; border: 1px solid #555; padding: 4px 10px; cursor: pointer; }
+  button:disabled { opacity: .4; cursor: default; }
+  #seek { flex: 1 1 200px; }
+  #log { position: absolute; left: 0; right: 0; bottom: 0; max-height: 40%; overflow: auto; margin: 0; padding: 6px 10px; font: 11px/1.3 ui-monospace, monospace; background: rgba(0,0,0,.6); color: #9d9; pointer-events: none; }
+  #status { font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+<header>
+  <input id="url" type="text" placeholder="DASH manifest URL">
+  <button id="start">Start</button>
+  <button id="stop" disabled>Stop</button>
+  <label><input id="showlog" type="checkbox" checked> events</label>
+</header>
+<div id="stage">
+  <canvas id="canvas"></canvas>
+  <pre id="log"></pre>
+</div>
+<footer>
+  <button id="playpause" disabled>Pause</button>
+  <input id="seek" type="range" min="0" max="1000" value="0" disabled>
+  <span id="status">--:-- / --:--</span>
+  <label>vol <input id="vol" type="range" min="0" max="100" value="100" style="width:80px"></label>
+  <select id="video" disabled><option>video: auto</option></select>
+  <select id="audio" disabled><option>audio</option></select>
+  <select id="subs" disabled><option>subs: off</option></select>
+</footer>
+
+<script type="module">
+import init, { RustPlayer, testStream } from './pkg/rustplayer.js';
+
+const $ = (id) => document.getElementById(id);
+const canvas = $('canvas');
+const logEl = $('log');
+let player = null;
+let tracks = null;
+let seeking = false;
+
+function log(line) {
+  if (!$('showlog').checked) return;
+  logEl.textContent += line + '\n';
+  if (logEl.textContent.length > 20000) logEl.textContent = logEl.textContent.slice(-15000);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+function fmt(ms) {
+  if (!isFinite(ms) || ms < 0) return '--:--';
+  const s = Math.floor(ms / 1000);
+  return `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
+}
+
+function fitCanvas() {
+  const dpr = window.devicePixelRatio || 1;
+  const w = Math.max(1, Math.round(canvas.clientWidth * dpr));
+  const h = Math.max(1, Math.round(canvas.clientHeight * dpr));
+  if (canvas.width !== w || canvas.height !== h) {
+    canvas.width = w;
+    canvas.height = h;
+    if (player) player.resize(w, h);
+  }
+}
+new ResizeObserver(fitCanvas).observe(canvas);
+
+function fillTracks() {
+  const v = $('video'), a = $('audio'), s = $('subs');
+  // tracks JSON is flat: {video:[{adapt,repr,width,height,bandwidth,hdr10,label}], audio:[{adapt,repr,lang,codecs,channels,label}], text:[{adapt,repr,lang,forced,label}]}
+  v.innerHTML = '<option value="auto">video: auto</option>';
+  for (const r of tracks.video || []) {
+    const o = document.createElement('option');
+    o.value = `${r.adapt}:${r.repr}`;
+    o.textContent = `${r.width}x${r.height} ${Math.round((r.bandwidth || 0) / 1000)}k${r.hdr10 ? ' HDR' : ''}${r.dolbyVision ? ' DV' : ''}`;
+    v.appendChild(o);
+  }
+  a.innerHTML = '';
+  for (const r of tracks.audio || []) {
+    const o = document.createElement('option');
+    o.value = `${r.adapt}:${r.repr}`;
+    o.textContent = `${r.lang || '?'} ${r.codecs || ''} ${r.channels || ''}ch`;
+    a.appendChild(o);
+  }
+  s.innerHTML = '<option value="off">subs: off</option>';
+  for (const r of tracks.text || []) {
+    const o = document.createElement('option');
+    o.value = `${r.adapt}:${r.repr}`;
+    o.textContent = `subs: ${r.lang || '?'}${r.forced ? ' (forced)' : ''}`;
+    s.appendChild(o);
+  }
+  v.disabled = a.disabled = s.disabled = false;
+}
+
+const host = {
+  onEvent(json) {
+    const ev = JSON.parse(json);
+    if (ev.type === 'position') {
+      if (!seeking) {
+        $('seek').value = ev.duration_ms ? Math.round(1000 * ev.position_ms / ev.duration_ms) : 0;
+      }
+      $('status').textContent = `${fmt(ev.position_ms)} / ${fmt(ev.duration_ms)}` +
+        (ev.buffered_ahead_secs != null ? `  (+${ev.buffered_ahead_secs.toFixed(1)}s)` : '');
+      return;
+    }
+    if (ev.type === 'stats') {
+      log(`stats ${ev.decoder || ''} ${ev.width}x${ev.height} decoded=${ev.frames_decoded} dropped=${ev.frames_dropped} late=${ev.frames_late} drift=${ev.av_drift_ms}ms vbuf=${ev.video_buffer_ahead_ms}ms abuf=${ev.audio_buffer_ahead_ms}ms`);
+      return;
+    }
+    log(json);
+    if (ev.type === 'tracks_ready') {
+      tracks = JSON.parse(player.tracksJson());
+      fillTracks();
+      $('seek').disabled = false;
+      $('playpause').disabled = false;
+    }
+    if (ev.type === 'playing') $('playpause').textContent = 'Pause';
+    if (ev.type === 'paused') $('playpause').textContent = 'Play';
+  },
+};
+
+async function start() {
+  if (player) return;
+  $('start').disabled = true;
+  logEl.textContent = '';
+  fitCanvas();
+  const fixture = testStream();
+  const url = $('url').value.trim() || fixture.url;
+  const options = { clearKeys: fixture.clearKeys, autoSelectSubtitle: false };
+  try {
+    player = await RustPlayer.create(canvas, url, host, options);
+    player.setVolume($('vol').value / 100);
+    $('stop').disabled = false;
+  } catch (e) {
+    log('create failed: ' + e);
+    $('start').disabled = false;
+  }
+}
+
+function stop() {
+  if (!player) return;
+  player.shutdown();
+  player.free();
+  player = null;
+  tracks = null;
+  $('stop').disabled = true;
+  $('start').disabled = false;
+  for (const id of ['playpause', 'seek', 'video', 'audio', 'subs']) $(id).disabled = true;
+  $('status').textContent = '--:-- / --:--';
+}
+
+$('start').onclick = start;
+$('stop').onclick = stop;
+$('playpause').onclick = () => {
+  if (!player) return;
+  if (player.isPaused()) player.play(); else player.pause();
+};
+$('seek').oninput = () => { seeking = true; };
+$('seek').onchange = () => {
+  seeking = false;
+  if (player) player.seekMs(player.durationMs() * $('seek').value / 1000);
+};
+$('vol').oninput = () => { if (player) player.setVolume($('vol').value / 100); };
+$('video').onchange = (e) => {
+  if (!player) return;
+  if (e.target.value === 'auto') player.setVideoAuto();
+  else { const [a, r] = e.target.value.split(':').map(Number); player.setVideoTrackSoft(a, r); }
+};
+$('audio').onchange = (e) => {
+  if (!player) return;
+  const [a, r] = e.target.value.split(':').map(Number); player.setAudioTrack(a, r);
+};
+$('subs').onchange = (e) => {
+  if (!player) return;
+  if (e.target.value === 'off') player.clearSubtitles();
+  else { const [a, r] = e.target.value.split(':').map(Number); player.setSubtitleTrack(a, r); }
+};
+window.addEventListener('keydown', (e) => {
+  if (e.code === 'Space' && player) { e.preventDefault(); $('playpause').click(); }
+});
+
+await init();
+$('url').value = testStream().url;
+log('module ready — WebGPU: ' + (navigator.gpu ? 'yes' : 'no (WebGL2 fallback)') +
+    ', WebCodecs: ' + (typeof VideoDecoder !== 'undefined' ? 'yes' : 'NO'));
+</script>
+</body>
+</html>

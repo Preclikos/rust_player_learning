@@ -74,7 +74,7 @@ impl Segment {
         kind: RequestKind,
     ) -> Result<DownloadResult, Box<dyn Error + Send + Sync>> {
         let url = format!("{}{}", &self.base_url, &self.file_url);
-        let started = std::time::Instant::now();
+        let started = crate::rt::Instant::now();
         let bytes = http.get_range(url, kind, self.start, self.end).await?;
         Ok(DownloadResult {
             data: bytes.to_vec(),

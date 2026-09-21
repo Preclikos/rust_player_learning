@@ -231,7 +231,7 @@ fn start_null_sink(
         })
         .expect("spawn null audio thread");
 
-    tokio::spawn(async move {
+    crate::rt::spawn(async move {
         #[allow(clippy::never_loop)]
         while let Some(command) = command_receiver.recv().await {
             match command {
@@ -332,7 +332,7 @@ pub(super) fn start_thread(
         .spawn(move || audio_fut.block_on())
         .expect("spawn audio output thread");
 
-    tokio::spawn(async move {
+    crate::rt::spawn(async move {
         // `Stop` is the only command today, so this drains exactly once —
         // but the loop is kept so adding non-terminal commands later is a
         // pure addition (new match arm) rather than a control-flow rewrite.

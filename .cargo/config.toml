@@ -6,3 +6,9 @@
 # and decrypts at ~1 GB/s.
 [target.aarch64-linux-android]
 rustflags = ["-C", "target-feature=+aes,+neon", "--cfg", "aes_armv8"]
+
+# Browser build. WebCodecs (VideoDecoder / AudioDecoder / VideoFrame / …) is
+# still behind web-sys's unstable gate, so every crate compiled for this
+# target must see the cfg — hence here and not in a build script.
+[target.wasm32-unknown-unknown]
+rustflags = ["--cfg=web_sys_unstable_apis"]

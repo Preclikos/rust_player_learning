@@ -14,7 +14,8 @@
 
 use std::error::Error;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use crate::rt::Instant;
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
@@ -181,7 +182,21 @@ fn build_client() -> Client {
         .expect("reqwest client (rustls + webpki-roots)")
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "android")))]
+/// Browser: reqwest rides on `fetch`. TLS, connection pooling and timeouts
+/// belong to the browser; the builder exposes none of the native knobs, so
+/// the stall guards above don't apply — a hung fetch surfaces through the
+/// RetryPolicy on the caller side instead.
+#[cfg(target_arch = "wasm32")]
+fn build_client() -> Client {
+    Client::builder().build().expect("reqwest client (fetch)")
+}
+
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "android",
+    target_arch = "wasm32"
+)))]
 fn build_client() -> Client {
     // Same stall guards as the rustls path — see the comment there.
     Client::builder()
@@ -283,7 +298,7 @@ impl HttpClient {
     ) -> Result<Bytes, BoxError> {
         let interceptor = self.interceptor.load_full();
         let timeout = **self.callback_timeout.load();
-        let prep = match tokio::time::timeout(timeout, interceptor.intercept(url, kind)).await {
+        let prep = match crate::rt::timeout(timeout, interceptor.intercept(url, kind)).await {
             Ok(Ok(p)) => p,
             Ok(Err(e)) => return Err(format!("interceptor: {}", e).into()),
             Err(_) => return Err(format!("interceptor timeout ({}ms)", timeout.as_millis()).into()),
@@ -304,7 +319,7 @@ impl HttpClient {
                     last_err = Some(e);
                     if attempt + 1 < policy.max_attempts {
                         let backoff = jittered(delay, policy.jitter);
-                        tokio::time::sleep(backoff).await;
+                        crate::rt::sleep(backoff).await;
                         delay = scale_delay(delay, policy.multiplier, policy.max_delay);
                     }
                 }

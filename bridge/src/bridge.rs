@@ -180,7 +180,7 @@ pub fn start(
 
     spawn_event_pump(player.events(), host.clone(), duration_ms.clone());
 
-    tokio::spawn(orchestrate(
+    player::rt::spawn(orchestrate(
         player.clone(),
         manifest_url,
         host,
@@ -334,7 +334,7 @@ async fn orchestrate(
     // retries; the event pump reports those to the host. We don't auto-loop —
     // the host drives replay.
     let play_player = player.clone();
-    let mut play_task = tokio::spawn(async move {
+    let mut play_task = player::rt::spawn(async move {
         // Consume the Result (its `Box<dyn Error>` is not Send) BEFORE the
         // await, so the spawned future stays Send.
         let handle = match play_player.play() {
@@ -411,7 +411,7 @@ fn spawn_event_pump(
     host: Arc<dyn BridgeHost>,
     duration_ms: Arc<AtomicU64>,
 ) {
-    tokio::spawn(async move {
+    player::rt::spawn(async move {
         let mut last_size = (0u32, 0u32);
         loop {
             match rx.recv().await {

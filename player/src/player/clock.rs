@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 // tokio's Instant, matching `player.rs` — `start_time` is shared with the sync
 // loop and the two must be the same type.
-use tokio::time::Instant;
+use crate::rt::Instant;
 
 use crate::renderers::AudioSink;
 

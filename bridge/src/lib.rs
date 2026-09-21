@@ -141,7 +141,7 @@ pub(crate) fn subtitle_style() -> player::SubtitleStyle {
 /// `debug` for the 4 Hz position and 1 Hz stats firehose.
 fn spawn_event_log(player: &Player) {
     let mut rx = player.events();
-    tokio::spawn(async move {
+    player::rt::spawn(async move {
         while let Ok(ev) = rx.recv().await {
             match ev {
                 player::PlayerEvent::Position {
@@ -194,7 +194,7 @@ pub async fn run_test_playback(mut player: Player) {
     // Re-spawn the play() task on natural exit so the stream loops
     // continuously — useful for soak testing the pipeline.
     let player_for_loop = player.clone();
-    tokio::spawn(async move {
+    player::rt::spawn(async move {
         loop {
             let handle = match player_for_loop.play() {
                 Ok(h) => h,

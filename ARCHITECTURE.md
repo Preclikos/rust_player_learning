@@ -95,6 +95,21 @@ the SwiftPM package or the wasm-pack `pkg/` — **and compiles no Rust**.
   `.github/workflows/publish-ios.yml` attaches it to a release. Simulator run:
   `platform/ios/ios/build_sim.sh`.
 
+## Versioning across platforms
+
+One version line for all three shells, and the number means **the engine
+state**, not a per-platform counter:
+
+- A release of ANY platform takes `max(all android-v*/ios-v*/web-v* tags) + 1`
+  (patch bump; minor/major when the engine API changes).
+- A platform with no changes is simply not re-released and keeps its last
+  number. The same number on two platforms is the same engine commit.
+- The version comes from the tag, nothing is bumped in a file
+  (`android-v0.1.24` → AAR 0.1.24, `ios-v0.1.24` → SwiftPM 0.1.24,
+  `web-v0.1.24` → `@preclikos/rustplayer@0.1.24`).
+
+Check the current maximum before tagging: `git tag -l '*-v*' | sed 's/.*-v//' | sort -V | tail -1`.
+
 ## Naming conventions
 
 - Rust crates name their role: `player` (engine), `bridge` (core),

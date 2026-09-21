@@ -52,13 +52,27 @@ player.shutdown(); player.free();
 `create` must run inside a user gesture (a click handler), otherwise the
 browser keeps the `AudioContext` suspended.
 
+## HDR
+
+The browser converts every `VideoFrame` to RGB itself and tone-maps PQ
+content with its own curve before any of our shaders run (measured in
+Chrome: `importExternalTexture` and `copyExternalImageToTexture` return the
+same compressed values regardless of the canvas `toneMapping` mode; hardware
+HEVC frames are opaque, so the planes cannot be read out). The engine's
+PQ → SDR mapping (`shader_hdr.wgsl`) is therefore unreachable in the browser.
+
+That mapping was calibrated to land on the SDR ladder's displayed values, so
+the default `hdr: "sdr"` — SDR representations only — shows the same picture
+as the native players. `hdr: "browser"` allows the HDR rungs with Chrome's
+tone-map (different look, higher resolution ceiling on the test fixture).
+
 ## Known limits (first cut)
 
 - HEVC only, like the other platforms; codec support is whatever the
   browser's WebCodecs exposes (AC-3 / E-AC-3 audio is Safari-only in practice).
-- Frames take one CPU copy (`VideoFrame.copyTo`) per frame; 4K is heavy on
-  the main thread. Zero-copy `VideoFrame → GPUExternalTexture` needs a wgpu
-  addition.
+- Frames go GPU→GPU (`copyExternalImageToTexture`), one copy per frame on
+  the GPU; `importExternalTexture` (no copy) would need the wgpu webgpu
+  backend's external-texture path, which is `unimplemented!` upstream.
 - `ScriptProcessorNode` output; an `AudioWorklet` would lower latency and
   survive a busy main thread better.
 - No DRM beyond ClearKey (EME requires MSE, a different architecture).

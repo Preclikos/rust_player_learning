@@ -28,7 +28,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bridge::{BoxError, BridgeHandle, BridgeHost, PreparedRequest, RequestKind, StartConfig};
 use js_sys::{Function, Promise, Reflect};
-use player::Player;
+use player::{AbrVideoProfile, Player};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
@@ -213,11 +213,36 @@ impl BridgeHost for WebHost {
 
 // --- options -----------------------------------------------------------------
 
-fn read_options(options: &JsValue) -> Result<(StartConfig, HashMap<[u8; 16], [u8; 16]>), String> {
+/// HDR policy for the browser. The browser converts every frame to RGB
+/// itself and, for PQ content, tone-maps with its own curve before any of
+/// our shaders run — measured in Chrome: `importExternalTexture` and
+/// `copyExternalImageToTexture` both return the same compressed values
+/// whatever the canvas `toneMapping` mode, and hardware HEVC frames are
+/// opaque so the planes can't be read out either. The engine's own PQ →
+/// SDR mapping is therefore unreachable here.
+///
+/// That mapping was calibrated to land on the SDR ladder's displayed values
+/// (see shader_hdr.wgsl), so the way to show the SAME picture as the native
+/// players is to play the SDR representations: the default. `Browser` opts
+/// into the HDR rungs with Chrome's tone-map instead (higher resolution
+/// ceiling on this fixture, different look).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WebHdrPolicy {
+    SdrOnly,
+    Browser,
+}
+
+fn read_options(options: &JsValue) -> Result<(StartConfig, HashMap<[u8; 16], [u8; 16]>, WebHdrPolicy), String> {
     let mut config = StartConfig::default();
     let mut keys = HashMap::new();
+    let mut hdr = WebHdrPolicy::SdrOnly;
     if options.is_undefined() || options.is_null() {
-        return Ok((config, keys));
+        return Ok((config, keys, hdr));
+    }
+    match get(options, "hdr").and_then(|v| v.as_string()).as_deref() {
+        None | Some("sdr") => {}
+        Some("browser") => hdr = WebHdrPolicy::Browser,
+        Some(other) => return Err(format!("options.hdr: expected \"sdr\" or \"browser\", got {other:?}")),
     }
     if let Some(ms) = get(options, "startPositionMs").and_then(|v| v.as_f64()) {
         config.start_position = Some(Duration::from_millis(ms.max(0.0) as u64));
@@ -239,7 +264,7 @@ fn read_options(options: &JsValue) -> Result<(StartConfig, HashMap<[u8; 16], [u8
             keys.insert(parse_hex16(&kid_hex, "clearKeys kid")?, parse_hex16(&key_hex, "clearKeys key")?);
         }
     }
-    Ok((config, keys))
+    Ok((config, keys, hdr))
 }
 
 // --- the exported player -----------------------------------------------------
@@ -258,7 +283,11 @@ impl RustPlayer {
     ///
     /// `host`: `{ onEvent(json), resolveKey?(kidHex) → keyHex, intercept?(url, kind) → {url?, headers?} }`.
     /// `options`: `{ startPositionMs?, startFraction?, autoSelectSubtitle?,
-    /// preferredAudioLanguage?, preferredSubtitleLanguage?, clearKeys?: {kidHex: keyHex} }`.
+    /// preferredAudioLanguage?, preferredSubtitleLanguage?, clearKeys?: {kidHex: keyHex},
+    /// hdr?: "sdr" | "browser" }` — `hdr` defaults to `"sdr"`: only SDR
+    /// representations play (the same picture the engine's HDR tonemap
+    /// produces natively); `"browser"` allows the HDR rungs with the
+    /// browser's own tone-map (see [`WebHdrPolicy`]).
     ///
     /// Call from a user gesture (a click handler): the browser only lets the
     /// `AudioContext` run after one. The canvas's drawing-buffer size
@@ -270,10 +299,13 @@ impl RustPlayer {
         host: JsValue,
         options: JsValue,
     ) -> Result<RustPlayer, JsValue> {
-        let (config, keys) = read_options(&options).map_err(|e| JsValue::from_str(&e))?;
+        let (config, keys, hdr) = read_options(&options).map_err(|e| JsValue::from_str(&e))?;
         let (w, h) = (canvas.width().max(1), canvas.height().max(1));
-        log::info!("[web] creating player on {}x{} canvas for {}", w, h, manifest_url);
+        log::info!("[web] creating player on {}x{} canvas for {} (hdr policy {:?})", w, h, manifest_url, hdr);
         let player = Player::new_from_canvas(canvas, w, h).await;
+        if hdr == WebHdrPolicy::SdrOnly {
+            player.set_abr_video_profile(AbrVideoProfile::SdrOnly);
+        }
         let host: Arc<dyn BridgeHost> = Arc::new(WebHost { host, keys });
         let handle = bridge::start(player, manifest_url, host, config);
         Ok(RustPlayer { handle })

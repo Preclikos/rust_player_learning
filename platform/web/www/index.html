@@ -48,6 +48,11 @@ const logEl = $('log');
 let player = null;
 let tracks = null;
 let seeking = false;
+// Playlist: the URL field takes one or more manifest URLs (whitespace or
+// comma separated). On `end_of_stream` the next one starts automatically;
+// after the last one the player is closed (nothing left to play).
+let playlist = [];
+let playlistIndex = 0;
 
 function log(line) {
   if (!$('showlog').checked) return;
@@ -125,16 +130,46 @@ const host = {
     }
     if (ev.type === 'playing') $('playpause').textContent = 'Pause';
     if (ev.type === 'paused') $('playpause').textContent = 'Play';
+    if (ev.type === 'end_of_stream') onEnded();
   },
 };
 
+// End of an item: next playlist entry, or close the player when there is
+// none. (A host that wants a replay control instead just calls player.play()
+// — after end_of_stream it restarts from the beginning, seekMs from a position.)
+function onEnded() {
+  // ?onend=replay: loop the item instead (exercises play() after end_of_stream).
+  if (new URLSearchParams(location.search).get('onend') === 'replay') {
+    log('end of item — replaying');
+    player.play();
+    return;
+  }
+  if (playlistIndex + 1 < playlist.length) {
+    playlistIndex += 1;
+    log(`end of item — starting next (${playlistIndex + 1}/${playlist.length})`);
+    teardown();
+    startItem(playlist[playlistIndex]);
+  } else {
+    log('end of playlist — player closed');
+    stop();
+  }
+}
+
 async function start() {
   if (player) return;
-  $('start').disabled = true;
   logEl.textContent = '';
+  const fixture = testStream();
+  playlist = $('url').value.split(/[\s,]+/).filter(Boolean);
+  if (!playlist.length) playlist = [fixture.url];
+  playlistIndex = 0;
+  await startItem(playlist[0]);
+}
+
+async function startItem(url) {
+  if (player) return;
+  $('start').disabled = true;
   fitCanvas();
   const fixture = testStream();
-  const url = $('url').value.trim() || fixture.url;
   const options = { clearKeys: fixture.clearKeys, autoSelectSubtitle: false };
   // ?hdr=auto|sdr|browser (see README "HDR"); default auto.
   const hdr = new URLSearchParams(location.search).get('hdr');
@@ -149,12 +184,19 @@ async function start() {
   }
 }
 
-function stop() {
+// Release the current player without touching the controls (used between
+// playlist items).
+function teardown() {
   if (!player) return;
   player.shutdown();
   player.free();
   player = null;
   tracks = null;
+}
+
+function stop() {
+  if (!player) return;
+  teardown();
   $('stop').disabled = true;
   $('start').disabled = false;
   for (const id of ['playpause', 'seek', 'video', 'audio', 'subs']) $(id).disabled = true;

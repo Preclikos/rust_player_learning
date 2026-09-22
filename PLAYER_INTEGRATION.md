@@ -61,6 +61,12 @@ let handle = player.play()?;                       // spawns the pipeline
 `play()` returns a `JoinHandle` that completes when playback truly ends
 (EndOfStream, stop, or exhausted error retries). Internally, `seek()`
 and track changes restart the pipeline without the handle completing.
+After a natural end the pipeline is gone: `seek()` / `resume()` on the
+`Player` do nothing until `play()` is called again (a parked
+`set_start_position` is honoured, so "seek then play" replays from the
+target). The `bridge` handle wraps this: its `play()` / `seek_ms()` after
+`end_of_stream` replay automatically; "next episode" is the host's move
+(shut the handle down, start a new one).
 
 ### Resume semantics (important for retry UX)
 

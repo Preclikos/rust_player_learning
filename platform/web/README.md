@@ -80,6 +80,14 @@ player.shutdown(); player.free();
 `create` must run inside a user gesture (a click handler), otherwise the
 browser keeps the `AudioContext` suspended.
 
+**End of stream.** The engine emits `{"type":"end_of_stream"}` and stops; it
+never auto-advances. The host decides: for a "next episode" call `shutdown()`
++ `free()` and `create` the next manifest (the demo page does this for a
+whitespace/comma-separated URL list and closes the player after the last
+one); for a replay control call `play()` (restarts from the beginning) or
+`seekMs(ms)` (restarts at that position) — before this, both were ignored
+after the end.
+
 ## HDR
 
 The browser converts every `VideoFrame` to RGB itself before any of our

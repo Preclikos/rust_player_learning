@@ -17,7 +17,7 @@
 //! ClearKeys). A product app implements real auth/license there. The player
 //! crate stays provider-agnostic exactly as before.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -90,6 +90,10 @@ impl LicenseResolver for HostResolver {
 // --- commands that need the (private) Tracks type for an index→repr lookup ---
 
 enum Cmd {
+    /// Start a new `play()` after the pipeline ended (EndOfStream). Issued by
+    /// `play()` / `seek_ms()` on an ended handle — the orchestrator owns the
+    /// play task, so only it can respawn one.
+    Replay,
     Video { adapt: usize, repr: usize, soft: bool },
     VideoAuto,
     Audio { adapt: usize, repr: usize },
@@ -158,6 +162,11 @@ pub struct BridgeHandle {
     shutdown: Arc<Notify>,
     tracks_json: Arc<Mutex<String>>,
     duration_ms: Arc<AtomicU64>,
+    /// Set by the event pump on `EndOfStream`, cleared when a replay starts.
+    /// While set, `play()` restarts from the beginning and `seek_ms()`
+    /// restarts at the target instead of being ignored by the finished
+    /// pipeline.
+    ended: Arc<AtomicBool>,
 }
 
 /// Wire the host's provider hooks into `player`, spawn the event pump and the
@@ -176,9 +185,10 @@ pub fn start(
     let shutdown = Arc::new(Notify::new());
     let tracks_json = Arc::new(Mutex::new(String::from("{}")));
     let duration_ms = Arc::new(AtomicU64::new(0));
+    let ended = Arc::new(AtomicBool::new(false));
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<Cmd>();
 
-    spawn_event_pump(player.events(), host.clone(), duration_ms.clone());
+    spawn_event_pump(player.events(), host.clone(), duration_ms.clone(), ended.clone());
 
     player::rt::spawn(orchestrate(
         player.clone(),
@@ -186,6 +196,7 @@ pub fn start(
         host,
         tracks_json.clone(),
         duration_ms.clone(),
+        ended.clone(),
         cmd_rx,
         shutdown.clone(),
         config,
@@ -197,14 +208,22 @@ pub fn start(
         shutdown,
         tracks_json,
         duration_ms,
+        ended,
     }
 }
 
 impl BridgeHandle {
     /// Resume after a [`pause`](Self::pause). (The orchestrator issues the
     /// initial `play()`; this is the UI play/pause toggle's resume side.)
+    /// After `end_of_stream` the pipeline is gone, so this replays from the
+    /// beginning instead — a host that wants "next episode" shuts this handle
+    /// down on `end_of_stream` and starts a new one; a host that wants a
+    /// replay control just calls `play()`.
     pub fn play(&self) {
         self.player.resume();
+        if self.ended.load(Ordering::Relaxed) {
+            let _ = self.cmd_tx.send(Cmd::Replay);
+        }
     }
     pub fn pause(&self) {
         self.player.pause();
@@ -212,9 +231,18 @@ impl BridgeHandle {
     pub fn is_paused(&self) -> bool {
         self.player.is_paused()
     }
+    /// Seek. After `end_of_stream` this restarts playback at `position_ms`
+    /// (the finished pipeline would otherwise ignore it): the position is
+    /// parked as the start position of the replayed `play()`.
     pub fn seek_ms(&self, position_ms: i64) {
-        self.player
-            .seek(Duration::from_millis(position_ms.max(0) as u64));
+        let target = Duration::from_millis(position_ms.max(0) as u64);
+        if self.ended.load(Ordering::Relaxed) {
+            self.player.set_start_position(Some(target));
+            self.player.resume();
+            let _ = self.cmd_tx.send(Cmd::Replay);
+        } else {
+            self.player.seek(target);
+        }
     }
     /// Absolute volume, 0.0..=1.0.
     pub fn set_volume(&self, volume: f32) {
@@ -290,6 +318,7 @@ async fn orchestrate(
     host: Arc<dyn BridgeHost>,
     tracks_json: Arc<Mutex<String>>,
     duration_ms: Arc<AtomicU64>,
+    ended: Arc<AtomicBool>,
     mut cmd_rx: mpsc::UnboundedReceiver<Cmd>,
     shutdown: Arc<Notify>,
     config: StartConfig,
@@ -339,26 +368,40 @@ async fn orchestrate(
 
     // Initial playback. play() resolves on EndOfStream / stop / exhausted
     // retries; the event pump reports those to the host. We don't auto-loop —
-    // the host drives replay.
-    let play_player = player.clone();
-    let mut play_task = player::rt::spawn(async move {
-        // Consume the Result (its `Box<dyn Error>` is not Send) BEFORE the
-        // await, so the spawned future stays Send.
-        let handle = match play_player.play() {
-            Ok(h) => h,
-            Err(e) => {
-                log::error!("play(): {e}");
-                return;
-            }
-        };
-        let _ = handle.await;
-    });
+    // the host decides what follows `end_of_stream` (next item: shut down and
+    // start a new handle; replay: `play()` / `seek_ms()`, which arrive here
+    // as `Cmd::Replay`).
+    let spawn_play = |player: Player| {
+        player::rt::spawn(async move {
+            // Consume the Result (its `Box<dyn Error>` is not Send) BEFORE the
+            // await, so the spawned future stays Send.
+            let handle = match player.play() {
+                Ok(h) => h,
+                Err(e) => {
+                    log::error!("play(): {e}");
+                    return;
+                }
+            };
+            let _ = handle.await;
+        })
+    };
+    let mut play_task = spawn_play(player.clone());
 
     loop {
         tokio::select! {
             _ = shutdown.notified() => break,
             cmd = cmd_rx.recv() => match cmd {
                 None => break,
+                Some(Cmd::Replay) => {
+                    // EndOfStream is emitted just before the finished play()
+                    // resolves; let its task complete, then start a fresh one.
+                    // The play loop reads the parked start position / seek
+                    // target on entry, so a post-end seek lands where asked.
+                    let _ = (&mut play_task).await;
+                    ended.store(false, Ordering::Relaxed);
+                    log::info!("[bridge] replay after end_of_stream");
+                    play_task = spawn_play(player.clone());
+                }
                 Some(c) => apply_cmd(&player, &tracks, c),
             },
         }
@@ -371,6 +414,8 @@ async fn orchestrate(
 
 fn apply_cmd(player: &Player, tracks: &Tracks, cmd: Cmd) {
     match cmd {
+        // Handled by the orchestrator loop (it owns the play task).
+        Cmd::Replay => {}
         Cmd::Video { adapt, repr, soft } => {
             if let Some(r) = tracks
                 .video
@@ -417,6 +462,7 @@ fn spawn_event_pump(
     mut rx: broadcast::Receiver<PlayerEvent>,
     host: Arc<dyn BridgeHost>,
     duration_ms: Arc<AtomicU64>,
+    ended: Arc<AtomicBool>,
 ) {
     player::rt::spawn(async move {
         let mut last_size = (0u32, 0u32);
@@ -428,6 +474,7 @@ fn spawn_event_pump(
                         | PlayerEvent::Position { duration, .. } => {
                             duration_ms.store(duration.as_millis() as u64, Ordering::Relaxed);
                         }
+                        PlayerEvent::EndOfStream => ended.store(true, Ordering::Relaxed),
                         // Synthesize a dedicated video-size event the first time
                         // (and whenever) the rendered resolution changes, so a
                         // consumer can shape its video plane without parsing the

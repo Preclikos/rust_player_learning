@@ -222,6 +222,7 @@ impl BridgeHandle {
     pub fn play(&self) {
         self.player.resume();
         if self.ended.load(Ordering::Relaxed) {
+            log::info!("[bridge] play() after end_of_stream → replay from the beginning");
             let _ = self.cmd_tx.send(Cmd::Replay);
         }
     }
@@ -397,6 +398,7 @@ async fn orchestrate(
                     // resolves; let its task complete, then start a fresh one.
                     // The play loop reads the parked start position / seek
                     // target on entry, so a post-end seek lands where asked.
+                    log::info!("[bridge] replay requested — waiting for the ended pipeline task");
                     let _ = (&mut play_task).await;
                     ended.store(false, Ordering::Relaxed);
                     log::info!("[bridge] replay after end_of_stream");
@@ -474,7 +476,10 @@ fn spawn_event_pump(
                         | PlayerEvent::Position { duration, .. } => {
                             duration_ms.store(duration.as_millis() as u64, Ordering::Relaxed);
                         }
-                        PlayerEvent::EndOfStream => ended.store(true, Ordering::Relaxed),
+                        PlayerEvent::EndOfStream => {
+                            log::info!("[bridge] end_of_stream — play()/seek_ms() now replay");
+                            ended.store(true, Ordering::Relaxed);
+                        }
                         // Synthesize a dedicated video-size event the first time
                         // (and whenever) the rendered resolution changes, so a
                         // consumer can shape its video plane without parsing the

@@ -40,7 +40,11 @@
 </footer>
 
 <script type="module">
-import init, { RustPlayer, testStream, setLogLevel } from './pkg/rustplayer.js';
+// Dev page: load the glue + wasm with a per-load version so a rebuilt pkg/ is
+// never served from the browser's heuristic cache (a production host sets
+// proper cache headers / hashed file names instead).
+const PKG_VERSION = Date.now();
+const { default: init, RustPlayer, testStream, setLogLevel } = await import(`./pkg/rustplayer.js?v=${PKG_VERSION}`);
 
 const $ = (id) => document.getElementById(id);
 const canvas = $('canvas');
@@ -233,10 +237,18 @@ window.addEventListener('keydown', (e) => {
   if (e.code === 'Space' && player) { e.preventDefault(); $('playpause').click(); }
 });
 
-await init();
-// ?log=debug for the engine's verbose diagnostics in the console.
+await init({ module_or_path: new URL(`./pkg/rustplayer_bg.wasm?v=${PKG_VERSION}`, location.href) });
+// ?log=debug for the engine's verbose diagnostics in the console. With ?log
+// set, info/warn/error lines are mirrored into the events pane too — readable
+// on devices without devtools.
 const logLevel = new URLSearchParams(location.search).get('log');
-if (logLevel) setLogLevel(logLevel);
+if (logLevel) {
+  setLogLevel(logLevel);
+  for (const level of ['info', 'warn', 'error']) {
+    const orig = console[level].bind(console);
+    console[level] = (...args) => { orig(...args); try { log(`[${level}] ` + args.map(String).join(' ')); } catch (_) {} };
+  }
+}
 $('url').value = testStream().url;
 log('module ready — WebGPU: ' + (navigator.gpu ? 'yes' : 'no (WebGL2 fallback)') +
     ', WebCodecs: ' + (typeof VideoDecoder !== 'undefined' ? 'yes' : 'NO'));

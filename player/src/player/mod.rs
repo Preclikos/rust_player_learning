@@ -2132,6 +2132,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                 let (play_res, audio_res) = join!(video, audio);
                 log_task_result("video_supervisor", play_res);
                 log_task_result("audio_play", audio_res);
+                log::info!("[player] pipeline gen {} tasks joined", gen);
 
                 // Drop the watch sender so a stale apply_video_representation
                 // between pipelines becomes a no-op.
@@ -2146,6 +2147,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             // Outer loop ended — this play() invocation is truly over.
             // Kick the abr_tick task off the executor.
             let _ = abr_kill_tx.send(());
+            log::info!("[player] play() finished — no pending seek, pipeline released");
         });
         Ok(play)
     }

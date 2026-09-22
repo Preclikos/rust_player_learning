@@ -986,6 +986,15 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         *self.video_representation.lock().unwrap() = Some(representation.clone());
         let size = PhysicalSize::new(representation.width, representation.height);
         self.change_frame_size(size);
+        // A selection the consumer did not make itself is still a selection it
+        // has to render: without this event a UI has no way to learn what the
+        // default pick was, and its track menu shows nothing as current until
+        // the user changes something. Same event as every later switch, so
+        // consumers need no separate startup path.
+        let _ = self.events.send(PlayerEvent::TrackChanged {
+            kind: TrackKind::Video,
+            info: video_track_info(representation),
+        });
     }
 
     pub fn set_audio_track(
@@ -995,6 +1004,10 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
     ) {
         *self.audio_adaptation.lock().unwrap() = Some(adaptation.clone());
         *self.audio_representation.lock().unwrap() = Some(representation.clone());
+        let _ = self.events.send(PlayerEvent::TrackChanged {
+            kind: TrackKind::Audio,
+            info: audio_track_info(adaptation, representation),
+        });
     }
 
     /// Session-cumulative conformance gauges for automated soak testing (the
@@ -1432,6 +1445,10 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
     /// segment list is exhausted or `clear_subtitle_track` fires.
     pub fn set_subtitle_track(&self, representation: &crate::tracks::text::TextRepresenation) {
         *self.subtitle_representation.lock().unwrap() = Some(representation.clone());
+        let _ = self.events.send(PlayerEvent::TrackChanged {
+            kind: TrackKind::Subtitle,
+            info: text_track_info(representation),
+        });
         // Wipe any cues from the previous track so they don't bleed
         // across the switch.
         self.video_renderer.clear_subtitles();
@@ -1591,6 +1608,10 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
     ) {
         *self.audio_adaptation.lock().unwrap() = Some(adaptation.clone());
         *self.audio_representation.lock().unwrap() = Some(representation.clone());
+        let _ = self.events.send(PlayerEvent::TrackChanged {
+            kind: TrackKind::Audio,
+            info: audio_track_info(adaptation, representation),
+        });
         // Only an already-running pipeline needs a seek to restart at the
         // current position with the new track. BEFORE the pipeline goes live,
         // a seek here is destructive: position() is still 0 and seek(0) parks

@@ -590,6 +590,46 @@ pub(super) fn video_track_info(repr: &VideoRepresenation) -> TrackInfo {
     }
 }
 
+/// Build a `TrackInfo` snapshot from an audio representation. The language
+/// lives on the adaptation, not the representation, so the caller passes it.
+pub(super) fn audio_track_info(
+    adaptation: &AudioAdaptation,
+    repr: &AudioRepresentation,
+) -> TrackInfo {
+    TrackInfo {
+        representation_id: repr.id,
+        codec: repr.codec_short().to_string(),
+        bitrate_bps: repr.bandwidth,
+        width: None,
+        height: None,
+        fps: None,
+        channels: repr.channels(),
+        sample_rate_hz: Some(repr.audio_sampling_rate),
+        language: adaptation.language().map(str::to_string),
+        label: repr.label(),
+        hdr10: false,
+        dolby_vision: false,
+    }
+}
+
+/// Build a `TrackInfo` snapshot from a subtitle representation.
+pub(super) fn text_track_info(repr: &crate::tracks::text::TextRepresenation) -> TrackInfo {
+    TrackInfo {
+        representation_id: repr.id,
+        codec: repr.codec_short().to_string(),
+        bitrate_bps: repr.bandwidth,
+        width: None,
+        height: None,
+        fps: None,
+        channels: None,
+        sample_rate_hz: None,
+        language: None,
+        label: repr.label(),
+        hdr10: false,
+        dolby_vision: false,
+    }
+}
+
 pub(super) fn find_segment_index(segments: &[Segment], target: Duration) -> usize {
     if segments.is_empty() {
         return 0;

@@ -57,11 +57,11 @@ Per frame, entirely on the GPU (zero-copy — the imported decoder texture is
 read in place, statistics live in a 536-byte GPU buffer, nothing is ever
 read back to the CPU):
 
-1. Three small compute passes (`shader_hdr_detect.wgsl`) update the
+1. Three small compute passes (`shader_hdr_detect_common.wgsl`) update the
    frame peak/average statistics — the filter's libplacebo-derived
    `detect_peak_avg`: per-workgroup average signal, 63-frame rolling
    window, scene-change reset.
-2. The fragment shader (`shader_hdr.wgsl`) decodes limited-range
+2. The fragment shader (`shader_hdr_common.wgsl`) decodes limited-range
    BT.2020-NCL Y'CbCr, linearises with the ST 2084 (PQ) EOTF, converts
    primaries BT.2020 → BT.709, tonemaps the max RGB component with the
    Möbius curve scaled by the detected peak/average, and encodes with the

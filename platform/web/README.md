@@ -82,17 +82,27 @@ browser keeps the `AudioContext` suspended.
 
 ## HDR
 
-The browser converts every `VideoFrame` to RGB itself and tone-maps PQ
-content with its own curve before any of our shaders run (measured in
-Chrome: `importExternalTexture` and `copyExternalImageToTexture` return the
-same compressed values regardless of the canvas `toneMapping` mode; hardware
-HEVC frames are opaque, so the planes cannot be read out). The engine's
-PQ → SDR mapping (`shader_hdr.wgsl`) is therefore unreachable in the browser.
+The browser converts every `VideoFrame` to RGB itself before any of our
+shaders run, and hardware HEVC frames are opaque (no plane readout). For PQ
+content Chrome was measured (synthetic 10-bit ramp + colour patches, then
+pixel-for-pixel on real HDR10 content) to apply the BT.2020 → BT.709 matrix to
+the still PQ-encoded values and sRGB-encode them — no tone-map at all, which
+is why HDR looked washed out and lifted.
 
-That mapping was calibrated to land on the SDR ladder's displayed values, so
-the default `hdr: "sdr"` — SDR representations only — shows the same picture
-as the native players. `hdr: "browser"` allows the HDR rungs with Chrome's
-tone-map (different look, higher resolution ceiling on the test fixture).
+Both steps are invertible, so the renderer keeps the frame on the GPU
+(`copyExternalImageToTexture` into rgba16float), undoes the conversion in the
+shader (`shader_chrome_inverse.wgsl`) and runs the engine's own PQ → SDR
+tonemap and frame peak/average detection — the same math and numbers as the
+native players. At start-up the renderer verifies the browser's conversion on
+a synthetic frame (one 32 KiB readback, not video); if a browser behaves
+differently the engine tonemap is disabled and `hdr: "auto"` falls back to SDR
+representations only.
+
+- `hdr: "auto"` (default): HDR representations through the engine tonemap when
+  verified, else SDR representations only.
+- `hdr: "sdr"`: SDR representations only.
+- `hdr: "browser"`: HDR representations as the browser converts them
+  (comparison; the washed-out look).
 
 ## Known limits (first cut)
 

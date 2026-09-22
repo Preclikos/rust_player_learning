@@ -136,6 +136,9 @@ async function start() {
   const fixture = testStream();
   const url = $('url').value.trim() || fixture.url;
   const options = { clearKeys: fixture.clearKeys, autoSelectSubtitle: false };
+  // ?hdr=auto|sdr|browser (see README "HDR"); default auto.
+  const hdr = new URLSearchParams(location.search).get('hdr');
+  if (hdr) options.hdr = hdr;
   try {
     player = await RustPlayer.create(canvas, url, host, options);
     player.setVolume($('vol').value / 100);

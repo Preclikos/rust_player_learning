@@ -6,7 +6,7 @@
 // rgb2yuv leg of FFmpeg's tonemap_opencl (yuv_matrix = BT.709,
 // r=tv), which produced this project's SDR ladder — keeping it inverse-
 // exact makes an SDR representation land on the same displayed values as
-// the player's own HDR tonemap of the HDR sibling (see shader_hdr.wgsl).
+// the player's own HDR tonemap of the HDR sibling (see shader_hdr_common.wgsl).
 //
 // The previous version of this shader expanded Y to [0, 219/255] (white
 // rendered ~14 % dark), dropped the /224 chroma normalisation and used

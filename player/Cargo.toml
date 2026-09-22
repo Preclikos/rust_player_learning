@@ -115,6 +115,9 @@ web-sys = { version = "0.3", features = [
     "VideoDecoder", "VideoDecoderConfig", "VideoDecoderInit", "VideoDecoderSupport",
     "EncodedVideoChunk", "EncodedVideoChunkInit", "EncodedVideoChunkType",
     "VideoFrame", "VideoFrameCopyToOptions", "PlaneLayout", "VideoPixelFormat",
+    # synthetic PQ VideoFrame for the HDR calibration (renderers/web_hdr_calib.rs)
+    "VideoFrameBufferInit", "VideoColorSpaceInit", "VideoColorPrimaries",
+    "VideoTransferCharacteristics", "VideoMatrixCoefficients",
     "DomRectInit", "DomRectReadOnly", "HardwareAcceleration", "CodecState",
     "AudioDecoder", "AudioDecoderConfig", "AudioDecoderInit", "AudioDecoderSupport",
     "EncodedAudioChunk", "EncodedAudioChunkInit", "EncodedAudioChunkType",

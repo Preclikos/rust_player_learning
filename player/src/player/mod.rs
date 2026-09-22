@@ -587,6 +587,22 @@ impl Player<VideoRenderer, AudioRenderer> {
         Self::from_renderers(video_renderer, audio_renderer)
     }
 
+    /// Browser: whether PQ (HDR10) representations render through the
+    /// engine's own PQ → SDR tonemap — the same mapping as the native
+    /// players — or, when the browser's frame conversion could not be
+    /// verified at start-up, through the browser's own conversion.
+    #[cfg(target_arch = "wasm32")]
+    pub fn web_hdr_tonemap_available(&self) -> bool {
+        self.video_renderer.web_hdr_tonemap_available()
+    }
+
+    /// Browser: render PQ frames as the browser converts them instead of
+    /// the engine tonemap. See [`VideoRenderer::set_web_hdr_passthrough`].
+    #[cfg(target_arch = "wasm32")]
+    pub fn set_web_hdr_passthrough(&self, passthrough: bool) {
+        self.video_renderer.set_web_hdr_passthrough(passthrough)
+    }
+
     /// Assemble a `Player` from already-built renderers. Shared tail of every
     /// constructor above — the only difference between the winit and embedded
     /// paths is how the `VideoRenderer` obtained its surface.

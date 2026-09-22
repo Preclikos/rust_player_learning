@@ -112,7 +112,7 @@ void main() {
 }";
 
 // HDR10 (PQ / BT.2020) → SDR fragment shader. GLSL ES port of
-// shader_hdr.wgsl, which is itself an exact port of FFmpeg's
+// shader_hdr_common.wgsl, which is itself an exact port of FFmpeg's
 // tonemap_opencl (mobius). One difference from the wgpu path: the OES
 // sampler has already applied the Y'CbCr→R'G'B' matrix for the buffer's
 // dataspace (BT.2020 limited for MediaCodec HDR output), so sampling
@@ -201,7 +201,7 @@ void main() {
 }";
 
 // ---------------------------------------------------------------------------
-// Scene peak/average detection (GLES port of shader_hdr_detect.wgsl)
+// Scene peak/average detection (GLES port of shader_hdr_detect_common.wgsl)
 // ---------------------------------------------------------------------------
 // The ES 3.0 present-hook context has no compute, so the same statistics
 // are produced with two fragment-shader reduction passes + an async PBO
@@ -218,12 +218,12 @@ void main() {
 //           is never stalled. One frame of latency — the same semantics as
 //           the desktop's publish-before-accumulate ordering.
 // The rolling 63-frame window + scene-change reset then runs on the CPU
-// with the same constants as shader_hdr_detect.wgsl, and the result
+// with the same constants as shader_hdr_detect_common.wgsl, and the result
 // overrides the seed peak/average uniforms of the tonemap draw.
 
 const DETECT_W: i32 = 80;
 const DETECT_H: i32 = 45;
-/// Sliding window length (frames) — shader_hdr_detect.wgsl's DETECTION_FRAMES.
+/// Sliding window length (frames) — shader_hdr_detect_common.wgsl's DETECTION_FRAMES.
 const DETECT_WINDOW: usize = 63;
 const REFERENCE_WHITE: f32 = 100.0;
 
@@ -516,7 +516,7 @@ impl HdrDetectGl {
                 let avg = sum / cells as f32;
                 gl.unmap_buffer(glow::PIXEL_PACK_BUFFER);
 
-                // Scene-change reset — same rule as shader_hdr_detect.wgsl:
+                // Scene-change reset — same rule as shader_hdr_detect_common.wgsl:
                 // |frame avg − window mean| > threshold (REFERENCE_WHITE
                 // units) drops the whole window.
                 if scene_threshold > 0.0 && !st.window.is_empty() {

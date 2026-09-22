@@ -4,6 +4,8 @@ pub mod video;
 // Additive: offscreen VideoSink for in-app (shared-device) video. Does not
 // affect the windowed `video` renderer.
 pub mod video_offscreen;
+// Browser HDR start-up calibration (math is target-independent, tested natively).
+pub(crate) mod web_hdr_calib;
 
 use std::future::Future;
 

@@ -21,6 +21,8 @@ mod net;
 mod parsers;
 mod renderers;
 pub mod rt;
+#[doc(hidden)]
+pub mod shader_src;
 mod subtitle_style;
 mod tracks;
 mod utils;

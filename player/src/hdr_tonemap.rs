@@ -20,10 +20,10 @@
 //! ## When this applies
 //!
 //! On every platform where the player owns the HDR→SDR conversion:
-//!   - Windows (D3D11VA → DX12 P010 import → our shader_hdr.wgsl)
-//!   - Linux   (VAAPI    → Vulkan P010 import → our shader_hdr.wgsl)
+//!   - Windows (D3D11VA → DX12 P010 import → our shader_hdr_common.wgsl)
+//!   - Linux   (VAAPI    → Vulkan P010 import → our shader_hdr_common.wgsl)
 //!   - macOS / iOS (VideoToolbox → Metal plane import → the same
-//!     shader_hdr.wgsl). Preferred surface is 10-bit 'x420'; when VT
+//!     shader_hdr_common.wgsl). Preferred surface is 10-bit 'x420'; when VT
 //!     refuses it the 8-bit NV12 fallback is still a PQ/BT.2020 signal
 //!     (VT converts pixel format only, never colour) and tonemaps
 //!     through the same shader at 8-bit precision.

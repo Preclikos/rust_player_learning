@@ -24,7 +24,9 @@ The actual product: a `Player` that fetches a DASH manifest, decrypts (CENC
 ClearKey), decodes (per-platform HW: MediaCodec / VideoToolbox / D3D12 / VAAPI /
 WebCodecs), A/V-syncs, and renders (wgpu / GLES / direct HW plane / WebGPU
 canvas). HDR10 / HDR10+ / Dolby
-Vision, ABR, subtitles. Provider-agnostic: it exposes generic primitives
+Vision, ABR, subtitles. The HDR tonemap is one WGSL source composed per input
+(`shader_src.rs`: P010 planes natively, the browser-converted frame undone
+back to PQ codes on the web) so every platform computes the same numbers. Provider-agnostic: it exposes generic primitives
 (`RequestInterceptor`, `LicenseResolver`, `events()`, sinks) and bakes in NO
 auth/CDN/DRM-endpoint specifics. See `PLAYER_INTEGRATION.md`.
 

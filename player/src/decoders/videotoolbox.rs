@@ -92,7 +92,7 @@ const K_CF_NUMBER_SINT32_TYPE: CFIndex = 3;
 const K_CV_PIXEL_FORMAT_TYPE_420_YPCBCR8_BIPLANAR_VIDEO_RANGE: i32 = 0x34323076;
 // kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange = 'x420'. P010-style
 // layout: 10-bit codes in the high bits of 16-bit containers, biplanar
-// Y + interleaved CbCr — exactly what shader_hdr.wgsl expects.
+// Y + interleaved CbCr — exactly what shader_hdr_common.wgsl expects.
 const K_CV_PIXEL_FORMAT_TYPE_420_YPCBCR10_BIPLANAR_VIDEO_RANGE: i32 = 0x78343230;
 
 #[link(name = "CoreFoundation", kind = "framework")]
@@ -311,7 +311,7 @@ impl HwVideoDecoder for VideoToolboxDecoder {
         // Destination image buffer attributes:
         //   PixelFormatType = NV12 (420v) for SDR, or the P010-layout
         //   10-bit biplanar format ('x420') for PQ/HLG streams so the
-        //   renderer's own tonemap (shader_hdr.wgsl) gets the full-depth
+        //   renderer's own tonemap (shader_hdr_common.wgsl) gets the full-depth
         //   PQ signal (the 8-bit fallback tonemaps too, at lower precision).
         //   MetalCompatibility = true (request IOSurface usable from Metal)
         //   IOSurfaceProperties = empty dict (signals "use IOSurface backing")

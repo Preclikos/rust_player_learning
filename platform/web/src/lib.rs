@@ -213,21 +213,24 @@ impl BridgeHost for WebHost {
 
 // --- options -----------------------------------------------------------------
 
-/// HDR policy for the browser. The browser converts every frame to RGB
-/// itself and, for PQ content, tone-maps with its own curve before any of
-/// our shaders run — measured in Chrome: `importExternalTexture` and
-/// `copyExternalImageToTexture` both return the same compressed values
-/// whatever the canvas `toneMapping` mode, and hardware HEVC frames are
-/// opaque so the planes can't be read out either. The engine's own PQ →
-/// SDR mapping is therefore unreachable here.
+/// HDR policy for the browser. The browser converts every `VideoFrame` to
+/// RGB itself before any of our shaders run; for PQ content Chrome was
+/// measured to apply the BT.2020 → BT.709 matrix to the still PQ-encoded
+/// values and sRGB-encode them — no tone-map, a washed-out picture. The
+/// renderer verifies that conversion at start-up with a synthetic frame and,
+/// when it holds, undoes it in the shader and runs the engine's own PQ →
+/// SDR tonemap on the GPU — the same math and numbers as the native players
+/// (`player/src/renderers/shader_chrome_inverse.wgsl`).
 ///
-/// That mapping was calibrated to land on the SDR ladder's displayed values
-/// (see shader_hdr.wgsl), so the way to show the SAME picture as the native
-/// players is to play the SDR representations: the default. `Browser` opts
-/// into the HDR rungs with Chrome's tone-map instead (higher resolution
-/// ceiling on this fixture, different look).
+/// - `Auto` (default): HDR representations play through the engine tonemap
+///   when the calibration passed; otherwise only SDR representations play
+///   (the SDR ladder is the same picture the tonemap was calibrated to).
+/// - `SdrOnly`: SDR representations only, whatever the browser does.
+/// - `Browser`: HDR representations with the browser's own conversion
+///   (comparison / a host that prefers it).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WebHdrPolicy {
+    Auto,
     SdrOnly,
     Browser,
 }
@@ -235,14 +238,17 @@ enum WebHdrPolicy {
 fn read_options(options: &JsValue) -> Result<(StartConfig, HashMap<[u8; 16], [u8; 16]>, WebHdrPolicy), String> {
     let mut config = StartConfig::default();
     let mut keys = HashMap::new();
-    let mut hdr = WebHdrPolicy::SdrOnly;
+    let mut hdr = WebHdrPolicy::Auto;
     if options.is_undefined() || options.is_null() {
         return Ok((config, keys, hdr));
     }
     match get(options, "hdr").and_then(|v| v.as_string()).as_deref() {
-        None | Some("sdr") => {}
+        None | Some("auto") => {}
+        Some("sdr") => hdr = WebHdrPolicy::SdrOnly,
         Some("browser") => hdr = WebHdrPolicy::Browser,
-        Some(other) => return Err(format!("options.hdr: expected \"sdr\" or \"browser\", got {other:?}")),
+        Some(other) => {
+            return Err(format!("options.hdr: expected \"auto\", \"sdr\" or \"browser\", got {other:?}"))
+        }
     }
     if let Some(ms) = get(options, "startPositionMs").and_then(|v| v.as_f64()) {
         config.start_position = Some(Duration::from_millis(ms.max(0.0) as u64));
@@ -284,10 +290,12 @@ impl RustPlayer {
     /// `host`: `{ onEvent(json), resolveKey?(kidHex) → keyHex, intercept?(url, kind) → {url?, headers?} }`.
     /// `options`: `{ startPositionMs?, startFraction?, autoSelectSubtitle?,
     /// preferredAudioLanguage?, preferredSubtitleLanguage?, clearKeys?: {kidHex: keyHex},
-    /// hdr?: "sdr" | "browser" }` — `hdr` defaults to `"sdr"`: only SDR
-    /// representations play (the same picture the engine's HDR tonemap
-    /// produces natively); `"browser"` allows the HDR rungs with the
-    /// browser's own tone-map (see [`WebHdrPolicy`]).
+    /// hdr?: "auto" | "sdr" | "browser" }` — `hdr` defaults to `"auto"`: HDR
+    /// representations render through the engine's own PQ → SDR tonemap on
+    /// the GPU (same numbers as the native players) when the renderer could
+    /// verify the browser's frame conversion, else SDR representations only;
+    /// `"sdr"` forces SDR only; `"browser"` shows the HDR rungs as the
+    /// browser converts them (see [`WebHdrPolicy`]).
     ///
     /// Call from a user gesture (a click handler): the browser only lets the
     /// `AudioContext` run after one. The canvas's drawing-buffer size
@@ -303,8 +311,20 @@ impl RustPlayer {
         let (w, h) = (canvas.width().max(1), canvas.height().max(1));
         log::info!("[web] creating player on {}x{} canvas for {} (hdr policy {:?})", w, h, manifest_url, hdr);
         let player = Player::new_from_canvas(canvas, w, h).await;
-        if hdr == WebHdrPolicy::SdrOnly {
-            player.set_abr_video_profile(AbrVideoProfile::SdrOnly);
+        let engine_tonemap = player.web_hdr_tonemap_available();
+        match hdr {
+            WebHdrPolicy::Auto if engine_tonemap => {
+                log::info!("[web] HDR representations enabled: engine PQ → SDR tonemap on the GPU");
+            }
+            WebHdrPolicy::Auto => {
+                log::info!("[web] browser frame conversion not verified → SDR representations only");
+                player.set_abr_video_profile(AbrVideoProfile::SdrOnly);
+            }
+            WebHdrPolicy::SdrOnly => player.set_abr_video_profile(AbrVideoProfile::SdrOnly),
+            WebHdrPolicy::Browser => {
+                log::info!("[web] HDR representations with the browser's own conversion (hdr: \"browser\")");
+                player.set_web_hdr_passthrough(true);
+            }
         }
         let host: Arc<dyn BridgeHost> = Arc::new(WebHost { host, keys });
         let handle = bridge::start(player, manifest_url, host, config);

@@ -258,6 +258,12 @@ pub struct VideoRenderer {
     /// (shader_rgba.wgsl), same bind-group layout as the NV12 pipelines.
     #[cfg(target_arch = "wasm32")]
     render_pipeline_rgba: Option<RenderPipeline>,
+    /// Browser: the engine's PQ → SDR tonemap over the browser-converted
+    /// frame (see [`WebHdr`]). `None` without WebGPU or when the start-up
+    /// calibration met a browser conversion this build cannot invert — PQ
+    /// frames then draw through `render_pipeline_rgba` (the browser's look).
+    #[cfg(target_arch = "wasm32")]
+    web_hdr: Option<WebHdr>,
     frame_size: Arc<RwLock<PhysicalSize<u32>>>,
     // Crop factor for the texture axes: content / buffer size.
     // Always 1.0 on desktop; set to <1.0 on Android when the hardware codec
@@ -300,7 +306,7 @@ pub struct VideoRenderer {
     /// it. `None` on devices without NV12 (no shader pipeline at all).
     hdr_tonemap_uniform: Option<wgpu::Buffer>,
     /// GPU-side frame peak/average detection for the HDR tonemap (the
-    /// tonemap_opencl detect_peak_avg port — see shader_hdr_detect.wgsl).
+    /// tonemap_opencl detect_peak_avg port — see shader_hdr_detect_common.wgsl).
     /// Fully zero-copy: the compute passes read the already-imported P010
     /// plane views and keep their rolling statistics in a small storage
     /// buffer that never leaves the GPU; the HDR fragment shader reads the
@@ -366,11 +372,11 @@ pub struct VideoRenderer {
     overlay_presented_gen: std::sync::atomic::AtomicU64,
 }
 
-/// Size of the HDR tonemap uniform (TonemapUniforms in shader_hdr.wgsl /
-/// shader_hdr_detect.wgsl): 4× f32 params + 3× u32 detection geometry + pad.
+/// Size of the HDR tonemap uniform (TonemapUniforms in shader_hdr_common.wgsl /
+/// shader_hdr_detect_common.wgsl): 4× f32 params + 3× u32 detection geometry + pad.
 const HDR_TONEMAP_UNIFORM_SIZE: u64 = 32;
 /// Size of the detection state buffer (DetectionBuf in
-/// shader_hdr_detect.wgsl): two 64-slot u32 rings + 4 totals/indices +
+/// shader_hdr_detect_common.wgsl): two 64-slot u32 rings + 4 totals/indices +
 /// 2 f32 result slots — the tonemap_opencl util_buf layout plus the
 /// published result. wgpu zero-initialises it, which is the detection's
 /// valid starting state (scene_frame_num == 0 → seed values used).
@@ -378,9 +384,41 @@ const HDR_DETECT_BUFFER_SIZE: u64 = (64 + 64 + 4 + 2) * 4;
 
 /// GPU resources of the frame peak/average detection that drives the HDR
 /// tonemap (port of tonemap_opencl's detect_peak_avg — three compute
-/// passes encoded before each P010 draw; see shader_hdr_detect.wgsl).
+/// passes encoded before each P010 draw; see shader_hdr_detect_common.wgsl).
 /// Everything stays on the GPU: textures in, statistics in `buffer`,
 /// result consumed by the HDR fragment shader via `frag_bind_group`.
+/// Browser: the engine's HDR path over the browser-converted `VideoFrame`.
+/// PQ frames are copied into an rgba16float texture (GPU → GPU, like the
+/// SDR path's RGBA8), `shader_hdr_web.wgsl` undoes the browser's conversion
+/// back to the PQ codes and runs the SAME tonemap + detection math as the
+/// native P010 path — the browser shows the PC picture. Built only when
+/// the start-up calibration (`web_hdr_calib`) verified the conversion is
+/// the one the shader inverts.
+#[cfg(target_arch = "wasm32")]
+struct WebHdr {
+    /// Tonemap render pipeline (group 0 = shared layout, group 1 = the
+    /// detection result), target = surface format.
+    render_pipeline: RenderPipeline,
+    /// `cs_accumulate` reading the RGBA texture; publish/finalize are the
+    /// native `HdrDetect` kernels (same buffer, same layout).
+    accumulate: wgpu::ComputePipeline,
+    /// rgba16float copy destination, reused while the frame size holds.
+    texture: std::sync::Mutex<Option<(u32, u32, wgpu::Texture)>>,
+    /// Which inverse the calibration selected (`u_tm.web_inverse`).
+    inverse: super::web_hdr_calib::Inverse,
+    /// Host request to show the browser's own picture instead (comparison,
+    /// or a host that prefers it). Flipped at runtime.
+    passthrough: std::sync::atomic::AtomicBool,
+}
+
+/// `ShaderModuleDescriptor` over a composed WGSL source (`shader_src`).
+fn wgsl_module(label: &'static str, src: String) -> wgpu::ShaderModuleDescriptor<'static> {
+    wgpu::ShaderModuleDescriptor {
+        label: Some(label),
+        source: wgpu::ShaderSource::Wgsl(src.into()),
+    }
+}
+
 struct HdrDetect {
     /// Rolling detection state + published result (HDR_DETECT_BUFFER_SIZE).
     buffer: wgpu::Buffer,
@@ -390,11 +428,32 @@ struct HdrDetect {
     /// Layout for the per-frame compute bind group (Y view, UV view,
     /// tonemap uniform, `buffer` read-write).
     compute_layout: BindGroupLayout,
+    /// Layout of `frag_bind_group` (group 1 of the HDR render pipelines);
+    /// the browser's HDR pipeline is built over it after construction.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    frag_layout: BindGroupLayout,
     /// detect publish/accumulate/finalize kernels (one module, three entry
     /// points) — dispatched in this order before the HDR draw.
     publish: wgpu::ComputePipeline,
     accumulate: wgpu::ComputePipeline,
     finalize: wgpu::ComputePipeline,
+}
+
+/// Pipeline set for [`VideoRenderer::draw_planes`].
+#[cfg(any(target_os = "macos", target_os = "ios", target_arch = "wasm32"))]
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug)]
+enum PlaneDraw {
+    /// NV12 / SDR planes → shader.wgsl.
+    Sdr,
+    /// P010 / PQ planes → HDR tonemap + detection (SDR when unavailable).
+    Hdr,
+    /// Browser: RGBA8 the browser converted → passthrough quad.
+    #[cfg(target_arch = "wasm32")]
+    WebRgba,
+    /// Browser: rgba16float of a PQ frame → inverse + engine tonemap.
+    #[cfg(target_arch = "wasm32")]
+    WebHdr,
 }
 
 pub enum VideoRendererCommand {
@@ -730,7 +789,7 @@ impl VideoRenderer {
                             ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                             count: None,
                         },
-                        // HDR tonemap params uniform — read by shader_hdr.wgsl
+                        // HDR tonemap params uniform — read by shader_hdr_common.wgsl
                         // and the detection compute passes. Provided in every
                         // bind group (including SDR / Apple Metal) so the
                         // descriptor shape is stable; the SDR shaders simply
@@ -775,10 +834,14 @@ impl VideoRenderer {
             });
 
             let shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
-            let shader_hdr = hdr_capable
-                .then(|| device.create_shader_module(wgpu::include_wgsl!("shader_hdr.wgsl")));
+            let shader_hdr = hdr_capable.then(|| {
+                device.create_shader_module(wgsl_module("shader_hdr (P010)", crate::shader_src::hdr()))
+            });
             let shader_hdr_detect = hdr_capable.then(|| {
-                device.create_shader_module(wgpu::include_wgsl!("shader_hdr_detect.wgsl"))
+                device.create_shader_module(wgsl_module(
+                    "shader_hdr_detect (P010)",
+                    crate::shader_src::hdr_detect(),
+                ))
             });
 
             let pipeline_layout =
@@ -945,6 +1008,7 @@ impl VideoRenderer {
                 buffer: detect_buffer,
                 frag_bind_group: detect_frag_bind_group,
                 compute_layout: detect_compute_layout,
+                frag_layout: hdr_detect_frag_layout.clone(),
                 publish: make_detect_pipeline("HDR Detect (publish)", "cs_publish"),
                 accumulate: make_detect_pipeline("HDR Detect (accumulate)", "cs_accumulate"),
                 finalize: make_detect_pipeline("HDR Detect (finalize)", "cs_finalize"),
@@ -977,11 +1041,17 @@ impl VideoRenderer {
         // engine's own curve on the web needs `importExternalTexture` with
         // untone-mapped output, which wgpu does not expose yet.
         #[cfg(target_arch = "wasm32")]
-        let web_quad_pipeline = |label: &'static str, module: wgpu::ShaderModule| {
+        let web_quad_pipeline = |label: &'static str,
+                                 module: wgpu::ShaderModule,
+                                 group1: Option<&BindGroupLayout>| {
             let layout = texture_bind_group_layout.as_ref()?;
+            let groups: Vec<Option<&BindGroupLayout>> = match group1 {
+                Some(g) => vec![Some(layout), Some(g)],
+                None => vec![Some(layout)],
+            };
             let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Pipeline Layout (RGBA)"),
-                bind_group_layouts: &[Some(layout)],
+                bind_group_layouts: &groups,
                 immediate_size: 0,
             });
             Some(device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -1014,7 +1084,68 @@ impl VideoRenderer {
         let render_pipeline_rgba = web_quad_pipeline(
             "Render Pipeline (RGBA / VideoFrame)",
             device.create_shader_module(wgpu::include_wgsl!("shader_rgba.wgsl")),
+            None,
         );
+
+        // Browser HDR: verify what the browser does to PQ frames on THIS
+        // device (one synthetic frame, one 32 KiB readback — not video), then
+        // build the tonemap + detection pipelines that undo it. Failure is
+        // not fatal: PQ frames fall back to the browser's own picture.
+        #[cfg(target_arch = "wasm32")]
+        let web_hdr = match hdr_detect.as_ref() {
+            Some(det) => match super::web_hdr_calib::calibrate(&device, &queue).await {
+                Ok(verdict) => {
+                    let render_pipeline = web_quad_pipeline(
+                        "Render Pipeline (HDR / VideoFrame)",
+                        device.create_shader_module(wgsl_module(
+                            "shader_hdr (web)",
+                            crate::shader_src::web_hdr(),
+                        )),
+                        Some(&det.frag_layout),
+                    );
+                    let accumulate = {
+                        let module = device.create_shader_module(wgsl_module(
+                            "shader_hdr_detect (web)",
+                            crate::shader_src::web_hdr_detect(),
+                        ));
+                        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                            label: Some("HDR Detect Pipeline Layout (web)"),
+                            bind_group_layouts: &[Some(&det.compute_layout)],
+                            immediate_size: 0,
+                        });
+                        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                            label: Some("HDR Detect (accumulate, web)"),
+                            layout: Some(&pl),
+                            module: &module,
+                            entry_point: Some("cs_accumulate"),
+                            compilation_options: wgpu::PipelineCompilationOptions::default(),
+                            cache: None,
+                        })
+                    };
+                    log::info!(
+                        "[renderer] web HDR: browser PQ conversion verified as {:?} (grey ramp rms {:.4} max {:.4}, colour patches max {:.4}) → engine tonemap runs on the GPU",
+                        verdict.inverse,
+                        verdict.grey_rms,
+                        verdict.grey_max,
+                        verdict.patch_max
+                    );
+                    render_pipeline.map(|rp| WebHdr {
+                        render_pipeline: rp,
+                        accumulate,
+                        texture: std::sync::Mutex::new(None),
+                        inverse: verdict.inverse,
+                        passthrough: std::sync::atomic::AtomicBool::new(false),
+                    })
+                }
+                Err(e) => {
+                    log::warn!(
+                        "[renderer] web HDR: browser PQ conversion is not one this build can invert ({e}); PQ frames show the browser's own picture"
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
 
         // Capacity sized for drag-resize bursts: Win32 generates many WM_SIZE
         // events per second while the user drags a window edge. The consumer
@@ -1143,6 +1274,8 @@ impl VideoRenderer {
             web_rgba: std::sync::Mutex::new(None),
             #[cfg(target_arch = "wasm32")]
             render_pipeline_rgba,
+            #[cfg(target_arch = "wasm32")]
+            web_hdr,
             #[cfg(target_os = "android")]
             gles_oes_renderer,
             #[cfg(target_os = "android")]
@@ -1247,9 +1380,12 @@ impl VideoRenderer {
             });
 
         let shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
-        let shader_hdr = device.create_shader_module(wgpu::include_wgsl!("shader_hdr.wgsl"));
-        let shader_hdr_detect =
-            device.create_shader_module(wgpu::include_wgsl!("shader_hdr_detect.wgsl"));
+        let shader_hdr =
+            device.create_shader_module(wgsl_module("shader_hdr (P010)", crate::shader_src::hdr()));
+        let shader_hdr_detect = device.create_shader_module(wgsl_module(
+            "shader_hdr_detect (P010)",
+            crate::shader_src::hdr_detect(),
+        ));
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Pipeline Layout"),
@@ -1393,6 +1529,7 @@ impl VideoRenderer {
             buffer: detect_buffer,
             frag_bind_group: detect_frag_bind_group,
             compute_layout: detect_compute_layout,
+            frag_layout: hdr_detect_frag_layout.clone(),
             publish: make_detect_pipeline("HDR Detect (publish)", "cs_publish"),
             accumulate: make_detect_pipeline("HDR Detect (accumulate)", "cs_accumulate"),
             finalize: make_detect_pipeline("HDR Detect (finalize)", "cs_finalize"),
@@ -1500,6 +1637,8 @@ impl VideoRenderer {
             web_rgba: std::sync::Mutex::new(None),
             #[cfg(target_arch = "wasm32")]
             render_pipeline_rgba: None,
+            #[cfg(target_arch = "wasm32")]
+            web_hdr: None,
             #[cfg(target_os = "android")]
             gles_oes_renderer: None,
             #[cfg(target_os = "android")]
@@ -1545,6 +1684,8 @@ impl VideoRenderer {
         render_pipeline: &wgpu::RenderPipeline,
         is_hdr: bool,
         detect_bind_group: Option<&wgpu::BindGroup>,
+        // `cs_accumulate` variant for the source (None = native P010 kernel).
+        accumulate_override: Option<&wgpu::ComputePipeline>,
         wg_x: u32,
         wg_y: u32,
         vertex_buffer: &wgpu::Buffer,
@@ -1561,7 +1702,7 @@ impl VideoRenderer {
             cpass.set_pipeline(&det.publish);
             cpass.set_bind_group(0, detect_group, &[]);
             cpass.dispatch_workgroups(1, 1, 1);
-            cpass.set_pipeline(&det.accumulate);
+            cpass.set_pipeline(accumulate_override.unwrap_or(&det.accumulate));
             cpass.dispatch_workgroups(wg_x, wg_y, 1);
             cpass.set_pipeline(&det.finalize);
             cpass.dispatch_workgroups(1, 1, 1);
@@ -1885,27 +2026,44 @@ impl VideoRenderer {
     }
 
     /// Browser GPU path: `copyExternalImageToTexture` from the WebCodecs
-    /// `VideoFrame` into an RGBA8 texture (the browser converts colour — and
-    /// tone-maps HDR — on the GPU), then one textured-quad draw. The
+    /// `VideoFrame` into a texture (GPU → GPU; the browser does the Y'CbCr →
+    /// R'G'B' conversion), then one textured-quad draw. SDR frames land in
+    /// RGBA8 and draw as-is. PQ frames land in rgba16float and, when the
+    /// start-up calibration verified the browser's conversion, go through
+    /// the engine's own PQ → SDR tonemap (the browser's conversion undone
+    /// in the shader — see [`WebHdr`]); otherwise they draw as the browser
+    /// converted them. No CPU touches the pixels on either path. The
     /// `VideoFrame` is closed when `frame` drops at the end of this call —
     /// the copy is recorded on the queue synchronously, so the browser has
     /// captured the pixels by then.
     #[cfg(target_arch = "wasm32")]
     async fn render_web_video_frame(&self, frame: WebVideoFrame, color: crate::decoders::VideoColorInfo) {
-        let Some(pipeline) = self.render_pipeline_rgba.as_ref() else {
+        if self.render_pipeline_rgba.is_none() {
             return;
-        };
+        }
         let (w, h) = (frame.width.max(1), frame.height.max(1));
+        let engine_hdr = color.is_hdr()
+            && self
+                .web_hdr
+                .as_ref()
+                .map(|wh| !wh.passthrough.load(std::sync::atomic::Ordering::Relaxed))
+                .unwrap_or(false);
+        let (slot, format, label) = if engine_hdr {
+            (
+                &self.web_hdr.as_ref().expect("engine_hdr implies web_hdr").texture,
+                TextureFormat::Rgba16Float,
+                "PQ → engine tonemap",
+            )
+        } else if color.is_hdr() {
+            (&self.web_rgba, TextureFormat::Rgba8Unorm, "PQ, browser conversion")
+        } else {
+            (&self.web_rgba, TextureFormat::Rgba8Unorm, "SDR, browser conversion")
+        };
         let texture = {
-            let mut slot = self.web_rgba.lock().unwrap();
-            let stale = slot.as_ref().map(|(tw, th, _)| *tw != w || *th != h).unwrap_or(true);
+            let mut guard = slot.lock().unwrap();
+            let stale = guard.as_ref().map(|(tw, th, _)| *tw != w || *th != h).unwrap_or(true);
             if stale {
-                log::info!(
-                    "[renderer] web frame texture {}x{} Rgba8Unorm ({}, browser conversion)",
-                    w,
-                    h,
-                    if color.is_hdr() { "HDR" } else { "SDR" }
-                );
+                log::info!("[renderer] web frame texture {}x{} {:?} ({})", w, h, format, label);
                 let tex = self.device.create_texture(&wgpu::TextureDescriptor {
                     label: Some("web VideoFrame"),
                     size: wgpu::Extent3d {
@@ -1916,7 +2074,7 @@ impl VideoRenderer {
                     mip_level_count: 1,
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
-                    format: TextureFormat::Rgba8Unorm,
+                    format,
                     // copyExternalImageToTexture requires RENDER_ATTACHMENT on
                     // the destination in addition to COPY_DST.
                     usage: wgpu::TextureUsages::TEXTURE_BINDING
@@ -1924,9 +2082,9 @@ impl VideoRenderer {
                         | wgpu::TextureUsages::RENDER_ATTACHMENT,
                     view_formats: &[],
                 });
-                *slot = Some((w, h, tex));
+                *guard = Some((w, h, tex));
             }
-            slot.as_ref().unwrap().2.clone()
+            guard.as_ref().unwrap().2.clone()
         };
         self.queue.copy_external_image_to_texture(
             &wgpu::CopyExternalImageSourceInfo {
@@ -1949,7 +2107,26 @@ impl VideoRenderer {
             },
         );
         let view = texture.create_view(&Default::default());
-        self.draw_planes(&view, &view, w, h, false, Some(pipeline)).await;
+        let mode = if engine_hdr { PlaneDraw::WebHdr } else { PlaneDraw::WebRgba };
+        self.draw_planes(&view, &view, w, h, mode).await;
+    }
+
+    /// Browser: whether PQ frames run through the engine's own PQ → SDR
+    /// tonemap (the start-up calibration verified the browser's conversion
+    /// is invertible). `false` → PQ frames show the browser's own picture.
+    #[cfg(target_arch = "wasm32")]
+    pub fn web_hdr_tonemap_available(&self) -> bool {
+        self.web_hdr.is_some()
+    }
+
+    /// Browser: show PQ frames as the browser converts them instead of the
+    /// engine tonemap (comparison, or a host that prefers the browser's
+    /// look). No effect when the engine tonemap is unavailable.
+    #[cfg(target_arch = "wasm32")]
+    pub fn set_web_hdr_passthrough(&self, passthrough: bool) {
+        if let Some(wh) = self.web_hdr.as_ref() {
+            wh.passthrough.store(passthrough, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// Windows / Linux FFmpeg → wgpu native-import draw path. macOS / iOS
@@ -2042,7 +2219,7 @@ impl VideoRenderer {
         // Detection accumulate grid: one invocation per UV texel, 16×16 per
         // workgroup, grid rounded UP like ff_opencl_filter_work_size_from_image
         // (edge overflow clamps into the frame and still counts — see
-        // shader_hdr_detect.wgsl).
+        // shader_hdr_detect_common.wgsl).
         let (wg_x, wg_y) = (uv_w.div_ceil(16), uv_h.div_ceil(16));
         self.queue.write_buffer(
             tonemap_uniform,
@@ -2141,6 +2318,7 @@ impl VideoRenderer {
             // Resolve overlay snapshot BEFORE begin_render_pass so no
             // async/mutex hazard happens inside the render-pass scope.
             let overlay_snapshot = self.subtitle_overlay.lock().unwrap().clone();
+            let accumulate_override: Option<&wgpu::ComputePipeline> = None;
 
             if let Some(off) = self.offscreen.clone() {
                 // In-app (offscreen) path: draw into the host-shared ring, then
@@ -2156,6 +2334,7 @@ impl VideoRenderer {
                     render_pipeline,
                     is_hdr,
                     detect_bind_group.as_ref(),
+                    accumulate_override,
                     wg_x,
                     wg_y,
                     &vertex_buffer,
@@ -2222,6 +2401,7 @@ impl VideoRenderer {
                     render_pipeline,
                     is_hdr,
                     detect_bind_group.as_ref(),
+                    accumulate_override,
                     wg_x,
                     wg_y,
                     &vertex_buffer,
@@ -2285,17 +2465,22 @@ impl VideoRenderer {
             metal_frame.y_texture.width(),
             metal_frame.y_texture.height(),
         );
-        self.draw_planes(&y_plane_view, &uv_plane_view, frame_w, frame_h, is_hdr, None)
-            .await;
+        self.draw_planes(
+            &y_plane_view,
+            &uv_plane_view,
+            frame_w,
+            frame_h,
+            if is_hdr { PlaneDraw::Hdr } else { PlaneDraw::Sdr },
+        )
+        .await;
     }
 
     /// Draw one frame given its two plane views (Y, interleaved UV) — the
     /// shared tail of the Apple zero-copy path and the browser GPU-frame
     /// path: pipeline selection (SDR vs HDR tonemap + detection passes), the
-    /// bind groups, the surface acquire / present. `is_hdr` follows the
-    /// frame's signalled transfer; it draws through the SDR pipeline when the
-    /// device has no HDR pipeline (WebGL2). `pipeline_override` swaps in a
-    /// pipeline over the same bind-group layout (the browser's RGBA quad).
+    /// bind groups, the surface acquire / present. `mode` picks the pipeline
+    /// set; `Hdr` follows the frame's signalled transfer and degrades to the
+    /// SDR pipeline when the device built none (WebGL2).
     #[cfg(any(target_os = "macos", target_os = "ios", target_arch = "wasm32"))]
     async fn draw_planes(
         &self,
@@ -2303,10 +2488,34 @@ impl VideoRenderer {
         uv_plane_view: &wgpu::TextureView,
         frame_w: u32,
         frame_h: u32,
-        is_hdr: bool,
-        pipeline_override: Option<&wgpu::RenderPipeline>,
+        mode: PlaneDraw,
     ) {
-        let is_hdr = is_hdr && self.render_pipeline_hdr.is_some() && pipeline_override.is_none();
+        let sdr = || self.render_pipeline.as_ref().expect("no render pipeline");
+        let (render_pipeline, is_hdr, accumulate, web_inverse): (
+            &RenderPipeline,
+            bool,
+            Option<&wgpu::ComputePipeline>,
+            u32,
+        ) = match mode {
+            PlaneDraw::Sdr => (sdr(), false, None, 0),
+            PlaneDraw::Hdr => match self.render_pipeline_hdr.as_ref() {
+                Some(p) => (p, true, None, 0),
+                None => (sdr(), false, None, 0),
+            },
+            #[cfg(target_arch = "wasm32")]
+            PlaneDraw::WebRgba => (
+                self.render_pipeline_rgba.as_ref().expect("no RGBA pipeline"),
+                false,
+                None,
+                0,
+            ),
+            #[cfg(target_arch = "wasm32")]
+            PlaneDraw::WebHdr => {
+                let wh = self.web_hdr.as_ref().expect("no web HDR pipeline");
+                (&wh.render_pipeline, true, Some(&wh.accumulate), wh.inverse as u32)
+            }
+        };
+        let accumulate_override = accumulate;
         let (uv_w, uv_h) = (frame_w.div_ceil(2), frame_h.div_ceil(2));
         let (wg_x, wg_y) = (uv_w.div_ceil(16), uv_h.div_ceil(16));
 
@@ -2335,7 +2544,7 @@ impl VideoRenderer {
             self.queue.write_buffer(
                 tonemap_uniform,
                 16,
-                bytemuck::cast_slice(&[wg_x * wg_y, frame_w, frame_h, 0u32]),
+                bytemuck::cast_slice(&[wg_x * wg_y, frame_w, frame_h, web_inverse]),
             );
         }
         let texture_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -2394,14 +2603,6 @@ impl VideoRenderer {
 
         let vb_arc = self.vertex_buffer.as_ref().expect("no vertex buffer");
         let vertex_buffer = vb_arc.read().await;
-        let render_pipeline = match pipeline_override {
-            Some(p) => p,
-            None if is_hdr => self
-                .render_pipeline_hdr
-                .as_ref()
-                .expect("no HDR render pipeline"),
-            None => self.render_pipeline.as_ref().expect("no render pipeline"),
-        };
         let overlay_snapshot = self.subtitle_overlay.lock().unwrap().clone();
 
         if let Some(off) = self.offscreen.clone() {
@@ -2415,6 +2616,7 @@ impl VideoRenderer {
                 render_pipeline,
                 is_hdr,
                 detect_bind_group.as_ref(),
+                accumulate_override,
                 wg_x,
                 wg_y,
                 &vertex_buffer,
@@ -2473,6 +2675,7 @@ impl VideoRenderer {
                 render_pipeline,
                 is_hdr,
                 detect_bind_group.as_ref(),
+                accumulate_override,
                 wg_x,
                 wg_y,
                 &vertex_buffer,

@@ -59,8 +59,8 @@ player/src/
     video/video_metal.rs      Apple CVPixelBuffer→Metal plane import (8-bit + 10-bit)
     video/video_frame.rs      Desktop frame wrapper (native import / upload)
   renderers/shader.wgsl           SDR NV12 → RGB (exact limited-range BT.709)
-  renderers/shader_hdr.wgsl       HDR10 P010 → SDR (tonemap_opencl mobius port)
-  renderers/shader_hdr_detect.wgsl  Scene peak/average compute passes (desktop/Apple)
+  renderers/shader_hdr_common.wgsl       HDR10 P010 → SDR (tonemap_opencl mobius port)
+  renderers/shader_hdr_detect_common.wgsl  Scene peak/average compute passes (desktop/Apple)
 ```
 
 ---

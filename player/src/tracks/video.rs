@@ -122,6 +122,7 @@ impl VideoRepresenation {
     pub fn label(&self) -> String {
         let resolution = match self.height {
             h if h >= 2160 => "4K".to_string(),
+            h if h >= 1440 => "1440p".to_string(),
             h if h >= 1080 => "1080p".to_string(),
             h if h >= 720 => "720p".to_string(),
             h if h >= 480 => "480p".to_string(),

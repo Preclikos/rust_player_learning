@@ -76,12 +76,15 @@ pub(super) fn prepare_segment(
             data_vec.extend_from_slice(&init_data);
             data_vec.extend_from_slice(&segment.data[..]);
             let copy_ms = t_copy.elapsed().as_millis();
+            crate::prof::SEGMENT_PREP.add(t_copy.elapsed().as_micros() as u64);
             let t_dec = Instant::now();
             decrypt_segment_in_place_cooperative(&mut data_vec, crypto.as_ref()).await?;
             let dec_ms = t_dec.elapsed().as_millis();
             let t_parse = Instant::now();
             let sample_info = mp4_sample_table(&data_vec)?;
             let parse_ms = t_parse.elapsed().as_millis();
+            crate::prof::SEGMENT_PREP.add(t_parse.elapsed().as_micros() as u64);
+            crate::prof::DECRYPT.add((dec_ms * 1000) as u64);
             if copy_ms + dec_ms + parse_ms > 30 {
                 log::debug!(
                     "[prep] segment {} {} KiB: copy {}ms decrypt {}ms (cooperative) parse {}ms",
@@ -180,7 +183,27 @@ macro_rules! breathe {
                 );
                 break;
             }
-            crate::rt::cooperative_yield().await;
+            // Wait for the decoder to actually deliver something, rather
+            // than bouncing the event loop and asking again. The bounce has no
+            // delay by design, so on a decoder that stays full — which is the
+            // steady state while the pipeline feeds ahead — this loop ran flat
+            // out and cost a whole core. Measured on a 720p stream: one
+            // renderer thread at 0.99 of a core, of which the engine's own
+            // timed work was 1.2%; the rest was this.
+            //
+            // The timeout keeps the old behaviour's safety: a decoder that
+            // silently stops delivering still gets re-checked rather than
+            // parking here until MAX_BREATHE.
+            match $decoder.output_ready() {
+                Some(ready) => {
+                    let _ = crate::rt::timeout(
+                        std::time::Duration::from_millis(50),
+                        ready.notified(),
+                    )
+                    .await;
+                }
+                None => crate::rt::cooperative_yield().await,
+            }
             turns += 1;
         }
     }};
@@ -341,7 +364,10 @@ pub(super) async fn video_decoder_task(
                 return Ok(());
             }
 
-            decoder.submit(sample_data, pts_us)?;
+            {
+                let _p = crate::prof::Timer::new(&crate::prof::VIDEO_SUBMIT);
+                decoder.submit(sample_data, pts_us)?;
+            }
             breathe!(decoder, stop_flag);
         }
         if let Some(first) = first_pts_us {
@@ -410,6 +436,7 @@ pub(super) async fn drain_video_decoder(
     sender: &Sender<DecodedVideoFrame>,
     stop_flag: &Arc<AtomicBool>,
 ) -> Result<bool, Box<dyn Error + Send + Sync>> {
+    let _p = crate::prof::Timer::new(&crate::prof::VIDEO_DRAIN);
     loop {
         match decoder.try_recv()? {
             Some(frame) => {
@@ -524,7 +551,10 @@ pub(super) async fn audio_decoder_task(
             let sample_data = &data_vec[offset..offset + size];
             let pts_us = if ts_scale > 0 { ts * 1_000_000 / ts_scale as i64 } else { 0 };
 
-            decoder.submit(sample_data, pts_us)?;
+            {
+                let _p = crate::prof::Timer::new(&crate::prof::AUDIO_SUBMIT);
+                decoder.submit(sample_data, pts_us)?;
+            }
             breathe!(decoder, stop_flag);
 
             loop {

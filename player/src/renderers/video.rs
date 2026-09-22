@@ -2038,6 +2038,7 @@ impl VideoRenderer {
     /// captured the pixels by then.
     #[cfg(target_arch = "wasm32")]
     async fn render_web_video_frame(&self, frame: WebVideoFrame, color: crate::decoders::VideoColorInfo) {
+        let _prof = crate::prof::Timer::new(&crate::prof::VIDEO_RENDER);
         if self.render_pipeline_rgba.is_none() {
             return;
         }

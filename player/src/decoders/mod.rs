@@ -441,12 +441,28 @@ pub trait HwVideoDecoder: Send {
     /// teardown instead of wedging the rebuild. Default: ignored — only the
     /// direct MediaCodec path needs it.
     fn set_stop_signal(&mut self, _stop: std::sync::Arc<std::sync::atomic::AtomicBool>) {}
+
+    /// Signalled once every time the decoder delivers output.
+    ///
+    /// `wants_event_loop` says "full, do not feed me yet"; this says when that
+    /// might have changed. Without it the only way to wait was to bounce the
+    /// event loop and re-ask, which on a saturated decoder — the normal state
+    /// while the pipeline feeds ahead — spun a whole CPU core doing nothing.
+    /// `None` keeps the old bounce for decoders that have no such signal.
+    fn output_ready(&self) -> Option<std::sync::Arc<tokio::sync::Notify>> {
+        None
+    }
 }
 
 pub trait AudioDecoder: Send {
     /// See [`HwVideoDecoder::wants_event_loop`].
     fn wants_event_loop(&self) -> bool {
         false
+    }
+
+    /// See [`HwVideoDecoder::output_ready`].
+    fn output_ready(&self) -> Option<std::sync::Arc<tokio::sync::Notify>> {
+        None
     }
 
     /// See [`HwVideoDecoder::signal_end_of_stream`].

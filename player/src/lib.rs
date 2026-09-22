@@ -19,6 +19,7 @@ mod hdr_tonemap;
 mod manifest;
 mod net;
 mod parsers;
+pub mod prof;
 mod renderers;
 pub mod rt;
 #[doc(hidden)]

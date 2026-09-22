@@ -406,6 +406,17 @@ impl RustPlayer {
 /// `"error" | "warn" | "info" | "debug" | "trace"`. Default `info`; `debug`
 /// adds the per-second stats, the audio callback diagnostics and the
 /// segment-preparation timings.
+/// Cumulative microseconds per subsystem since the module loaded, as JSON:
+/// `{"audio_output":{"ms":..,"calls":..}, ..}`.
+///
+/// The web build runs everything on one thread, so "which subsystem" and "how
+/// busy is the thread" are the same question. Measured against wall-clock
+/// playback time, each entry reads directly as a share of that thread.
+#[wasm_bindgen(js_name = profJson)]
+pub fn prof_json() -> String {
+    player::prof::json()
+}
+
 #[wasm_bindgen(js_name = setLogLevel)]
 pub fn set_log_level(level: &str) {
     let lvl = match level {

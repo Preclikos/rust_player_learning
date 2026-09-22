@@ -102,6 +102,9 @@ struct VideoShared {
     color: Cell<VideoColorInfo>,
     /// Frames the browser has handed to the output callback.
     delivered: Cell<u64>,
+    /// Signalled on every delivered frame, so a full decoder can be waited on
+    /// instead of polled. See `HwVideoDecoder::output_ready`.
+    output_ready: std::sync::Arc<tokio::sync::Notify>,
 }
 
 impl VideoShared {
@@ -147,6 +150,7 @@ impl WebCodecsVideoDecoder {
                 error: RefCell::new(None),
                 color: Cell::new(VideoColorInfo::default()),
                 delivered: Cell::new(0),
+                output_ready: std::sync::Arc::new(tokio::sync::Notify::new()),
             }),
             nal_len_size: 4,
             await_key: true,
@@ -174,6 +178,10 @@ impl Default for WebCodecsVideoDecoder {
 /// Output callback: wrap the GPU-resident frame and queue it for `try_recv`.
 fn on_video_output(shared: &Rc<VideoShared>, frame: web_sys::VideoFrame) {
     shared.delivered.set(shared.delivered.get() + 1);
+    // `notify_one` stores a permit, so a waiter that has not parked yet still
+    // sees it — with `notify_waiters` this would race and the waiter would sit
+    // until its timeout.
+    shared.output_ready.notify_one();
     let pts_us = frame.timestamp() as i64;
     let wrapped = WebVideoFrame::new(frame);
     let (width, height) = (wrapped.width, wrapped.height);
@@ -280,6 +288,10 @@ impl HwVideoDecoder for WebCodecsVideoDecoder {
         self.submitted.get().saturating_sub(self.shared.delivered.get()) >= VIDEO_IN_FLIGHT
     }
 
+    fn output_ready(&self) -> Option<std::sync::Arc<tokio::sync::Notify>> {
+        Some(self.shared.output_ready.clone())
+    }
+
     fn signal_end_of_stream(&mut self) {
         if self.draining.is_some() {
             return;
@@ -326,6 +338,8 @@ struct AudioShared {
     /// Built on the first output (that is when the real input rate is
     /// known); keeps its phase across AUs so the output frame count is exact.
     resampler: RefCell<Option<LinearResampler>>,
+    /// See `HwVideoDecoder::output_ready`.
+    output_ready: std::sync::Arc<tokio::sync::Notify>,
 }
 
 impl AudioShared {
@@ -363,6 +377,7 @@ impl WebCodecsAudioDecoder {
                 output_rate: Cell::new(48_000),
                 frames_out: Cell::new(0),
                 resampler: RefCell::new(None),
+                output_ready: std::sync::Arc::new(tokio::sync::Notify::new()),
             }),
             submitted: Cell::new(0),
             draining: None,
@@ -400,12 +415,20 @@ fn audio_codec_string(codec: AudioCodec, asc: &[u8]) -> String {
 }
 
 fn on_audio_output(shared: &AudioShared, data: web_sys::AudioData) {
+    let __prof_audio = crate::rt::Instant::now();
+    let __r = on_audio_output_inner(shared, data);
+    crate::prof::AUDIO_OUTPUT.add(__prof_audio.elapsed().as_micros() as u64);
+    __r
+}
+
+fn on_audio_output_inner(shared: &AudioShared, data: web_sys::AudioData) {
     let channels = data.number_of_channels() as usize;
     let frames = data.number_of_frames() as usize;
     let rate = data.sample_rate().round() as u32;
     let pts_ms = (data.timestamp() / 1000.0) as i64;
     let n = shared.frames_out.get();
     shared.frames_out.set(n + 1);
+    shared.output_ready.notify_one();
     if n < 3 || n % 200 == 0 {
         log::debug!(
             "[webcodecs] audio out #{n}: {frames} frames {channels}ch {rate}Hz ts={pts_ms}ms dur={:.2}ms fmt={:?}",
@@ -434,7 +457,9 @@ fn on_audio_output(shared: &AudioShared, data: web_sys::AudioData) {
     let stereo = downmix_to_stereo(&interleaved, channels);
     let mut rs = shared.resampler.borrow_mut();
     let resampler = rs.get_or_insert_with(|| LinearResampler::new(2, rate, shared.output_rate.get()));
+    let __t_rs = crate::rt::Instant::now();
     let samples = resampler.process(&stereo);
+    crate::prof::AUDIO_RESAMPLE.add(__t_rs.elapsed().as_micros() as u64);
     shared.ready.borrow_mut().push_back(DecodedAudioFrame { pts_ms, samples });
 }
 
@@ -509,6 +534,10 @@ impl AudioDecoder for WebCodecsAudioDecoder {
             return !done.get();
         }
         self.submitted.get().saturating_sub(self.shared.frames_out.get()) >= AUDIO_IN_FLIGHT
+    }
+
+    fn output_ready(&self) -> Option<std::sync::Arc<tokio::sync::Notify>> {
+        Some(self.shared.output_ready.clone())
     }
 
     fn signal_end_of_stream(&mut self) {

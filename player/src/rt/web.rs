@@ -232,6 +232,40 @@ pub async fn timeout<F: Future>(duration: Duration, fut: F) -> Result<F::Output,
     }
 }
 
+/// Resolves at the browser's next animation frame with its timestamp
+/// (`DOMHighResTimeStamp`, ms): the tick just before the display's next
+/// vsync, the moment to draw a frame that should show on that vsync. Where
+/// there is no `Window` (a worker) it degrades to a ~16 ms sleep.
+pub struct AnimationFrame(JsFuture);
+
+// Single thread: see the module docs.
+unsafe impl Send for AnimationFrame {}
+unsafe impl Sync for AnimationFrame {}
+
+impl Future for AnimationFrame {
+    type Output = f64;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<f64> {
+        match Pin::new(&mut self.get_mut().0).poll(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(v) => Poll::Ready(v.ok().and_then(|v| v.as_f64()).unwrap_or(0.0)),
+        }
+    }
+}
+
+pub fn animation_frame() -> AnimationFrame {
+    let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+        let global = js_sys::global();
+        if let Some(win) = global.dyn_ref::<web_sys::Window>() {
+            if win.request_animation_frame(&resolve).is_ok() {
+                return;
+            }
+        }
+        set_timeout(&resolve, 16);
+    });
+    AnimationFrame(JsFuture::from(promise))
+}
+
 // ---------------------------------------------------------------------------
 // Cooperative yield
 // ---------------------------------------------------------------------------

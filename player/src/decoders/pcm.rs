@@ -30,7 +30,7 @@ pub fn remix(input: &[f32], in_ch: usize, out_ch: usize) -> Vec<f32> {
     }
     if out_ch == 1 {
         let st = downmix_to_stereo(input, in_ch);
-        return st.chunks_exact(2).map(|lr| (lr[0] + lr[1]) * 0.5).collect();
+        return st.as_chunks::<2>().0.iter().map(|lr| (lr[0] + lr[1]) * 0.5).collect();
     }
     let frames = input.len() / in_ch;
     let mut out = Vec::with_capacity(frames * out_ch);

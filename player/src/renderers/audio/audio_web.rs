@@ -395,17 +395,17 @@ async fn pump(
             output_latency_ms.store(context_latency_ms(&ctx), Ordering::Relaxed);
             report.notify_one();
             let now = ctx.current_time();
+            // Every 5 s, INCLUDING the first window: start-up underruns are
+            // exactly the ones that matter (the audible "crackle" report).
             if now - diag_last >= 5.0 {
-                if diag_last > 0.0 {
-                    log::debug!(
-                        "[audio] web: played={}f buffered={}f starved={}f latency={}ms state={:?}",
-                        played as u64,
-                        buffered.get(),
-                        diag_starved,
-                        output_latency_ms.load(Ordering::Relaxed),
-                        ctx.state()
-                    );
-                }
+                log::debug!(
+                    "[audio] web: played={}f buffered={}f starved={}f latency={}ms state={:?}",
+                    played as u64,
+                    buffered.get(),
+                    diag_starved,
+                    output_latency_ms.load(Ordering::Relaxed),
+                    ctx.state()
+                );
                 diag_last = now;
                 diag_starved = 0;
             }

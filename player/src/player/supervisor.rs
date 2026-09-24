@@ -157,11 +157,13 @@ fn measured_download_bps(stats: &StatsState) -> f64 {
     stats.bandwidth_bps_ewma.load(Ordering::Relaxed) as f64 / 8.0
 }
 
-/// How long the swap may hold the OLD rung at the segment boundary waiting for
-/// NEW's first segment to finish decrypting. Covers a 14 Mbps 4K segment
-/// (~0.65 s at the ~17 MB/s software-AES rate) with headroom; past that
-/// something is wrong and dropping a few frames beats stalling the swap.
-const PREPARE_READY_BUDGET: Duration = Duration::from_millis(1_200);
+/// How long the swap may hold the OLD rung past the segment boundary waiting
+/// for NEW's first segment to finish decrypting. OLD keeps decoding its
+/// downloaded content meanwhile, so the hold costs the viewer nothing while
+/// swapping unprepared costs a visible hole (~10 dropped frames on a 4K
+/// upswitch). Sized to a whole segment (6 s ladders): a decrypt that has
+/// not finished by then is wedged and the swap goes ahead regardless.
+const PREPARE_READY_BUDGET: Duration = Duration::from_millis(5_000);
 
     loop {
         // Race: play-level stop, the current pipeline finishing on its own
@@ -619,7 +621,14 @@ const PREPARE_READY_BUDGET: Duration = Duration::from_millis(1_200);
         if let Some(pf) = new_pf.as_mut() {
             if let Some(h) = pf.first_prepared.as_ref() {
                 let wait_t0 = Instant::now();
-                while !h.is_finished() && wait_t0.elapsed() < PREPARE_READY_BUDGET {
+                // Hold while OLD is still alive to cover the wait; once OLD
+                // has run out there is nothing left to show and the swap must
+                // proceed whatever state NEW is in.
+                while !h.is_finished()
+                    && wait_t0.elapsed() < PREPARE_READY_BUDGET
+                    && !old_done
+                    && !cur_handle.is_finished()
+                {
                     crate::rt::sleep(Duration::from_millis(10)).await;
                 }
                 let waited = wait_t0.elapsed();

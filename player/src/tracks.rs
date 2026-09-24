@@ -393,7 +393,6 @@ impl Tracks {
         raw_mpd: &str,
         http: &HttpClient,
     ) -> Result<(VideoAdaptation, Vec<u32>), Box<dyn Error>> {
-        let video_representations: Vec<VideoRepresenation>;
 
         // DASH lets @frameRate, @maxWidth, @maxHeight live either on the
         // AdaptationSet or on each Representation. Real-world manifests
@@ -463,7 +462,7 @@ impl Tracks {
                 async move { fut.await.map_err(|e| e.to_string()) }
             })
             .collect();
-        video_representations = stream::iter(rep_futs)
+        let video_representations: Vec<VideoRepresenation> = stream::iter(rep_futs)
         .buffered(PREPARE_REP_CONCURRENCY)
         .try_collect()
         .await
@@ -502,7 +501,6 @@ impl Tracks {
         raw_mpd: &str,
         http: &HttpClient,
     ) -> Result<AudioAdaptation, Box<dyn Error>> {
-        let audio_representations: Vec<AudioRepresentation>;
 
         // @lang is optional in DASH (and often omitted on the single
         // audio adaptation of a mono-lingual stream). Treat absence as
@@ -529,7 +527,7 @@ impl Tracks {
                 async move { fut.await.map_err(|e| e.to_string()) }
             })
             .collect();
-        audio_representations = stream::iter(rep_futs)
+        let audio_representations: Vec<AudioRepresentation> = stream::iter(rep_futs)
         .buffered(PREPARE_REP_CONCURRENCY)
         .try_collect()
         .await

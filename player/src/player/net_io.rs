@@ -657,6 +657,8 @@ pub(super) async fn download_and_queue(
         })?;
     if let Some(s) = stats {
         update_bandwidth_ewma(&s.bandwidth_bps_ewma, dl.data.len(), dl.elapsed);
+        s.bandwidth_bytes_total
+            .fetch_add(dl.data.len() as u64, Ordering::Relaxed);
         // net_stall = how much SLOWER than realtime this segment downloaded.
         // A large segment that arrives in ~its own media duration is keeping
         // pace (no stall); only download time BEYOND that means the link can't

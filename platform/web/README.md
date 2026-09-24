@@ -116,6 +116,15 @@ representations only.
 
 - HEVC only, like the other platforms; codec support is whatever the
   browser's WebCodecs exposes (AC-3 / E-AC-3 audio is Safari-only in practice).
+- Frames are presented on the display's vsync: the sync loop waits for
+  `requestAnimationFrame` ticks and draws each frame in the tick whose
+  upcoming vsync is nearest its clock time (what the `<video>` element and
+  the W3C WebCodecs sample player do), one frame per tick. On a 60 Hz display
+  24 fps content shows the regular 3:2 cadence; on a display or browser
+  limited to 30 fps (Chrome's energy saver, a 30 Hz panel) it is 1:2 — check
+  that before reading judder from the stats. A hidden tab gets no ticks, so
+  video advances on a 250 ms fallback (audio keeps playing) until it is
+  visible again.
 - Audio output follows the system output: when the browser's destination
   offers six or more channels (OS output configured as 5.1/7.1) the engine
   opens a 6-channel discrete output and 5.1 tracks play as 5.1 PCM; on a

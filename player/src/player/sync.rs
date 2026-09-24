@@ -144,6 +144,11 @@ pub(super) async fn video_sync_loop<V: VideoSink, A: AudioSink>(
     // (last + Δpts) instead of inheriting the audio clock's frame-to-frame
     // wobble. Bounded to ±PRESENT_SMOOTH_NS of the raw value (see present block).
     let mut last_present: Option<(i64, i64)> = None;
+    // Browser: present on the display's vsync (see VsyncCadence).
+    #[cfg(target_arch = "wasm32")]
+    let mut vsync = crate::av_sync::VsyncCadence::new();
+    #[cfg(target_arch = "wasm32")]
+    let mut drew_this_tick = false;
     // Max deviation of the smoothed present time from the raw `now + (pts −
     // clock)` value. ≥ the audio clock's per-callback quantization (~one cpal
     // buffer) so steady-state wobble is fully absorbed, yet small enough that a
@@ -267,7 +272,7 @@ pub(super) async fn video_sync_loop<V: VideoSink, A: AudioSink>(
                         .swap_grace_deadline
                         .lock()
                         .unwrap()
-                        .map_or(false, |d| Instant::now() < d);
+                        .is_some_and(|d| Instant::now() < d);
                     if in_swap_grace && !starving {
                         continue;
                     }
@@ -396,15 +401,57 @@ pub(super) async fn video_sync_loop<V: VideoSink, A: AudioSink>(
             };
             #[cfg(not(target_os = "android"))]
             let render_budget_ms = RENDER_BUDGET_MS;
-            let target_wake_ms = pts_ms.saturating_sub(render_budget_ms);
-            if target_wake_ms > elapsed {
-                tokio::select! {
-                    _ = crate::rt::sleep(Duration::from_millis(target_wake_ms - elapsed)) => {}
-                    _ = stop.notified() => break,
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let target_wake_ms = pts_ms.saturating_sub(render_budget_ms);
+                if target_wake_ms > elapsed {
+                    tokio::select! {
+                        _ = crate::rt::sleep(Duration::from_millis(target_wake_ms - elapsed)) => {}
+                        _ = stop.notified() => break,
+                    }
+                    if stop_flag.load(Ordering::Relaxed) {
+                        break;
+                    }
                 }
-                if stop_flag.load(Ordering::Relaxed) {
+            }
+            // Browser: the canvas is composited on the display's vsync, so a
+            // frame drawn between two vsyncs shows at the next one — timer
+            // pacing lands each frame on a random side of a vsync (±16 ms of
+            // judder the render-interval numbers never show). Wait for
+            // animation-frame ticks instead and draw in the tick whose
+            // upcoming vsync is nearest the frame's clock time; the draw
+            // below happens inside that tick, before the browser composites.
+            // A hidden tab stops animation frames — the 250 ms fallback keeps
+            // the pipeline moving (the LATE drain catches up when visible).
+            #[cfg(target_arch = "wasm32")]
+            {
+                let _ = render_budget_ms;
+                let mut stopped = false;
+                // One frame per tick: a second draw in the same tick only
+                // overwrites the first before the browser composites it (a
+                // frame the viewer never sees, but a "render" in the stats).
+                let mut need_tick = drew_this_tick;
+                loop {
+                    if !need_tick {
+                        let now_ms = (clock.now_us(pause_skew) / 1_000) as u64;
+                        if vsync.frame_due(pts_ms, now_ms) {
+                            break;
+                        }
+                    }
+                    tokio::select! {
+                        t = crate::rt::animation_frame() => { vsync.observe_tick(t); need_tick = false; }
+                        _ = crate::rt::sleep(Duration::from_millis(250)) => { need_tick = false; }
+                        _ = stop.notified() => { stopped = true; break; }
+                    }
+                    if stop_flag.load(Ordering::Relaxed) {
+                        stopped = true;
+                        break;
+                    }
+                }
+                if stopped {
                     break;
                 }
+                drew_this_tick = true;
             }
         }
 
@@ -525,7 +572,7 @@ pub(super) async fn video_sync_loop<V: VideoSink, A: AudioSink>(
         // DIAG: per-frame pacing. interval_ms = wall ms between renders (~41 at
         // 24fps; jitter here = judder), elapsed = master clock, pts_to_go = the
         // scheduled lead. Reveals clock-jitter judder that doesn't trip LATE.
-        if frame_idx % 60 == 0 {
+        if frame_idx.is_multiple_of(60) {
             log::info!(
                 "[vsync] f#{} pts={}ms elapsed={}ms interval={}ms dpts={}ms pts_to_go={}ms",
                 frame_idx, pts_ms, elapsed_us / 1000, interval_ms, delta_pts,
@@ -719,6 +766,9 @@ pub(super) async fn audio_sync_loop<A: AudioSink>(
     let mut aligner = crate::av_sync::AudioAligner::new(sample_rate, origin_ms + target_pts_ms);
     let mut gap_events = 0u32;
     let mut starving = false;
+    // Output starts once PREROLL_MS of PCM is queued (or the source goes
+    // quiet first) — never against an empty queue.
+    let mut preroll = crate::av_sync::PrerollGate::new(sample_rate, sink.is_passthrough());
     loop {
         if stop_flag.load(Ordering::Relaxed) {
             break;
@@ -756,6 +806,11 @@ pub(super) async fn audio_sync_loop<A: AudioSink>(
                     break f;
                 }
                 _ = &mut starvation_wait => {
+                    if preroll.force_open() && !paused.load(Ordering::Relaxed) {
+                        // A trickle that never filled the pre-roll: play
+                        // what there is rather than hold the start.
+                        sink.set_paused(false);
+                    }
                     if !starving {
                         starving = true;
                         log::warn!("[async] no audio frame for 300ms — entering buffering");
@@ -796,7 +851,7 @@ pub(super) async fn audio_sync_loop<A: AudioSink>(
         } else if skip_frames > 0 || pad_frames > 0 {
             gap_events += 1;
             // Rate-limit: the first few, then every 50th.
-            if gap_events <= 5 || gap_events % 50 == 0 {
+            if gap_events <= 5 || gap_events.is_multiple_of(50) {
                 log::warn!(
                     "[async] audio discontinuity #{} at pts={}ms: trimmed {}ms / padded {}ms to stay contiguous",
                     gap_events,
@@ -823,6 +878,15 @@ pub(super) async fn audio_sync_loop<A: AudioSink>(
                 stats.diag_audio_sunk.fetch_add(1, Ordering::Relaxed);
             }
             _ = stop.notified() => return,
+        }
+        if preroll.queued(trimmed.len() / channels) {
+            log::debug!(
+                "[async] audio pre-roll of {} ms queued — output starts",
+                crate::av_sync::PrerollGate::PREROLL_MS
+            );
+            if !paused.load(Ordering::Relaxed) {
+                sink.set_paused(false);
+            }
         }
     }
 }
@@ -930,11 +994,12 @@ pub(super) async fn av_sync_handler<V: VideoSink, A: AudioSink>(
             return;
         }
     }
-    // Unpause the audio device. AudioRenderer starts paused at construction
-    // (cpal would otherwise pull from an empty mpsc and play silence while
-    // the audio decoder warmed up, then "catch up" once real samples
-    // arrived). seek() re-pauses + flushes; this restores playback.
-    if !paused.load(Ordering::Relaxed) {
+    // The PCM output stays paused until `audio_sync_loop` has queued a short
+    // pre-roll (see `PrerollGate`): unpausing here, on the first decoded
+    // frame, ran the device against a near-empty queue and crackled at every
+    // start and seek. Bitstream passthrough primes its own track and is
+    // unpaused now, as before.
+    if !paused.load(Ordering::Relaxed) && audio_sink.is_passthrough() {
         audio_sink.set_paused(false);
     }
     // Universal start alignment (no per-device constants): anchor the video

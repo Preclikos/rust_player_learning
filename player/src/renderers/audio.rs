@@ -110,6 +110,12 @@ enum AudioRendererCommand {
     Stop,
 }
 
+impl Default for AudioRenderer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AudioRenderer {
     pub fn new() -> Self {
         let stop = Arc::new(Notify::new());

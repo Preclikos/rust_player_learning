@@ -164,6 +164,10 @@ pub(crate) struct StatsState {
     /// EWMA of segment download throughput in bits-per-second, surfaced via
     /// `Position.bandwidth_bps` and consumed by the ABR engine.
     bandwidth_bps_ewma: AtomicU64,
+    /// Total media bytes downloaded this session — the ABR engine does not
+    /// trust the estimate before `ABR_MIN_TOTAL_BYTES` (Shaka's
+    /// `abr.minTotalBytes`).
+    bandwidth_bytes_total: AtomicU64,
     /// Highest media-time PTS (in ms) currently available locally for
     /// **video** — bumped both when `download_task` finishes a segment
     /// (segment.end_time) and when `video_decoder_task` produces a
@@ -378,6 +382,12 @@ pub struct Player<V: VideoSink = VideoRenderer, A: AudioSink = AudioRenderer> {
     /// ignores this profile, but `BandwidthEwma` consults it before
     /// running the bitrate selector.
     abr_video_profile: Arc<ArcSwap<AbrVideoProfile>>,
+    /// When the current representation was chosen (pipeline (re)start or
+    /// ABR switch). The ABR tick waits `ABR_SWITCH_INTERVAL` from here
+    /// before switching again — Shaka's `abr.switchInterval` (8 s): "keeps
+    /// us from changing too often and annoying the user", and it covers the
+    /// start-up window where the first bandwidth samples are still noisy.
+    abr_switch_at: Arc<StdMutex<Option<Instant>>>,
 
     /// Watch channel the running `play()` supervisor listens on for
     /// mid-flight representation swaps. Each `play()` call installs a
@@ -490,6 +500,7 @@ impl<V: VideoSink, A: AudioSink> Clone for Player<V, A> {
             stats: Arc::clone(&self.stats),
             abr_strategy: Arc::clone(&self.abr_strategy),
             abr_video_profile: Arc::clone(&self.abr_video_profile),
+            abr_switch_at: Arc::clone(&self.abr_switch_at),
             video_switch_tx: Arc::clone(&self.video_switch_tx),
             buffer_target_secs: Arc::clone(&self.buffer_target_secs),
             subtitle_representation: Arc::clone(&self.subtitle_representation),
@@ -683,6 +694,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             stats: Arc::new(StatsState::default()),
             abr_strategy: Arc::new(ArcSwap::from_pointee(AbrStrategy::default())),
             abr_video_profile: Arc::new(ArcSwap::from_pointee(AbrVideoProfile::default())),
+            abr_switch_at: Arc::new(StdMutex::new(None)),
             video_switch_tx: Arc::new(StdMutex::new(None)),
             buffer_target_secs: Arc::new(AtomicU32::new(DEFAULT_BUFFER_TARGET_SECS)),
             subtitle_representation: Arc::new(StdMutex::new(None)),
@@ -1504,6 +1516,10 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
     /// candidate set (e.g. `SdrOnly` drops HDR10 reps), then the bitrate
     /// selector picks the highest-bandwidth survivor that fits the EWMA.
     fn abr_tick(&self) {
+        /// Shaka Player `abr.switchInterval` default.
+        const ABR_SWITCH_INTERVAL: Duration = Duration::from_secs(8);
+        /// Shaka Player `abr.minTotalBytes` default.
+        const ABR_MIN_TOTAL_BYTES: u64 = 128_000;
         let strategy = **self.abr_strategy.load();
         let safety = match strategy {
             AbrStrategy::Manual => return,
@@ -1540,6 +1556,19 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         // very first tick would always pick the lowest rung.
         if ewma_bps == 0 {
             return;
+        }
+        // Shaka `abr.minTotalBytes` (128 kB): an estimate built on less than
+        // this is a guess (one small init segment), not a measurement.
+        if self.stats.bandwidth_bytes_total.load(Ordering::Relaxed) < ABR_MIN_TOTAL_BYTES {
+            return;
+        }
+        // Shaka `abr.switchInterval` (8 s), measured from the last choice —
+        // the pipeline (re)start included, so the first seconds after a
+        // start, seek or switch never see another switch on top.
+        if let Some(at) = *self.abr_switch_at.lock().unwrap() {
+            if at.elapsed() < ABR_SWITCH_INTERVAL {
+                return;
+            }
         }
 
         // Stage 1: filter by HDR / bit-depth policy.
@@ -1582,6 +1611,9 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             .map(|r| r.bandwidth)
             .unwrap_or(0);
         if picked.bandwidth > cur_bw {
+            // ExoPlayer gates up-switches on buffered media too
+            // (`minDurationForQualityIncreaseMs`, 10 s against its 50 s
+            // buffer); ours is scaled to the 8 s buffer target.
             const MIN_UPSWITCH_BUFFER_MS: i64 = 4_000;
             let pos = self.position_ms.load(Ordering::Relaxed) as i64;
             let decoded = self.stats.last_decoded_pts_ms.load(Ordering::Relaxed);
@@ -1598,6 +1630,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             "[abr] switch repr {:?} -> {} (ewma={}bps safety={} profile={:?})",
             current_id, picked.id, ewma_bps, safety, profile
         );
+        *self.abr_switch_at.lock().unwrap() = Some(Instant::now());
         self.apply_video_representation_soft(picked);
     }
 
@@ -1790,6 +1823,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             .and_then(|a| a.fps());
         let pending_resume = Arc::clone(&self.pending_resume);
         let pipeline_live = Arc::clone(&self.pipeline_live);
+        let abr_switch_at = Arc::clone(&self.abr_switch_at);
         let audio_passthrough = Arc::clone(&self.audio_passthrough);
         let hdr_decode_8bit = Arc::clone(&self.hdr_decode_8bit);
         let play = crate::rt::spawn(async move {
@@ -2112,8 +2146,10 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                 }
 
                 // New pipeline: not "live" until it produces its first frame.
-                // Gates the ABR tick off this fragile startup window.
+                // Gates the ABR tick off this fragile startup window, and the
+                // (re)start counts as a choice for the switch interval.
                 pipeline_live.store(false, Ordering::Relaxed);
+                *abr_switch_at.lock().unwrap() = Some(Instant::now());
                 // Audio-output liveness watch, scoped to this generation: it
                 // rebuilds the pipeline if the output dies under us, so it must
                 // not outlive the generation it is watching.

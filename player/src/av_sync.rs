@@ -114,6 +114,118 @@ impl FlushState {
     }
 }
 
+/// Start-of-stream audio pre-roll: how much PCM must be queued in the sink
+/// before its output is unpaused. Unpausing on the first decoded frame (the
+/// old behaviour) ran the device against a near-empty queue while the
+/// decoder was still warming up — every callback that found nothing played
+/// silence, and the alternation of a few ms of sound and a few ms of
+/// silence is the "crackle" heard at every start and after every seek. A
+/// short pre-roll costs that much start-up latency once and removes it.
+pub struct PrerollGate {
+    frames_needed: usize,
+    queued: usize,
+    open: bool,
+}
+
+impl PrerollGate {
+    /// Queue this much before the output starts.
+    pub const PREROLL_MS: usize = 120;
+
+    /// `already_open` for sinks that manage their own start (bitstream
+    /// passthrough primes its own track).
+    pub fn new(sample_rate: u32, already_open: bool) -> Self {
+        Self {
+            frames_needed: sample_rate as usize * Self::PREROLL_MS / 1000,
+            queued: 0,
+            open: already_open,
+        }
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.open
+    }
+
+    /// Account `frames` more per-channel frames queued. Returns true exactly
+    /// once, when the gate opens — the caller unpauses the sink then.
+    pub fn queued(&mut self, frames: usize) -> bool {
+        if self.open {
+            return false;
+        }
+        self.queued += frames;
+        if self.queued >= self.frames_needed {
+            self.open = true;
+            return true;
+        }
+        false
+    }
+
+    /// The source went quiet before the pre-roll filled (a trickle, or a
+    /// very short stream): open anyway so what is queued plays. Returns
+    /// true exactly once.
+    pub fn force_open(&mut self) -> bool {
+        if self.open {
+            return false;
+        }
+        self.open = true;
+        true
+    }
+}
+
+/// Display-vsync cadence for presenting on a compositor that shows a drawn
+/// frame at its next vsync (the browser canvas): tracks the vsync period from
+/// animation-frame timestamps and decides, per tick, whether a frame is due —
+/// i.e. whether the upcoming vsync is the nearest one to the frame's clock
+/// time. Presenting on the nearest vsync turns 24 fps on a 60 Hz display into
+/// the regular 3:2 pull-down instead of landing frames on a random side of a
+/// vsync (±16 ms of judder that render-interval numbers never show).
+pub struct VsyncCadence {
+    period_ms: f64,
+    last_tick_ms: Option<f64>,
+}
+
+impl Default for VsyncCadence {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl VsyncCadence {
+    /// Start from a 60 Hz assumption; `observe_tick` converges on the real
+    /// display within a few frames.
+    pub fn new() -> Self {
+        Self {
+            period_ms: 1000.0 / 60.0,
+            last_tick_ms: None,
+        }
+    }
+
+    /// Feed an animation-frame timestamp (ms). Consecutive ticks measure the
+    /// period; gaps outside 4–50 ms (throttled/hidden tab, missed frames) are
+    /// ignored so a hiccup does not poison the estimate.
+    pub fn observe_tick(&mut self, ts_ms: f64) {
+        if let Some(last) = self.last_tick_ms {
+            let d = ts_ms - last;
+            if (4.0..=50.0).contains(&d) {
+                self.period_ms = self.period_ms * 0.75 + d * 0.25;
+            }
+        }
+        self.last_tick_ms = Some(ts_ms);
+    }
+
+    pub fn period_ms(&self) -> f64 {
+        self.period_ms
+    }
+
+    /// True when the frame at `pts_ms` should be drawn in the current tick.
+    /// `now_ms` is the media clock at the tick; what is drawn now reaches the
+    /// screen one period later, at the upcoming vsync. The frame is due when
+    /// that vsync is the nearest one to its clock time — within half a
+    /// period either side of `now + period`.
+    pub fn frame_due(&self, pts_ms: u64, now_ms: u64) -> bool {
+        pts_ms as f64 <= now_ms as f64 + self.period_ms * 1.5
+    }
+}
+
 /// Result of pulling the next chunk off a sink's queue.
 pub enum Pulled {
     /// A live chunk of the current generation. `starts_gen` is true for the
@@ -217,14 +329,13 @@ impl ChunkCursor {
     pub fn next_sample(&mut self) -> Option<f32> {
         loop {
             if let Some((buf, off)) = self.cur.as_mut() {
-                if self.cur_gen == self.state.current_gen() {
-                    if *off < buf.len() {
+                if self.cur_gen == self.state.current_gen()
+                    && *off < buf.len() {
                         let s = buf[*off];
                         *off += 1;
                         self.consumed += 1;
                         return Some(s);
                     }
-                }
                 self.cur = None;
             }
             match self.next_chunk() {
@@ -381,6 +492,84 @@ impl AudioAligner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- PrerollGate ----------------------------------------------------------
+
+    #[test]
+    fn preroll_opens_once_after_enough_audio_is_queued() {
+        let mut g = PrerollGate::new(48_000, false);
+        assert!(!g.is_open());
+        assert!(!g.queued(1024)); // 21 ms
+        assert!(!g.queued(1024));
+        assert!(!g.queued(1024));
+        assert!(!g.queued(1024));
+        assert!(!g.queued(1024)); // 107 ms
+        assert!(g.queued(1024)); // 128 ms ≥ 120 ms → opens
+        assert!(g.is_open());
+        assert!(!g.queued(1024)); // never twice
+        assert!(!g.force_open());
+    }
+
+    #[test]
+    fn preroll_can_be_forced_open_and_is_a_no_op_for_self_starting_sinks() {
+        let mut g = PrerollGate::new(48_000, false);
+        assert!(g.force_open());
+        assert!(!g.queued(100_000));
+        let mut p = PrerollGate::new(48_000, true);
+        assert!(p.is_open());
+        assert!(!p.queued(100_000));
+        assert!(!p.force_open());
+    }
+
+    // ---- VsyncCadence ---------------------------------------------------------
+
+    #[test]
+    fn vsync_period_converges_on_the_display_and_ignores_gaps() {
+        let mut v = VsyncCadence::new();
+        // 120 Hz display: 8.333 ms ticks.
+        for i in 0..40 {
+            v.observe_tick(i as f64 * 8.3333);
+        }
+        assert!((v.period_ms() - 8.3333).abs() < 0.2, "{}", v.period_ms());
+        // A hidden-tab gap and a duplicate timestamp must not move it.
+        v.observe_tick(2000.0);
+        v.observe_tick(2000.0);
+        assert!((v.period_ms() - 8.3333).abs() < 0.2, "{}", v.period_ms());
+    }
+
+    #[test]
+    fn frames_land_on_the_nearest_vsync_once_each() {
+        // 23.976 fps content on a 60 Hz display, clock == wall. Every frame
+        // must be presented exactly once, within half a period of its pts, and
+        // the presentation pattern must be the regular 3:2 pull-down.
+        let mut v = VsyncCadence::new();
+        let period = 1000.0 / 60.0;
+        let frame = 1001.0 / 24.0;
+        // Content starts 100 ms into the clock so the first frame is not a
+        // start-up special case (it can only ever show at the first vsync).
+        let pts0 = 100.0;
+        let mut next_frame = 0usize;
+        let mut shown_at: Vec<f64> = Vec::new();
+        for tick in 0..600 {
+            let t = tick as f64 * period;
+            v.observe_tick(t);
+            // The clock at this tick; what is drawn now shows at t + period.
+            let now_ms = t.round() as u64;
+            let pts_ms = (pts0 + next_frame as f64 * frame).round() as u64;
+            if v.frame_due(pts_ms, now_ms) {
+                shown_at.push(t + period);
+                next_frame += 1;
+            }
+        }
+        assert!(next_frame >= 230, "presented {} frames in 10 s", next_frame);
+        for (i, shown) in shown_at.iter().enumerate() {
+            let err = (shown - (pts0 + i as f64 * frame)).abs();
+            assert!(err <= period / 2.0 + 1.0, "frame {i} shown {err:.1} ms off its pts");
+        }
+        // 3:2 cadence: consecutive gaps alternate between 2 and 3 vsyncs.
+        let gaps: Vec<i64> = shown_at.windows(2).map(|w| ((w[1] - w[0]) / period).round() as i64).collect();
+        assert!(gaps.iter().all(|g| *g == 2 || *g == 3), "{gaps:?}");
+    }
     use std::sync::Arc;
 
     // ---------------- FlushState / played_since_flush ----------------

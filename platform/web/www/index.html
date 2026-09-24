@@ -122,7 +122,7 @@ const host = {
       return;
     }
     if (ev.type === 'stats') {
-      log(`stats ${ev.decoder || ''} ${ev.width}x${ev.height} decoded=${ev.frames_decoded} dropped=${ev.frames_dropped} late=${ev.frames_late} drift=${ev.av_drift_ms}ms vbuf=${ev.video_buffer_ahead_ms}ms abuf=${ev.audio_buffer_ahead_ms}ms`);
+      log(`stats ${ev.decoder || ''} ${ev.width}x${ev.height} decoded=${ev.frames_decoded} dropped=${ev.frames_dropped} late=${ev.frames_late} drift=${ev.av_drift_ms}ms vbuf=${ev.video_buffer_ahead_ms}ms abuf=${ev.audio_buffer_ahead_ms}ms judder=${ev.judder_frames} gap=${ev.render_gap_max_ms}ms int=<25:${ev.int_lt25} 25-41:${ev.int_25_41} 42-58:${ev.int_42_58} >58:${ev.int_gt58}`);
       return;
     }
     log(json);

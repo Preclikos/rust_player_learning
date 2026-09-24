@@ -318,6 +318,30 @@ pub extern "C" fn rustplayer_player_duration_ms(handle: *mut c_void) -> i64 {
         .unwrap_or(0)
 }
 
+/// Wrapped ClearKey licence endpoint (docs/CLEARKEY_WRAPPED_LICENCE.md);
+/// `hkdf_info` may be NULL for the default. Call right after create.
+#[no_mangle]
+pub extern "C" fn rustplayer_player_set_wrapped_licence(
+    handle: *mut c_void,
+    url: *const c_char,
+    hkdf_info: *const c_char,
+) {
+    if let Some(h) = unsafe { handle_ref(handle) } {
+        let url = unsafe { cstr(url) };
+        if url.is_empty() {
+            log::error!("rustplayer_player_set_wrapped_licence: empty url");
+            return;
+        }
+        let info = if hkdf_info.is_null() {
+            None
+        } else {
+            Some(unsafe { cstr(hkdf_info) }).filter(|s| !s.is_empty())
+        };
+        let _guard = runtime().enter();
+        h.bridge.set_wrapped_licence(url, info);
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn rustplayer_player_set_volume(handle: *mut c_void, volume: f32) {
     if let Some(h) = unsafe { handle_ref(handle) } {

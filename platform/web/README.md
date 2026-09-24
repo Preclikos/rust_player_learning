@@ -29,6 +29,9 @@ main thread (no `SharedArrayBuffer` / atomics needed).
 Open the page in a browser with WebCodecs HEVC support (Chrome / Edge,
 Safari 16.4+; Firefox has no HEVC in WebCodecs) and press **Start**. The URL
 box is pre-filled with the bundled test stream and its ClearKeys.
+`?licence=<url>` makes the demo fetch the keys **wrapped** from that endpoint
+instead (`docs/CLEARKEY_WRAPPED_LICENCE.md`); `scripts/wrapped_licence_mock.py`
+serves the test keys that way on `http://localhost:8090/licence/wrapped`.
 
 ## Consuming the published package
 
@@ -64,9 +67,13 @@ import init, { RustPlayer } from './pkg/rustplayer.js';
 await init();
 const player = await RustPlayer.create(canvas, manifestUrl, {
   onEvent(json) { /* unified event JSON — see bridge::event_to_json */ },
-  async resolveKey(kidHex) { return keyHex; },          // ClearKey lookup
+  async resolveKey(kidHex) { return keyHex; },          // ClearKey lookup (raw keys)
   async intercept(url, kind) { return { url, headers: [['Authorization', '…']] }; }, // optional
 }, { clearKeys: { kidHex: keyHex }, startPositionMs: 0, autoSelectSubtitle: false });
+// Wrapped keys instead of raw ones (docs/CLEARKEY_WRAPPED_LICENCE.md): the player
+// POSTs to the endpoint itself (headers via intercept(url, "license")) and unwraps
+// each key into a non-extractable WebCrypto key — no key bytes ever reach JS/wasm.
+//   { wrappedLicence: 'https://api.example/licence/wrapped' }        // or { url, info }
 player.play(); player.pause(); player.seekMs(ms); player.setVolume(0.5);
 JSON.parse(player.tracksJson()); player.setVideoTrack(adapt, repr); player.setVideoAuto();
 // setVideoTrack is the manual switch: immediate, locks ABR to manual. setVideoTrackSoft

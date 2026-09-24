@@ -92,6 +92,16 @@ impl RequestInterceptor for NoopInterceptor {
 #[async_trait]
 pub trait LicenseResolver: Send + Sync + 'static {
     async fn resolve(&self, kid: [u8; 16]) -> Result<[u8; 16], BoxError>;
+
+    /// Platform-held key: the resolver made the key for `kid` available to
+    /// the platform's crypto engine WITHOUT exposing its bytes (browser: a
+    /// non-extractable WebCrypto key, see `crypto_web::install_key`) and
+    /// returns `Ok(true)`. `Ok(false)` — the default — means "not handled
+    /// this way", and [`resolve`](Self::resolve) is called for a raw key.
+    /// Consulted first, once per KID.
+    async fn resolve_platform_key(&self, _kid: [u8; 16]) -> Result<bool, BoxError> {
+        Ok(false)
+    }
 }
 
 /// Retry behaviour for transient network / 5xx failures. See

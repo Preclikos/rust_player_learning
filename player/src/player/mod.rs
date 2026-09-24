@@ -797,6 +797,21 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
     /// Install a `LicenseResolver` to fetch keys lazily on first encounter
     /// of an unknown KID. May be combined with `set_clearkey` — pre-seeded
     /// keys win on cache hit, the resolver is only asked on cache miss.
+    /// Fetch ClearKey content keys WRAPPED from `url`
+    /// (`docs/CLEARKEY_WRAPPED_LICENCE.md`): per KID an ephemeral ECDH P-256
+    /// exchange, HKDF-SHA256 and AES-256-GCM, so no key crosses the wire in
+    /// the clear. The POST goes through the request interceptor
+    /// (`RequestKind::License`) for the host's authorisation headers.
+    /// Natively the unwrapped key lands in the ClearKey cache; in the browser
+    /// it is unwrapped into a non-extractable WebCrypto key and every
+    /// decrypt for that KID runs through WebCrypto. `hkdf_info` must match
+    /// the server's (`None` = the documented default). Replaces any
+    /// previously installed `LicenseResolver`.
+    pub fn set_wrapped_licence(&self, url: String, hkdf_info: Option<String>) {
+        let resolver = crate::wrapped_licence::WrappedLicenceResolver::new(url, hkdf_info, Arc::clone(&self.http));
+        self.set_license_resolver(Arc::new(resolver));
+    }
+
     pub fn set_license_resolver(&self, resolver: Arc<dyn LicenseResolver>) {
         let mut slot = self.decryptor.lock().unwrap();
         let dec = slot.get_or_insert_with(|| {

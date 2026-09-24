@@ -135,6 +135,23 @@ public final class RustPlayer {
     public var durationMs: Int64 { handle.map { rustplayer_player_duration_ms($0) } ?? 0 }
     public func setVolume(_ v: Float) { handle.map { rustplayer_player_set_volume($0, v) } }
 
+    /// Fetch ClearKey content keys WRAPPED from `url` instead of through the
+    /// provider's resolveKey (see docs/CLEARKEY_WRAPPED_LICENCE.md): per KID an
+    /// ephemeral ECDH P-256 exchange, HKDF-SHA256 and AES-256-GCM, so no key
+    /// crosses the wire in the clear. Authorization headers come from the
+    /// provider's intercept for kind "license". Call right after `start`.
+    /// `hkdfInfo` must match the server's; nil = the documented default.
+    public func setWrappedLicence(url: String, hkdfInfo: String? = nil) {
+        guard let handle else { return }
+        url.withCString { u in
+            if let info = hkdfInfo {
+                info.withCString { i in rustplayer_player_set_wrapped_licence(handle, u, i) }
+            } else {
+                rustplayer_player_set_wrapped_licence(handle, u, nil)
+            }
+        }
+    }
+
     public func tracksJSON() -> String {
         guard let handle, let c = rustplayer_player_tracks_json(handle) else { return "{}" }
         defer { rustplayer_string_free(c) }

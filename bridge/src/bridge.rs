@@ -137,6 +137,15 @@ pub struct StartConfig {
     /// host no longer needs a post-start `selectSubtitle()`. No match → falls
     /// back to the `auto_select_subtitle` policy.
     pub preferred_subtitle_language: Option<String>,
+    /// Wrapped ClearKey licence endpoint (`docs/CLEARKEY_WRAPPED_LICENCE.md`).
+    /// When set, content keys are fetched from here — per KID an ephemeral
+    /// ECDH exchange, never a key in the clear on the wire — and the host's
+    /// `resolve_key` is not consulted. Authorisation headers come from the
+    /// host's `intercept` for `RequestKind::License`. `None` keeps the
+    /// `clearKeys` / `resolve_key` behaviour.
+    pub wrapped_licence_url: Option<String>,
+    /// HKDF `info` the licence server uses; `None` = the documented default.
+    pub wrapped_licence_hkdf_info: Option<String>,
 }
 
 impl Default for StartConfig {
@@ -148,6 +157,8 @@ impl Default for StartConfig {
             auto_select_subtitle: true,
             preferred_audio_language: None,
             preferred_subtitle_language: None,
+            wrapped_licence_url: None,
+            wrapped_licence_hkdf_info: None,
         }
     }
 }
@@ -180,7 +191,10 @@ pub fn start(
     config: StartConfig,
 ) -> BridgeHandle {
     player.set_request_interceptor(Arc::new(HostInterceptor(host.clone())));
-    player.set_license_resolver(Arc::new(HostResolver(host.clone())));
+    match &config.wrapped_licence_url {
+        Some(url) => player.set_wrapped_licence(url.clone(), config.wrapped_licence_hkdf_info.clone()),
+        None => player.set_license_resolver(Arc::new(HostResolver(host.clone()))),
+    }
 
     let shutdown = Arc::new(Notify::new());
     let tracks_json = Arc::new(Mutex::new(String::from("{}")));
@@ -298,6 +312,16 @@ impl BridgeHandle {
     pub fn resize(&self, width: u32, height: u32) {
         self.player
             .resize(player::PhysicalSize::new(width.max(1), height.max(1)));
+    }
+
+    /// Fetch content keys WRAPPED from `url` (`docs/CLEARKEY_WRAPPED_LICENCE.md`)
+    /// instead of through the host's `resolve_key`. Same as
+    /// `StartConfig::wrapped_licence_url`, for shells whose create signature is
+    /// fixed: call it right after `start()` — keys are only resolved once the
+    /// init segments are parsed, well after that. `hkdf_info` `None` = the
+    /// documented default.
+    pub fn set_wrapped_licence(&self, url: String, hkdf_info: Option<String>) {
+        self.player.set_wrapped_licence(url, hkdf_info);
     }
 
     /// The underlying player, for platform-specific wiring the unified surface

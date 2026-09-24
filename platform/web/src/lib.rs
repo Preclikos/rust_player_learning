@@ -262,6 +262,19 @@ fn read_options(options: &JsValue) -> Result<(StartConfig, HashMap<[u8; 16], [u8
     config.preferred_audio_language = get(options, "preferredAudioLanguage").and_then(|v| v.as_string());
     config.preferred_subtitle_language =
         get(options, "preferredSubtitleLanguage").and_then(|v| v.as_string());
+    // wrappedLicence: { url, info? } — keys arrive wrapped and end up as
+    // non-extractable WebCrypto keys (docs/CLEARKEY_WRAPPED_LICENCE.md).
+    if let Some(wl) = get(options, "wrappedLicence") {
+        let url = if let Some(s) = wl.as_string() {
+            s
+        } else {
+            get(&wl, "url")
+                .and_then(|v| v.as_string())
+                .ok_or("options.wrappedLicence needs a url")?
+        };
+        config.wrapped_licence_url = Some(url);
+        config.wrapped_licence_hkdf_info = get(&wl, "info").and_then(|v| v.as_string());
+    }
     if let Some(ck) = get(options, "clearKeys") {
         let names = Reflect::own_keys(&ck).map_err(|e| js_string(&e))?;
         for k in names.iter() {
@@ -290,6 +303,9 @@ impl RustPlayer {
     /// `host`: `{ onEvent(json), resolveKey?(kidHex) → keyHex, intercept?(url, kind) → {url?, headers?} }`.
     /// `options`: `{ startPositionMs?, startFraction?, autoSelectSubtitle?,
     /// preferredAudioLanguage?, preferredSubtitleLanguage?, clearKeys?: {kidHex: keyHex},
+    /// wrappedLicence?: { url, info? } (keys fetched wrapped, unwrapped into
+    /// non-extractable WebCrypto keys — see docs/CLEARKEY_WRAPPED_LICENCE.md;
+    /// auth headers via `intercept(url, "license")`),
     /// hdr?: "auto" | "sdr" | "browser" }` — `hdr` defaults to `"auto"`: HDR
     /// representations render through the engine's own PQ → SDR tonemap on
     /// the GPU (same numbers as the native players) when the renderer could

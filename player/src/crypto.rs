@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::sync::{Arc, Mutex};
 
@@ -186,6 +186,15 @@ pub trait Decryptor: Send + Sync {
     fn raw_key(&self, _kid: &[u8; 16]) -> Option<[u8; 16]> {
         None
     }
+
+    /// True when the key for `kid` is held by the platform's crypto engine
+    /// only (a non-extractable WebCrypto key) — no raw bytes exist, so the
+    /// caller MUST decrypt through the platform path, never
+    /// [`decrypt_sample`](Self::decrypt_sample).
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    fn has_platform_key(&self, _kid: &[u8; 16]) -> bool {
+        false
+    }
 }
 
 /// Software AES-128-CTR ClearKey decryptor. Holds a `(kid → key)` cache
@@ -199,6 +208,10 @@ pub trait Decryptor: Send + Sync {
 /// point before playback starts.
 pub struct ClearKeyDecryptor {
     keys: Mutex<HashMap<[u8; 16], [u8; 16]>>,
+    /// KIDs whose key the resolver installed in the platform crypto engine
+    /// (`LicenseResolver::resolve_platform_key`): usable, but never in the
+    /// clear here.
+    platform_kids: Mutex<HashSet<[u8; 16]>>,
     resolver: Mutex<Option<Arc<dyn LicenseResolver>>>,
 }
 
@@ -206,6 +219,7 @@ impl ClearKeyDecryptor {
     pub fn new(keys: HashMap<[u8; 16], [u8; 16]>) -> Self {
         Self {
             keys: Mutex::new(keys),
+            platform_kids: Mutex::new(HashSet::new()),
             resolver: Mutex::new(None),
         }
     }
@@ -246,13 +260,39 @@ impl ClearKeyDecryptor {
         self.keys.into_inner().unwrap_or_default()
     }
 
-    /// Look up a key for `kid`. Returns from cache if present; otherwise
+    /// Make the key for `kid` usable: cached raw key, platform-held key, or
+    /// a round trip through the resolver (platform path first, then raw).
+    /// `Err` when nothing can provide it — surfaces as
+    /// `PlayerErrorKind::LicenseResolver`.
+    pub async fn ensure_key_available(&self, kid: [u8; 16]) -> Result<(), BoxError> {
+        if self.keys.lock().unwrap().contains_key(&kid) || self.platform_kids.lock().unwrap().contains(&kid) {
+            return Ok(());
+        }
+        let resolver = self.resolver.lock().unwrap().clone();
+        if let Some(r) = resolver.as_ref() {
+            if r.resolve_platform_key(kid).await? {
+                self.platform_kids.lock().unwrap().insert(kid);
+                return Ok(());
+            }
+        }
+        self.ensure_key(kid).await.map(|_| ())
+    }
+
+    /// Look up a RAW key for `kid`. Returns from cache if present; otherwise
     /// calls the attached `LicenseResolver` (await-able) and caches the
     /// result. If no key is cached AND no resolver is attached, returns
-    /// `Err` — surfaces as `PlayerErrorKind::LicenseResolver`.
+    /// `Err` — surfaces as `PlayerErrorKind::LicenseResolver`. A
+    /// platform-held key has no raw bytes and is an `Err` here too.
     pub async fn ensure_key(&self, kid: [u8; 16]) -> Result<[u8; 16], BoxError> {
         if let Some(k) = self.keys.lock().unwrap().get(&kid).copied() {
             return Ok(k);
+        }
+        if self.platform_kids.lock().unwrap().contains(&kid) {
+            return Err(format!(
+                "key for KID {} is platform-held (WebCrypto); it has no raw bytes",
+                kid_short(&kid)
+            )
+            .into());
         }
         let resolver = self.resolver.lock().unwrap().clone();
         let resolver = resolver.ok_or_else(|| -> BoxError {
@@ -272,7 +312,15 @@ impl ClearKeyDecryptor {
 #[async_trait::async_trait]
 impl Decryptor for ClearKeyDecryptor {
     async fn ensure_key_for(&self, kid: [u8; 16]) -> Result<(), BoxError> {
-        self.ensure_key(kid).await.map(|_| ())
+        self.ensure_key_available(kid).await
+    }
+
+    fn raw_key(&self, kid: &[u8; 16]) -> Option<[u8; 16]> {
+        self.keys.lock().unwrap().get(kid).copied()
+    }
+
+    fn has_platform_key(&self, kid: &[u8; 16]) -> bool {
+        self.platform_kids.lock().unwrap().contains(kid)
     }
 
     fn decrypt_sample(
@@ -288,9 +336,19 @@ impl Decryptor for ClearKeyDecryptor {
         // decoder hot path.
         let key = {
             let keys = self.keys.lock().unwrap();
-            *keys
-                .get(kid)
-                .ok_or_else(|| format!("ClearKey: no key for KID {} (ensure_key not called?)", kid_short(kid)))?
+            match keys.get(kid) {
+                Some(k) => *k,
+                None if self.platform_kids.lock().unwrap().contains(kid) => {
+                    return Err(format!(
+                        "ClearKey: key for KID {} is platform-held (WebCrypto); software decrypt is unavailable",
+                        kid_short(kid)
+                    )
+                    .into())
+                }
+                None => {
+                    return Err(format!("ClearKey: no key for KID {} (ensure_key not called?)", kid_short(kid)).into())
+                }
+            }
         };
         // CENC applies the counter as if every PROTECTED byte of the sample
         // were contiguous — clear subsample runs do not advance it. The
@@ -335,9 +393,6 @@ impl Decryptor for ClearKeyDecryptor {
         Ok(())
     }
 
-    fn raw_key(&self, kid: &[u8; 16]) -> Option<[u8; 16]> {
-        self.keys.lock().unwrap().get(kid).copied()
-    }
 }
 
 // =================== CENC / MP4 box parsing ===================

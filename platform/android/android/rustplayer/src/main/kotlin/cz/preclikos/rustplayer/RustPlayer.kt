@@ -180,6 +180,19 @@ class RustPlayer(private val context: Context) {
         if (handle != 0L) NativeBridge.nativeSetVideoAuto(handle)
     }
 
+    /**
+     * Fetch ClearKey content keys WRAPPED from [url] instead of through the
+     * host's resolveKey (see docs/CLEARKEY_WRAPPED_LICENCE.md): per KID an
+     * ephemeral ECDH P-256 exchange, HKDF-SHA256 and AES-256-GCM, so no key
+     * crosses the wire in the clear. Authorization headers come from the
+     * host's `intercept` for kind "license". Call right after start(); keys
+     * are resolved when the init segments are parsed. [hkdfInfo] must match
+     * the server's; null = the documented default.
+     */
+    fun setWrappedLicence(url: String, hkdfInfo: String? = null) {
+        if (handle != 0L) NativeBridge.nativeSetWrappedLicence(handle, url, hkdfInfo)
+    }
+
     fun selectAudio(adapt: Int, repr: Int) {
         if (handle != 0L) NativeBridge.nativeSetAudioTrack(handle, adapt, repr)
     }

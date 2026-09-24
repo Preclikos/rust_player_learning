@@ -24,6 +24,8 @@ mod renderers;
 pub mod rt;
 #[doc(hidden)]
 pub mod shader_src;
+// Wrapped ClearKey licences (docs/CLEARKEY_WRAPPED_LICENCE.md).
+pub mod wrapped_licence;
 mod subtitle_style;
 mod tracks;
 mod utils;

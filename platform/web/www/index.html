@@ -176,8 +176,16 @@ async function startItem(url) {
   const fixture = testStream();
   const options = { clearKeys: fixture.clearKeys, autoSelectSubtitle: false };
   // ?hdr=auto|sdr|browser (see README "HDR"); default auto.
-  const hdr = new URLSearchParams(location.search).get('hdr');
+  const params = new URLSearchParams(location.search);
+  const hdr = params.get('hdr');
   if (hdr) options.hdr = hdr;
+  // ?licence=URL — wrapped ClearKey licence endpoint (docs/CLEARKEY_WRAPPED_LICENCE.md);
+  // the fixture's clearKeys are then NOT passed, every key comes wrapped.
+  const licence = params.get('licence');
+  if (licence) {
+    delete options.clearKeys;
+    options.wrappedLicence = { url: licence };
+  }
   try {
     player = await RustPlayer.create(canvas, url, host, options);
     player.setVolume($('vol').value / 100);

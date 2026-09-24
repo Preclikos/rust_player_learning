@@ -53,10 +53,160 @@ pub fn subtle() -> Option<web_sys::SubtleCrypto> {
     Some(crypto.subtle())
 }
 
-async fn crypto_key(subtle: &web_sys::SubtleCrypto, kid: &[u8; 16], key: &[u8; 16]) -> Result<web_sys::CryptoKey, BoxError> {
+/// Register a key the platform holds for `kid` — a non-extractable
+/// `CryptoKey` from a wrapped licence (`wrapped_licence`). From here on the
+/// CENC path decrypts this KID through WebCrypto only.
+pub fn install_key(kid: [u8; 16], key: web_sys::CryptoKey) {
+    KEYS.with(|m| m.borrow_mut().insert(kid, key));
+}
+
+fn js_obj(pairs: &[(&str, JsValue)]) -> js_sys::Object {
+    let o = js_sys::Object::new();
+    for (k, v) in pairs {
+        let _ = js_sys::Reflect::set(&o, &JsValue::from_str(k), v);
+    }
+    o
+}
+
+fn str_array(items: &[&str]) -> JsValue {
+    let a = js_sys::Array::new();
+    for s in items {
+        a.push(&JsValue::from_str(s));
+    }
+    a.into()
+}
+
+async fn await_key(promise: Result<js_sys::Promise, JsValue>, what: &str) -> Result<web_sys::CryptoKey, BoxError> {
+    let promise = promise.map_err(|e| -> BoxError { format!("{what}: {}", describe(&e)).into() })?;
+    Ok(JsFuture::from(promise)
+        .await
+        .map_err(|e| -> BoxError { format!("{what}: {}", describe(&e)).into() })?
+        .unchecked_into())
+}
+
+/// Client half of a wrapped-licence exchange: an ephemeral, non-extractable
+/// ECDH P-256 key pair whose public coordinates go into the request `epk`.
+pub struct KeyAgreement {
+    private: web_sys::CryptoKey,
+    pub x: Vec<u8>,
+    pub y: Vec<u8>,
+}
+
+impl KeyAgreement {
+    pub async fn begin() -> Result<Self, BoxError> {
+        let subtle = subtle().ok_or("WebCrypto unavailable (not a secure context?)")?;
+        let alg = js_obj(&[("name", "ECDH".into()), ("namedCurve", "P-256".into())]);
+        let pair_promise = subtle
+            .generate_key_with_object(&alg, false, &str_array(&["deriveBits"]))
+            .map_err(|e| -> BoxError { format!("generateKey(ECDH): {}", describe(&e)).into() })?;
+        let pair = JsFuture::from(pair_promise)
+            .await
+            .map_err(|e| -> BoxError { format!("generateKey(ECDH): {}", describe(&e)).into() })?;
+        let private: web_sys::CryptoKey = js_sys::Reflect::get(&pair, &"privateKey".into())
+            .map_err(|e| -> BoxError { describe(&e).into() })?
+            .unchecked_into();
+        let public: web_sys::CryptoKey = js_sys::Reflect::get(&pair, &"publicKey".into())
+            .map_err(|e| -> BoxError { describe(&e).into() })?
+            .unchecked_into();
+        let jwk_promise = subtle
+            .export_key("jwk", &public)
+            .map_err(|e| -> BoxError { format!("exportKey(jwk): {}", describe(&e)).into() })?;
+        let jwk = JsFuture::from(jwk_promise)
+            .await
+            .map_err(|e| -> BoxError { format!("exportKey(jwk): {}", describe(&e)).into() })?;
+        let coord = |name: &str| -> Result<Vec<u8>, BoxError> {
+            let v = js_sys::Reflect::get(&jwk, &JsValue::from_str(name)).map_err(|e| -> BoxError { describe(&e).into() })?;
+            let s = v.as_string().ok_or_else(|| -> BoxError { format!("jwk.{name} missing").into() })?;
+            Ok(crate::wrapped_licence::base64url_decode(&s)?)
+        };
+        Ok(Self {
+            private,
+            x: coord("x")?,
+            y: coord("y")?,
+        })
+    }
+}
+
+/// Derive the wrapping key from the server's `epk` and `salt`, unwrap
+/// `entry` into a non-extractable AES-CTR key and register it for its KID.
+/// Byte-for-byte the server's recipe: ECDH x-coordinate → HKDF-SHA256(salt,
+/// info) → AES-256-GCM with the KID as additional data.
+pub async fn unwrap_and_install(
+    agreement: &KeyAgreement,
+    server_x: &[u8],
+    server_y: &[u8],
+    salt: &[u8],
+    info: &[u8],
+    entry: &crate::wrapped_licence::WrappedKey,
+) -> Result<(), BoxError> {
+    use crate::wrapped_licence::base64url_encode;
+    let subtle = subtle().ok_or("WebCrypto unavailable (not a secure context?)")?;
+    let ecdh = js_obj(&[("name", "ECDH".into()), ("namedCurve", "P-256".into())]);
+    let server_jwk = js_obj(&[
+        ("kty", "EC".into()),
+        ("crv", "P-256".into()),
+        ("x", base64url_encode(server_x).into()),
+        ("y", base64url_encode(server_y).into()),
+        ("ext", JsValue::TRUE),
+    ]);
+    let server_pub = await_key(
+        subtle.import_key_with_object("jwk", &server_jwk, &ecdh, false, &js_sys::Array::new().into()),
+        "importKey(server epk)",
+    )
+    .await?;
+    let derive_alg = js_obj(&[("name", "ECDH".into()), ("public", server_pub.into())]);
+    let bits_promise = subtle
+        .derive_bits_with_object(&derive_alg, &agreement.private, 256)
+        .map_err(|e| -> BoxError { format!("deriveBits(ECDH): {}", describe(&e)).into() })?;
+    let secret: js_sys::ArrayBuffer = JsFuture::from(bits_promise)
+        .await
+        .map_err(|e| -> BoxError { format!("deriveBits(ECDH): {}", describe(&e)).into() })?
+        .unchecked_into();
+    let hkdf_key = await_key(
+        subtle.import_key_with_str("raw", &Uint8Array::new(&secret), "HKDF", false, &str_array(&["deriveKey"])),
+        "importKey(HKDF)",
+    )
+    .await?;
+    let hkdf_alg = js_obj(&[
+        ("name", "HKDF".into()),
+        ("hash", "SHA-256".into()),
+        ("salt", Uint8Array::from(salt).into()),
+        ("info", Uint8Array::from(info).into()),
+    ]);
+    let gcm_type = js_obj(&[("name", "AES-GCM".into()), ("length", JsValue::from_f64(256.0))]);
+    let wrap_key = await_key(
+        subtle.derive_key_with_object_and_object(&hkdf_alg, &hkdf_key, &gcm_type, false, &str_array(&["unwrapKey"])),
+        "deriveKey(HKDF→AES-GCM)",
+    )
+    .await?;
+    let unwrap_alg = js_obj(&[
+        ("name", "AES-GCM".into()),
+        ("iv", Uint8Array::from(&entry.iv[..]).into()),
+        ("additionalData", Uint8Array::from(&entry.kid[..]).into()),
+    ]);
+    let ctr_type = js_obj(&[("name", "AES-CTR".into()), ("length", JsValue::from_f64(128.0))]);
+    let content_key = await_key(
+        subtle.unwrap_key_with_buffer_source_and_object_and_object(
+            "raw",
+            &Uint8Array::from(&entry.wrapped[..]),
+            &wrap_key,
+            &unwrap_alg,
+            &ctr_type,
+            false,
+            &str_array(&["decrypt"]),
+        ),
+        "unwrapKey(AES-GCM → AES-CTR)",
+    )
+    .await?;
+    install_key(entry.kid, content_key);
+    Ok(())
+}
+
+async fn crypto_key(subtle: &web_sys::SubtleCrypto, kid: &[u8; 16], key: Option<&[u8; 16]>) -> Result<web_sys::CryptoKey, BoxError> {
     if let Some(k) = KEYS.with(|m| m.borrow().get(kid).cloned()) {
         return Ok(k);
     }
+    let key = key.ok_or("no WebCrypto key installed for this KID and no raw key to import")?;
     let usages = js_sys::Array::new();
     usages.push(&JsValue::from_str("decrypt"));
     let promise = subtle
@@ -72,10 +222,13 @@ async fn crypto_key(subtle: &web_sys::SubtleCrypto, kid: &[u8; 16], key: &[u8; 1
 
 /// Decrypt every protected sample of a segment in place. `sample_ranges` and
 /// `senc` are the segment's sample table and senc entries, index-aligned.
+/// `key`: the raw ClearKey bytes to import when no `CryptoKey` is registered
+/// for `kid` yet; `None` when the key is platform-held (installed by a
+/// wrapped licence) — then a missing registration is an error.
 pub async fn decrypt_samples(
     data: &mut [u8],
     kid: &[u8; 16],
-    key: &[u8; 16],
+    key: Option<&[u8; 16]>,
     sample_ranges: &[(usize, usize)],
     senc: &[SencEntry],
 ) -> Result<(), BoxError> {

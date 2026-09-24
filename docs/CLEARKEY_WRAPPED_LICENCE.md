@@ -334,12 +334,48 @@ exception filter, or catch it here and `BadRequest` it.
   (`default_KID` per period); rate limiting and audit on the endpoint.
 - Never log key material (the player logs KIDs only — checked).
 
-## Player side (next step)
+## Player side (implemented on every platform)
 
-Web shell: `RustPlayer.create(..., { licenceUrl, authToken })` (or a host
-`resolveWrappedKeys(kids)` hook returning the response JSON) generates the
-ECDH pair, calls the endpoint, derives the wrapping key and `unwrapKey`s each
-content key into a non-extractable AES-CTR `CryptoKey`; the CENC path then
-always decrypts through WebCrypto (the software AES fallback needs raw key
-bytes and is skipped for wrapped keys). Native shells keep raw keys for now;
-the same protocol can follow with `p256` + `hkdf` + `aes-gcm` crates.
+The player fetches the wrapped licence **itself** — one POST per KID, at the
+moment the init segment reveals the KID (so ~at start, plus once per new KID
+on a track switch). No host callback is involved; only the host's
+`intercept(url, "license")` runs first, which is where an
+`Authorization` header goes. Configuration is one URL (+ an optional HKDF
+info string, default `"rustplayer-clearkey-wrap-v1"`, which must match the
+server's).
+
+| Where | How |
+|---|---|
+| Engine (`player` crate) | `player.set_wrapped_licence(url, hkdf_info)` — installs a `WrappedLicenceResolver` as the `LicenseResolver`. `set_clearkey` still pre-populates the cache; the resolver only runs on a miss. |
+| Bridge (`StartConfig`) | `wrapped_licence_url: Some(url)`, `wrapped_licence_hkdf_info: None` — replaces the host `resolve_key` hook for that session. Or `bridge.set_wrapped_licence(url, info)` right after `start()`. |
+| Web (`RustPlayer.create` options) | `{ wrappedLicence: url }` or `{ wrappedLicence: { url, info } }`; `resolveKey` may then be omitted. Demo: `index.html?licence=<endpoint>`. |
+| Android (`RustPlayer.kt`) | `player.setWrappedLicence(url, hkdfInfo = null)` right after `start(...)`. |
+| iOS (`RustPlayer.swift`) | `player.setWrappedLicence(url: url, hkdfInfo: nil)` right after `start(...)`; C: `rustplayer_player_set_wrapped_licence(handle, url, NULL)`. |
+
+What each platform does with the response:
+
+- **Web** — WebCrypto end to end: `generateKey(ECDH P-256, non-extractable)`
+  → `deriveBits` → `importKey(HKDF)` → `deriveKey(AES-GCM-256)` →
+  `unwrapKey` into a **non-extractable AES-CTR `CryptoKey`**. The content key
+  never exists as bytes in JS/wasm memory, so it cannot be read from the
+  inspector, a heap snapshot or a breakpoint. Every CENC segment of such a
+  track (video and audio) then decrypts through `crypto.subtle.decrypt`;
+  the software AES-CTR fallback is skipped for it.
+- **Native (Windows / Linux / macOS / Android / iOS)** — `p256` ECDH +
+  `hkdf`/`sha2` + `aes-gcm`. The unwrapped 16 bytes live in the process's
+  key cache like a `set_clearkey` key would: they are never on the wire in
+  the clear and never in a log, but a debugger attached to the process can
+  still read them. That is the same trust level as the raw ClearKey path
+  today; the win is that a public codebase no longer implies a key in every
+  network trace.
+
+Dev/test: `scripts/wrapped_licence_mock.py` is an independent (python
+`cryptography`) implementation of the endpoint serving the test-stream keys
+with open CORS: `py -3.12 scripts/wrapped_licence_mock.py --port 8090`, then
+`http://localhost:8080/?licence=http://localhost:8090/licence/wrapped`. The
+Rust side has a self-contained round-trip test (`wrapped_licence::tests`).
+
+Failure semantics: a non-2xx, a malformed response, a missing KID in
+`keys`, a wrong `alg`/length or a GCM tag failure (wrong HKDF info or a
+tampered key) surface as `Error { LicenseResolver }` for that track,
+exactly like a failing `resolve_key` did.

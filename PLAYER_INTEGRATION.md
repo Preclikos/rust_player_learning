@@ -209,6 +209,15 @@ Implemented exactly as originally specced — summary:
 - `LicenseResolver::resolve(kid: [u8;16]) -> [u8;16]` is consulted on
   cache miss; `set_clearkey(HashMap)` pre-populates the cache so the
   resolver is never called for known keys.
+- `set_wrapped_licence(url, hkdf_info)` installs the built-in resolver for
+  the wrapped-licence endpoint (`docs/CLEARKEY_WRAPPED_LICENCE.md`: ECDH
+  P-256 + HKDF-SHA256 + AES-256-GCM, so no content key crosses the wire in
+  the clear). The POST goes through the interceptor as `RequestKind::License`
+  (put the auth header there). Bridge: `StartConfig::wrapped_licence_url` /
+  `BridgeHandle::set_wrapped_licence`; shells: `setWrappedLicence(url, info)`
+  on Android/iOS, `options.wrappedLicence` on the web (where the key becomes
+  a non-extractable WebCrypto key and all CENC decryption of that track runs
+  through `crypto.subtle`).
 - Both callbacks are time-boxed (~10 s, `set_callback_timeout`);
   failures surface as `Error { Interceptor | LicenseResolver }`.
 - Retry policy for transient HTTP/transport errors:

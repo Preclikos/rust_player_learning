@@ -533,6 +533,7 @@ pub(super) async fn audio_decoder_task(
         // MediaCodec calls below: BLOCKING WORK MUST NOT OCCUPY A RUNTIME
         // WORKER, or the reactive tasks (vsync pacing, audio feed, timers)
         // starve and playback degrades to a ~1 fps convoy.
+        #[cfg(not(target_arch = "wasm32"))]
         let (data_vec, sample_info) = crate::rt::block_in_place(
             || -> Result<(Vec<u8>, Vec<(usize, usize, i64, u64)>), Box<dyn Error + Send + Sync>> {
                 let mut data_vec = init_data.clone();
@@ -543,6 +544,17 @@ pub(super) async fn audio_decoder_task(
                 Ok((data_vec, sample_info))
             },
         )?;
+        // Browser: the same cooperative path as video — WebCrypto when the
+        // key is platform-held (wrapped licence) or the segment is large,
+        // sliced software AES otherwise. There is no blocking pool here.
+        #[cfg(target_arch = "wasm32")]
+        let (data_vec, sample_info) = {
+            let mut data_vec = init_data.clone();
+            data_vec.extend_from_slice(&segment.data[..]);
+            decrypt_segment_in_place_cooperative(&mut data_vec, track_crypto.as_ref()).await?;
+            let sample_info = mp4_sample_table(&data_vec)?;
+            (data_vec, sample_info)
+        };
 
         for (offset, size, ts, ts_scale) in sample_info {
             if offset + size > data_vec.len() {

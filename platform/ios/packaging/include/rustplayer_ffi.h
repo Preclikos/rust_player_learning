@@ -49,6 +49,8 @@ void rustplayer_player_seek_ms(void *handle, int64_t position_ms);
 int64_t rustplayer_player_position_ms(void *handle);
 int64_t rustplayer_player_duration_ms(void *handle);
 void rustplayer_player_set_volume(void *handle, float volume);
+/* Wrapped ClearKey licence endpoint (docs/CLEARKEY_WRAPPED_LICENCE.md); hkdf_info may be NULL. */
+void rustplayer_player_set_wrapped_licence(void *handle, const char *url, const char *hkdf_info);
 
 // Tracks. Returns a heap C string the caller MUST free with rustplayer_string_free.
 char *rustplayer_player_tracks_json(void *handle);

@@ -354,6 +354,9 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeStart(
         auto_select_subtitle: auto_select_subtitle != 0,
         preferred_audio_language,
         preferred_subtitle_language,
+        // Set after create via nativeSetWrappedLicence (fixed create signature).
+        wrapped_licence_url: None,
+        wrapped_licence_hkdf_info: None,
     };
 
     let bridge = bridge::start(player, manifest, host.clone(), config);
@@ -511,6 +514,33 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetVideoT
         h.bridge
             .set_video_track_soft(adapt.max(0) as usize, repr.max(0) as usize);
     }
+}
+
+/// Wrapped ClearKey licence endpoint (docs/CLEARKEY_WRAPPED_LICENCE.md).
+/// `info` may be null for the default HKDF info. Call right after nativeStart.
+#[no_mangle]
+pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetWrappedLicence(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    url: JString,
+    info: JString,
+) {
+    let Some(h) = (unsafe { handle_ref(handle) }) else { return };
+    let url: String = match env.get_string(&url) {
+        Ok(s) => s.into(),
+        Err(e) => {
+            log::error!("nativeSetWrappedLicence: url: {}", e);
+            return;
+        }
+    };
+    let info: Option<String> = if info.is_null() {
+        None
+    } else {
+        env.get_string(&info).ok().map(|s| s.into()).filter(|s: &String| !s.is_empty())
+    };
+    let _guard = runtime().enter();
+    h.bridge.set_wrapped_licence(url, info);
 }
 
 #[no_mangle]

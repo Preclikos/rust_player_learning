@@ -509,25 +509,30 @@ pub(super) async fn decrypt_segment_in_place_cooperative(
     // the segment is big enough for the promise round-trips to pay off:
     // the AES then runs on the browser's crypto pool with hardware
     // acceleration and the main thread only gathers/scatters bytes.
+    // A platform-held key (wrapped licence → non-extractable WebCrypto key)
+    // has no software path at all, whatever the segment size.
     let total_bytes: usize = sample_ranges.iter().map(|&(_, sz)| sz).sum();
-    if total_bytes >= WEBCRYPTO_MIN_BYTES {
-        if let Some(key) = tc.decryptor.raw_key(&tc.kid) {
-            let t_wc = Instant::now();
-            match crate::crypto_web::decrypt_samples(data_vec, &tc.kid, &key, &sample_ranges, &senc_entries).await {
-                Ok(()) => {
-                    log::debug!(
-                        "[crypto] {} samples via WebCrypto in {}ms ({} KiB)",
-                        sample_ranges.len(),
-                        t_wc.elapsed().as_millis(),
-                        total_bytes / 1024
-                    );
-                    return Ok(());
-                }
-                Err(e) => {
-                    // Not a secure context, or the browser refused: software
-                    // AES below still gets the segment out.
-                    log::warn!("[crypto] WebCrypto decrypt failed ({e}); falling back to software AES");
-                }
+    let platform = tc.decryptor.has_platform_key(&tc.kid);
+    let raw = tc.decryptor.raw_key(&tc.kid);
+    if platform || (total_bytes >= WEBCRYPTO_MIN_BYTES && raw.is_some()) {
+        let t_wc = Instant::now();
+        match crate::crypto_web::decrypt_samples(data_vec, &tc.kid, raw.as_ref(), &sample_ranges, &senc_entries).await {
+            Ok(()) => {
+                log::debug!(
+                    "[crypto] {} samples via WebCrypto in {}ms ({} KiB)",
+                    sample_ranges.len(),
+                    t_wc.elapsed().as_millis(),
+                    total_bytes / 1024
+                );
+                return Ok(());
+            }
+            Err(e) if platform => {
+                return Err(format!("WebCrypto decrypt failed for a platform-held key: {e}").into());
+            }
+            Err(e) => {
+                // Not a secure context, or the browser refused: software
+                // AES below still gets the segment out.
+                log::warn!("[crypto] WebCrypto decrypt failed ({e}); falling back to software AES");
             }
         }
     }

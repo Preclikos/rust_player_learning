@@ -536,6 +536,7 @@ pub(super) async fn audio_play(
     audio_ready: Arc<Notify>,
     sender: Sender<DecodedAudioFrame>,
     output_sample_rate: u32,
+    output_channels: u16,
     stop: Arc<Notify>,
     stop_flag: Arc<AtomicBool>,
     decryptor: Option<Arc<dyn Decryptor>>,
@@ -600,6 +601,7 @@ pub(super) async fn audio_play(
         input_sample_rate,
         input_channels,
         output_sample_rate,
+        output_channels,
         codec_specific_data,
     })?;
 

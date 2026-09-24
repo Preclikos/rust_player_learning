@@ -30,17 +30,19 @@ pub struct MediaCodecAudioDecoder {
     /// the manifest hint; corrected by the OutputFormatChanged event before
     /// the first frame is drained.
     channels: usize,
+    /// Channel count the output device takes (`AudioDecoderParams::output_channels`).
+    output_channels: usize,
 }
 
 unsafe impl Send for MediaCodecAudioDecoder {}
 
 impl MediaCodecAudioDecoder {
     pub fn new() -> Self {
-        Self { codec: None, input_rate: 44100, output_rate: 44100, channels: 2 }
+        Self { codec: None, input_rate: 44100, output_rate: 44100, channels: 2, output_channels: 2 }
     }
 }
 
-use super::pcm::{downmix_to_stereo, resample_linear};
+use super::pcm::{remix, resample_linear};
 
 
 impl AudioDecoder for MediaCodecAudioDecoder {
@@ -81,6 +83,7 @@ impl AudioDecoder for MediaCodecAudioDecoder {
         self.input_rate = params.input_sample_rate;
         self.output_rate = params.output_sample_rate;
         self.channels = params.input_channels as usize;
+        self.output_channels = params.output_channels.max(1) as usize;
         Ok(())
     }
 
@@ -138,7 +141,8 @@ impl AudioDecoder for MediaCodecAudioDecoder {
                 // Decode pipeline:
                 //   1. Read i16 PCM from the codec buffer
                 //   2. Convert to f32 normalised to ±1.0
-                //   3. Downmix to stereo (no-op when input is already stereo)
+                //   3. Mix to the output device's channel count (no-op when
+                //      the layouts already match)
                 //   4. Linear resample to the output device rate
                 let samples = {
                     let buf: &[u8] = out.buffer();
@@ -146,9 +150,8 @@ impl AudioDecoder for MediaCodecAudioDecoder {
                     let pcm_i16: &[i16] = bytemuck::cast_slice(pcm);
                     let raw_f32: Vec<f32> =
                         pcm_i16.iter().map(|&s| s as f32 / 32768.0_f32).collect();
-                    let stereo = downmix_to_stereo(&raw_f32, self.channels);
-                    // After downmix we ALWAYS have 2 channels.
-                    resample_linear(&stereo, 2, self.input_rate, self.output_rate)
+                    let mixed = remix(&raw_f32, self.channels, self.output_channels);
+                    resample_linear(&mixed, self.output_channels, self.input_rate, self.output_rate)
                 };
 
                 codec

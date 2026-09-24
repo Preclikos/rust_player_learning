@@ -33,7 +33,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 
-use super::pcm::{downmix_to_stereo, interleave, LinearResampler};
+use super::pcm::{interleave, remix, LinearResampler};
 use super::{
     AudioCodec, AudioDecoder, AudioDecoderParams, DecodedAudioFrame, DecodedVideoFrame,
     DecoderError, HwVideoDecoder, PlatformFrame, VideoColorInfo, VideoDecoderParams,
@@ -334,6 +334,8 @@ struct AudioShared {
     ready: RefCell<VecDeque<DecodedAudioFrame>>,
     error: RefCell<Option<String>>,
     output_rate: Cell<u32>,
+    /// Channel count the output device takes (`AudioDecoderParams::output_channels`).
+    output_channels: Cell<usize>,
     frames_out: Cell<u64>,
     /// Built on the first output (that is when the real input rate is
     /// known); keeps its phase across AUs so the output frame count is exact.
@@ -375,6 +377,7 @@ impl WebCodecsAudioDecoder {
                 ready: RefCell::new(VecDeque::new()),
                 error: RefCell::new(None),
                 output_rate: Cell::new(48_000),
+                output_channels: Cell::new(2),
                 frames_out: Cell::new(0),
                 resampler: RefCell::new(None),
                 output_ready: std::sync::Arc::new(tokio::sync::Notify::new()),
@@ -454,11 +457,13 @@ fn on_audio_output_inner(shared: &AudioShared, data: web_sys::AudioData) {
     }
     data.close();
     let interleaved = interleave(&planes);
-    let stereo = downmix_to_stereo(&interleaved, channels);
+    let out_channels = shared.output_channels.get();
+    let mixed = remix(&interleaved, channels, out_channels);
     let mut rs = shared.resampler.borrow_mut();
-    let resampler = rs.get_or_insert_with(|| LinearResampler::new(2, rate, shared.output_rate.get()));
+    let resampler =
+        rs.get_or_insert_with(|| LinearResampler::new(out_channels, rate, shared.output_rate.get()));
     let __t_rs = crate::rt::Instant::now();
-    let samples = resampler.process(&stereo);
+    let samples = resampler.process(&mixed);
     crate::prof::AUDIO_RESAMPLE.add(__t_rs.elapsed().as_micros() as u64);
     shared.ready.borrow_mut().push_back(DecodedAudioFrame { pts_ms, samples });
 }
@@ -467,6 +472,7 @@ impl AudioDecoder for WebCodecsAudioDecoder {
     fn configure(&mut self, params: AudioDecoderParams) -> Result<(), DecoderError> {
         let codec = audio_codec_string(params.codec, &params.codec_specific_data);
         self.shared.output_rate.set(params.output_sample_rate.max(1));
+        self.shared.output_channels.set(params.output_channels.max(1) as usize);
         *self.shared.resampler.borrow_mut() = None;
 
         let shared = Rc::clone(&self.shared);
@@ -495,11 +501,12 @@ impl AudioDecoder for WebCodecsAudioDecoder {
             .configure(&config)
             .map_err(|e| js_err(&format!("AudioDecoder::configure({codec})"), e))?;
         log::info!(
-            "[webcodecs] audio configured: {} {}Hz {}ch → {}Hz stereo",
+            "[webcodecs] audio configured: {} {}Hz {}ch → {}Hz {}ch",
             codec,
             params.input_sample_rate,
             params.input_channels,
-            params.output_sample_rate
+            params.output_sample_rate,
+            params.output_channels
         );
 
         self.decoder = Some(decoder);

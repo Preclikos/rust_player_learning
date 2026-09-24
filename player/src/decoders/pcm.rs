@@ -2,8 +2,53 @@
 //! layout and leave the conversion to us — MediaCodec (Android) and
 //! WebCodecs (browser). FFmpeg's decoder goes through swresample instead.
 //!
-//! The pipeline contract downstream of every audio decoder is "packed
-//! stereo f32 at the output device rate" (see `DecodedAudioFrame`).
+//! The pipeline contract downstream of every audio decoder is "packed f32 at
+//! the output device rate with the output device's channel count" (see
+//! `DecodedAudioFrame` / `AudioDecoderParams::output_channels`); [`remix`]
+//! is the one place that maps a source layout onto it.
+
+/// Mix interleaved PCM from `in_ch` channels to `out_ch` channels. Channel
+/// order is the AOSP / WebCodecs / WAVE convention: L,R,C,LFE,BL,BR(,SL,SR).
+///
+/// - same count → unchanged;
+/// - to stereo → [`downmix_to_stereo`] (ITU-R BS.775);
+/// - to mono → stereo downmix averaged;
+/// - fewer source channels than outputs → source channels in place, the
+///   rest silent (stereo on a 5.1 device plays from the front pair; the
+///   receiver's own upmix, if the user wants one, stays its business);
+/// - 7.1 → 5.1 → sides folded into the backs at −3 dB;
+/// - anything else → channels copied/dropped in order (always audible).
+#[cfg_attr(not(any(target_os = "android", target_arch = "wasm32")), allow(dead_code))]
+pub fn remix(input: &[f32], in_ch: usize, out_ch: usize) -> Vec<f32> {
+    let in_ch = in_ch.max(1);
+    let out_ch = out_ch.max(1);
+    if in_ch == out_ch {
+        return input.to_vec();
+    }
+    if out_ch == 2 {
+        return downmix_to_stereo(input, in_ch);
+    }
+    if out_ch == 1 {
+        let st = downmix_to_stereo(input, in_ch);
+        return st.chunks_exact(2).map(|lr| (lr[0] + lr[1]) * 0.5).collect();
+    }
+    let frames = input.len() / in_ch;
+    let mut out = Vec::with_capacity(frames * out_ch);
+    const ATT: f32 = 0.707; // -3 dB
+    for f in 0..frames {
+        let src = &input[f * in_ch..(f + 1) * in_ch];
+        if in_ch == 8 && out_ch == 6 {
+            out.extend_from_slice(&src[..4]);
+            out.push((src[4] + ATT * src[6]).clamp(-1.0, 1.0));
+            out.push((src[5] + ATT * src[7]).clamp(-1.0, 1.0));
+            continue;
+        }
+        for c in 0..out_ch {
+            out.push(if c < in_ch { src[c] } else { 0.0 });
+        }
+    }
+    out
+}
 
 /// Downmix interleaved multichannel f32 PCM to stereo. Channel order follows
 /// the AOSP / WebCodecs convention: mono / L,R / L,R,C / L,R,C,LFE,BL,BR for
@@ -181,6 +226,45 @@ impl LinearResampler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remix_same_layout_is_identity() {
+        let six: Vec<f32> = (0..12).map(|i| i as f32 * 0.05).collect();
+        assert_eq!(remix(&six, 6, 6), six);
+        assert_eq!(remix(&[0.1, 0.2, 0.3, 0.4], 2, 2), vec![0.1, 0.2, 0.3, 0.4]);
+    }
+
+    #[test]
+    fn remix_5_1_to_stereo_is_the_itu_downmix() {
+        // L,R,C,LFE,BL,BR
+        let frame = [0.5, -0.5, 0.2, 0.9, 0.1, -0.1];
+        let out = remix(&frame, 6, 2);
+        assert_eq!(out.len(), 2);
+        assert!((out[0] - (0.5 + 0.707 * 0.2 + 0.707 * 0.1)).abs() < 1e-6);
+        assert!((out[1] - (-0.5 + 0.707 * 0.2 + 0.707 * -0.1)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn remix_stereo_onto_5_1_uses_the_front_pair_only() {
+        let out = remix(&[0.3, -0.3, 0.6, -0.6], 2, 6);
+        assert_eq!(out, vec![0.3, -0.3, 0.0, 0.0, 0.0, 0.0, 0.6, -0.6, 0.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn remix_7_1_to_5_1_folds_sides_into_backs() {
+        // L,R,C,LFE,BL,BR,SL,SR
+        let out = remix(&[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.2, 0.4], 8, 6);
+        assert_eq!(out.len(), 6);
+        assert_eq!(&out[..4], &[0.1, 0.2, 0.3, 0.4]);
+        assert!((out[4] - (0.5 + 0.707 * 0.2)).abs() < 1e-6);
+        assert!((out[5] - (0.6 + 0.707 * 0.4)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn remix_to_mono_averages_the_stereo_downmix() {
+        let out = remix(&[0.4, 0.2], 2, 1);
+        assert_eq!(out, vec![0.3]);
+    }
 
     #[test]
     fn stateful_resampler_output_count_is_exact_over_many_chunks() {

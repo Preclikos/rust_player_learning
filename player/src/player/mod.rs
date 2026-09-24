@@ -2016,6 +2016,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                 ));
 
                 let sample_rate = audio_sink.sample_rate();
+                let out_channels = audio_sink.channels();
                 // Audio passthrough decision: host opted in AND the selected
                 // track is a passthrough codec. The sink create self-gates
                 // (None on unsupported → PCM). When engaged, feed raw AUs to
@@ -2079,6 +2080,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                             audio_ready.clone(),
                             sample_sender,
                             sample_rate,
+                            out_channels,
                             stop.clone(),
                             stop_flag.clone(),
                             decryptor_snapshot,
@@ -2098,6 +2100,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                         audio_ready.clone(),
                         sample_sender,
                         sample_rate,
+                        out_channels,
                         stop.clone(),
                         stop_flag.clone(),
                         decryptor_snapshot,

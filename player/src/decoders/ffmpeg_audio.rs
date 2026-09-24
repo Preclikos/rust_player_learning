@@ -26,6 +26,8 @@ pub struct FfmpegAudioDecoder {
     resampler_in_layout_bits: u64,
     /// Target output rate (cpal device rate) passed in at configure time.
     output_sample_rate: u32,
+    /// Target channel count (the device's) passed in at configure time.
+    output_channels: u16,
 }
 
 unsafe impl Send for FfmpegAudioDecoder {}
@@ -38,32 +40,46 @@ impl FfmpegAudioDecoder {
             resampler_in_rate: 0,
             resampler_in_layout_bits: 0,
             output_sample_rate: 0,
+            output_channels: 2,
+        }
+    }
+
+    /// swresample output layout for the device's channel count (FFmpeg's
+    /// default layout for N channels: L,R,C,LFE,BL,BR,… — the same order the
+    /// devices and the other decoders use).
+    fn out_layout(&self) -> ChannelLayout {
+        match self.output_channels {
+            1 => ChannelLayout::MONO,
+            2 => ChannelLayout::STEREO,
+            n => ChannelLayout::default(n as i32),
         }
     }
 
     /// (Re)build the resampler so its input matches the decoded frame's
-    /// actual `rate` + `layout`, and its output is fixed stereo at the
-    /// device rate. Called lazily on first frame and whenever the input
-    /// format drifts.
+    /// actual `rate` + `layout`, and its output is the device's layout at
+    /// the device rate (swresample does the channel mixing — ITU downmix to
+    /// stereo, or 5.1 → 5.1 untouched). Called lazily on first frame and
+    /// whenever the input format drifts.
     fn build_resampler(&mut self, in_rate: u32, in_layout: ChannelLayout) -> Result<(), DecoderError> {
+        let out_layout = self.out_layout();
         let resampler = ResampleCtx::get(
             ffmpeg_next::util::format::sample::Sample::F32(Type::Planar),
             in_layout,
             in_rate,
             ffmpeg_next::util::format::sample::Sample::F32(Type::Packed),
-            ChannelLayout::STEREO,
+            out_layout,
             self.output_sample_rate,
         )
         .map_err(|e| -> DecoderError {
-            format!("resampler init ({}Hz {}ch -> {}Hz stereo): {}",
-                in_rate, in_layout.channels(), self.output_sample_rate, e).into()
+            format!("resampler init ({}Hz {}ch -> {}Hz {}ch): {}",
+                in_rate, in_layout.channels(), self.output_sample_rate, self.output_channels, e).into()
         })?;
         self.resampler_in_rate = in_rate;
         self.resampler_in_layout_bits = in_layout.bits();
         self.resampler = Some(resampler);
         log::info!(
-            "FfmpegAudioDecoder: resampler {}Hz {}ch -> {}Hz stereo",
-            in_rate, in_layout.channels(), self.output_sample_rate
+            "FfmpegAudioDecoder: resampler {}Hz {}ch -> {}Hz {}ch",
+            in_rate, in_layout.channels(), self.output_sample_rate, self.output_channels
         );
         Ok(())
     }
@@ -100,6 +116,7 @@ impl AudioDecoder for FfmpegAudioDecoder {
             2 => ffmpeg_next::util::channel_layout::ChannelLayout::STEREO,
             n => ffmpeg_next::util::channel_layout::ChannelLayout::default(n as i32),
         };
+        self.output_channels = params.output_channels.max(1);
 
         unsafe {
             let ctx_ptr = ctx.as_mut_ptr();
@@ -141,12 +158,13 @@ impl AudioDecoder for FfmpegAudioDecoder {
         decoder.request_format(ffmpeg_next::util::format::sample::Sample::F32(Type::Planar));
 
         log::info!(
-            "FfmpegAudioDecoder: opened {:?} (manifest hint: {}Hz {}ch -> stereo {}Hz). \
+            "FfmpegAudioDecoder: opened {:?} (manifest hint: {}Hz {}ch -> {}Hz {}ch). \
              Resampler will be built lazily from the first decoded frame.",
             params.codec,
             params.input_sample_rate,
             params.input_channels,
             params.output_sample_rate,
+            params.output_channels,
         );
         self.decoder = Some(decoder);
         self.output_sample_rate = params.output_sample_rate;
@@ -206,7 +224,6 @@ impl AudioDecoder for FfmpegAudioDecoder {
                     self.build_resampler(in_rate, in_layout)?;
                 }
                 let out_rate = self.output_sample_rate;
-                let resampler = self.resampler.as_mut().unwrap();
 
                 // Size the destination ourselves. Handing `run()` an EMPTY
                 // frame looks harmless but is not: ffmpeg-next then allocates
@@ -220,12 +237,15 @@ impl AudioDecoder for FfmpegAudioDecoder {
                 // as a rapid flicker. (48 kHz sources were unaffected: no rate
                 // change means in_samples == out_samples, which is why this
                 // only ever showed on 44.1 kHz titles.)
-                let pending = resampler.delay().map_or(0, |d| d.input);
+                let pending = self.resampler.as_ref().unwrap().delay().map_or(0, |d| d.input);
                 let cap = out_capacity(pending, frame.samples() as i64, in_rate, out_rate);
+                let out_layout = self.out_layout();
+                let out_channels = self.output_channels.max(1) as usize;
+                let resampler = self.resampler.as_mut().unwrap();
                 let mut dst = ffmpeg_next::util::frame::Audio::new(
                     ffmpeg_next::util::format::sample::Sample::F32(Type::Packed),
                     cap,
-                    ChannelLayout::STEREO,
+                    out_layout,
                 );
                 resampler
                     .run(&frame, &mut dst)
@@ -240,7 +260,7 @@ impl AudioDecoder for FfmpegAudioDecoder {
                         return Ok(None);
                     }
                 }
-                let expected_bytes = dst.samples() * 2 * std::mem::size_of::<f32>();
+                let expected_bytes = dst.samples() * out_channels * std::mem::size_of::<f32>();
                 let samples: Vec<f32> = bytemuck::cast_slice(&dst.data(0)[..expected_bytes]).to_vec();
                 Ok(Some(DecodedAudioFrame { pts_ms, samples }))
             }

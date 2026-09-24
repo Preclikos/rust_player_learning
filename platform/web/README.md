@@ -116,6 +116,11 @@ representations only.
 
 - HEVC only, like the other platforms; codec support is whatever the
   browser's WebCodecs exposes (AC-3 / E-AC-3 audio is Safari-only in practice).
+- Audio output follows the system output: when the browser's destination
+  offers six or more channels (OS output configured as 5.1/7.1) the engine
+  opens a 6-channel discrete output and 5.1 tracks play as 5.1 PCM; on a
+  stereo output they fold down (ITU-R BS.775). No bitstream passthrough in a
+  browser — there is no API for it.
 - Frames go GPU→GPU (`copyExternalImageToTexture`), one copy per frame on
   the GPU; `importExternalTexture` (no copy) would need the wgpu webgpu
   backend's external-texture path, which is `unimplemented!` upstream.

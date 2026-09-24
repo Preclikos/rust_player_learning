@@ -39,6 +39,9 @@ pub struct AudioRenderer {
     /// with the flush generation (see `av_sync::FlushState`).
     sample_sender: Sender<AudioChunk>,
     sample_rate: u32,
+    /// Interleaved channel count the output was opened with (what the
+    /// decoders mix to and `samples_consumed` counts per frame).
+    channels: u16,
     /// Flush generation + post-flush playback boundary, shared with the
     /// backend consumer. `flush()` bumps the generation (stale chunks are
     /// dropped by the consumer — race-free); the consumer marks where the
@@ -138,22 +141,19 @@ impl AudioRenderer {
         let (command_sender, command_receiver) = mpsc::channel(4);
 
         #[cfg(not(any(target_os = "android", target_arch = "wasm32")))]
-        let (sample_sender, sample_rate) = {
-            let t = audio_cpal::start_thread(
-                command_receiver,
-                stop,
-                flush_state.clone(),
-                paused_flag.clone(),
-                volume.clone(),
-                samples_consumed.clone(),
-                output_latency_ms.clone(),
-            );
-            (t.0, t.1)
-        };
+        let (sample_sender, sample_rate, channels) = audio_cpal::start_thread(
+            command_receiver,
+            stop,
+            flush_state.clone(),
+            paused_flag.clone(),
+            volume.clone(),
+            samples_consumed.clone(),
+            output_latency_ms.clone(),
+        );
         #[cfg(target_arch = "wasm32")]
         let output_running = Arc::new(AtomicBool::new(false));
         #[cfg(target_arch = "wasm32")]
-        let (sample_sender, sample_rate) = audio_web::start_thread(
+        let (sample_sender, sample_rate, channels) = audio_web::start_thread(
             command_receiver,
             stop,
             flush_state.clone(),
@@ -179,11 +179,16 @@ impl AudioRenderer {
                 volume.clone(),
             )
         };
+        // The AudioTrack PCM path is stereo (CHANNEL_OUT_STEREO); 5.1 on
+        // Android goes through the compressed passthrough sink.
+        #[cfg(target_os = "android")]
+        let channels: u16 = 2;
 
         AudioRenderer {
             command_sender,
             sample_sender,
             sample_rate,
+            channels,
             flush_state,
             paused_flag,
             volume,
@@ -202,17 +207,19 @@ impl AudioRenderer {
         }
     }
 
-    /// Compute interleaved-stereo peak in dB and stash it for the next
-    /// `last_peak_db()` poll. Cheap — one abs+max per sample.
+    /// Compute the front L/R peak in dB and stash it for the next
+    /// `last_peak_db()` poll. Cheap — one abs+max per sample. On a
+    /// multichannel output the meter reads the front pair (channels 0/1).
     fn update_peaks(&self, samples: &[f32]) {
         if samples.is_empty() {
             return;
         }
         let mut max_l = 0.0_f32;
         let mut max_r = 0.0_f32;
-        for chunk in samples.chunks_exact(2) {
+        let ch = self.channels.max(1) as usize;
+        for chunk in samples.chunks_exact(ch) {
             max_l = max_l.max(chunk[0].abs());
-            max_r = max_r.max(chunk[1].abs());
+            max_r = max_r.max(chunk[ch.min(2) - 1].abs());
         }
         // 20 * log10(|s|). Floor at -120 dB to avoid log(0) = -inf.
         let to_db = |v: f32| -> f32 {
@@ -266,6 +273,11 @@ impl AudioRenderer {
         self.sample_rate
     }
 
+    /// Interleaved channel count the output device was opened with.
+    pub fn channels(&self) -> u16 {
+        self.channels
+    }
+
     /// Output-path latency in ms (device buffer + DAC) reported by the cpal
     /// backend; 0 until the first callback or when unsupported.
     pub fn output_latency_ms(&self) -> u64 {
@@ -301,7 +313,7 @@ impl AudioRenderer {
         }
         let consumed = self.samples_consumed.load(Ordering::Acquire);
         let since = self.flush_state.played_since_flush(consumed);
-        Some(since / 2 * 1000 / self.sample_rate as u64)
+        Some(since / self.channels.max(1) as u64 * 1000 / self.sample_rate as u64)
     }
 
     /// HOST pause/unpause. This inherent method is what `Player::pause/resume/
@@ -354,6 +366,10 @@ impl super::AudioSink for AudioRenderer {
         AudioRenderer::sample_rate(self)
     }
 
+    fn channels(&self) -> u16 {
+        AudioRenderer::channels(self)
+    }
+
     fn played_ms(&self) -> Option<u64> {
         // Passthrough: the bitstream output's playback head is the clock source.
         if let Some(pt) = self.passthrough.lock().unwrap().as_ref() {
@@ -374,9 +390,9 @@ impl super::AudioSink for AudioRenderer {
             if !self.output_running.load(Ordering::Relaxed) {
                 return None;
             }
-            // Interleaved stereo: 2 f32s per frame at the OUTPUT rate (the
+            // Interleaved: `channels` f32s per frame at the OUTPUT rate (the
             // resampler preserves duration, so output time = media time).
-            let frames = self.samples_consumed.load(Ordering::Relaxed) / 2;
+            let frames = self.samples_consumed.load(Ordering::Relaxed) / self.channels.max(1) as u64;
             Some(frames * 1000 / self.sample_rate as u64)
         }
     }

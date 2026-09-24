@@ -108,11 +108,10 @@ async fn start_audio(
     // before the last flush and records the consumed-sample position at which
     // each new generation begins (the post-flush clock boundary).
     let mut cursor = ChunkCursor::new(sample_receiver, flush_state, samples_consumed);
-    // The resampler always emits packed STEREO. With a stereo stream
-    // (the normal case) the callback copies 1:1; on a mono-only output it
-    // downmixes (L+R)/2 — otherwise stereo fed 1:1 into a mono stream plays
-    // at half speed (an octave low, "deep voice").
-    let out_ch = out_channels as usize;
+    // The decoders mix to exactly `out_channels` (AudioSink::channels()), so
+    // the callback copies 1:1 whatever the device layout — stereo, mono, 5.1.
+    // (Before, a stereo stream was copied 1:1 into a 6-channel device buffer:
+    // wrong speed and channel order on every 5.1-configured PC.)
     let stream_config = StreamConfig {
         channels: out_channels,
         sample_rate: out_rate,
@@ -149,18 +148,8 @@ async fn start_audio(
             return;
         }
         let vol = f32::from_bits(volume.load(Ordering::Relaxed));
-        if out_ch >= 2 {
-            for sample in data.iter_mut() {
-                *sample = cursor.next_sample().unwrap_or(Sample::EQUILIBRIUM) * vol;
-            }
-        } else {
-            // Mono output device: downmix the packed-stereo source (L+R)/2
-            // per output sample so playback runs at the correct speed/pitch.
-            for sample in data.iter_mut() {
-                let l = cursor.next_sample().unwrap_or(Sample::EQUILIBRIUM);
-                let r = cursor.next_sample().unwrap_or(l);
-                *sample = (l + r) * 0.5 * vol;
-            }
+        for sample in data.iter_mut() {
+            *sample = cursor.next_sample().unwrap_or(Sample::EQUILIBRIUM) * vol;
         }
         // Publish the consumed-sample count once per callback (the clock).
         cursor.commit();
@@ -253,7 +242,7 @@ pub(super) fn start_thread(
     volume: Arc<AtomicU32>,
     samples_consumed: Arc<AtomicU64>,
     output_latency_ms: Arc<AtomicU64>,
-) -> (Sender<AudioChunk>, u32) {
+) -> (Sender<AudioChunk>, u32, u16) {
     let (sample_sender, sample_receiver) = mpsc::channel::<AudioChunk>(QUEUE_CHUNKS);
 
     // No usable audio output (headless CI runner, server, unplugged dock):
@@ -299,9 +288,15 @@ pub(super) fn start_thread(
             paused_flag,
             samples_consumed,
         );
-        return (sample_sender, 48_000);
+        return (sample_sender, 48_000, 2);
     };
 
+    // Layouts the decoders know how to mix to; anything odd (3, 5, 7 …)
+    // falls back to stereo and the OS/driver spreads it.
+    let out_channels = match out_channels {
+        1 | 2 | 6 | 8 => out_channels,
+        _ => 2,
+    };
     log::info!("[audio] opening output {} Hz / {} ch", out_rate, out_channels);
 
     let stop_cpal = stop.clone();
@@ -347,5 +342,5 @@ pub(super) fn start_thread(
         }
     });
 
-    (sample_sender, out_rate)
+    (sample_sender, out_rate, out_channels)
 }

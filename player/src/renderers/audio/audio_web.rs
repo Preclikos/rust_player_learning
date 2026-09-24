@@ -2,7 +2,8 @@
 //!
 //! The worklet processor (JS, embedded below and loaded from a Blob URL, so
 //! the host page ships nothing) runs on the browser's audio rendering
-//! thread. The main thread feeds it packed-stereo f32 chunks over its
+//! thread. The main thread feeds it packed f32 chunks (the destination's
+//! channel count — stereo, or 5.1 discrete when the output offers it) over its
 //! `MessagePort`; it plays them back to back, keeps silent when paused or
 //! starved, and reports what it actually played. Same contract as the cpal
 //! backend: `samples_consumed` = samples the device presented (pause and
@@ -47,7 +48,7 @@ use crate::av_sync::{AudioChunk, FlushState};
 const WORKLET_TARGET_FRAMES: u64 = 24_000; // 0.5 s at 48 kHz
 
 /// The processor. `process()` runs per 128-frame render quantum on the audio
-/// thread. Messages in: `pcm` (gen + interleaved stereo Float32Array), `flush`
+/// thread. Messages in: `pcm` (gen + interleaved Float32Array, N channels), `flush`
 /// (drop everything below gen), `pause`, `vol`. Messages out: `stats` with the
 /// cumulative frames played, frames still buffered, frames of underrun
 /// silence since the last report, and the generations whose first frame
@@ -55,37 +56,42 @@ const WORKLET_TARGET_FRAMES: u64 = 24_000; // 0.5 s at 48 kHz
 /// instant (the flush boundary the clock needs).
 const PROCESSOR_JS: &str = r#"
 class RustPlayerSink extends AudioWorkletProcessor {
-  constructor() {
+  constructor(options) {
     super();
+    // Interleaved channel count of the incoming PCM = this node's output count.
+    this.N = (options && options.outputChannelCount && options.outputChannelCount[0]) || 2;
     this.q = []; this.off = 0; this.played = 0; this.buffered = 0; this.starved = 0;
     this.paused = false; this.vol = 1.0; this.lastGen = -1; this.starts = []; this.tick = 0;
     this.port.onmessage = (e) => {
       const m = e.data;
-      if (m.t === 'pcm') { this.q.push({ gen: m.gen, d: m.d }); this.buffered += m.d.length >> 1; }
+      if (m.t === 'pcm') { this.q.push({ gen: m.gen, d: m.d }); this.buffered += (m.d.length / this.N) | 0; }
       else if (m.t === 'flush') {
         if (this.q.length && this.q[0].gen < m.gen) { this.off = 0; }
         this.q = this.q.filter(c => c.gen >= m.gen);
-        let b = 0; for (const c of this.q) b += c.d.length >> 1; this.buffered = b - (this.off >> 1);
+        let b = 0; for (const c of this.q) b += (c.d.length / this.N) | 0; this.buffered = b - ((this.off / this.N) | 0);
       }
       else if (m.t === 'pause') { this.paused = !!m.v; }
       else if (m.t === 'vol') { this.vol = m.v; }
     };
   }
   process(_inputs, outputs) {
-    const out = outputs[0]; const L = out[0]; const R = out.length > 1 ? out[1] : out[0]; const n = L.length;
+    const out = outputs[0]; const N = Math.min(this.N, out.length); const n = out[0].length;
     let i = 0;
     if (!this.paused) {
       while (i < n && this.q.length) {
         const c = this.q[0]; const d = c.d;
         if (this.off === 0 && c.gen !== this.lastGen) { this.starts.push([c.gen, this.played + i]); this.lastGen = c.gen; }
         const v = this.vol;
-        while (i < n && this.off < d.length) { L[i] = d[this.off] * v; R[i] = d[this.off + 1] * v; this.off += 2; i++; }
+        while (i < n && this.off < d.length) {
+          for (let ch = 0; ch < N; ch++) out[ch][i] = d[this.off + ch] * v;
+          this.off += this.N; i++;
+        }
         if (this.off >= d.length) { this.q.shift(); this.off = 0; }
       }
       this.played += i; this.buffered -= i;
       if (i < n) this.starved += n - i;
     }
-    for (; i < n; i++) { L[i] = 0; R[i] = 0; }
+    for (; i < n; i++) { for (let ch = 0; ch < out.length; ch++) out[ch][i] = 0; }
     this.tick++;
     if (this.starts.length || (this.tick & 7) === 0) {
       this.port.postMessage({ t: 'stats', played: this.played, buffered: this.buffered, starved: this.starved, starts: this.starts });
@@ -242,7 +248,7 @@ pub(super) fn start_thread(
     // (an `AudioContext` created outside a user gesture stays suspended and
     // never renders). See `AudioRenderer::output_running`.
     output_running: Arc<AtomicBool>,
-) -> (Sender<AudioChunk>, u32) {
+) -> (Sender<AudioChunk>, u32, u16) {
     let (sample_sender, sample_receiver) = mpsc::channel::<AudioChunk>(QUEUE_CHUNKS);
 
     let context = match web_sys::AudioContext::new() {
@@ -255,10 +261,20 @@ pub(super) fn start_thread(
             // The null sink drains at real-time pace from the start: it IS the clock.
             output_running.store(true, Ordering::Relaxed);
             start_null_sink(sample_receiver, command_receiver, stop, flush_state, paused_flag, samples_consumed);
-            return (sample_sender, 48_000);
+            return (sample_sender, 48_000, 2);
         }
     };
     let out_rate = context.sample_rate().round() as u32;
+    // Output layout: 5.1 discrete when the destination (the OS output the
+    // browser renders to) offers six or more channels, stereo otherwise. The
+    // decoders mix to this count, so a 5.1 track reaches a 5.1 system intact.
+    let destination = context.destination();
+    let max_channels = destination.max_channel_count();
+    let channels: u16 = if max_channels >= 6 { 6 } else { 2 };
+    if channels > 2 {
+        destination.set_channel_count(channels as u32);
+        destination.set_channel_interpretation(web_sys::ChannelInterpretation::Discrete);
+    }
 
     // Autoplay policy: a context created outside a user gesture starts
     // suspended. Ask; the host's un-pause asks again. Until the first report
@@ -276,6 +292,7 @@ pub(super) fn start_thread(
     crate::rt::spawn(pump(
         SendCell(context),
         out_rate,
+        channels,
         sample_receiver,
         command_receiver,
         stop,
@@ -287,7 +304,7 @@ pub(super) fn start_thread(
         output_running,
     ));
 
-    (sample_sender, out_rate)
+    (sample_sender, out_rate, channels)
 }
 
 /// JS handle carried into a spawned future. Single thread (see rt/web.rs).
@@ -298,6 +315,7 @@ unsafe impl<T> Send for SendCell<T> {}
 async fn pump(
     context: SendCell<web_sys::AudioContext>,
     out_rate: u32,
+    channels: u16,
     mut rx: Receiver<AudioChunk>,
     mut command_receiver: Receiver<AudioRendererCommand>,
     stop: Arc<Notify>,
@@ -309,7 +327,8 @@ async fn pump(
     output_running: Arc<AtomicBool>,
 ) {
     let context = context.0;
-    let node = match setup_worklet(&context).await {
+    let ch = channels.max(1) as u64;
+    let node = match setup_worklet(&context, channels).await {
         Ok(n) => n,
         Err(e) => {
             log::warn!("[audio] AudioWorklet unavailable ({e}) — NULL audio sink (silent playback, real-time drain)");
@@ -329,7 +348,12 @@ async fn pump(
             return;
         }
     };
-    log::info!("[audio] Web Audio output {} Hz / 2 ch (AudioWorklet)", out_rate);
+    log::info!(
+        "[audio] Web Audio output {} Hz / {} ch (AudioWorklet; destination offers {})",
+        out_rate,
+        channels,
+        context.destination().max_channel_count()
+    );
 
     // Worklet → main: played frames (the clock), buffered frames
     // (backpressure), generation starts (flush boundaries), underrun frames.
@@ -360,12 +384,12 @@ async fn pump(
                         let gen = pair.get(0).as_f64().unwrap_or(0.0) as u64;
                         let at = pair.get(1).as_f64().unwrap_or(0.0) as u64;
                         if !flush_state.has_boundary(gen) {
-                            flush_state.mark_boundary(gen, at * 2);
+                            flush_state.mark_boundary(gen, at * ch);
                         }
                     }
                 }
             }
-            samples_consumed.store(played as u64 * 2, Ordering::Release);
+            samples_consumed.store(played as u64 * ch, Ordering::Release);
             buffered.set(get_f64(&m, "buffered").unwrap_or(0.0).max(0.0) as u64);
             diag_starved += get_f64(&m, "starved").unwrap_or(0.0) as u64;
             output_latency_ms.store(context_latency_ms(&ctx), Ordering::Relaxed);
@@ -470,7 +494,7 @@ async fn pump(
             crate::rt::sleep(Duration::from_millis(20)).await;
             continue;
         }
-        buffered.set(buffered.get() + (chunk.samples.len() / 2) as u64);
+        buffered.set(buffered.get() + chunk.samples.len() as u64 / ch);
     }
 
     stop.notify_waiters();
@@ -484,8 +508,11 @@ async fn pump(
 }
 
 /// Load the processor from a Blob URL and create the node (0 inputs, one
-/// stereo output).
-async fn setup_worklet(context: &web_sys::AudioContext) -> Result<web_sys::AudioWorkletNode, String> {
+/// output of `channels` discrete channels).
+async fn setup_worklet(
+    context: &web_sys::AudioContext,
+    channels: u16,
+) -> Result<web_sys::AudioWorkletNode, String> {
     let worklet = context.audio_worklet().map_err(|e| describe(&e))?;
     let parts = Array::new();
     parts.push(&JsValue::from_str(PROCESSOR_JS));
@@ -501,8 +528,13 @@ async fn setup_worklet(context: &web_sys::AudioContext) -> Result<web_sys::Audio
     let node_opts = web_sys::AudioWorkletNodeOptions::new();
     node_opts.set_number_of_inputs(0);
     node_opts.set_number_of_outputs(1);
-    let channels = Array::new();
-    channels.push(&JsValue::from_f64(2.0));
-    node_opts.set_output_channel_count(&channels);
+    let counts = Array::new();
+    counts.push(&JsValue::from_f64(channels.max(1) as f64));
+    node_opts.set_output_channel_count(&counts);
+    if channels > 2 {
+        // Discrete: no speaker up/down-mix between the node and the
+        // destination — channel i of our PCM is channel i of the device.
+        node_opts.set_channel_interpretation(web_sys::ChannelInterpretation::Discrete);
+    }
     web_sys::AudioWorkletNode::new_with_options(context, "rustplayer-sink", &node_opts).map_err(|e| describe(&e))
 }

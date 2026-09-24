@@ -117,6 +117,14 @@ pub trait AudioPassthrough: Send + Sync {
 pub trait AudioSink: Send + Sync + 'static {
     fn put_samples<'a>(&'a self, samples: &'a [f32]) -> impl Future<Output = ()> + Send + 'a;
     fn sample_rate(&self) -> u32;
+    /// Interleaved channel count of the PCM this sink takes — what the output
+    /// device was opened with (2 on a stereo device, 6 on a 5.1 one, …). The
+    /// decoders mix their output to exactly this many channels, so a 5.1
+    /// track reaches a 5.1 device intact and folds down (ITU-R BS.775) only
+    /// where the device is stereo. Default 2 for mocks.
+    fn channels(&self) -> u16 {
+        2
+    }
     /// Media milliseconds the output device has actually PLAYED (samples
     /// consumed by the device callback; pause/underrun silence does not
     /// count). The device crystal is the clock the listener hears, so the

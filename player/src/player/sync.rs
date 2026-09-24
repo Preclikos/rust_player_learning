@@ -714,6 +714,8 @@ pub(super) async fn audio_sync_loop<A: AudioSink>(
     //    discontinuity) is padded and an overlap trimmed, so a dropped 32 ms
     //    frame cannot shift all subsequent audio 32 ms early for good.
     let sample_rate = sink.sample_rate();
+    // Interleaved channel count of the sink's PCM (the decoders mix to it).
+    let channels = sink.channels().max(1) as usize;
     let mut aligner = crate::av_sync::AudioAligner::new(sample_rate, origin_ms + target_pts_ms);
     let mut gap_events = 0u32;
     let mut starving = false;
@@ -774,8 +776,8 @@ pub(super) async fn audio_sync_loop<A: AudioSink>(
         if frame.samples.is_empty() {
             continue;
         }
-        // Stereo interleaved: samples.len() / 2 = per-channel frames.
-        let frames_per_chan = frame.samples.len() / 2;
+        // Interleaved: samples.len() / channels = per-channel frames.
+        let frames_per_chan = frame.samples.len() / channels;
         let was_aligned = aligner.is_aligned();
         let (skip_frames, pad_frames) = match aligner.plan(frame.pts_ms, frames_per_chan) {
             crate::av_sync::AlignAction::Drop => continue,
@@ -804,12 +806,12 @@ pub(super) async fn audio_sync_loop<A: AudioSink>(
                 );
             }
         }
-        let skip_idx = (skip_frames * 2).min(frame.samples.len());
+        let skip_idx = (skip_frames * channels).min(frame.samples.len());
         let trimmed: std::borrow::Cow<'_, [f32]> = if pad_frames == 0 {
             std::borrow::Cow::Borrowed(&frame.samples[skip_idx..])
         } else {
-            let mut buf = Vec::with_capacity(pad_frames * 2 + frame.samples.len() - skip_idx);
-            buf.resize(pad_frames * 2, 0.0_f32);
+            let mut buf = Vec::with_capacity(pad_frames * channels + frame.samples.len() - skip_idx);
+            buf.resize(pad_frames * channels, 0.0_f32);
             buf.extend_from_slice(&frame.samples[skip_idx..]);
             std::borrow::Cow::Owned(buf)
         };

@@ -365,6 +365,12 @@ pub struct AudioDecoderParams {
     pub input_channels: u16,
     /// Target sample rate for the output device (from AudioRenderer::sample_rate()).
     pub output_sample_rate: u32,
+    /// Interleaved channel count the output device takes
+    /// (`AudioSink::channels()`): the decoder mixes to exactly this — a 5.1
+    /// source stays 5.1 on a 6-channel device, folds to stereo on a 2-channel
+    /// one, and a stereo source on a 5.1 device lands in L/R with the rest
+    /// silent (see `pcm::remix`).
+    pub output_channels: u16,
     /// Codec-specific extradata. For AAC this is the 2-byte AudioSpecificConfig
     /// from `esds`. For AC-3 / EAC-3 it is empty — those formats are
     /// self-describing (each frame carries its own syncinfo header), so neither
@@ -372,8 +378,9 @@ pub struct AudioDecoderParams {
     pub codec_specific_data: Vec<u8>,
 }
 
-/// A decoded audio buffer: interleaved stereo f32 PCM samples at
-/// `output_sample_rate`, timestamped in milliseconds.
+/// A decoded audio buffer: interleaved f32 PCM at `output_sample_rate` with
+/// `output_channels` channels (the sink's layout), timestamped in
+/// milliseconds.
 pub struct DecodedAudioFrame {
     pub pts_ms: i64,
     pub samples: Vec<f32>,

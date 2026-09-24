@@ -84,15 +84,22 @@ const contentKey = await crypto.subtle.unwrapKey("raw", k, wrapKey,
 
 ## Server (C#, .NET 10, Newtonsoft.Json) — reference implementation
 
-Drop-in beside the existing `GetLicence`; reuses its KID/Guid helpers
-(`Base64UrlToByteArray`, `FromBigEndianByteArray`, `ToBigEndianByteArray`,
-`ByteArrayToBase64Url`), the `UnitOfWork.Licences` lookup and the existing
-`ContentKey` JWK class extended with `alg` / `iv`.
+Layering mirrors the existing `Get` → `_licenceService.GetLicence(request.Kids)`:
+the controller decodes the JSON/base64url DTOs into internal byte models and
+encodes the result back; the service holds the domain (KID ↔ Guid, `Licences`
+lookup, wrapping) over bytes only; `ClearKeyWrap` is pure cryptography.
+
+### Internal models (`Services/Models`, no JSON, no base64)
 
 ```csharp
-using System.Security.Cryptography;
-using Newtonsoft.Json;
+public sealed record EcPublicKey(byte[] X, byte[] Y);
+public sealed record WrappedKey(byte[] Kid, byte[] Iv, byte[] Wrapped);
+public sealed record WrappedLicence(EcPublicKey ServerKey, byte[] Salt, WrappedKey[] Keys);
+```
 
+### API DTOs (`Models/Licence`)
+
+```csharp
 public class EcPublicJwk
 {
     [JsonProperty("kty")] public string Type { get; set; } = "EC";
@@ -107,7 +114,7 @@ public class WrappedLicenceRequest
     [JsonProperty("epk")] public EcPublicJwk Epk { get; set; } = new();
 }
 
-/// The existing ClearKey JWK, plus the wrapping fields (null on the plain endpoint).
+/// The existing ClearKey JWK plus the wrapping fields.
 public class WrappedContentKey : ContentKey
 {
     [JsonProperty("alg")] public string Alg { get; } = ClearKeyWrap.Alg;
@@ -120,37 +127,63 @@ public class WrappedLicenceResponse
     [JsonProperty("salt")] public string SaltAsBase64Url { get; set; } = "";
     [JsonProperty("keys")] public WrappedContentKey[] Keys { get; set; } = Array.Empty<WrappedContentKey>();
 }
+```
+
+### Shared helpers
+
+`Base64Url` moves out of the service (the controller needs it now); the Guid
+endianness helpers stay in the service — they are the KID ↔ database domain.
+
+```csharp
+public static class Base64Url
+{
+    public static string Encode(byte[] bytes) =>
+        Convert.ToBase64String(bytes).Replace('/', '_').Replace('+', '-').TrimEnd('=');
+
+    public static byte[] Decode(string base64url)
+    {
+        ArgumentNullException.ThrowIfNull(base64url);
+        var padding = new string('=', (4 - base64url.Length % 4) % 4);
+        return Convert.FromBase64String(base64url.Replace('_', '/').Replace('-', '+') + padding);
+    }
+}
+```
+
+(The original `Base64UrlToByteArray` pads with `4 - len % 4` characters, which
+adds four `=` when the length is already a multiple of four; `Convert`
+tolerates it today, the `% 4` above makes it exact.)
+
+### `ClearKeyWrap` (`Services/Crypto`, pure functions over bytes)
+
+```csharp
+using System.Security.Cryptography;
+using System.Text;
 
 public static class ClearKeyWrap
 {
     public const string Alg = "ECDH-HKDF-A256GCM";
     // Must match the client byte-for-byte.
-    private static readonly byte[] HkdfInfo = System.Text.Encoding.ASCII.GetBytes("rustplayer-clearkey-wrap-v1");
-    private const int MaxKidsPerRequest = 16;
+    private static readonly byte[] HkdfInfo = Encoding.ASCII.GetBytes("rustplayer-clearkey-wrap-v1");
 
-    public static ECDiffieHellman ImportPublicJwk(EcPublicJwk jwk)
+    public static ECDiffieHellman ImportPublicKey(EcPublicKey key)
     {
-        if (jwk.Type != "EC" || jwk.Curve != "P-256")
-            throw new ArgumentException("epk must be an EC P-256 JWK");
-        var x = Base64UrlToByteArray(jwk.X);
-        var y = Base64UrlToByteArray(jwk.Y);
-        if (x.Length != 32 || y.Length != 32)
-            throw new ArgumentException("epk coordinates must be 32 bytes");
-        var p = new ECParameters { Curve = ECCurve.NamedCurves.nistP256, Q = new ECPoint { X = x, Y = y } };
+        if (key.X.Length != 32 || key.Y.Length != 32)
+            throw new ArgumentException("P-256 coordinates must be 32 bytes");
+        var p = new ECParameters { Curve = ECCurve.NamedCurves.nistP256, Q = new ECPoint { X = key.X, Y = key.Y } };
         p.Validate(); // rejects points off the curve
         return ECDiffieHellman.Create(p);
     }
 
-    public static EcPublicJwk ExportPublicJwk(ECDiffieHellman key)
+    public static EcPublicKey ExportPublicKey(ECDiffieHellman key)
     {
         var q = key.ExportParameters(false).Q;
-        return new EcPublicJwk { X = ByteArrayToBase64Url(q.X!), Y = ByteArrayToBase64Url(q.Y!) };
+        return new EcPublicKey(q.X!, q.Y!);
     }
 
     /// One wrapping key per response: fresh server ECDH pair + fresh salt.
-    public static (ECDiffieHellman serverKey, byte[] salt, byte[] wrappingKey) DeriveWrappingKey(EcPublicJwk clientEpk)
+    public static (ECDiffieHellman serverKey, byte[] salt, byte[] wrappingKey) DeriveWrappingKey(EcPublicKey clientKey)
     {
-        using var clientPub = ImportPublicJwk(clientEpk);
+        using var clientPub = ImportPublicKey(clientKey);
         var serverKey = ECDiffieHellman.Create(ECCurve.NamedCurves.nistP256);
         // Raw x-coordinate — what WebCrypto deriveBits(ECDH) yields.
         byte[] shared = serverKey.DeriveRawSecretAgreement(clientPub.PublicKey);
@@ -160,79 +193,136 @@ public static class ClearKeyWrap
         return (serverKey, salt, wrappingKey);
     }
 
-    /// k = AES-256-GCM(key, iv, aad = raw kid) ciphertext || 16-byte tag.
+    /// wrapped = AES-256-GCM(key, iv, aad = raw kid) ciphertext || 16-byte tag.
     public static (byte[] iv, byte[] wrapped) Wrap(byte[] wrappingKey, byte[] kid, byte[] contentKey)
     {
         var iv = RandomNumberGenerator.GetBytes(12);
-        var ct = new byte[contentKey.Length];
-        var tag = new byte[16];
+        var wrapped = new byte[contentKey.Length + 16];
         using var gcm = new AesGcm(wrappingKey, tagSizeInBytes: 16);
-        gcm.Encrypt(iv, contentKey, ct, tag, associatedData: kid);
-        var wrapped = new byte[ct.Length + tag.Length];
-        Buffer.BlockCopy(ct, 0, wrapped, 0, ct.Length);
-        Buffer.BlockCopy(tag, 0, wrapped, ct.Length, tag.Length);
+        gcm.Encrypt(iv, contentKey, wrapped.AsSpan(0, contentKey.Length), wrapped.AsSpan(contentKey.Length, 16), kid);
         return (iv, wrapped);
     }
-
-    public static void ValidateRequest(WrappedLicenceRequest req)
-    {
-        if (req.Kids is null || req.Kids.Length == 0 || req.Kids.Length > MaxKidsPerRequest)
-            throw new ArgumentException($"1..{MaxKidsPerRequest} kids per request");
-        if (req.Epk is null) throw new ArgumentException("epk missing");
-    }
 }
-
-// In the licence service, next to GetLicence:
-public async Task<WrappedLicenceResponse> GetWrappedLicence(WrappedLicenceRequest request)
-{
-    ClearKeyWrap.ValidateRequest(request);
-    var (serverKey, salt, wrappingKey) = ClearKeyWrap.DeriveWrappingKey(request.Epk);
-    try
-    {
-        var keys = new List<WrappedContentKey>();
-        foreach (var baseKeyId in request.Kids)
-        {
-            var kidBytes = Base64UrlToByteArray(baseKeyId);
-            if (kidBytes.Length != 16) continue;
-            // Same KID → Guid → Licences lookup as GetLicence.
-            var idKey = Guid.Parse(FromBigEndianByteArray(kidBytes).ToString().Replace("-", ""));
-            var licence = await UnitOfWork.Licences.GetByKeyAsync(idKey.ToString());
-            if (licence == null) continue;
-            // TODO (entitlement): confirm the authenticated user may play the
-            // title this KID belongs to — the existing endpoint's rule applies.
-            var contentKey = ToBigEndianByteArray(Guid.Parse(licence.Value));
-            var (iv, wrapped) = ClearKeyWrap.Wrap(wrappingKey, kidBytes, contentKey);
-            CryptographicOperations.ZeroMemory(contentKey);
-            keys.Add(new WrappedContentKey
-            {
-                IdAsBase64Url = baseKeyId,
-                IvAsBase64Url = ByteArrayToBase64Url(iv),
-                ValueAsBase64Url = ByteArrayToBase64Url(wrapped),
-            });
-        }
-        return new WrappedLicenceResponse
-        {
-            Epk = ClearKeyWrap.ExportPublicJwk(serverKey),
-            SaltAsBase64Url = ByteArrayToBase64Url(salt),
-            Keys = keys.ToArray(),
-        };
-    }
-    finally
-    {
-        CryptographicOperations.ZeroMemory(wrappingKey);
-        serverKey.Dispose();
-    }
-}
-
-// Controller: [Authorize] + [HttpPost("licence/wrapped")] → GetWrappedLicence(request).
-// Add the usual rate limit; the response is cheap but the endpoint hands out
-// entitlements.
 ```
 
-`ContentKey.Type` is a get-only `"oct"` in the existing class; `WrappedContentKey`
-inherits it, so the response keys stay valid ClearKey JWKs for any consumer
-that ignores `alg`/`iv` — and such a consumer would then fail to decrypt,
-which is the intended outcome for a client that does not speak the protocol.
+### `LicenceService`
+
+```csharp
+public interface ILicenceService
+{
+    Task<ContentKey[]> GetLicence(string[] keys);                       // unchanged
+    Task<WrappedLicence> GetWrappedLicence(byte[][] kids, EcPublicKey clientKey);
+    Task SaveLicence(int manifestId, LicenceKeyValue[] keyValuePairs);   // unchanged
+}
+
+public class LicenceService : ILicenceService
+{
+    private const int MaxKidsPerRequest = 16;
+    private readonly IUnitOfWork UnitOfWork;
+    public LicenceService(IUnitOfWork unitOfWork) => UnitOfWork = unitOfWork;
+
+    public async Task<ContentKey[]> GetLicence(string[] keys)
+    {
+        var contentKeys = new List<ContentKey>();
+        foreach (var baseKeyId in keys)
+        {
+            var licence = await FindLicenceByKid(Base64Url.Decode(baseKeyId));
+            if (licence == null) continue;
+            contentKeys.Add(new ContentKey
+            {
+                IdAsBase64Url = baseKeyId,
+                ValueAsBase64Url = Base64Url.Encode(ContentKeyBytes(licence)),
+            });
+        }
+        return contentKeys.ToArray();
+    }
+
+    public async Task<WrappedLicence> GetWrappedLicence(byte[][] kids, EcPublicKey clientKey)
+    {
+        if (kids.Length is 0 or > MaxKidsPerRequest)
+            throw new ArgumentException($"1..{MaxKidsPerRequest} kids per request");
+        var (serverKey, salt, wrappingKey) = ClearKeyWrap.DeriveWrappingKey(clientKey);
+        try
+        {
+            var keys = new List<WrappedKey>();
+            foreach (var kid in kids)
+            {
+                if (kid.Length != 16) continue;
+                var licence = await FindLicenceByKid(kid);
+                if (licence == null) continue;
+                // TODO (entitlement): confirm the authenticated user may play the
+                // title this KID belongs to — the existing endpoint's rule applies.
+                var contentKey = ContentKeyBytes(licence);
+                var (iv, wrapped) = ClearKeyWrap.Wrap(wrappingKey, kid, contentKey);
+                CryptographicOperations.ZeroMemory(contentKey);
+                keys.Add(new WrappedKey(kid, iv, wrapped));
+            }
+            return new WrappedLicence(ClearKeyWrap.ExportPublicKey(serverKey), salt, keys.ToArray());
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(wrappingKey);
+            serverKey.Dispose();
+        }
+    }
+
+    // --- domain: KID bytes ↔ the Guid the Licences table is keyed by ---------
+
+    private Task<Licence?> FindLicenceByKid(byte[] kid)
+    {
+        var idKey = FromBigEndianByteArray(kid);
+        return UnitOfWork.Licences.GetByKeyAsync(idKey.ToString());
+    }
+
+    private static byte[] ContentKeyBytes(Licence licence) =>
+        ToBigEndianByteArray(Guid.Parse(licence.Value));
+
+    // ToBigEndianByteArray / FromBigEndianByteArray / FlipSerializedGuidEndianness
+    // stay exactly as they are today.
+}
+```
+
+`GetByKeyAsync(idKey.ToString())` receives the same value as before: the old
+code went Guid → string → strip dashes → `Guid.Parse` → `ToString()`, which is
+the identity on a Guid.
+
+### Controller
+
+```csharp
+[HttpPost]
+[Produces("application/json")]
+public async Task<LicenseResponse> Get([FromBody] LicenceRequest request) =>
+    new LicenseResponse { SessionType = request.Type, Keys = await _licenceService.GetLicence(request.Kids) };
+
+[HttpPost("wrapped")]
+[Produces("application/json")]
+public async Task<ActionResult<WrappedLicenceResponse>> GetWrapped([FromBody] WrappedLicenceRequest request)
+{
+    if (request.Epk is not { Type: "EC", Curve: "P-256" })
+        return BadRequest("epk must be an EC P-256 JWK");
+
+    var clientKey = new EcPublicKey(Base64Url.Decode(request.Epk.X), Base64Url.Decode(request.Epk.Y));
+    var kids = request.Kids.Select(Base64Url.Decode).ToArray();
+
+    var licence = await _licenceService.GetWrappedLicence(kids, clientKey);
+
+    return new WrappedLicenceResponse
+    {
+        Epk = new EcPublicJwk { X = Base64Url.Encode(licence.ServerKey.X), Y = Base64Url.Encode(licence.ServerKey.Y) },
+        SaltAsBase64Url = Base64Url.Encode(licence.Salt),
+        Keys = licence.Keys.Select(k => new WrappedContentKey
+        {
+            IdAsBase64Url = Base64Url.Encode(k.Kid),
+            IvAsBase64Url = Base64Url.Encode(k.Iv),
+            ValueAsBase64Url = Base64Url.Encode(k.Wrapped),
+        }).ToArray(),
+    };
+}
+```
+
+`[Authorize]` on the controller (or the action) and the usual rate limit; an
+`ArgumentException` from the service maps to 400 through the existing
+exception filter, or catch it here and `BadRequest` it.
 
 ## Operational hardening that matters more than the wrapping
 

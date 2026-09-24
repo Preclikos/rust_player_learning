@@ -580,10 +580,30 @@ impl VideoRenderer {
                     .create_surface_unsafe(wgpu::SurfaceTargetUnsafe::CoreAnimationLayer(layer))
                     .unwrap()
             },
+            // Not `SurfaceTarget::Canvas`: in wgpu 29 that path hands
+            // wgpu-core no display handle, and wgpu-core then refuses the
+            // surface (`CreateSurfaceError::MissingDisplayHandle`) — which
+            // is every browser WITHOUT WebGPU (Safari < 26 → the WebGL2
+            // fallback; Chrome takes the webgpu backend and never sees it).
+            // Upstream trunk fixed `SurfaceTarget::Canvas` by supplying a
+            // `WebDisplayHandle`; this is that fix, applied on our side.
             #[cfg(target_arch = "wasm32")]
-            SurfaceSource::Canvas(canvas) => instance
-                .create_surface(wgpu::SurfaceTarget::Canvas(canvas))
-                .expect("wgpu surface on canvas"),
+            SurfaceSource::Canvas(canvas) => {
+                use raw_window_handle::{WebCanvasWindowHandle, WebDisplayHandle};
+                let value: &wasm_bindgen::JsValue = &canvas;
+                let obj = std::ptr::NonNull::from(value).cast();
+                let raw_window_handle = RawWindowHandle::WebCanvas(WebCanvasWindowHandle::new(obj));
+                let raw_display_handle = RawDisplayHandle::Web(WebDisplayHandle::new());
+                // The surface clones the canvas handle internally, so
+                // `canvas` only has to outlive this call.
+                unsafe {
+                    instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
+                        raw_display_handle: Some(raw_display_handle),
+                        raw_window_handle,
+                    })
+                }
+                .expect("wgpu surface on canvas")
+            }
         };
 
         #[cfg(target_os = "android")]

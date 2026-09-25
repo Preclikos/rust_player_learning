@@ -1227,12 +1227,16 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
     /// clear TV overscan and system bars without the player guessing a
     /// per-device margin.
     ///
-    /// The host should pass the real bottom inset from `WindowInsets`
-    /// (system bars / display cutout / reported overscan). On Android TV,
-    /// where HDMI overscan is usually invisible to the app, the host should
-    /// pass `max(windowInsets.bottom, 0.10 * surfaceHeight)` so the
-    /// title-safe margin still applies. 0 (default, host never called this)
-    /// makes the renderers fall back to a 10% title-safe margin.
+    /// Cues are laid out ExoPlayer-style inside the aspect-fitted picture
+    /// (8 % of the picture height above its bottom edge by default — media3
+    /// `SubtitleView.DEFAULT_BOTTOM_PADDING_FRACTION`). This inset is the
+    /// equivalent of padding that view: it raises the bottom of the layout
+    /// box in surface pixels, so pass the real bottom inset from
+    /// `WindowInsets` (system bars / display cutout / reported overscan).
+    /// On Android TV, where HDMI overscan is usually invisible to the app,
+    /// pass `max(windowInsets.bottom, 0.05 * surfaceHeight)` (the Android
+    /// TV title-safe margin) so cues clear it. 0 (default) = no extra
+    /// padding, i.e. exactly what an ExoPlayer app shows out of the box.
     ///
     /// Takes effect on the next presented frame. Re-call it on every
     /// inset/size change.

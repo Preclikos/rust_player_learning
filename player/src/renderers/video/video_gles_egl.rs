@@ -607,9 +607,8 @@ pub struct GlesOesPendingFrame {
     /// Rasterized cue to draw over the frame; None = no active cue.
     pub subtitle: Option<std::sync::Arc<crate::renderers::subtitle::SubtitleBitmap>>,
     /// Bottom safe-area inset (device px) the host reported for this surface;
-    /// the subtitle quad anchors its bottom edge here so cues clear TV
-    /// overscan / system bars. 0 = host provided none → 10% TV title-safe
-    /// fallback. Sourced from the host's WindowInsets (see
+    /// raises the bottom of the cue layout box (`CueParent`) so cues clear
+    /// TV overscan / system bars. Sourced from the host's WindowInsets (see
     /// Player::set_subtitle_safe_insets).
     pub subtitle_bottom_inset_px: u32,
     pub scale_x: f32,
@@ -1120,6 +1119,8 @@ impl GlesOesRenderer {
                 subtitle.as_deref(),
                 viewport_width,
                 viewport_height,
+                scale_x,
+                scale_y,
                 subtitle_bottom_inset_px,
             );
             return Ok(());
@@ -1252,6 +1253,8 @@ impl GlesOesRenderer {
             subtitle.as_deref(),
             viewport_width,
             viewport_height,
+            scale_x,
+            scale_y,
             subtitle_bottom_inset_px,
         );
 
@@ -1287,15 +1290,20 @@ impl GlesOesRenderer {
         Ok(())
     }
 
-    /// Draw the rasterized cue bottom-center with alpha blending. The
-    /// bitmap is uploaded into the persistent GL texture only when its
-    /// generation changes (texts persist across many frames).
+    /// Draw the rasterized cue with alpha blending, placed by
+    /// `subtitle::cue_quad` inside the picture rect (`scale_x`/`scale_y`
+    /// are the video quad's letterbox factors). The bitmap is uploaded
+    /// into the persistent GL texture only when its generation changes
+    /// (texts persist across many frames).
+    #[allow(clippy::too_many_arguments)]
     unsafe fn draw_subtitle(
         &self,
         gl: &glow::Context,
         bitmap: Option<&crate::renderers::subtitle::SubtitleBitmap>,
         viewport_width: i32,
         viewport_height: i32,
+        scale_x: f32,
+        scale_y: f32,
         bottom_inset_px: u32,
     ) {
         let (Some(bmp), Some(sub)) = (bitmap, &self.subtitle) else {
@@ -1327,29 +1335,23 @@ impl GlesOesRenderer {
         gl.enable(glow::BLEND);
         gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
         gl.use_program(Some(sub.program));
-        // Bottom-center of the FULL surface with a 7% safe area. We always
-        // aspect-FIT (never crop), so the surface's bottom is at or below
-        // the video's bottom: on a letterboxed clip the subtitle sits in
-        // the lower black bar (unobstructed picture); when the video
-        // reaches the bottom edge it sits over the video bottom. Either way
-        // it stays fully on-screen — clamp guards against a very tall cue.
-        let half_w = bmp.width as f32 / viewport_width as f32;
-        let half_h = bmp.height as f32 / viewport_height as f32;
-        // Anchor the cue's bottom edge to the host-reported bottom safe area
-        // (real screen geometry — WindowInsets, which on a TV the host maxes
-        // with the title-safe margin so HDMI overscan that the OS can't see is
-        // still cleared). bottom_inset_px == 0 means the host gave none, so we
-        // fall back to a 10% TV title-safe margin (the Streamer clips ~7%, so
-        // a smaller default would be eaten). Clamp so a tall multi-line cue
-        // can't run off the top edge.
-        let safe_frac = if bottom_inset_px > 0 {
-            (bottom_inset_px as f32 / viewport_height as f32).clamp(0.0, 0.45)
-        } else {
-            0.10
-        };
-        let center_y = (-1.0 + 2.0 * safe_frac + half_h).min(1.0 - half_h);
+        // Same geometry as the wgpu overlay: the cue lives inside the
+        // aspect-fitted picture (ExoPlayer's SubtitleView sits inside the
+        // AspectRatioFrameLayout), 8% of the picture height above its
+        // bottom by default, the host inset raising that bottom edge for
+        // system bars / TV overscan. In direct mode the OS fits the video
+        // plane to the same window, so the picture rect is the same.
+        let parent = crate::renderers::subtitle::CueParent::from_scale(
+            viewport_width as u32,
+            viewport_height as u32,
+            scale_x,
+            scale_y,
+            bottom_inset_px,
+        );
+        let [center_x, center_y, half_w, half_h] =
+            crate::renderers::subtitle::cue_quad(bmp, &parent);
         if let Some(ref loc) = sub.rect_loc {
-            gl.uniform_4_f32(Some(loc), 0.0, center_y, half_w, half_h);
+            gl.uniform_4_f32(Some(loc), center_x, center_y, half_w, half_h);
         }
         gl.bind_vertex_array(Some(self.vao));
         gl.draw_arrays(glow::TRIANGLES, 0, 6);

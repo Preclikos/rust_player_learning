@@ -5,10 +5,14 @@
 //! raw WebVTT text inside `mdat`. The entry point [`parse_segment`] sniffs
 //! both forms.
 //!
-//! Phase 1 scope: plain-text cues only. We strip any inline tags
-//! (`<b>`, `<i>`, `<c.classname>` …) so the renderer just gets readable
-//! UTF-8. Cue settings (`line:`, `position:`, `align:`) are parsed for
-//! future use but currently ignored by the overlay.
+//! Text scope: plain-text cues. We strip any inline tags (`<b>`, `<i>`,
+//! `<c.classname>` …) so the renderer just gets readable UTF-8. Cue
+//! settings (`line:`, `position:`, `align:`, `size:`) are parsed into
+//! [`CueLayout`] and drive where the overlay puts the cue — the same
+//! fields, defaults and derivations as ExoPlayer's `WebvttCueParser`
+//! (`Cue.line`/`lineType`/`lineAnchor`, `position`/`positionAnchor`,
+//! `size`, `textAlignment`). `region:` and `vertical:` are accepted and
+//! ignored (vertical text renders horizontally).
 
 use std::time::Duration;
 use unicode_normalization::UnicodeNormalization;
@@ -25,6 +29,187 @@ pub struct VttCue {
     /// Raw cue settings string ("line:90% position:50% align:center").
     /// Empty when the cue had none.
     pub settings: String,
+    /// `settings` parsed — what the overlay actually positions by.
+    pub layout: CueLayout,
+}
+
+/// Where a cue goes, from its WebVTT cue settings. Field for field what
+/// ExoPlayer's `WebvttCueParser` fills on `Cue`, with the same defaults
+/// when a setting is absent or malformed (that setting is skipped, the
+/// rest still apply).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CueLayout {
+    /// `line:` — `Auto` when absent (renderer default placement).
+    pub line: CueLine,
+    /// `line:…,start|center|end` — which edge of the cue box `line` pins.
+    pub line_anchor: Anchor,
+    /// `position:` as a fraction `0..=1` of the parent width; `None` =
+    /// derived from `align` (left → 0, right → 1, else 0.5).
+    pub position: Option<f32>,
+    /// `position:…,line-left|center|line-right`; `None` = derived from
+    /// `align` (left/start → Start, right/end → End, else Middle).
+    pub position_anchor: Option<Anchor>,
+    /// `align:` — text alignment inside the cue box. Default center.
+    pub align: TextAlign,
+    /// `size:` as a fraction `0..=1` of the available width. Default 1.
+    pub size: f32,
+    /// A `vertical:` setting was present (rendered horizontally anyway).
+    pub vertical: bool,
+}
+
+/// `line:` value.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CueLine {
+    /// No `line:` — the renderer's default (bottom padding) placement.
+    Auto,
+    /// `line:N%` — fraction `0..=1` of the parent height (`Cue.LINE_TYPE_FRACTION`).
+    Fraction(f32),
+    /// `line:N` — line number; `0` = first line at the top, `-1` = last
+    /// line at the bottom (`Cue.LINE_TYPE_NUMBER`).
+    Number(i32),
+}
+
+/// `Cue.ANCHOR_TYPE_*`: which edge of the cue box an anchor coordinate pins.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Anchor {
+    Start,
+    Middle,
+    End,
+}
+
+/// `align:` values. `Start`/`End` follow the text direction; the overlay
+/// has no bidi layout and treats them as left/right.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TextAlign {
+    Start,
+    Center,
+    End,
+    Left,
+    Right,
+}
+
+impl CueLayout {
+    pub const DEFAULT: Self = Self {
+        line: CueLine::Auto,
+        line_anchor: Anchor::Start,
+        position: None,
+        position_anchor: None,
+        align: TextAlign::Center,
+        size: 1.0,
+        vertical: false,
+    };
+
+    /// Parse a cue settings string (`line:90% position:50%,line-left
+    /// align:center size:80%`). Unknown names and malformed values are
+    /// skipped individually, like ExoPlayer's per-setting `try/catch`.
+    pub fn parse(settings: &str) -> Self {
+        let mut l = Self::DEFAULT;
+        for setting in settings.split_ascii_whitespace() {
+            let Some((name, value)) = setting.split_once(':') else { continue };
+            match name {
+                "line" => {
+                    let (value, anchor) = split_anchor(value);
+                    if let Some(a) = anchor.and_then(parse_line_anchor) {
+                        l.line_anchor = a;
+                    }
+                    if let Some(pct) = value.strip_suffix('%') {
+                        if let Some(f) = parse_fraction(pct) {
+                            l.line = CueLine::Fraction(f);
+                        }
+                    } else if let Ok(n) = value.parse::<i32>() {
+                        l.line = CueLine::Number(n);
+                    }
+                }
+                "position" => {
+                    let (value, anchor) = split_anchor(value);
+                    if let Some(a) = anchor.and_then(parse_position_anchor) {
+                        l.position_anchor = Some(a);
+                    }
+                    if let Some(f) = value.strip_suffix('%').and_then(parse_fraction) {
+                        l.position = Some(f);
+                    }
+                }
+                "size" => {
+                    if let Some(f) = value.strip_suffix('%').and_then(parse_fraction) {
+                        l.size = f;
+                    }
+                }
+                "align" => {
+                    l.align = match value {
+                        "start" => TextAlign::Start,
+                        "center" | "middle" => TextAlign::Center,
+                        "end" => TextAlign::End,
+                        "left" => TextAlign::Left,
+                        "right" => TextAlign::Right,
+                        _ => l.align,
+                    }
+                }
+                "vertical" => l.vertical = matches!(value, "rl" | "lr"),
+                _ => {}
+            }
+        }
+        l
+    }
+
+    /// Effective `position` (fraction) — explicit, else derived from
+    /// `align` exactly as `WebvttCueParser.derivePosition`.
+    pub fn position_or_derived(&self) -> f32 {
+        self.position.unwrap_or(match self.align {
+            TextAlign::Left => 0.0,
+            TextAlign::Right => 1.0,
+            _ => 0.5,
+        })
+    }
+
+    /// Effective position anchor — explicit, else derived from `align`
+    /// exactly as `WebvttCueParser.derivePositionAnchor`.
+    pub fn position_anchor_or_derived(&self) -> Anchor {
+        self.position_anchor.unwrap_or(match self.align {
+            TextAlign::Left | TextAlign::Start => Anchor::Start,
+            TextAlign::Right | TextAlign::End => Anchor::End,
+            TextAlign::Center => Anchor::Middle,
+        })
+    }
+}
+
+impl Default for CueLayout {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// `value[,anchor]` → (`value`, `Some(anchor)`).
+fn split_anchor(value: &str) -> (&str, Option<&str>) {
+    match value.split_once(',') {
+        Some((v, a)) => (v, Some(a)),
+        None => (value, None),
+    }
+}
+
+/// `"12.5"` (the part before `%`) → `0.125`; out-of-range or non-numeric → None.
+fn parse_fraction(pct: &str) -> Option<f32> {
+    pct.parse::<f32>()
+        .ok()
+        .filter(|f| f.is_finite() && (0.0..=100.0).contains(f))
+        .map(|f| f / 100.0)
+}
+
+fn parse_line_anchor(s: &str) -> Option<Anchor> {
+    match s {
+        "start" => Some(Anchor::Start),
+        "center" => Some(Anchor::Middle),
+        "end" => Some(Anchor::End),
+        _ => None,
+    }
+}
+
+fn parse_position_anchor(s: &str) -> Option<Anchor> {
+    match s {
+        "line-left" => Some(Anchor::Start),
+        "center" => Some(Anchor::Middle),
+        "line-right" => Some(Anchor::End),
+        _ => None,
+    }
 }
 
 impl VttCue {
@@ -167,11 +352,13 @@ pub(crate) fn parse_cue_block(block: &str) -> Option<VttCue> {
     // (NFD) to precomposed code points (NFC) so diacritics render as a
     // single glyph the font actually carries.
     let text: String = text.nfc().collect();
+    let layout = CueLayout::parse(&settings);
     Some(VttCue {
         start_ms,
         end_ms,
         text,
         settings,
+        layout,
     })
 }
 
@@ -410,11 +597,13 @@ fn parse_vttc(body: &[u8], start_ms: i64, end_ms: i64) -> Option<VttCue> {
     }
     // Same NFC fold-down as the raw-WebVTT path — see parse_cue_block.
     let payload: String = payload.nfc().collect();
+    let layout = CueLayout::parse(&settings);
     Some(VttCue {
         start_ms,
         end_ms,
         text: payload,
         settings,
+        layout,
     })
 }
 
@@ -431,6 +620,48 @@ mod tests {
         assert_eq!(cues[0].end_ms, 4000);
         assert_eq!(cues[0].text, "Hello world");
         assert_eq!(cues[1].settings, "align:center");
+        assert_eq!(cues[1].layout.align, TextAlign::Center);
+        assert_eq!(cues[0].layout, CueLayout::DEFAULT);
+    }
+
+    #[test]
+    fn cue_settings_map_like_exoplayers_webvtt_cue_parser() {
+        // Absent → the same defaults WebvttCueParser starts from.
+        assert_eq!(CueLayout::parse(""), CueLayout::DEFAULT);
+
+        let l = CueLayout::parse("line:90% position:20%,line-left align:left size:60%");
+        assert_eq!(l.line, CueLine::Fraction(0.9));
+        assert_eq!(l.line_anchor, Anchor::Start);
+        assert_eq!(l.position, Some(0.2));
+        assert_eq!(l.position_anchor, Some(Anchor::Start));
+        assert_eq!(l.align, TextAlign::Left);
+        assert!((l.size - 0.6).abs() < 1e-6);
+
+        // Integer line numbers, negative counts from the bottom; the
+        // anchor suffix applies to percentages and numbers alike.
+        assert_eq!(CueLayout::parse("line:-2").line, CueLine::Number(-2));
+        let l = CueLayout::parse("line:0,end");
+        assert_eq!(l.line, CueLine::Number(0));
+        assert_eq!(l.line_anchor, Anchor::End);
+        assert_eq!(CueLayout::parse("line:50%,center").line_anchor, Anchor::Middle);
+
+        // Derived position/anchor follow the alignment when unset.
+        let right = CueLayout::parse("align:right");
+        assert_eq!(right.position_or_derived(), 1.0);
+        assert_eq!(right.position_anchor_or_derived(), Anchor::End);
+        let start = CueLayout::parse("align:start");
+        assert_eq!(start.position_or_derived(), 0.5);
+        assert_eq!(start.position_anchor_or_derived(), Anchor::Start);
+        assert_eq!(CueLayout::DEFAULT.position_or_derived(), 0.5);
+        assert_eq!(CueLayout::DEFAULT.position_anchor_or_derived(), Anchor::Middle);
+
+        // Malformed values skip only that setting; the rest still apply.
+        let l = CueLayout::parse("line:abc position:150% size:x% align:right vertical:rl region:r1");
+        assert_eq!(l.line, CueLine::Auto);
+        assert_eq!(l.position, None);
+        assert_eq!(l.size, 1.0);
+        assert_eq!(l.align, TextAlign::Right);
+        assert!(l.vertical);
     }
 
     #[test]

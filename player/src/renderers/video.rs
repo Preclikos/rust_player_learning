@@ -1494,6 +1494,20 @@ impl VideoRenderer {
         vertex_buffer: &wgpu::Buffer,
         overlay_snapshot: Option<Arc<super::subtitle::SubtitleOverlay>>,
     ) {
+        // Cue layout box: the aspect-fitted picture (same fit as the video
+        // quad's vertex buffer) minus the host's bottom inset. Resolved
+        // before the pass so no await sits inside the render-pass scope.
+        let cue_parent = {
+            let frame = *self.frame_size.read().await;
+            super::subtitle::CueParent::fit(
+                target_w,
+                target_h,
+                frame.width,
+                frame.height,
+                self.subtitle_safe_bottom_px
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )
+        };
         let mut encoder = self.device.create_command_encoder(&Default::default());
 
         if let Some(detect_group) = detect_bind_group {
@@ -1540,13 +1554,7 @@ impl VideoRenderer {
             render_pass.draw(0..6, 0..1);
 
             if let Some(overlay) = overlay_snapshot {
-                overlay.draw_into(
-                    &mut render_pass,
-                    target_w,
-                    target_h,
-                    self.subtitle_safe_bottom_px
-                        .load(std::sync::atomic::Ordering::Relaxed),
-                );
+                overlay.draw_into(&mut render_pass, &cue_parent);
             }
         }
 
@@ -1563,9 +1571,25 @@ impl VideoRenderer {
             return;
         }
         let size = self.inner_size();
+        // Direct mode: the video plane below is aspect-fitted by the OS to
+        // the same window, so the picture rect follows from the content
+        // size exactly as on the GLES path.
+        let inset = self
+            .subtitle_safe_bottom_px
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let frame = *self.frame_size.read().await;
+        let (scale_x, scale_y) = Self::aspect_fit_scale(size, frame);
         let subtitle = {
             let overlay = self.subtitle_overlay.lock().unwrap().clone();
-            overlay.and_then(|o| o.active_bitmap(size.width, size.height))
+            overlay.and_then(|o| {
+                o.active_bitmap(&super::subtitle::CueParent::from_scale(
+                    size.width,
+                    size.height,
+                    scale_x,
+                    scale_y,
+                    inset,
+                ))
+            })
         };
         let gen = subtitle.as_ref().map(|b| b.generation).unwrap_or(0);
         if self
@@ -1590,16 +1614,14 @@ impl VideoRenderer {
             let mut pending = self.gles_oes_pending.lock().unwrap();
             *pending = Some(video_gles_egl::GlesOesPendingFrame {
                 ahb_ptr: 0,
-                scale_x: 1.0,
-                scale_y: 1.0,
+                scale_x,
+                scale_y,
                 tex_x_max: 1.0,
                 tex_y_max: 1.0,
                 desired_present_ns: 0,
                 mode: video_gles_egl::OesRenderMode::Sdr,
                 subtitle,
-                subtitle_bottom_inset_px: self
-                    .subtitle_safe_bottom_px
-                    .load(std::sync::atomic::Ordering::Relaxed),
+                subtitle_bottom_inset_px: inset,
             });
         }
         self.queue.submit([]);
@@ -1768,6 +1790,22 @@ impl VideoRenderer {
             .command_sender
             .send(VideoRendererCommand::Resize(new_size))
             .await;
+    }
+
+    /// Aspect-FIT scale of a `frame`-sized picture into `window` — the
+    /// letterbox/pillarbox factors ∈ (0, 1]. Unknown frame size → (1, 1).
+    fn aspect_fit_scale(window: PhysicalSize<u32>, frame: PhysicalSize<u32>) -> (f32, f32) {
+        if frame.width > 0 && frame.height > 0 && window.width > 0 && window.height > 0 {
+            let wa = window.width as f32 / window.height as f32;
+            let fa = frame.width as f32 / frame.height as f32;
+            if fa > wa {
+                (1.0_f32, wa / fa)
+            } else {
+                (fa / wa, 1.0_f32)
+            }
+        } else {
+            (1.0_f32, 1.0_f32)
+        }
     }
 
     pub async fn change_frame_size(&self, new_size: PhysicalSize<u32>) {
@@ -2650,17 +2688,7 @@ impl VideoRenderer {
         let frame_size = *self.frame_size.read().await;
         let tex_x_max = *self.tex_x_max.read().await;
         let tex_y_max = *self.tex_y_max.read().await;
-        let (scale_x, scale_y) = if frame_size.width > 0 && frame_size.height > 0 {
-            let wa = window_size.width as f32 / window_size.height as f32;
-            let fa = frame_size.width as f32 / frame_size.height as f32;
-            if fa > wa {
-                (1.0_f32, wa / fa)
-            } else {
-                (fa / wa, 1.0_f32)
-            }
-        } else {
-            (1.0_f32, 1.0_f32)
-        };
+        let (scale_x, scale_y) = Self::aspect_fit_scale(window_size, frame_size);
 
         // HDR passthrough: when the display can present HDR10 natively,
         // switch the surface dataspace to BT2020_PQ on the first PQ frame
@@ -2755,10 +2783,20 @@ impl VideoRenderer {
             video_gles_egl::OesRenderMode::Sdr
         };
 
-        // Active subtitle cue for this frame (None = no cue / no track).
+        // Active subtitle cue for this frame (None = no cue / no track),
+        // rasterized for the picture rect the hook will place it in.
         let subtitle = {
             let overlay = self.subtitle_overlay.lock().unwrap().clone();
-            overlay.and_then(|o| o.active_bitmap(window_size.width, window_size.height))
+            overlay.and_then(|o| {
+                o.active_bitmap(&super::subtitle::CueParent::from_scale(
+                    window_size.width,
+                    window_size.height,
+                    scale_x,
+                    scale_y,
+                    self.subtitle_safe_bottom_px
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                ))
+            })
         };
 
         // Publish frame data for the present hook to consume.

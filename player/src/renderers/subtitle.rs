@@ -1,8 +1,11 @@
 //! WebVTT subtitle overlay rendered via wgpu.
 //!
-//! Phase 1 scope: plain white text with a dark drop shadow, bottom-center,
-//! fixed proportional size. No styling, no positioning, no language
-//! mixing — just makes cues readable.
+//! Text is plain (white with a dark drop shadow by default, `SubtitleStyle`
+//! for colours/size); placement follows the cue's WebVTT settings
+//! (`line:`, `position:`, `align:`, `size:`) with ExoPlayer's geometry —
+//! see [`CueParent`] and [`place_cue`], which are a port of media3's
+//! `SubtitlePainter.setupTextLayout` so the same cue lands where an
+//! ExoPlayer app shows it.
 //!
 //! Pipeline:
 //!   1. `queue_cues` — text_play task pushes parsed cues here as they
@@ -35,11 +38,189 @@ use std::sync::{Arc, Mutex};
 
 use wgpu::util::DeviceExt;
 
-use crate::parsers::vtt::VttCue;
+use crate::parsers::vtt::{Anchor, CueLayout, CueLine, VttCue};
 use crate::SubtitleStyle;
 
 // CPU cue rasterization (fontdue) lives in its own file (mirrors `video`).
 mod rasterizer;
+
+// ---------------------------------------------------------------------------
+// Geometry — a port of media3 `SubtitleView` / `SubtitlePainter` defaults so
+// cues sit where ExoPlayer puts them. Keep the numbers in sync with upstream:
+// libraries/ui/src/main/java/androidx/media3/ui/SubtitleView.java and
+// SubtitlePainter.java.
+// ---------------------------------------------------------------------------
+
+/// `SubtitleView.DEFAULT_TEXT_SIZE_FRACTION`: text size as a fraction of the
+/// parent (padded picture) height.
+pub(crate) const TEXT_SIZE_FRACTION: f32 = 0.0533;
+/// `SubtitleView.DEFAULT_BOTTOM_PADDING_FRACTION`: how far above the parent's
+/// bottom edge a cue without `line:` sits, as a fraction of the parent height.
+pub(crate) const BOTTOM_PADDING_FRACTION: f32 = 0.08;
+/// `SubtitlePainter.INNER_PADDING_RATIO`: horizontal box padding relative to
+/// the text size.
+pub(crate) const INNER_PADDING_RATIO: f32 = 0.125;
+
+/// The rectangle cues are laid out in, in target (surface) pixels.
+///
+/// ExoPlayer's `SubtitleView` lives inside `PlayerView`'s
+/// `AspectRatioFrameLayout`, so its parent rect is the aspect-fitted
+/// picture — not the screen. A 2.39:1 film on a 16:9 screen gets its cues
+/// inside the picture, `BOTTOM_PADDING_FRACTION` of the *picture* height
+/// above the picture's bottom edge, never down in the letterbox bar. The
+/// host's bottom inset (`Player::set_subtitle_safe_insets`: system bars,
+/// TV overscan) plays the role of the view's bottom padding: it raises the
+/// parent's bottom edge, and — as in `CanvasSubtitleOutput`, which resolves
+/// the text size against `viewHeightMinusPadding` — shrinks the height the
+/// text size is derived from.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CueParent {
+    pub target_w: u32,
+    pub target_h: u32,
+    pub left: f32,
+    pub top: f32,
+    pub right: f32,
+    pub bottom: f32,
+}
+
+impl CueParent {
+    /// From the aspect-fit scale the video quad is drawn with (`scale_x`,
+    /// `scale_y` ∈ (0, 1], the letterbox factors) — what the GLES hook has.
+    pub fn from_scale(
+        target_w: u32,
+        target_h: u32,
+        scale_x: f32,
+        scale_y: f32,
+        bottom_inset_px: u32,
+    ) -> Self {
+        let tw = target_w as f32;
+        let th = target_h as f32;
+        let sane = |s: f32| if s.is_finite() && s > 0.0 { s.min(1.0) } else { 1.0 };
+        let pw = (tw * sane(scale_x)).round();
+        let ph = (th * sane(scale_y)).round();
+        let left = ((tw - pw) / 2.0).floor();
+        let top = ((th - ph) / 2.0).floor();
+        // Clamp the inset like the old path did so a bogus inset can't push
+        // the whole layout box off the top of the screen.
+        let inset = (bottom_inset_px as f32).min(th * 0.45);
+        let bottom = (top + ph).min(th - inset).max(top + 1.0);
+        Self {
+            target_w,
+            target_h,
+            left,
+            top,
+            right: left + pw,
+            bottom,
+        }
+    }
+
+    /// From the content (frame) size; 0×0 = unknown → the whole target.
+    pub fn fit(
+        target_w: u32,
+        target_h: u32,
+        content_w: u32,
+        content_h: u32,
+        bottom_inset_px: u32,
+    ) -> Self {
+        let (scale_x, scale_y) = if content_w > 0 && content_h > 0 && target_w > 0 && target_h > 0 {
+            let wa = target_w as f32 / target_h as f32;
+            let fa = content_w as f32 / content_h as f32;
+            if fa > wa {
+                (1.0, wa / fa)
+            } else {
+                (fa / wa, 1.0)
+            }
+        } else {
+            (1.0, 1.0)
+        };
+        Self::from_scale(target_w, target_h, scale_x, scale_y, bottom_inset_px)
+    }
+
+    /// Layout box size the rasterizer works in.
+    pub fn width(&self) -> u32 {
+        (self.right - self.left).round().max(1.0) as u32
+    }
+
+    pub fn height(&self) -> u32 {
+        (self.bottom - self.top).round().max(1.0) as u32
+    }
+}
+
+/// Top-left corner (target px) of a `bmp_w`×`bmp_h` cue bitmap inside
+/// `parent`, per the cue's settings. Line by line
+/// `SubtitlePainter.setupTextLayout`:
+///
+/// * horizontal: anchor at `position` × parent width, the box's
+///   start/middle/end edge on it, then clamped into the parent;
+/// * `line:N%`: anchor at N × parent height, the box's start/middle/end
+///   edge on it (`line_anchor`);
+/// * `line:N` (integer): `N ≥ 0` → N line heights below the top,
+///   `N < 0` → the box's bottom `(N+1)` line heights above the bottom
+///   (`-1` = flush with it);
+/// * no `line:` → `BOTTOM_PADDING_FRACTION` of the parent height above the
+///   bottom;
+/// * finally clamped into the parent (bottom first, then top).
+pub fn place_cue(
+    bmp_w: u32,
+    bmp_h: u32,
+    line_height_px: u32,
+    layout: &CueLayout,
+    parent: &CueParent,
+) -> (f32, f32) {
+    let w = bmp_w as f32;
+    let h = bmp_h as f32;
+    let pw = parent.right - parent.left;
+    let ph = parent.bottom - parent.top;
+
+    let anchor_x = (pw * layout.position_or_derived()).round() + parent.left;
+    let x = match layout.position_anchor_or_derived() {
+        Anchor::Start => anchor_x,
+        Anchor::Middle => anchor_x - w / 2.0,
+        Anchor::End => anchor_x - w,
+    };
+    // media3 only clamps the left edge and clips the right; keeping the
+    // whole box visible is the friendlier reading of the same intent.
+    let x = x.min(parent.right - w).max(parent.left);
+
+    let lh = line_height_px as f32;
+    let mut y = match layout.line {
+        CueLine::Fraction(f) => {
+            let anchor_y = (ph * f).round() + parent.top;
+            match layout.line_anchor {
+                Anchor::Start => anchor_y,
+                Anchor::Middle => anchor_y - h / 2.0,
+                Anchor::End => anchor_y - h,
+            }
+        }
+        CueLine::Number(n) if n >= 0 => (n as f32 * lh).round() + parent.top,
+        CueLine::Number(n) => ((n + 1) as f32 * lh).round() + parent.bottom - h,
+        CueLine::Auto => parent.bottom - h - (ph * BOTTOM_PADDING_FRACTION).floor(),
+    };
+    if y + h > parent.bottom {
+        y = parent.bottom - h;
+    }
+    if y < parent.top {
+        y = parent.top;
+    }
+    (x, y)
+}
+
+/// The quad both draw paths share: `[center_x, center_y, half_w, half_h]`
+/// in NDC (y up) for `bitmap` placed by [`place_cue`] on `parent`'s target.
+pub fn cue_quad(bitmap: &SubtitleBitmap, parent: &CueParent) -> [f32; 4] {
+    let (x, y) = place_cue(bitmap.width, bitmap.height, bitmap.line_height_px, &bitmap.layout, parent);
+    let tw = parent.target_w as f32;
+    let th = parent.target_h as f32;
+    let bw = bitmap.width as f32;
+    let bh = bitmap.height as f32;
+    // Half-extent in NDC = (px/2) / (target/2) = px / target.
+    [
+        (x + bw / 2.0) / tw * 2.0 - 1.0,
+        1.0 - (y + bh / 2.0) / th * 2.0,
+        bw / tw,
+        bh / th,
+    ]
+}
 
 const SHADER_WGSL: &str = r#"
 struct VertexOut {
@@ -180,8 +361,9 @@ struct Inner {
     /// wanted. Both draw paths read from here and never rasterize.
     ready: Vec<std::sync::Arc<SubtitleBitmap>>,
     generation: u64,
-    /// Surface size the render path last drew at. The worker needs it to
-    /// size a cue, so before the first draw (0×0) it has nothing to do.
+    /// Layout box (`CueParent` width/height) the render path last drew
+    /// at. The worker needs it to size a cue, so before the first draw
+    /// (0×0) it has nothing to do.
     target_w: u32,
     target_h: u32,
     /// Cue indices the worker was last asked to have ready — `[active,
@@ -248,10 +430,15 @@ impl Inner {
     /// produced one. The 5% width tolerance matches the old cache rule:
     /// a window drag resizes continuously and re-rasterizing on every
     /// pixel would be pointless churn.
-    fn ready_for(&self, text: &str, target_w: u32) -> Option<&std::sync::Arc<SubtitleBitmap>> {
+    fn ready_for(
+        &self,
+        text: &str,
+        layout: &CueLayout,
+        target_w: u32,
+    ) -> Option<&std::sync::Arc<SubtitleBitmap>> {
         self.ready
             .iter()
-            .find(|b| b.text == text && width_close(b.target_w, target_w))
+            .find(|b| b.text == text && b.layout == *layout && width_close(b.target_w, target_w))
     }
 
     /// Record the surface size the render path is drawing at. Returns
@@ -290,7 +477,12 @@ pub struct SubtitleBitmap {
     /// Monotonic content identity — changes whenever the visible bitmap
     /// changes. Lets callers cache uploads and detect updates cheaply.
     pub generation: u64,
-    /// Identity for cache validation (mirrors CachedCue).
+    /// One text line's height, for `line:N` placement (see `place_cue`).
+    pub line_height_px: u32,
+    /// The cue's placement settings — `cue_quad` positions by them.
+    pub layout: CueLayout,
+    /// Identity for cache validation: same text + same settings at about
+    /// the same parent width = same bitmap.
     text: String,
     target_w: u32,
 }
@@ -509,15 +701,13 @@ impl SubtitleOverlay {
     /// GLES-hook variant of `draw_into`: the bitmap for the cue active at
     /// the current PTS, or `None` when there's nothing to show (no cue, or
     /// the worker hasn't caught up yet after a seek). `generation`
-    /// identifies the content so the hook can skip redundant uploads.
+    /// identifies the content so the hook can skip redundant uploads; the
+    /// hook places it with [`cue_quad`] on the same `parent`.
     ///
     /// Pure lookup — no rasterization, no allocation. Runs on the render
     /// thread for every frame.
-    pub fn active_bitmap(
-        &self,
-        target_w: u32,
-        target_h: u32,
-    ) -> Option<std::sync::Arc<SubtitleBitmap>> {
+    pub fn active_bitmap(&self, parent: &CueParent) -> Option<std::sync::Arc<SubtitleBitmap>> {
+        let (target_w, target_h) = (parent.width(), parent.height());
         let (bitmap, resized) = {
             let mut inner = self.shared.inner.lock().unwrap();
             let resized = inner.note_target(target_w, target_h);
@@ -527,8 +717,8 @@ impl SubtitleOverlay {
                 .and_then(|idx| {
                     // Borrow the text for the lookup; nothing is cloned
                     // unless we actually have a bitmap to hand back.
-                    let text = inner.cues[idx].text.as_str();
-                    inner.ready_for(text, target_w)
+                    let cue = &inner.cues[idx];
+                    inner.ready_for(cue.text.as_str(), &cue.layout, target_w)
                 })
                 .cloned();
             (bitmap, resized)
@@ -574,24 +764,19 @@ impl SubtitleOverlay {
 
     /// Issue the draw into a caller-owned render pass. The caller has
     /// already attached the surface color target; we just emit one
-    /// textured-quad draw at the bottom-center of the viewport.
+    /// textured-quad draw placed by [`cue_quad`] inside `parent`.
     ///
-    /// `target_w`/`target_h` are pixel dimensions of the surface, used to
-    /// place the quad and to tell the worker what size to rasterize at.
+    /// `parent` is the layout box (picture rect minus insets) on the
+    /// surface being drawn; its size is what the worker rasterizes at.
     ///
     /// Draws whatever the worker has ready for the active cue. Nothing
     /// ready (no cue, or a seek the worker hasn't caught up with) simply
     /// draws nothing this frame.
-    pub fn draw_into(
-        &self,
-        render_pass: &mut wgpu::RenderPass<'_>,
-        target_w: u32,
-        target_h: u32,
-        bottom_inset_px: u32,
-    ) {
-        if target_w == 0 || target_h == 0 {
+    pub fn draw_into(&self, render_pass: &mut wgpu::RenderPass<'_>, parent: &CueParent) {
+        if parent.target_w == 0 || parent.target_h == 0 {
             return;
         }
+        let (target_w, target_h) = (parent.width(), parent.height());
         // No rasterizer thread (the browser build, or a spawn failure):
         // bake the wanted cue right here. Cue changes are rare (seconds
         // apart) and one rasterization is a few ms, so paying it on the
@@ -606,8 +791,8 @@ impl SubtitleOverlay {
             let bitmap = inner
                 .active_index(pts)
                 .and_then(|idx| {
-                    let text = inner.cues[idx].text.as_str();
-                    inner.ready_for(text, target_w)
+                    let cue = &inner.cues[idx];
+                    inner.ready_for(cue.text.as_str(), &cue.layout, target_w)
                 })
                 .cloned();
             (bitmap, resized)
@@ -621,24 +806,9 @@ impl SubtitleOverlay {
             _ => return,
         };
 
-        // Position: bottom-center, anchored to the host-reported bottom safe
-        // area (real screen geometry via WindowInsets; on a TV the host maxes
-        // it with the title-safe margin so invisible HDMI overscan is still
-        // cleared). bottom_inset_px == 0 → 10% TV title-safe fallback. Kept in
-        // parity with the GLES path.
-        let tw = target_w as f32;
-        let th = target_h as f32;
-        // Half-extent in NDC = (px/2) / (target/2) = px / target.
-        let half_w = bitmap.width as f32 / tw;
-        let half_h = bitmap.height as f32 / th;
-        let center_x = 0.0; // horizontal center
-        let safe_frac = if bottom_inset_px > 0 {
-            (bottom_inset_px as f32 / th).clamp(0.0, 0.45)
-        } else {
-            0.10
-        };
-        let center_y = -1.0 + half_h + 2.0 * safe_frac;
-        let transform = [center_x, center_y, half_w, half_h];
+        // Same geometry as the GLES path: `cue_quad` is the one place that
+        // turns cue settings + parent rect into a quad.
+        let transform = cue_quad(&bitmap, parent);
 
         let mut gpu = self.gpu.lock().unwrap();
         // Upload only when the content changed. A texture of the same size
@@ -755,27 +925,22 @@ impl SubtitleOverlay {
             inner.note_target(target_w, target_h);
             next_job(&inner)
         };
-        let Some((font, text, style, tw, th)) = job else { return };
-        let rasterized = rasterizer::rasterize_cue(&font, &text, tw, th, &style);
+        let Some(job) = job else { return };
+        let rasterized = rasterizer::rasterize_cue(
+            &job.font, &job.text, &job.layout, job.target_w, job.target_h, &job.style,
+        );
         let mut inner = self.shared.inner.lock().unwrap();
-        if inner.target_w != tw || inner.target_h != th {
+        if inner.target_w != job.target_w || inner.target_h != job.target_h {
             return;
         }
         inner.generation += 1;
         let generation = inner.generation;
-        let (width, height, rgba) = rasterized.unwrap_or((0, 0, Vec::new()));
+        let bitmap = finished_bitmap(job, rasterized, generation);
         log::debug!(
             "[subs] rasterized cue inline gen={} {}x{} at {}x{}",
-            generation, width, height, tw, th
+            generation, bitmap.width, bitmap.height, bitmap.target_w, inner.target_h
         );
-        inner.ready.push(std::sync::Arc::new(SubtitleBitmap {
-            rgba,
-            width,
-            height,
-            generation,
-            text,
-            target_w: tw,
-        }));
+        inner.ready.push(std::sync::Arc::new(bitmap));
         if inner.ready.len() > READY_SLOTS {
             inner.ready.remove(0);
         }
@@ -811,7 +976,7 @@ impl Drop for SubtitleOverlay {
 /// the wait.
 fn raster_worker(shared: Arc<Shared>) {
     loop {
-        let (font, text, style, target_w, target_h) = {
+        let job = {
             let mut inner = shared.inner.lock().unwrap();
             loop {
                 if inner.shutdown {
@@ -826,7 +991,9 @@ fn raster_worker(shared: Arc<Shared>) {
         };
 
         // Lock released: this is the multi-millisecond part.
-        let rasterized = rasterizer::rasterize_cue(&font, &text, target_w, target_h, &style);
+        let rasterized = rasterizer::rasterize_cue(
+            &job.font, &job.text, &job.layout, job.target_w, job.target_h, &job.style,
+        );
 
         let mut inner = shared.inner.lock().unwrap();
         if inner.shutdown {
@@ -835,27 +1002,17 @@ fn raster_worker(shared: Arc<Shared>) {
         // A resize or a restyle while we were working invalidates the
         // result — `ready` was cleared, and storing this would hand the
         // render path a bitmap for the wrong geometry.
-        if inner.target_w != target_w || inner.target_h != target_h {
+        if inner.target_w != job.target_w || inner.target_h != job.target_h {
             continue;
         }
         inner.generation += 1;
         let generation = inner.generation;
-        // `None` means the cue laid out to nothing. Recorded as a
-        // zero-size bitmap so this job counts as done and the worker
-        // doesn't spin on it; both draw paths skip zero-size entries.
-        let (width, height, rgba) = rasterized.unwrap_or((0, 0, Vec::new()));
+        let bitmap = finished_bitmap(job, rasterized, generation);
         log::debug!(
             "[subs] rasterized cue gen={} {}x{} at {}x{}",
-            generation, width, height, target_w, target_h
+            generation, bitmap.width, bitmap.height, bitmap.target_w, inner.target_h
         );
-        inner.ready.push(std::sync::Arc::new(SubtitleBitmap {
-            rgba,
-            width,
-            height,
-            generation,
-            text,
-            target_w,
-        }));
+        inner.ready.push(std::sync::Arc::new(bitmap));
         if inner.ready.len() > READY_SLOTS {
             inner.ready.remove(0);
         }
@@ -863,11 +1020,21 @@ fn raster_worker(shared: Arc<Shared>) {
     }
 }
 
+/// One cue to rasterize: everything the worker needs, copied out so the
+/// lock is not held while it works.
+struct RasterJob {
+    font: Arc<fontdue::Font>,
+    text: String,
+    layout: CueLayout,
+    style: SubtitleStyle,
+    target_w: u32,
+    target_h: u32,
+}
+
 /// The next cue that needs rasterizing, or `None` when everything wanted
 /// is already in `ready`. Split out of the worker so the borrow of
 /// `inner` ends before the guard is re-assigned in the wait loop.
-#[allow(clippy::type_complexity)]
-fn next_job(inner: &Inner) -> Option<(Arc<fontdue::Font>, String, SubtitleStyle, u32, u32)> {
+fn next_job(inner: &Inner) -> Option<RasterJob> {
     let font = inner.font.as_ref()?;
     // Before the first draw we don't know the surface size, so there is
     // nothing sensible to rasterize at yet.
@@ -875,18 +1042,40 @@ fn next_job(inner: &Inner) -> Option<(Arc<fontdue::Font>, String, SubtitleStyle,
         return None;
     }
     for idx in inner.wanted_indices(inner.current_pts_ms).into_iter().flatten() {
-        let text = inner.cues[idx].text.as_str();
-        if inner.ready_for(text, inner.target_w).is_none() {
-            return Some((
-                Arc::clone(font),
-                text.to_string(),
-                inner.style,
-                inner.target_w,
-                inner.target_h,
-            ));
+        let cue = &inner.cues[idx];
+        if inner.ready_for(cue.text.as_str(), &cue.layout, inner.target_w).is_none() {
+            return Some(RasterJob {
+                font: Arc::clone(font),
+                text: cue.text.clone(),
+                layout: cue.layout,
+                style: inner.style,
+                target_w: inner.target_w,
+                target_h: inner.target_h,
+            });
         }
     }
     None
+}
+
+/// Wrap a rasterizer result as the `ready` entry for `job`. `None` (the
+/// cue laid out to nothing) becomes a zero-size bitmap so the job counts
+/// as done and the worker doesn't spin on it; both draw paths skip
+/// zero-size entries.
+fn finished_bitmap(job: RasterJob, rasterized: Option<rasterizer::CueRaster>, generation: u64) -> SubtitleBitmap {
+    let (width, height, rgba, line_height_px) = match rasterized {
+        Some(r) => (r.width, r.height, r.rgba, r.line_height_px),
+        None => (0, 0, Vec::new(), 0),
+    };
+    SubtitleBitmap {
+        rgba,
+        width,
+        height,
+        generation,
+        line_height_px,
+        layout: job.layout,
+        text: job.text,
+        target_w: job.target_w,
+    }
 }
 
 #[cfg(test)]
@@ -899,6 +1088,7 @@ mod tests {
             end_ms,
             text: text.to_string(),
             settings: String::new(),
+            layout: CueLayout::DEFAULT,
         }
     }
 
@@ -1013,13 +1203,15 @@ mod tests {
             width: 1,
             height: 1,
             generation: 1,
+            line_height_px: 1,
+            layout: CueLayout::DEFAULT,
             text: "first".to_string(),
             target_w: 1920,
         }));
         // Within 5%: keep the rasterization, a dragged window resizes by
         // a pixel at a time and re-baking each step is pure churn.
         assert!(!inner.note_target(1940, 1080));
-        assert!(inner.ready_for("first", 1940).is_some());
+        assert!(inner.ready_for("first", &CueLayout::DEFAULT, 1940).is_some());
         // A real resize invalidates it.
         assert!(inner.note_target(1280, 720));
         assert!(inner.ready.is_empty());
@@ -1083,17 +1275,17 @@ mod tests {
         // further prompting — that prefetch is what keeps a cue change
         // off the render thread.
         run_worker_until(&shared, "first two cues baked", |i| {
-            i.ready_for("first line", 1920).is_some()
-                && i.ready_for("second line", 1920).is_some()
+            i.ready_for("first line", &CueLayout::DEFAULT, 1920).is_some()
+                && i.ready_for("second line", &CueLayout::DEFAULT, 1920).is_some()
         });
         {
             let inner = shared.inner.lock().unwrap();
-            let bmp = inner.ready_for("first line", 1920).unwrap();
+            let bmp = inner.ready_for("first line", &CueLayout::DEFAULT, 1920).unwrap();
             assert!(bmp.width > 0 && bmp.height > 0, "cue rasterized to nothing");
             assert_eq!(bmp.rgba.len(), (bmp.width * bmp.height * 4) as usize);
             // The third cue is neither active nor next, so it must not
             // have been baked speculatively.
-            assert!(inner.ready_for("third line", 1920).is_none());
+            assert!(inner.ready_for("third line", &CueLayout::DEFAULT, 1920).is_none());
         }
         stop_worker(&shared, handle);
     }
@@ -1109,7 +1301,7 @@ mod tests {
         let (shared, handle) = spawn_worker(inner);
         shared.wake.notify_one();
         run_worker_until(&shared, "initial bake", |i| {
-            i.ready_for("first line", 1920).is_some()
+            i.ready_for("first line", &CueLayout::DEFAULT, 1920).is_some()
         });
 
         // Jump the playhead onto the second cue, the way set_pts_ms does.
@@ -1119,7 +1311,7 @@ mod tests {
         }
         shared.wake.notify_one();
         run_worker_until(&shared, "third cue prefetched", |i| {
-            i.ready_for("third line", 1920).is_some()
+            i.ready_for("third line", &CueLayout::DEFAULT, 1920).is_some()
         });
         {
             // Bounded memory: the oldest entry is evicted rather than the
@@ -1127,7 +1319,7 @@ mod tests {
             let inner = shared.inner.lock().unwrap();
             assert!(inner.ready.len() <= READY_SLOTS);
             // The cue actually on screen must have survived the eviction.
-            assert!(inner.ready_for("second line", 1920).is_some());
+            assert!(inner.ready_for("second line", &CueLayout::DEFAULT, 1920).is_some());
         }
         stop_worker(&shared, handle);
     }
@@ -1155,7 +1347,7 @@ mod tests {
         }
         shared.wake.notify_one();
         run_worker_until(&shared, "bake after first draw", |i| {
-            i.ready_for("first line", 1280).is_some()
+            i.ready_for("first line", &CueLayout::DEFAULT, 1280).is_some()
         });
         stop_worker(&shared, handle);
     }
@@ -1179,5 +1371,104 @@ mod tests {
         inner.cues.sort_by_key(|c| c.start_ms);
         assert_eq!(inner.max_cue_span_ms, 19_500);
         assert_eq!(inner.active_index(19_000), Some(1));
+    }
+
+    fn bitmap(w: u32, h: u32, lh: u32, settings: &str) -> SubtitleBitmap {
+        SubtitleBitmap {
+            rgba: Vec::new(),
+            width: w,
+            height: h,
+            generation: 1,
+            line_height_px: lh,
+            layout: CueLayout::parse(settings),
+            text: String::new(),
+            target_w: 0,
+        }
+    }
+
+    #[test]
+    fn parent_is_the_aspect_fitted_picture_minus_the_bottom_inset() {
+        // 16:9 content on a 16:9 surface: the whole surface.
+        let p = CueParent::fit(1920, 1080, 1920, 1080, 0);
+        assert_eq!((p.left, p.top, p.right, p.bottom), (0.0, 0.0, 1920.0, 1080.0));
+        // 2.39:1 film on 16:9: letterboxed, the parent is the picture
+        // (PlayerView puts SubtitleView inside the AspectRatioFrameLayout).
+        let p = CueParent::fit(1920, 1080, 2390, 1000, 0);
+        assert_eq!((p.left, p.right), (0.0, 1920.0));
+        let pic_h = (1920.0f32 / 2.39).round();
+        assert!((p.top - ((1080.0 - pic_h) / 2.0).floor()).abs() <= 1.0);
+        assert!((p.bottom - (p.top + pic_h)).abs() <= 1.0);
+        // Pillarboxed 4:3.
+        let p = CueParent::fit(1920, 1080, 640, 480, 0);
+        assert_eq!((p.top, p.bottom), (0.0, 1080.0));
+        assert_eq!(p.left, 240.0);
+        assert_eq!(p.right, 1680.0);
+        // The inset only raises the bottom (view padding), never below it.
+        let p = CueParent::fit(1920, 1080, 1920, 1080, 100);
+        assert_eq!(p.bottom, 980.0);
+        let p = CueParent::fit(1920, 1080, 2390, 1000, 40);
+        assert!((p.bottom - (p.top + pic_h)).abs() <= 1.0, "inset inside the bar changes nothing");
+        // Unknown content size → whole target.
+        assert_eq!(CueParent::fit(1280, 720, 0, 0, 0), CueParent::fit(1280, 720, 1280, 720, 0));
+    }
+
+    #[test]
+    fn default_cue_sits_bottom_padding_above_the_parent_bottom_centered() {
+        let p = CueParent::fit(1920, 1080, 1920, 1080, 0);
+        let (x, y) = place_cue(400, 60, 40, &CueLayout::DEFAULT, &p);
+        assert_eq!(x, 760.0);
+        // textTop = parentBottom - textHeight - (int)(parentHeight * 0.08)
+        assert_eq!(y, 1080.0 - 60.0 - 86.0);
+        // As NDC: centered horizontally, bottom edge 8% up.
+        let q = cue_quad(&bitmap(400, 60, 40, ""), &p);
+        assert!((q[0]).abs() < 1e-6);
+        assert!((q[1] - (-1.0 + 60.0 / 1080.0 + 2.0 * 86.0 / 1080.0)).abs() < 1e-5);
+        assert!((q[2] - 400.0 / 1920.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn line_settings_place_vertically_like_subtitle_painter() {
+        let p = CueParent::fit(1000, 1000, 1000, 1000, 0);
+        // line:10% → box top at 10% (lineAnchor start).
+        assert_eq!(place_cue(100, 50, 25, &CueLayout::parse("line:10%"), &p).1, 100.0);
+        // ,center / ,end move the anchored edge.
+        assert_eq!(place_cue(100, 50, 25, &CueLayout::parse("line:10%,center"), &p).1, 75.0);
+        assert_eq!(place_cue(100, 50, 25, &CueLayout::parse("line:10%,end"), &p).1, 50.0);
+        // Integer lines: 0 = top, 2 = two line heights down, -1 = flush
+        // with the bottom, -2 one line height up.
+        assert_eq!(place_cue(100, 50, 25, &CueLayout::parse("line:0"), &p).1, 0.0);
+        assert_eq!(place_cue(100, 50, 25, &CueLayout::parse("line:2"), &p).1, 50.0);
+        assert_eq!(place_cue(100, 50, 25, &CueLayout::parse("line:-1"), &p).1, 950.0);
+        assert_eq!(place_cue(100, 50, 25, &CueLayout::parse("line:-2"), &p).1, 925.0);
+        // Clamped into the parent: 100% with a start anchor would hang
+        // below the bottom; -100 lines would poke out the top.
+        assert_eq!(place_cue(100, 50, 25, &CueLayout::parse("line:100%"), &p).1, 950.0);
+        assert_eq!(place_cue(100, 50, 25, &CueLayout::parse("line:-100"), &p).1, 0.0);
+        // The bottom inset raises the parent bottom for `-1` and default alike.
+        let p = CueParent::fit(1000, 1000, 1000, 1000, 100);
+        assert_eq!(place_cue(100, 50, 25, &CueLayout::parse("line:-1"), &p).1, 850.0);
+        assert_eq!(place_cue(100, 50, 25, &CueLayout::DEFAULT, &p).1, 900.0 - 50.0 - 72.0);
+    }
+
+    #[test]
+    fn position_and_align_place_horizontally_like_subtitle_painter() {
+        let p = CueParent::fit(1000, 1000, 1000, 1000, 0);
+        // align:left → position 0 / anchor start → flush left; right → flush right.
+        assert_eq!(place_cue(200, 50, 25, &CueLayout::parse("align:left"), &p).0, 0.0);
+        assert_eq!(place_cue(200, 50, 25, &CueLayout::parse("align:right"), &p).0, 800.0);
+        assert_eq!(place_cue(200, 50, 25, &CueLayout::parse("align:start"), &p).0, 500.0);
+        assert_eq!(place_cue(200, 50, 25, &CueLayout::parse("align:end"), &p).0, 300.0);
+        // Explicit position with derived anchor (center → middle).
+        assert_eq!(place_cue(200, 50, 25, &CueLayout::parse("position:30%"), &p).0, 200.0);
+        // Explicit anchor.
+        assert_eq!(place_cue(200, 50, 25, &CueLayout::parse("position:30%,line-left"), &p).0, 300.0);
+        assert_eq!(place_cue(200, 50, 25, &CueLayout::parse("position:30%,line-right"), &p).0, 100.0);
+        // Clamped into the parent on both sides.
+        assert_eq!(place_cue(200, 50, 25, &CueLayout::parse("position:5%"), &p).0, 0.0);
+        assert_eq!(place_cue(200, 50, 25, &CueLayout::parse("position:95%"), &p).0, 800.0);
+        // Inside a pillarboxed picture the parent's own edges apply.
+        let p = CueParent::fit(1920, 1080, 640, 480, 0);
+        assert_eq!(place_cue(200, 50, 25, &CueLayout::parse("align:left"), &p).0, 240.0);
+        assert_eq!(place_cue(200, 50, 25, &CueLayout::parse("align:right"), &p).0, 1480.0);
     }
 }

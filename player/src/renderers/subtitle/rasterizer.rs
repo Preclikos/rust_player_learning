@@ -6,6 +6,7 @@
 //! bytes itself. Extracted from `subtitle.rs` so the renderer (`overlay`) and
 //! the rasterizer live in separate files (mirrors the `video` module split).
 
+use crate::parsers::vtt::{CueLayout, TextAlign};
 use crate::SubtitleStyle;
 
 /// Default font baked into the binary: DejaVu Sans (Bitstream Vera +
@@ -33,32 +34,53 @@ pub(super) fn default_font() -> Option<fontdue::Font> {
     }
 }
 
-/// Lay out a cue's text into an RGBA8 bitmap. Returns (width, height,
-/// pixels) or None when the text is empty or the layout doesn't fit.
+/// A rasterized cue: the bitmap plus the line height the vertical
+/// `line:N` placement counts in.
+pub(super) struct CueRaster {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+    /// Height of one text line in the bitmap (ExoPlayer's
+    /// `firstLineHeight` in `SubtitlePainter`).
+    pub line_height_px: u32,
+}
+
+/// Lay out a cue's text into an RGBA8 bitmap sized for a parent box of
+/// `parent_w`×`parent_h` px (the picture rectangle minus insets — see
+/// `CueParent`). `None` when the text is empty or lays out to nothing.
 ///
-/// Glyph fill, outline colour and size come from `style`; the layout is
-/// still Phase 1 (a 1px drop-shadow offset each direction, line break at
-/// `\n` and at word boundaries when a single line would exceed 90% of the
-/// target width).
+/// Sizing follows ExoPlayer's `SubtitleView`/`SubtitlePainter`: text size
+/// is `TEXT_SIZE_FRACTION` of the parent height (times the style's
+/// `size_scale`), the box gets `INNER_PADDING_RATIO` × text size of
+/// horizontal padding, the wrap width is the padded parent width times
+/// the cue's `size:`, and lines are aligned inside the box by `align:`.
+/// Glyph fill and outline colour come from `style`; the outline is a 1px
+/// drop shadow.
 pub(super) fn rasterize_cue(
     font: &fontdue::Font,
     text: &str,
-    target_w: u32,
-    target_h: u32,
+    layout: &CueLayout,
+    parent_w: u32,
+    parent_h: u32,
     style: &SubtitleStyle,
-) -> Option<(u32, u32, Vec<u8>)> {
+) -> Option<CueRaster> {
     if text.is_empty() {
         return None;
     }
-    // Font size: ~5% of video height scaled by the user's size_scale,
-    // clamped to a readable range. The lower 12px floor keeps the 0.5×
-    // setting legible on tiny preview windows; the upper bound caps the
-    // cue bitmap so a 3× setting on a 4K surface can't exceed texture
+    // The 12px floor keeps the 0.5× setting legible on tiny preview
+    // windows; the cap keeps a 3× setting on a 4K surface inside texture
     // limits.
-    let px_size = (target_h as f32 * 0.05 * style.size_scale).clamp(12.0, 160.0);
-    let max_line_w = (target_w as f32 * 0.9) as i32;
-    let line_height = (px_size * 1.25).ceil() as i32;
+    let px_size = (parent_h as f32 * super::TEXT_SIZE_FRACTION * style.size_scale).clamp(12.0, 160.0);
+    // SubtitlePainter: textPaddingX = (int)(textSize * INNER_PADDING_RATIO + 0.5)
     let shadow = 2i32;
+    let pad_x = ((px_size * super::INNER_PADDING_RATIO + 0.5) as i32).max(shadow);
+    // availableWidth = parentWidth - 2*textPaddingX, then × cue size.
+    let mut available_w = parent_w as i32 - 2 * pad_x;
+    if layout.size < 1.0 {
+        available_w = (available_w as f32 * layout.size) as i32;
+    }
+    let max_line_w = available_w.max(1);
+    let line_height = (px_size * 1.25).ceil() as i32;
 
     // Wrap each input line, then concatenate into a flat list of layout lines.
     let mut layout_lines: Vec<String> = Vec::new();
@@ -80,22 +102,34 @@ pub(super) fn rasterize_cue(
         }
     }
 
-    let bitmap_w = (max_width + shadow * 2).max(8) as u32;
+    // SubtitlePainter: textWidth = widest line + 2*textPaddingX. The
+    // padding also gives the drop shadow room on the right/bottom.
+    let bitmap_w = (max_width + pad_x * 2).max(8) as u32;
     let bitmap_h = (line_height * layout_lines.len() as i32 + shadow * 2).max(8) as u32;
 
     let mut rgba = vec![0u8; (bitmap_w * bitmap_h * 4) as usize];
 
-    // Second pass: rasterize each line centered horizontally in the bitmap.
+    // Second pass: rasterize each line, aligned inside the box by `align:`
+    // (start/end have no bidi layout behind them → left/right).
     for (idx, line) in layout_lines.iter().enumerate() {
         let line_w = line_widths[idx];
-        let x_start = (bitmap_w as i32 - line_w) / 2;
+        let x_start = match layout.align {
+            TextAlign::Left | TextAlign::Start => pad_x,
+            TextAlign::Right | TextAlign::End => bitmap_w as i32 - pad_x - line_w,
+            TextAlign::Center => (bitmap_w as i32 - line_w) / 2,
+        };
         let y_start = idx as i32 * line_height + shadow;
         rasterize_line(
             font, line, px_size, x_start, y_start, bitmap_w, bitmap_h,
             style.text_color, style.outline_color, &mut rgba,
         );
     }
-    Some((bitmap_w, bitmap_h, rgba))
+    Some(CueRaster {
+        width: bitmap_w,
+        height: bitmap_h,
+        rgba,
+        line_height_px: line_height as u32,
+    })
 }
 
 /// Greedy word wrap at `max_w`. Widths accumulate as words are appended:
@@ -250,5 +284,76 @@ fn blit_coverage(
             let a_out = a_src + (a_dst * inv) / 255;
             rgba[idx + 3] = a_out.min(255) as u8;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn font() -> fontdue::Font {
+        default_font().expect("embedded font")
+    }
+
+    /// First and last bitmap column holding any ink.
+    fn ink_span(r: &CueRaster) -> (u32, u32) {
+        let mut first = u32::MAX;
+        let mut last = 0;
+        for y in 0..r.height {
+            for x in 0..r.width {
+                if r.rgba[((y * r.width + x) * 4 + 3) as usize] > 0 {
+                    first = first.min(x);
+                    last = last.max(x);
+                }
+            }
+        }
+        (first, last)
+    }
+
+    #[test]
+    fn size_setting_narrows_the_wrap_width() {
+        let f = font();
+        let text = "a fairly long subtitle line that will certainly need wrapping somewhere";
+        let full = rasterize_cue(&f, text, &CueLayout::DEFAULT, 1280, 720, &SubtitleStyle::DEFAULT).unwrap();
+        let narrow = rasterize_cue(&f, text, &CueLayout::parse("size:40%"), 1280, 720, &SubtitleStyle::DEFAULT).unwrap();
+        assert!(narrow.width < full.width, "{} !< {}", narrow.width, full.width);
+        assert!(narrow.height > full.height, "narrower box must wrap onto more lines");
+        // Text size follows the parent height, so the line height does too.
+        let small = rasterize_cue(&f, "x", &CueLayout::DEFAULT, 640, 360, &SubtitleStyle::DEFAULT).unwrap();
+        assert!(small.line_height_px < full.line_height_px);
+    }
+
+    #[test]
+    fn align_moves_short_lines_inside_the_box() {
+        let f = font();
+        let text = "a much longer first line of text\nshort";
+        let left = rasterize_cue(&f, text, &CueLayout::parse("align:left"), 1280, 720, &SubtitleStyle::DEFAULT).unwrap();
+        let right = rasterize_cue(&f, text, &CueLayout::parse("align:right"), 1280, 720, &SubtitleStyle::DEFAULT).unwrap();
+        let center = rasterize_cue(&f, text, &CueLayout::DEFAULT, 1280, 720, &SubtitleStyle::DEFAULT).unwrap();
+        // Same widest line → same bitmap for all three; only the short
+        // second line moves. Compare where its ink sits on its own row band.
+        assert_eq!(left.width, right.width);
+        let row = |r: &CueRaster| {
+            let y0 = r.line_height_px + 2;
+            let mut first = u32::MAX;
+            let mut last = 0;
+            for y in y0..r.height {
+                for x in 0..r.width {
+                    if r.rgba[((y * r.width + x) * 4 + 3) as usize] > 0 {
+                        first = first.min(x);
+                        last = last.max(x);
+                    }
+                }
+            }
+            (first, last)
+        };
+        let (l0, l1) = row(&left);
+        let (r0, r1) = row(&right);
+        let (c0, c1) = row(&center);
+        assert!(l0 < c0 && c0 < r0, "left {l0} center {c0} right {r0}");
+        assert!(l1 < c1 && c1 < r1, "left {l1} center {c1} right {r1}");
+        // And the whole bitmap still has ink within its padding.
+        let (a, b) = ink_span(&left);
+        assert!(a < left.width && b < left.width);
     }
 }

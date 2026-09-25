@@ -322,9 +322,24 @@ player.clear_subtitle_track();
 Rendering is built in on every platform: wgpu overlay pass on
 desktop/Apple, GLES quad on Android (including direct mode, where the
 translucent overlay surface presents only when the active cue changes).
-Styling is fixed phase-1 (white, drop shadow, bottom-center, 7 % safe
-area). The rasterizer feeds plain RGBA bitmaps into the renderers — a
-future libass backend slots in at that same boundary.
+Text styling is white + drop shadow by default (`set_subtitle_style` for
+colours/size). The rasterizer feeds plain RGBA bitmaps into the renderers
+— a future libass backend slots in at that same boundary.
+
+**Placement (ExoPlayer parity).** Cues are positioned by their WebVTT
+settings — `line:` (percentage or line number, with `,start|center|end`),
+`position:` (with `,line-left|center|line-right`), `align:` and `size:` —
+using a port of media3's `SubtitlePainter.setupTextLayout`, with the same
+defaults as `SubtitleView`: text size 5.33 % and bottom padding 8 % of the
+layout box height, 0.125 × text size of horizontal box padding. The layout
+box is the **aspect-fitted picture** (media3 mounts `SubtitleView` inside
+`PlayerView`'s `AspectRatioFrameLayout`), so on a letterboxed film the
+cues sit inside the picture, not in the black bar, and shrink with it. The
+host's `set_subtitle_safe_insets(bottom_px)` is the equivalent of padding
+that view: it raises the box's bottom edge (system bars, TV overscan); an
+ExoPlayer app that pads its `SubtitleView` should pass the same number.
+Inline tags, `region:` and `vertical:` are still ignored (vertical text
+renders horizontally).
 
 On Android a system font works fine:
 `std::fs::read("/system/fonts/Roboto-Regular.ttf")`.

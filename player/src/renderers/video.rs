@@ -356,9 +356,19 @@ pub struct VideoRenderer {
     subtitle_safe_bottom_px: std::sync::atomic::AtomicU32,
     /// `ANativeWindow*` of the host surface (embed model) for
     /// `ANativeWindow_setBuffersDataSpace`. 0 when unavailable (winit
-    /// path) — passthrough then stays off.
+    /// path) — passthrough then stays off. Atomic: the host can hand over a
+    /// new overlay window mid-play ([`Self::set_android_surface`]).
     #[cfg(target_os = "android")]
-    android_window: usize,
+    android_window: std::sync::atomic::AtomicUsize,
+    /// The instance the surface came from — a replacement surface for a new
+    /// host window must be created on the same one (it owns the EGL display
+    /// and context the device renders with). `None` offscreen.
+    #[cfg(target_os = "android")]
+    instance: Option<wgpu::Instance>,
+    /// False between the host's surfaceDestroyed and the next overlay window:
+    /// rendering skips instead of touching the dead window.
+    #[cfg(target_os = "android")]
+    surface_attached: std::sync::atomic::AtomicBool,
     /// Sticky: the surface dataspace has been switched to BT2020_PQ.
     /// Never un-set while the renderer lives — flapping the dataspace
     /// makes TVs re-negotiate their HDR mode (black flash) on every ABR
@@ -521,7 +531,9 @@ impl VideoRenderer {
         // Keep the raw window for ANativeWindow_setBuffersDataSpace (HDR
         // passthrough). The host owns the acquired reference and releases
         // it only after the renderer is dropped.
-        renderer.android_window = native_window as usize;
+        renderer
+            .android_window
+            .store(native_window as usize, std::sync::atomic::Ordering::Release);
         renderer
     }
 
@@ -950,37 +962,7 @@ impl VideoRenderer {
         #[cfg(target_os = "android")]
         if backend == wgpu::Backend::Gl {
             if let Some(oes) = &gles_oes_renderer {
-                let oes_arc = Arc::clone(oes);
-                let pending_clone = Arc::clone(&gles_oes_pending);
-                if let Some(s) = unsafe { surface.as_hal::<wgpu::hal::api::Gles>() } {
-                    use std::ops::Deref;
-                    let s_ref: &wgpu::hal::gles::Surface = s.deref();
-                    s_ref.set_present_hook(Box::new(move |gl, w, h| {
-                        let frame = pending_clone.lock().unwrap().take();
-                        if let Some(f) = frame {
-                            if let Err(e) = unsafe {
-                                oes_arc.render(
-                                    gl,
-                                    f.ahb_ptr as *mut std::ffi::c_void,
-                                    w as i32,
-                                    h as i32,
-                                    f.scale_x,
-                                    f.scale_y,
-                                    f.tex_x_max,
-                                    f.tex_y_max,
-                                    f.desired_present_ns,
-                                    f.mode,
-                                    f.subtitle,
-                                    f.subtitle_bottom_inset_px,
-                                    f.subtitle_anchor,
-                                )
-                            } {
-                                log::warn!("[gles_oes] hook render failed: {}", e);
-                            }
-                        }
-                    }));
-                    log::info!("[gles_oes] present hook installed");
-                }
+                Self::install_gles_present_hook(&surface, oes, &gles_oes_pending);
             }
         }
 
@@ -1046,7 +1028,11 @@ impl VideoRenderer {
             display_hdr_types: std::sync::atomic::AtomicU32::new(0),
             subtitle_safe_bottom_px: std::sync::atomic::AtomicU32::new(0),
             #[cfg(target_os = "android")]
-            android_window: 0,
+            android_window: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(target_os = "android")]
+            instance: Some(instance),
+            #[cfg(target_os = "android")]
+            surface_attached: std::sync::atomic::AtomicBool::new(true),
             #[cfg(target_os = "android")]
             android_pq_session: std::sync::atomic::AtomicBool::new(false),
             #[cfg(target_os = "android")]
@@ -1457,7 +1443,11 @@ impl VideoRenderer {
             display_hdr_types: std::sync::atomic::AtomicU32::new(0),
             subtitle_safe_bottom_px: std::sync::atomic::AtomicU32::new(0),
             #[cfg(target_os = "android")]
-            android_window: 0,
+            android_window: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(target_os = "android")]
+            instance: None,
+            #[cfg(target_os = "android")]
+            surface_attached: std::sync::atomic::AtomicBool::new(true),
             #[cfg(target_os = "android")]
             android_pq_session: std::sync::atomic::AtomicBool::new(false),
             #[cfg(target_os = "android")]
@@ -1605,6 +1595,9 @@ impl VideoRenderer {
         log::debug!("[subs] presenting overlay gen={} (subtitle={})", gen, subtitle.is_some());
 
         let surface = self.surface.as_ref().expect("surface (android)").lock().await;
+        if !self.surface_attached.load(std::sync::atomic::Ordering::Acquire) {
+            return; // host window gone; the next set_android_surface resumes
+        }
         let surface_texture = match surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t)
             | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
@@ -1787,6 +1780,112 @@ impl VideoRenderer {
                 }
             }
         });
+    }
+
+    /// Install the OES present hook on a GLES surface (at construction, and
+    /// again on every replacement surface — the hook lives on the hal
+    /// surface, so a new host window starts without one).
+    #[cfg(target_os = "android")]
+    fn install_gles_present_hook(
+        surface: &wgpu::Surface<'static>,
+        oes: &Arc<video_gles_egl::GlesOesRenderer>,
+        gles_oes_pending: &Arc<std::sync::Mutex<Option<video_gles_egl::GlesOesPendingFrame>>>,
+    ) {
+        let oes_arc = Arc::clone(oes);
+        let pending_clone = Arc::clone(gles_oes_pending);
+        if let Some(s) = unsafe { surface.as_hal::<wgpu::hal::api::Gles>() } {
+            use std::ops::Deref;
+            let s_ref: &wgpu::hal::gles::Surface = s.deref();
+            s_ref.set_present_hook(Box::new(move |gl, w, h| {
+                let frame = pending_clone.lock().unwrap().take();
+                if let Some(f) = frame {
+                    if let Err(e) = unsafe {
+                        oes_arc.render(
+                            gl,
+                            f.ahb_ptr as *mut std::ffi::c_void,
+                            w as i32,
+                            h as i32,
+                            f.scale_x,
+                            f.scale_y,
+                            f.tex_x_max,
+                            f.tex_y_max,
+                            f.desired_present_ns,
+                            f.mode,
+                            f.subtitle,
+                            f.subtitle_bottom_inset_px,
+                            f.subtitle_anchor,
+                        )
+                    } {
+                        log::warn!("[gles_oes] hook render failed: {}", e);
+                    }
+                }
+            }));
+            log::info!("[gles_oes] present hook installed");
+        }
+    }
+
+    /// Hand the renderer a new host window for its presentation surface, or
+    /// detach it (`null`). Android hosts call this from their SurfaceHolder
+    /// callbacks: after Home the system destroys the SurfaceView and a new
+    /// Surface arrives on return, while the player (paused) stays alive. The
+    /// first surface was the only one the renderer could ever draw into, so
+    /// the picture never came back. A replacement is created on the same
+    /// wgpu instance (same EGL display/context), configured with the current
+    /// size, and swapped in under the surface lock, so no frame is in flight
+    /// on the old one; the GLES present hook is re-installed on it.
+    ///
+    /// The caller keeps `native_window` acquired until the next call (or the
+    /// renderer drop) — the same contract as the constructor.
+    #[cfg(target_os = "android")]
+    pub async fn set_android_surface(&self, native_window: usize) {
+        use std::sync::atomic::Ordering;
+        let (Some(slot), Some(config)) = (&self.surface, &self.surface_config) else {
+            return; // offscreen renderer: nothing to re-target
+        };
+        let mut surface = slot.lock().await;
+        let Some(window) = std::ptr::NonNull::new(native_window as *mut std::ffi::c_void) else {
+            self.surface_attached.store(false, Ordering::Release);
+            self.android_window.store(0, Ordering::Release);
+            log::info!("[renderer] overlay window detached");
+            return;
+        };
+        let Some(instance) = &self.instance else { return };
+        let raw = RawWindowHandle::AndroidNdk(AndroidNdkWindowHandle::new(window));
+        let created = unsafe {
+            instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
+                raw_display_handle: Some(RawDisplayHandle::Android(AndroidDisplayHandle::new())),
+                raw_window_handle: raw,
+            })
+        };
+        let new_surface = match created {
+            Ok(s) => s,
+            Err(e) => {
+                log::error!("[renderer] new overlay surface: {}", e);
+                return;
+            }
+        };
+        let size = *self.surface_size.read().unwrap();
+        let cfg = {
+            let mut c = config.write().await;
+            if size.width > 0 && size.height > 0 {
+                c.width = size.width;
+                c.height = size.height;
+            }
+            c.clone()
+        };
+        new_surface.configure(&self.device, &cfg);
+        if let Some(oes) = &self.gles_oes_renderer {
+            Self::install_gles_present_hook(&new_surface, oes, &self.gles_oes_pending);
+        }
+        // The old surface (and its EGL window surface) drops here.
+        *surface = new_surface;
+        self.android_window.store(native_window, Ordering::Release);
+        // A PQ session re-asserts the dataspace per frame on the new window.
+        self.android_pq_session.store(false, Ordering::Relaxed);
+        // Force the next overlay present (cue or clear) onto the new window.
+        self.overlay_presented_gen.store(u64::MAX, Ordering::Relaxed);
+        self.surface_attached.store(true, Ordering::Release);
+        log::info!("[renderer] overlay window attached ({}x{})", cfg.width, cfg.height);
     }
 
     pub async fn resize(&self, new_size: PhysicalSize<u32>) {
@@ -2629,6 +2728,9 @@ impl VideoRenderer {
         }
 
         let surface = self.surface.as_ref().expect("surface (android)").lock().await;
+        if !self.surface_attached.load(std::sync::atomic::Ordering::Acquire) {
+            return; // host window gone; the next set_android_surface resumes
+        }
         let surface_texture = match surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t)
             | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
@@ -2704,13 +2806,14 @@ impl VideoRenderer {
         if is_pq
             && self.display_hdr_types.load(std::sync::atomic::Ordering::Relaxed) & DISPLAY_HDR10
                 != 0
-            && self.android_window != 0
+            && self.android_window.load(std::sync::atomic::Ordering::Acquire) != 0
         {
             // Re-asserted EVERY frame, not just on session entry: the EGL
             // wrapper re-applies its own (sRGB) dataspace on swaps after
             // any eglSurfaceAttrib call, silently undoing a one-shot
             // setting. The perform() hop is trivially cheap.
-            let win = self.android_window as *mut ndk_sys::ANativeWindow;
+            let win = self.android_window.load(std::sync::atomic::Ordering::Acquire)
+                as *mut ndk_sys::ANativeWindow;
             let rc = unsafe {
                 set_buffers_dataspace(win, ndk_sys::ADataSpace::ADATASPACE_BT2020_PQ.0 as i32)
             };
@@ -2915,6 +3018,9 @@ impl VideoRenderer {
                 );
             });
             let surface = self.surface.as_ref().expect("surface (android)").lock().await;
+        if !self.surface_attached.load(std::sync::atomic::Ordering::Acquire) {
+            return; // host window gone; the next set_android_surface resumes
+        }
             let surface_texture = match surface.get_current_texture() {
                 wgpu::CurrentSurfaceTexture::Success(t)
                 | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
@@ -3042,6 +3148,9 @@ impl VideoRenderer {
         });
 
         let surface = self.surface.as_ref().expect("surface (android)").lock().await;
+        if !self.surface_attached.load(std::sync::atomic::Ordering::Acquire) {
+            return; // host window gone; the next set_android_surface resumes
+        }
         let vbuf_read = vbuf.read().await;
         let surface_texture = match surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t) => t,
@@ -3135,6 +3244,11 @@ impl VideoRenderer {
 }
 
 impl super::VideoSink for VideoRenderer {
+    #[cfg(target_os = "android")]
+    fn set_android_surface(&self, window: usize) -> impl std::future::Future<Output = ()> + Send + '_ {
+        VideoRenderer::set_android_surface(self, window)
+    }
+
     fn render_frame(&self, frame: crate::decoders::DecodedVideoFrame) -> impl std::future::Future<Output = ()> + Send + '_ {
         VideoRenderer::render_frame(self, frame)
     }

@@ -93,6 +93,10 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private var scenario = ""
     private var manifestUrl = TEST_MANIFEST_URL
     private var startFraction: Float? = null
+    // --ez keep_alive true: BlackZone-style background handling — the player
+    // survives surfaceDestroyed (Home) paused, and the new surfaces are handed
+    // back on return instead of restarting the stream.
+    private var keepAlive = false
     private var scenarioIterations = 5
     private var scenarioSettleMs = 12_000L
     private var scenarioWarmupMs = 12_000L
@@ -112,6 +116,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         readScenarioExtras()
         // --ez verbose true: engine debug lines (audio clock internals etc.).
         if (intent.getBooleanExtra("verbose", false)) player.setVerboseLogging(true)
+        keepAlive = intent.getBooleanExtra("keep_alive", false)
         if (stormMode) {
             android.util.Log.i(
                 "rustplayer_repro",
@@ -484,11 +489,21 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         override fun surfaceCreated(holder: SurfaceHolder) {}
         override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
             videoSurface = holder.surface
-            maybeStart()
+            if (keepAlive && player.isStarted) {
+                player.setVideoSurface(holder.surface)
+                reattached()
+            } else {
+                maybeStart()
+            }
         }
         override fun surfaceDestroyed(holder: SurfaceHolder) {
             videoSurface = null
-            teardown()
+            if (keepAlive && player.isStarted) {
+                // The player pauses itself while a surface is gone.
+                player.setVideoSurface(null)
+            } else {
+                teardown()
+            }
         }
     }
 
@@ -500,6 +515,11 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         overlayW = width
         overlayH = height
         if (player.isStarted) {
+            if (keepAlive && overlayDetached) {
+                overlayDetached = false
+                player.setOverlaySurface(holder.surface)
+                reattached()
+            }
             player.setSize(width, height)
         } else {
             maybeStart()
@@ -508,7 +528,21 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
         overlaySurface = null
-        teardown()
+        if (keepAlive && player.isStarted) {
+            player.setOverlaySurface(null)
+            overlayDetached = true
+        } else {
+            teardown()
+        }
+    }
+
+    private var overlayDetached = false
+
+    /** Both planes back after a keep-alive background (the player resumes itself). */
+    private fun reattached() {
+        if (overlaySurface != null && videoSurface != null && !overlayDetached) {
+            traceMark("reattach")
+        }
     }
 
     private fun maybeStart() {

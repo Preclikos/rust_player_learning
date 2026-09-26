@@ -106,7 +106,132 @@ pub struct SharedDirectCodec {
     /// Our own `ANativeWindow` reference for the codec's whole life, taken
     /// while the pipeline's lease guaranteed the window was alive and
     /// released only after `AMediaCodec_delete`.
-    window: *mut ndk_sys::ANativeWindow,
+    window: std::sync::atomic::AtomicPtr<ndk_sys::ANativeWindow>,
+    /// Coded size, for the placeholder surface while the host has none.
+    size: (i32, i32),
+    /// Placeholder consumer the codec renders into while the host's video
+    /// Surface is gone (see [`park_direct_output`]); dropped on the next
+    /// real window.
+    placeholder: std::sync::Mutex<Option<ImageReader>>,
+}
+
+/// The direct codec currently bound to the video plane ([C2]: at most one at
+/// a time), so a host Surface swap can move its output without a rebuild.
+static LIVE_DIRECT: std::sync::Mutex<Option<std::sync::Weak<SharedDirectCodec>>> =
+    std::sync::Mutex::new(None);
+
+/// Move the running direct-mode codec's output to a new video window
+/// (`AMediaCodec_setOutputSurface`, API 23+). Called when the host hands over
+/// a new video Surface while a pipeline plays — after Home → back the old
+/// SurfaceView is destroyed, and a codec left on it renders into an abandoned
+/// BufferQueue ("BufferQueue has been abandoned"), so the picture never came
+/// back. `window` must stay acquired by the caller for the duration of the
+/// call; the codec takes its own reference. See [`Retarget`] for the result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Retarget {
+    /// No direct codec is playing: the next pipeline build uses the window.
+    NoLiveCodec,
+    /// The live codec now renders into the new window.
+    Moved,
+    /// The codec refused the new window (MediaTek Codec2 after its old
+    /// Surface was abandoned, -10000): the caller must rebuild.
+    Failed,
+}
+
+fn live_direct() -> Option<Arc<SharedDirectCodec>> {
+    let live = LIVE_DIRECT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|w| w.upgrade())?;
+    if live.stopped.load(std::sync::atomic::Ordering::Acquire) {
+        return None;
+    }
+    Some(live)
+}
+
+impl SharedDirectCodec {
+    /// Point the codec at `w` (caller holds `call_lock`); the codec takes
+    /// its own reference and gives up the previous window's.
+    unsafe fn switch_output(&self, w: *mut ndk_sys::ANativeWindow) -> ndk_sys::media_status_t {
+        ndk_sys::ANativeWindow_acquire(w);
+        let st = ndk_sys::AMediaCodec_setOutputSurface(self.raw, w);
+        if st != ndk_sys::media_status_t::AMEDIA_OK {
+            ndk_sys::ANativeWindow_release(w);
+            return st;
+        }
+        let old = self.window.swap(w, std::sync::atomic::Ordering::AcqRel);
+        if !old.is_null() {
+            ndk_sys::ANativeWindow_release(old);
+        }
+        st
+    }
+}
+
+pub fn retarget_direct_output(window: usize) -> Retarget {
+    if window == 0 {
+        return Retarget::NoLiveCodec;
+    }
+    let Some(codec) = live_direct() else { return Retarget::NoLiveCodec };
+    let _l = codec.call_lock.lock().unwrap_or_else(|e| e.into_inner());
+    let st = unsafe { codec.switch_output(window as *mut ndk_sys::ANativeWindow) };
+    if st != ndk_sys::media_status_t::AMEDIA_OK {
+        log::warn!("[mc-direct] setOutputSurface -> {:?}; the pipeline must be rebuilt", st);
+        return Retarget::Failed;
+    }
+    // Back on a real window: the placeholder has served its purpose.
+    codec.placeholder.lock().unwrap_or_else(|e| e.into_inner()).take();
+    log::info!("[mc-direct] output moved to the new video window");
+    Retarget::Moved
+}
+
+/// The host's video Surface is going away: move the live codec onto a
+/// private placeholder surface first (ExoPlayer's PlaceholderSurface trick).
+/// A codec left on the destroyed Surface renders into an abandoned
+/// BufferQueue, and Codec2 on MediaTek then refuses every later
+/// setOutputSurface (-10000), which forced a full rebuild (~3 s of black)
+/// on every Home -> back. From the placeholder the switch to the new window
+/// works. The placeholder drops every frame it gets. Best effort: returns
+/// false when there is no live codec or the switch is refused.
+pub fn park_direct_output() -> bool {
+    let Some(codec) = live_direct() else { return false };
+    let (w, h) = codec.size;
+    let reader = ImageReader::new_with_usage(
+        w.max(2),
+        h.max(2),
+        ImageFormat::PRIVATE,
+        HardwareBufferUsage::GPU_SAMPLED_IMAGE,
+        4,
+    );
+    let mut reader = match reader {
+        Ok(r) => r,
+        Err(e) => {
+            log::warn!("[mc-direct] placeholder surface: {:?}", e);
+            return false;
+        }
+    };
+    // Recycle every buffer at once so the codec never waits on the consumer.
+    let _ = reader.set_image_listener(Box::new(|r: &ImageReader| {
+        while let Ok(AcquireResult::Image(img)) = r.acquire_next_image() {
+            drop(img);
+        }
+    }));
+    let window = match reader.window() {
+        Ok(win) => win,
+        Err(e) => {
+            log::warn!("[mc-direct] placeholder window: {:?}", e);
+            return false;
+        }
+    };
+    let _l = codec.call_lock.lock().unwrap_or_else(|e| e.into_inner());
+    let st = unsafe { codec.switch_output(window.ptr().as_ptr()) };
+    if st != ndk_sys::media_status_t::AMEDIA_OK {
+        log::warn!("[mc-direct] setOutputSurface(placeholder) -> {:?}", st);
+        return false;
+    }
+    *codec.placeholder.lock().unwrap_or_else(|e| e.into_inner()) = Some(reader);
+    log::info!("[mc-direct] output parked on a placeholder surface");
+    true
 }
 
 unsafe impl Send for SharedDirectCodec {}
@@ -152,7 +277,10 @@ impl Drop for SharedDirectCodec {
         // Last reference (decoder + every in-flight frame) gone.
         unsafe {
             ndk_sys::AMediaCodec_delete(self.raw);
-            ndk_sys::ANativeWindow_release(self.window);
+            let w = self.window.load(std::sync::atomic::Ordering::Acquire);
+            if !w.is_null() {
+                ndk_sys::ANativeWindow_release(w);
+            }
         }
         // [C2] The Surface producer connection is now released (delete is
         // synchronous) — let the next direct codec configure onto it.
@@ -405,8 +533,13 @@ impl MediaCodecDecoder {
                 raw: codec,
                 call_lock: std::sync::Mutex::new(()),
                 stopped: std::sync::atomic::AtomicBool::new(false),
-                window,
+                window: std::sync::atomic::AtomicPtr::new(window),
+                size: (params.width as i32, params.height as i32),
+                placeholder: std::sync::Mutex::new(None),
             }));
+            if let Some(d) = &self.direct {
+                *LIVE_DIRECT.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::downgrade(d));
+            }
         }
         log::info!(
             "MediaCodecDecoder: configured {} DIRECT to video surface, {}x{}",

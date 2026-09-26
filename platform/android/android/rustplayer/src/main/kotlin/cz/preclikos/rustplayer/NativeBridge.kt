@@ -51,6 +51,7 @@ object NativeBridge {
 
     // Generic player knobs.
     external fun nativeSetVideoOutputWindow(handle: Long, surface: Surface?)
+    external fun nativeSetOverlayWindow(handle: Long, surface: Surface?)
     external fun nativeSetSubtitleSafeInsetBottom(handle: Long, bottomPx: Int)
     external fun nativeSetAdaptiveFrameRate(handle: Long, enabled: Boolean)
     external fun nativeSetSubtitleStyle(handle: Long, textArgb: Int, outlineArgb: Int, sizeScale: Float)

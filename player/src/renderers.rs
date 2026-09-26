@@ -20,6 +20,13 @@ pub trait VideoSink: Send + Sync + 'static {
     fn resize(&self, size: PhysicalSize<u32>) -> impl Future<Output = ()> + Send + '_;
     fn change_frame_size(&self, size: PhysicalSize<u32>) -> impl Future<Output = ()> + Send + '_;
 
+    /// Android embed: re-target the presentation surface to a new host
+    /// `ANativeWindow*` (0 = detach, from `surfaceDestroyed`). Resolves once
+    /// the previous window is no longer used. No-op for other sinks.
+    fn set_android_surface(&self, _window: usize) -> impl Future<Output = ()> + Send + '_ {
+        async {}
+    }
+
     /// Install a font for subtitle rendering. No-op on sinks that don't
     /// render subtitles themselves. Returns Err on invalid font bytes.
     fn set_subtitle_font(&self, _bytes: Vec<u8>) -> Result<(), String> {

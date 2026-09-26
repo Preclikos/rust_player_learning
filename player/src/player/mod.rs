@@ -327,6 +327,28 @@ pub struct ExternalSubtitleOptions {
 /// never collide.
 const EXTERNAL_TEXT_ID_BASE: u32 = u32::MAX;
 
+/// Which host surface a [`SurfaceHold`] transition is about.
+#[derive(Debug, Clone, Copy)]
+enum SurfacePlane {
+    Video,
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    Overlay,
+}
+
+/// Playback held because the host's surfaces are gone (Android: Home or
+/// another app on top destroys the SurfaceViews while the host keeps the
+/// player). Playing on would run the movie unseen and, in direct mode, into a
+/// destroyed window. The hold pauses it and resumes once every plane that
+/// went away is attached again, i.e. when the picture is really on screen,
+/// and only if the pause was the hold's own.
+#[derive(Default)]
+struct SurfaceHold {
+    video_gone: AtomicBool,
+    overlay_gone: AtomicBool,
+    /// The hold paused playback (so it may resume it).
+    held: AtomicBool,
+}
+
 pub struct Player<V: VideoSink = VideoRenderer, A: AudioSink = AudioRenderer> {
     base_url: Option<String>,
     manifest: Option<Manifest>,
@@ -346,6 +368,8 @@ pub struct Player<V: VideoSink = VideoRenderer, A: AudioSink = AudioRenderer> {
     /// inner ticks. Toggled by `pause()` / `resume()`. While set, both
     /// loops park on `pause_notify` and PTS does not advance.
     paused: Arc<AtomicBool>,
+    /// Host surfaces gone (app in the background): see [`SurfaceHold`].
+    surface_hold: Arc<SurfaceHold>,
     pause_notify: Arc<Notify>,
 
     video_adaptation: Arc<StdMutex<Option<VideoAdaptation>>>,
@@ -492,6 +516,7 @@ impl<V: VideoSink, A: AudioSink> Clone for Player<V, A> {
             http: Arc::clone(&self.http),
             events: Arc::clone(&self.events),
             paused: Arc::clone(&self.paused),
+            surface_hold: Arc::clone(&self.surface_hold),
             pause_notify: Arc::clone(&self.pause_notify),
             video_adaptation: Arc::clone(&self.video_adaptation),
             video_representation: Arc::clone(&self.video_representation),
@@ -680,6 +705,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             http: Arc::new(HttpClient::new()),
             events,
             paused: Arc::new(AtomicBool::new(false)),
+            surface_hold: Arc::new(SurfaceHold::default()),
             pause_notify: Arc::new(Notify::new()),
             video_adaptation: Arc::new(StdMutex::new(None)),
             video_representation: Arc::new(StdMutex::new(None)),
@@ -1271,6 +1297,57 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
     /// releases the Surface.
     pub fn set_video_output_window(&self, window: *mut std::ffi::c_void) {
         self.video_output_window.set(window as usize);
+        if window.is_null() {
+            self.surface_gone(SurfacePlane::Video);
+            // Keep the live codec on a surface that stays valid, so it can
+            // move to the next real window without a rebuild.
+            #[cfg(target_os = "android")]
+            crate::decoders::mediacodec::park_direct_output();
+            return;
+        }
+        // A pipeline already playing keeps its codec: move that codec's
+        // output to the new window instead of leaving it on a destroyed one.
+        // A codec that refuses the switch is rebuilt in place (paused, it
+        // shows its first frame at the current position and waits).
+        #[cfg(target_os = "android")]
+        if crate::decoders::mediacodec::retarget_direct_output(window as usize)
+            == crate::decoders::mediacodec::Retarget::Failed
+        {
+            log::info!("[player] video window changed under a live codec — rebuilding at the current position");
+            self.seek_internal(self.position());
+        }
+        self.surface_back(SurfacePlane::Video);
+    }
+
+    /// A host surface went away: hold playback (only if it is playing) so
+    /// nothing plays unseen in the background.
+    fn surface_gone(&self, plane: SurfacePlane) {
+        let h = &self.surface_hold;
+        match plane {
+            SurfacePlane::Video => h.video_gone.store(true, Ordering::SeqCst),
+            SurfacePlane::Overlay => h.overlay_gone.store(true, Ordering::SeqCst),
+        }
+        if !self.paused.load(Ordering::SeqCst) && !h.held.swap(true, Ordering::SeqCst) {
+            log::info!("[player] {:?} surface gone — pausing until it is back on screen", plane);
+            self.pause();
+        }
+    }
+
+    /// A host surface is back: resume once EVERY plane that went away is
+    /// attached again, and only if the pause was ours (a user pause stays).
+    fn surface_back(&self, plane: SurfacePlane) {
+        let h = &self.surface_hold;
+        match plane {
+            SurfacePlane::Video => h.video_gone.store(false, Ordering::SeqCst),
+            SurfacePlane::Overlay => h.overlay_gone.store(false, Ordering::SeqCst),
+        }
+        if h.video_gone.load(Ordering::SeqCst) || h.overlay_gone.load(Ordering::SeqCst) {
+            return;
+        }
+        if h.held.swap(false, Ordering::SeqCst) {
+            log::info!("[player] surfaces back on screen — resuming");
+            self.resume();
+        }
     }
 
     /// Adaptive frame rate (Android direct mode). When enabled (the default),
@@ -2347,6 +2424,23 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
     /// Current volume in 0.0..=1.0.
     pub fn get_volume(&self) -> f32 {
         self.audio_renderer.get_volume()
+    }
+
+    /// Android embed: re-target the presentation (overlay) surface to a new
+    /// host window, or detach it with `null` (from `surfaceDestroyed`). Blocks
+    /// until the renderer has stopped using the previous window, so the host
+    /// may release it as soon as this returns. The window must stay acquired
+    /// until the next call or the player drop. See
+    /// [`VideoRenderer::set_android_surface`].
+    #[cfg(target_os = "android")]
+    pub fn set_android_overlay_window(&self, window: *mut std::ffi::c_void) {
+        if window.is_null() {
+            self.surface_gone(SurfacePlane::Overlay);
+        }
+        self.video_renderer.set_android_surface(window as usize).block_on();
+        if !window.is_null() {
+            self.surface_back(SurfacePlane::Overlay);
+        }
     }
 
     pub fn resize(&self, size: PhysicalSize<u32>) {

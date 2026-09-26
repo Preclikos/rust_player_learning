@@ -30,7 +30,8 @@ struct Handle {
     /// Keeps the host callback object + JavaVM alive for the player's lifetime.
     _host: Arc<AndroidHost>,
     /// Overlay (wgpu/GLES) window — UI/subtitles, or video in non-direct mode.
-    native_window: *mut ndk_sys::ANativeWindow,
+    /// Swappable at runtime (`setOverlaySurface`) like the video window.
+    native_window: AtomicPtr<ndk_sys::ANativeWindow>,
     /// Video plane window — MediaCodec renders into it in direct mode. Swappable
     /// at runtime (`setVideoSurface`), so behind an atomic with old-ref release.
     video_window: AtomicPtr<ndk_sys::ANativeWindow>,
@@ -377,7 +378,7 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeStart(
     let handle = Box::new(Handle {
         bridge,
         _host: host,
-        native_window,
+        native_window: AtomicPtr::new(native_window),
         video_window: AtomicPtr::new(video_window),
     });
     Box::into_raw(handle) as jlong
@@ -636,6 +637,40 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetVideoO
     }
 }
 
+/// Re-point (or detach with a null surface) the overlay / presentation window
+/// the renderer draws into — the picture itself on the GLES path, subtitles in
+/// direct mode. Call with null from `surfaceDestroyed` (returns once the
+/// renderer no longer touches the old window) and with the new Surface from
+/// `surfaceCreated`, e.g. after Home → back with the player kept alive.
+#[no_mangle]
+pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetOverlayWindow(
+    env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    surface: JObject,
+) {
+    let Some(h) = (unsafe { handle_ref(handle) }) else {
+        return;
+    };
+    let new_window = if surface.is_null() {
+        std::ptr::null_mut()
+    } else {
+        unsafe {
+            ndk_sys::ANativeWindow_fromSurface(env.get_raw() as *mut _, surface.as_raw() as *mut _)
+        }
+    };
+    let _guard = runtime().enter();
+    // Blocks until the renderer has left the previous window, so it can be
+    // released right after.
+    h.bridge
+        .player()
+        .set_android_overlay_window(new_window as *mut c_void);
+    let old = h.native_window.swap(new_window, Ordering::AcqRel);
+    if !old.is_null() {
+        unsafe { ndk_sys::ANativeWindow_release(old) };
+    }
+}
+
 #[no_mangle]
 pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetSubtitleSafeInsetBottom(
     _env: JNIEnv,
@@ -729,8 +764,11 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeDestroy(
     drop(bridge);
     drop(_host);
     let vwin = video_window.load(Ordering::Acquire);
+    let native_window = native_window.load(Ordering::Acquire);
     unsafe {
-        ndk_sys::ANativeWindow_release(native_window);
+        if !native_window.is_null() {
+            ndk_sys::ANativeWindow_release(native_window);
+        }
         if !vwin.is_null() {
             ndk_sys::ANativeWindow_release(vwin);
         }

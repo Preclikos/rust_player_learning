@@ -145,6 +145,26 @@ Host responsibilities in direct mode:
   bitmask (bit 0 = Dolby Vision, 1 = HDR10, 2 = HLG, 3 = HDR10+).
 - **Window lifetime**: both `ANativeWindow` refs must outlive the
   player; release them after dropping it.
+- **Home → back with the player kept alive** (since 0.1.40): the system
+  destroys both SurfaceViews in the background and creates new ones on
+  return. Hand both planes over:
+  - `surfaceDestroyed` → `setVideoSurface(null)` / `setOverlaySurface(null)`
+    (Kotlin; Rust `set_video_output_window(null)` /
+    `set_android_overlay_window(null)`). Each returns once the player no
+    longer uses the old window.
+  - `surfaceChanged` of the new surfaces → `setVideoSurface(surface)` /
+    `setOverlaySurface(surface)`, then `setSize(w, h)`.
+
+  The player pauses by itself when a plane goes away and resumes by itself
+  once every plane is back, i.e. when the picture is on screen again — but
+  only if the pause was its own: a user pause stays paused. **Do not pause
+  or play from `onStop`/`onStart` as well**: a host pause before the
+  surface goes away counts as a user pause and the player will not resume.
+  The live MediaCodec is moved onto a private placeholder surface while
+  the host has none and then onto the new window (no rebuild, no black);
+  a codec that refuses the switch is rebuilt at the current position.
+  Without these calls the player keeps drawing into the destroyed windows
+  and the picture never returns.
 
 The non-direct GLES path additionally supports **HDR passthrough**
 (surface dataspace BT2020_PQ + SMPTE 2086/CTA-861.3 metadata) when the
@@ -314,7 +334,10 @@ Host controls:
 
 - `capabilities()` / `probe_capabilities()` — what this build can play.
 - `set_display_hdr_types(mask)` — display capability hint (Android).
-- `set_video_output_window(ptr)` — enable direct mode (Android).
+- `set_video_output_window(ptr)` — enable direct mode (Android); null on
+  `surfaceDestroyed`, the new window on return (see §3.2).
+- `set_android_overlay_window(ptr)` — re-target the overlay surface
+  (Android, since 0.1.40; null = detach).
 - `set_hdr_tonemap(HdrTonemapParams)` — tonemap tuning where
   `hdr_tonemap_tunable` is true; default reproduces the SDR ladder's
   reference transcode. Irrelevant in direct mode (display tonemaps).

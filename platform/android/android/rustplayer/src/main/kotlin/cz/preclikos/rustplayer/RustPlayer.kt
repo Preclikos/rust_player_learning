@@ -212,6 +212,21 @@ class RustPlayer(private val context: Context) {
         if (handle != 0L) NativeBridge.nativeSetVideoOutputWindow(handle, surface)
     }
 
+    /**
+     * Re-point the overlay surface (the one passed to [start]: the picture on
+     * the GLES path, subtitles in direct mode) to a new [Surface], or detach it
+     * with null. Keeping the player alive across Home → back needs both
+     * surfaces handed over again: call `setOverlaySurface(null)` and
+     * `setVideoSurface(null)` from `surfaceDestroyed` (the call returns once the
+     * player no longer draws into the old window), then the new surfaces from
+     * `surfaceCreated`, followed by [setSize]. Without it the player keeps
+     * drawing into the destroyed window and the picture never returns.
+     * Since 0.1.40.
+     */
+    fun setOverlaySurface(surface: Surface?) {
+        if (handle != 0L) NativeBridge.nativeSetOverlayWindow(handle, surface)
+    }
+
     fun setSubtitleSafeInsetBottom(px: Int) {
         if (handle != 0L) NativeBridge.nativeSetSubtitleSafeInsetBottom(handle, px)
     }

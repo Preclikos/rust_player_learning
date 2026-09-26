@@ -44,7 +44,7 @@ pub use events::{
 };
 pub use ffmpeg_log::{set_log_level, LogLevel};
 pub use hdr_tonemap::HdrTonemapParams;
-pub use subtitle_style::SubtitleStyle;
+pub use subtitle_style::{SubtitleAnchor, SubtitleStyle};
 /// Host-supplied sidecar subtitles — see
 /// [`Player::add_external_subtitle_track`].
 pub use parsers::sidecar::{SidecarError, SubtitleFormat};

@@ -67,10 +67,13 @@ pub(crate) fn clock_monotonic_ns() -> i64 { 0 }
 /// So a position that stands still while we are neither paused nor starving is
 /// treated as a dead output: the wall clock takes over AT THE VALUE the audio
 /// clock last read, which makes the handover continuous (no lurch), and the
-/// picture keeps real time with no sound instead of crawling. If the output
-/// comes back and agrees with where the wall clock got to, the audio master is
-/// re-adopted; if it comes back minutes behind, re-adopting would jerk the
-/// picture backwards by that span, so the wall clock keeps the session.
+/// picture keeps real time with no sound instead of crawling. When the output
+/// comes back the audio master is re-adopted — seamlessly if it agrees with
+/// where the wall clock got to, otherwise with one hold or skip of the gap.
+/// Staying on the wall clock instead left the picture permanently offset
+/// from the sound by that gap (a passthrough receiver relocking for 2 s
+/// after an HDMI mode switch came back 2 s "behind"); one visible correction
+/// beats a desync that lasts the rest of the title.
 pub(crate) struct MediaClock<A: AudioSink> {
     audio_sink: Arc<A>,
     // Wall anchor (= now − seek_offset): the fallback when the sink has no clock.
@@ -107,7 +110,8 @@ const AUDIO_CLOCK_STALE_MS: u64 = 3_000;
 const AUDIO_CLOCK_START_GRACE_MS: u64 = 5_000;
 
 /// How far a revived audio clock may be from the wall-extrapolated position
-/// and still be re-adopted as the master.
+/// and still be re-adopted SILENTLY; further away it is re-adopted with a
+/// warning (the picture holds or skips by the gap once).
 const AUDIO_CLOCK_REJOIN_TOL_MS: i64 = 200;
 
 #[derive(Default)]
@@ -141,7 +145,18 @@ pub(crate) struct ClockState {
     /// up. Only the pause accrued SINCE the handover may be subtracted, hence
     /// a baseline rather than the cumulative figure.
     wall_from: Option<(u64, Instant, Duration)>,
+    /// Set while a pause / starvation hold is in force (the position then):
+    /// until the position has advanced [`AUDIO_CLOCK_RESUME_ADVANCE_MS`] past
+    /// it the start-up grace applies to the staleness guard, because a
+    /// passthrough output takes 1.5–2.5 s after `play()` to present again —
+    /// and its first reads after the release can creep by an interpolated
+    /// few hundred ms before the real position moves.
+    resumed_from: Option<u64>,
 }
+
+/// How far the position must advance after a hold before the normal
+/// staleness guard applies again.
+const AUDIO_CLOCK_RESUME_ADVANCE_MS: u64 = 250;
 
 /// Real time between `from` and `now` MINUS the part of it spent paused.
 ///
@@ -187,25 +202,46 @@ impl<A: AudioSink> MediaClock<A> {
         let to_media_us =
             |ms: i64| -> i64 { (ms * 1_000 + self.seek_offset_us - lat_us).max(0) };
         let mut st = self.state.lock().unwrap();
+        let held = self.paused.load(Ordering::Relaxed)
+            || self.stats.audio_starving.load(Ordering::Relaxed)
+            || self.stats.video_starving.load(Ordering::Relaxed);
+        if held {
+            st.resumed_from = Some(played);
+        }
 
         if st.seen.map(|(p0, _, _)| played > p0).unwrap_or(true) {
             if st.seen.is_some() {
                 st.ever_advanced = true;
+                if st.resumed_from.is_some_and(|from| played >= from + AUDIO_CLOCK_RESUME_ADVANCE_MS) {
+                    st.resumed_from = None;
+                }
             }
             if let Some((wp, wt, skew0)) = st.wall_from {
-                // The output is alive again. Re-adopt it as the master only if
-                // it agrees with where the wall clock carried us; a device that
-                // was wedged for minutes comes back that far behind, and
-                // re-adopting it would jerk the picture backwards by the span.
+                // The output is alive again: it is the clock the listener
+                // hears, so it takes the master back. Seamlessly when it
+                // agrees with where the wall clock carried us; otherwise the
+                // picture holds (audio behind) or skips (audio ahead) by the
+                // gap once — the alternative, keeping the wall clock, is a
+                // permanent A/V offset of exactly that gap.
                 let wall_ms = wp as i64
                     + wall_played(now, wt, pause_skew, skew0).as_millis() as i64;
-                if (played as i64 - wall_ms).abs() <= AUDIO_CLOCK_REJOIN_TOL_MS {
+                let gap = played as i64 - wall_ms;
+                if gap.abs() <= AUDIO_CLOCK_REJOIN_TOL_MS {
                     log::info!(
                         "[clock] audio position advancing again at {}ms — re-adopting the audio master",
                         played
                     );
-                    st.wall_from = None;
+                } else {
+                    log::warn!(
+                        "[clock] audio position advancing again at {}ms, {}ms {} the wall clock — \
+                         re-anchoring to the audio master (picture {} once)",
+                        played,
+                        gap.abs(),
+                        if gap < 0 { "behind" } else { "ahead of" },
+                        if gap < 0 { "holds" } else { "skips" }
+                    );
                 }
+                st.wall_from = None;
             }
             st.seen = Some((played, now, pause_skew));
         }
@@ -224,15 +260,12 @@ impl<A: AudioSink> MediaClock<A> {
         // Standing position while we are supposed to be playing => dead output
         // (see the type docs). Hand over to the wall clock at exactly the value
         // the audio clock last read, so the handover is continuous.
-        let stale_after = if st.ever_advanced {
+        let stale_after = if st.ever_advanced && st.resumed_from.is_none() {
             AUDIO_CLOCK_STALE_MS
         } else {
             AUDIO_CLOCK_START_GRACE_MS
         };
-        if since >= Duration::from_millis(stale_after)
-            && !self.paused.load(Ordering::Relaxed)
-            && !self.stats.audio_starving.load(Ordering::Relaxed)
-        {
+        if since >= Duration::from_millis(stale_after) && !held {
             // Hand over at exactly the value the frozen clock last read, so
             // the transition is continuous, then keep real time from here.
             let extra = since.as_millis() as u64 - stale_after;
@@ -389,7 +422,7 @@ mod tests {
     }
 
     #[test]
-    fn revived_output_is_re_adopted_only_when_it_agrees() {
+    fn revived_output_is_re_adopted_even_when_far_behind() {
         // Wall clock has carried us to ~2000ms.
         let fx = fixture(1_000);
         {
@@ -406,8 +439,10 @@ mod tests {
             "an agreeing audio clock should take the master back"
         );
 
-        // Output comes back a long way behind -> keep the wall clock, because
-        // re-adopting would jerk the picture backwards by that span.
+        // Output comes back a long way behind (a passthrough receiver that
+        // relocked 800 ms later than the wall clock assumed) -> re-adopt
+        // anyway: the clock steps back to the audible position once, instead
+        // of leaving the picture 800 ms ahead of the sound for good.
         let fx = fixture(1_000);
         {
             let mut st = fx.clock.state.lock().unwrap();
@@ -418,12 +453,12 @@ mod tests {
         fx.sink.played_ms.store(1_200, Ordering::Relaxed);
         let now = fx.clock.audio_now_us(Duration::ZERO).unwrap();
         assert!(
-            fx.clock.state.lock().unwrap().wall_from.is_some(),
-            "a clock 800ms behind must not take the master back"
+            fx.clock.state.lock().unwrap().wall_from.is_none(),
+            "a revived audio clock must take the master back even 800ms behind"
         );
         assert!(
-            now >= 2_000_000,
-            "wall extrapolation should continue, got {now}us"
+            (1_150_000..=1_250_000).contains(&now),
+            "the clock should read the audible position, got {now}us"
         );
     }
 

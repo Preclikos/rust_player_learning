@@ -91,6 +91,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
     // Scripted scenario (see runScenarioStep) - empty = interactive app.
     private var scenario = ""
+    private var manifestUrl = TEST_MANIFEST_URL
     private var scenarioIterations = 5
     private var scenarioSettleMs = 12_000L
     private var scenarioWarmupMs = 12_000L
@@ -108,6 +109,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         stormPassthrough = intent.getBooleanExtra("storm_passthrough", false)
         traceEnabled = intent.getBooleanExtra("trace", true)
         readScenarioExtras()
+        // --ez verbose true: engine debug lines (audio clock internals etc.).
+        if (intent.getBooleanExtra("verbose", false)) player.setVerboseLogging(true)
         if (stormMode) {
             android.util.Log.i(
                 "rustplayer_repro",
@@ -307,6 +310,9 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     // Every step emits a MARK first, so the analyser windows on the cause.
 
     private fun readScenarioExtras() {
+        // --es url <manifest>: play something other than the bundled test
+        // stream (e.g. the E-AC-3 one for passthrough work).
+        intent.getStringExtra("url")?.takeIf { it.isNotBlank() }?.let { manifestUrl = it }
         scenario = intent.getStringExtra("scenario") ?: ""
         scenarioIterations = intent.getIntExtra("iterations", 5)
         scenarioSettleMs = intent.getIntExtra("settle_ms", 8_000).toLong()
@@ -505,7 +511,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         val overlay = overlaySurface ?: return
         val video = videoSurface ?: return
         if (!player.isStarted) {
-            traceMark("start", "url" to TEST_MANIFEST_URL, "storm" to stormMode)
+            traceMark("start", "url" to manifestUrl, "storm" to stormMode)
             if (stormMode) {
                 val passthrough = if (stormPassthrough) true else null
                 if (stormFix == "start_param") {
@@ -515,7 +521,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                     // so this picks the same mp4a track; the point is the path.)
                     player.start(
                         overlay, video, overlayW, overlayH, displayHdrTypes(),
-                        manifestUrl = TEST_MANIFEST_URL,
+                        manifestUrl = manifestUrl,
                         provider = TestProvider,
                         startFraction = stormFraction,
                         audioPassthrough = passthrough,
@@ -526,7 +532,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                     // BlackZone-style: resume mid-content + own subtitle selection.
                     player.start(
                         overlay, video, overlayW, overlayH, displayHdrTypes(),
-                        manifestUrl = TEST_MANIFEST_URL,
+                        manifestUrl = manifestUrl,
                         provider = TestProvider,
                         startFraction = stormFraction,
                         audioPassthrough = passthrough,
@@ -539,7 +545,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             } else {
                 player.start(
                     overlay, video, overlayW, overlayH, displayHdrTypes(),
-                    manifestUrl = TEST_MANIFEST_URL,
+                    manifestUrl = manifestUrl,
                     provider = TestProvider,
                 )
             }

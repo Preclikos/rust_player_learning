@@ -611,6 +611,8 @@ pub struct GlesOesPendingFrame {
     /// TV overscan / system bars. Sourced from the host's WindowInsets (see
     /// Player::set_subtitle_safe_insets).
     pub subtitle_bottom_inset_px: u32,
+    /// Layout box the cue was rasterized for (screen or picture).
+    pub subtitle_anchor: crate::SubtitleAnchor,
     pub scale_x: f32,
     pub scale_y: f32,
     /// (content_width - 1) / buffer_width — crops the right-edge codec
@@ -1042,6 +1044,7 @@ impl GlesOesRenderer {
         mode: OesRenderMode,
         subtitle: Option<std::sync::Arc<crate::renderers::subtitle::SubtitleBitmap>>,
         subtitle_bottom_inset_px: u32,
+        subtitle_anchor: crate::SubtitleAnchor,
     ) -> Result<(), String> {
         let get_client: FnEglGetNativeClientBufferANDROID =
             std::mem::transmute(self.fn_get_native_client_buffer);
@@ -1122,6 +1125,7 @@ impl GlesOesRenderer {
                 scale_x,
                 scale_y,
                 subtitle_bottom_inset_px,
+                subtitle_anchor,
             );
             return Ok(());
         }
@@ -1256,6 +1260,7 @@ impl GlesOesRenderer {
             scale_x,
             scale_y,
             subtitle_bottom_inset_px,
+            subtitle_anchor,
         );
 
         // Static HDR metadata, once per surface, on the first passthrough
@@ -1305,6 +1310,7 @@ impl GlesOesRenderer {
         scale_x: f32,
         scale_y: f32,
         bottom_inset_px: u32,
+        anchor: crate::SubtitleAnchor,
     ) {
         let (Some(bmp), Some(sub)) = (bitmap, &self.subtitle) else {
             return;
@@ -1347,6 +1353,7 @@ impl GlesOesRenderer {
             scale_x,
             scale_y,
             bottom_inset_px,
+            anchor,
         );
         let [center_x, center_y, half_w, half_h] =
             crate::renderers::subtitle::cue_quad(bmp, &parent);

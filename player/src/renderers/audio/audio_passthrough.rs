@@ -61,6 +61,11 @@ pub struct AudioTrackSink {
     /// in a loop (no audio). The feed gates the first write on video readiness,
     /// so playback begins with the first real audio, in step with video.
     started: std::sync::atomic::AtomicBool,
+    /// Highest `played_ms` reported for this track — the monotonic floor.
+    last_played_ms: std::sync::atomic::AtomicU64,
+    /// `framePosition` of the last timestamp read, to tell an advancing
+    /// timestamp from a repeated stale one.
+    last_ts_frame_pos: std::sync::atomic::AtomicI64,
     /// Desired paused state, honored ACROSS the lazy start. A `set_paused(true)`
     /// before the first AU can't touch the not-yet-playing track, so we remember
     /// it here and the lazy start in `write` skips `play()` while paused — else
@@ -228,6 +233,8 @@ impl AudioTrackSink {
                     sample_rate,
                     stopped: std::sync::atomic::AtomicBool::new(false),
                     started: std::sync::atomic::AtomicBool::new(false),
+                    last_played_ms: std::sync::atomic::AtomicU64::new(0),
+                    last_ts_frame_pos: std::sync::atomic::AtomicI64::new(-1),
                     paused: std::sync::atomic::AtomicBool::new(false),
                 })
             }
@@ -242,21 +249,45 @@ impl AudioTrackSink {
     /// the receiver's consumption rate, which is what makes the playback head a
     /// usable clock).
     pub fn write(&self, au: &[u8]) {
-        if self.stopped.load(std::sync::atomic::Ordering::Acquire) {
-            return;
-        }
+        // `AudioTrack.write` blocks on a full buffer only while the track is
+        // PLAYING; on a paused (or not yet started) track it returns after
+        // copying what fits — possibly 0 bytes — and the rest of the AU is
+        // simply not written. Ignoring that return value dropped whole
+        // seconds of E-AC-3 during a starvation hold (the feed saw 40 s of
+        // "write ahead" in 5 s while the track had taken none of it), so this
+        // loops until every byte is accepted, idling while the track takes
+        // nothing, and gives up only when the sink is being torn down.
         let vm = android_vm();
-        let _ = vm.attach_current_thread(|env| -> Result<(), jni::errors::Error> {
-            let arr = env.byte_array_from_slice(au)?;
-            // write(byte[], offsetInBytes, sizeInBytes): blocking in STREAM mode.
-            env.call_method(
-                self.track.as_obj(),
-                jni::jni_str!("write"),
-                jni::jni_sig!("([BII)I"),
-                &[(&arr).into(), 0i32.into(), (au.len() as i32).into()],
-            )?;
-            Ok(())
-        });
+        let mut offset = 0usize;
+        while offset < au.len() {
+            if self.stopped.load(std::sync::atomic::Ordering::Acquire) {
+                return;
+            }
+            let written = vm
+                .attach_current_thread(|env| -> Result<i32, jni::errors::Error> {
+                    let arr = env.byte_array_from_slice(&au[offset..])?;
+                    // write(byte[], offsetInBytes, sizeInBytes): blocking in
+                    // STREAM mode while playing.
+                    env.call_method(
+                        self.track.as_obj(),
+                        jni::jni_str!("write"),
+                        jni::jni_sig!("([BII)I"),
+                        &[(&arr).into(), 0i32.into(), ((au.len() - offset) as i32).into()],
+                    )?
+                    .i()
+                })
+                .unwrap_or(-1);
+            if written < 0 {
+                // ERROR_INVALID_OPERATION / ERROR_DEAD_OBJECT: the track is
+                // gone; the watchdog/rebuild path owns recovery.
+                log::warn!("[audio-pt] AudioTrack.write returned {}", written);
+                return;
+            }
+            offset += written as usize;
+            if written == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
         // Lazily start playback on the first AU: the track now has real data, so
         // play() begins output with actual audio (no silent pre-roll counted by
         // the clock, no "dead IAudioTrack" from getTimestamp on an idle track).
@@ -271,18 +302,14 @@ impl AudioTrackSink {
         }
     }
 
-    /// Presented-frame position as milliseconds — the passthrough clock source.
-    ///
-    /// Uses `AudioTrack.getTimestamp()` (precise presentation `framePosition`),
-    /// which gives a smooth, accurate position regardless of how coarsely the
-    /// playback head updates — `getPlaybackHeadPosition` alone is bursty for
-    /// compressed passthrough, so MediaClock's interpolation froze between
-    /// updates and video stuttered. Falls back to the head before the first
-    /// timestamp is available.
-    pub fn played_ms(&self) -> Option<u64> {
-        // Before the first AU (track not playing) getTimestamp churns the track
-        // ("dead IAudioTrack"); report no clock so MediaClock uses its wall
-        // fallback until audio actually starts.
+    /// Consumed position — `getPlaybackHeadPosition` in ms: how much of the
+    /// bitstream the output has TAKEN from the track buffer. Not what is
+    /// audible (that lags by the receiver's pipeline, see `played_ms`), but
+    /// the honest liveness signal: it keeps moving while an HDMI receiver
+    /// relocks after a mode switch or a pause, and stops only when the
+    /// output really stopped draining (`IAudioTrack` killed on TV standby).
+    /// `None` before the first AU / after stop.
+    pub fn consumed_ms(&self) -> Option<u64> {
         if self.sample_rate == 0
             || !self.started.load(std::sync::atomic::Ordering::Acquire)
             || self.stopped.load(std::sync::atomic::Ordering::Acquire)
@@ -290,11 +317,65 @@ impl AudioTrackSink {
             return None;
         }
         let vm = android_vm();
-        // Closure returns (have_ts, value_frames, consumed_frames):
-        //   have_ts=true  → value = PRESENTED position (getTimestamp, interp to
-        //                   now), consumed = getPlaybackHeadPosition (now).
-        //   have_ts=false → value = consumed = getPlaybackHeadPosition.
-        let res = vm.attach_current_thread(|env| -> Result<(bool, i64, i64), jni::errors::Error> {
+        vm.attach_current_thread(|env| -> Result<u64, jni::errors::Error> {
+            let head = env
+                .call_method(
+                    self.track.as_obj(),
+                    jni::jni_str!("getPlaybackHeadPosition"),
+                    jni::jni_sig!("()I"),
+                    &[],
+                )?
+                .i()? as u32 as u64;
+            Ok(head * 1000 / self.sample_rate as u64)
+        })
+        .ok()
+    }
+
+    /// Presented-frame position in ms — the passthrough clock source.
+    ///
+    /// `AudioTrack.getTimestamp()` gives the frame the receiver is presenting
+    /// at a CLOCK_MONOTONIC instant; that is interpolated to now, but only
+    /// over a FRESH timestamp and never while paused. An `AudioTimestamp` is a
+    /// snapshot: while the output is paused, or an HDMI receiver relocks after
+    /// a mode switch, its `nanoTime` stops moving, and extrapolating
+    /// `(now − nanoTime)` then ran the clock ahead by the whole stall — and,
+    /// worse, poisoned the consumed→presented latency learned below (Streamer
+    /// log: a latency cache near zero after a pause, then a fresh track whose
+    /// "presented" estimate led the real output by 2.1 s, so the video
+    /// anchored late, dropped 93 frames and froze for 2 s when the first
+    /// real timestamp arrived). ExoPlayer's `AudioTimestampPoller` likewise
+    /// stops trusting a timestamp that is not advancing.
+    ///
+    /// Before a track's first valid timestamp the presented position is
+    /// estimated as `consumed − latency`, `latency` being the consumed →
+    /// presented gap learned from fresh timestamps (process-wide: the HAL's
+    /// bitstream pipeline depth is a property of the device path, not of the
+    /// track). With nothing learned yet it reports 0 — video holds its first
+    /// frame until the receiver really presents, the start-up contract
+    /// `played_since_flush_ms` documents.
+    ///
+    /// Monotonic within a track: a presented position that lands behind what
+    /// was already reported freezes the clock instead of stepping it back;
+    /// the sync loop holds and the two meet again.
+    pub fn played_ms(&self) -> Option<u64> {
+        use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+        /// A timestamp older than this is a stale snapshot, not a clock.
+        const TIMESTAMP_FRESH_NS: i64 = 500_000_000;
+        /// Interpolate at most this far past a timestamp's instant.
+        const TIMESTAMP_INTERP_MAX_NS: i64 = 1_000_000_000;
+
+        // Before the first AU (track not playing) getTimestamp churns the track
+        // ("dead IAudioTrack"); report no clock so MediaClock uses its wall
+        // fallback until audio actually starts.
+        if self.sample_rate == 0
+            || !self.started.load(Ordering::Acquire)
+            || self.stopped.load(Ordering::Acquire)
+        {
+            return None;
+        }
+        let vm = android_vm();
+        // (consumed frames, Some((presented frame, its CLOCK_MONOTONIC ns)))
+        let res = vm.attach_current_thread(|env| -> Result<(i64, Option<(i64, i64)>), jni::errors::Error> {
             let head = env
                 .call_method(
                     self.track.as_obj(),
@@ -316,66 +397,82 @@ impl AudioTrackSink {
                     &[(&ts).into()],
                 )?
                 .z()?;
-            if have_ts {
-                // AudioTimestamp public fields (long): the presented frame at
-                // CLOCK_MONOTONIC instant `nanoTime`. Interpolate to NOW —
-                // returning the stale framePosition jitters the clock by the
-                // (now − nanoTime) staleness, which judders the video.
+            let ts = if have_ts {
                 let frame_pos = env
                     .get_field(&ts, jni::jni_str!("framePosition"), jni::jni_sig!("J"))?
                     .j()?;
                 let nano_time = env
                     .get_field(&ts, jni::jni_str!("nanoTime"), jni::jni_sig!("J"))?
                     .j()?;
-                let dt_ns = clock_monotonic_ns() - nano_time;
-                Ok((true, frame_pos + dt_ns * self.sample_rate as i64 / 1_000_000_000, head))
+                Some((frame_pos, nano_time))
             } else {
-                Ok((false, head, head))
-            }
+                None
+            };
+            Ok((head, ts))
         });
-        // Cached AVR decode latency (CONSUMED − PRESENTED frames). The device's
-        // E-AC-3 decode latency is stable, so we learn it once getTimestamp is
-        // valid and reuse it for the next pipeline's pre-getTimestamp window.
-        // Process-wide (each seek builds a fresh sink), 0 = not yet known.
-        use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-        static AVR_LATENCY_FRAMES: AtomicI64 = AtomicI64::new(0);
-        match res {
-            Ok((have_ts, value, consumed)) => {
-                let frames = if have_ts {
-                    // Learn the consumed→presented gap (AVR latency) for next time.
-                    let lat = consumed - value;
-                    if lat > 0 && lat < self.sample_rate as i64 * 5 {
-                        AVR_LATENCY_FRAMES.store(lat, Ordering::Relaxed);
+        let Ok((consumed, ts)) = res else { return None };
+
+        // Consumed → presented gap in frames, learned from fresh timestamps
+        // only. 0 = not yet known.
+        static LATENCY_FRAMES: AtomicI64 = AtomicI64::new(0);
+        let rate = self.sample_rate as i64;
+        let paused = self.paused.load(Ordering::Acquire);
+        let presented = match ts {
+            Some((frame_pos, nano_time)) => {
+                let age_ns = clock_monotonic_ns() - nano_time;
+                let fresh = !paused && (0..=TIMESTAMP_FRESH_NS).contains(&age_ns);
+                // A timestamp that has not moved since the last read and is
+                // past its freshness is a repeated snapshot of a stalled
+                // output (resuming after a pause, an HDMI relock): no
+                // interpolation on top of it. ExoPlayer's AudioTimestampPoller
+                // draws the same line (TIMESTAMP_ADVANCING vs stale).
+                let advancing = frame_pos > self.last_ts_frame_pos.swap(frame_pos, Ordering::AcqRel);
+                if fresh {
+                    let lat = consumed - frame_pos;
+                    if lat >= 0 && lat < rate * 5 {
+                        LATENCY_FRAMES.store(lat, Ordering::Relaxed);
                     }
-                    value
-                } else {
-                    // getTimestamp not valid yet: getPlaybackHeadPosition is the
-                    // CONSUMED position, which runs ahead of audible audio by the
-                    // AVR latency. Subtract the cached latency so this estimate
-                    // matches the PRESENTED position getTimestamp will soon report
-                    // — the source handoff is then continuous (no clock lurch /
-                    // post-start frame slowdown). Raw consumed only on the very
-                    // first start (cache still 0), one transient then primed.
-                    let lat = AVR_LATENCY_FRAMES.load(Ordering::Relaxed);
-                    if lat > 0 {
-                        (value - lat).max(0)
-                    } else {
-                        value
-                    }
-                };
-                static N: AtomicU64 = AtomicU64::new(0);
-                if N.fetch_add(1, Ordering::Relaxed) % 30 == 0 {
-                    log::debug!(
-                        "[audio-pt] played_ms: have_ts={} value={} consumed={} lat_cache={} -> {}ms",
-                        have_ts, value, consumed,
-                        AVR_LATENCY_FRAMES.load(Ordering::Relaxed),
-                        (frames.max(0) as u64) * 1000 / self.sample_rate as u64
-                    );
                 }
-                Some((frames.max(0) as u64) * 1000 / self.sample_rate as u64)
+                let interp_ns = if paused || !(fresh || advancing) {
+                    0
+                } else {
+                    age_ns.clamp(0, TIMESTAMP_INTERP_MAX_NS)
+                };
+                let estimate = frame_pos + interp_ns * rate / 1_000_000_000;
+                // Nothing can be presented before it was consumed. Right after
+                // `play()` (a fresh track, a resume) the HAL hands out
+                // timestamps 300–350 ms AHEAD of the head (Streamer: presented
+                // 32573 vs consumed 16223 frames at start, 1989999 vs 1976159
+                // after a resume) and corrects them a moment later; trusting
+                // them skipped the picture forward and then held it while the
+                // real position caught up. ExoPlayer's AudioTimestampPoller
+                // likewise refuses a timestamp until it has advanced
+                // consistently after start. The consumed head is the ceiling.
+                let ceiling = consumed - LATENCY_FRAMES.load(Ordering::Relaxed).max(0);
+                estimate.min(ceiling.max(0))
             }
-            Err(_) => None,
+            None => {
+                let lat = LATENCY_FRAMES.load(Ordering::Relaxed);
+                if lat > 0 {
+                    (consumed - lat).max(0)
+                } else {
+                    0
+                }
+            }
+        };
+        let ms = (presented.max(0) as u64) * 1000 / self.sample_rate as u64;
+        // Monotonic within the track (see above).
+        let prev = self.last_played_ms.fetch_max(ms, Ordering::AcqRel);
+        let out = ms.max(prev);
+        static N: AtomicU64 = AtomicU64::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) % 30 == 0 {
+            log::debug!(
+                "[audio-pt] played_ms: have_ts={} presented={} consumed={} lat_cache={} paused={} -> {}ms",
+                ts.is_some(), presented, consumed,
+                LATENCY_FRAMES.load(Ordering::Relaxed), paused, out
+            );
         }
+        Some(out)
     }
 
     fn call_void(&self, method: &'static jni::strings::JNIStr) {
@@ -397,6 +494,7 @@ impl AudioTrackSink {
     }
     pub fn flush(&self) {
         self.call_void(jni::jni_str!("flush"));
+        self.last_played_ms.store(0, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -406,6 +504,9 @@ impl crate::renderers::AudioPassthrough for AudioTrackSink {
     }
     fn played_ms(&self) -> Option<u64> {
         AudioTrackSink::played_ms(self)
+    }
+    fn consumed_ms(&self) -> Option<u64> {
+        AudioTrackSink::consumed_ms(self)
     }
     fn flush(&self) {
         AudioTrackSink::flush(self)

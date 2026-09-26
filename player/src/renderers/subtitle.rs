@@ -39,7 +39,7 @@ use std::sync::{Arc, Mutex};
 use wgpu::util::DeviceExt;
 
 use crate::parsers::vtt::{Anchor, CueLayout, CueLine, VttCue};
-use crate::SubtitleStyle;
+use crate::{SubtitleAnchor, SubtitleStyle};
 
 // CPU cue rasterization (fontdue) lives in its own file (mirrors `video`).
 mod rasterizer;
@@ -63,16 +63,21 @@ pub(crate) const INNER_PADDING_RATIO: f32 = 0.125;
 
 /// The rectangle cues are laid out in, in target (surface) pixels.
 ///
-/// ExoPlayer's `SubtitleView` lives inside `PlayerView`'s
-/// `AspectRatioFrameLayout`, so its parent rect is the aspect-fitted
-/// picture — not the screen. A 2.39:1 film on a 16:9 screen gets its cues
-/// inside the picture, `BOTTOM_PADDING_FRACTION` of the *picture* height
-/// above the picture's bottom edge, never down in the letterbox bar. The
-/// host's bottom inset (`Player::set_subtitle_safe_insets`: system bars,
-/// TV overscan) plays the role of the view's bottom padding: it raises the
-/// parent's bottom edge, and — as in `CanvasSubtitleOutput`, which resolves
-/// the text size against `viewHeightMinusPadding` — shrinks the height the
-/// text size is derived from.
+/// [`SubtitleAnchor::Screen`] (default): the whole surface. A cue without
+/// `line:` then sits `BOTTOM_PADDING_FRACTION` of the surface height above
+/// the surface's bottom edge — in the letterbox bar on a widescreen film.
+///
+/// [`SubtitleAnchor::Picture`]: ExoPlayer's geometry. Its `SubtitleView`
+/// lives inside `PlayerView`'s `AspectRatioFrameLayout`, so the parent rect
+/// is the aspect-fitted picture — a 2.39:1 film on a 16:9 screen gets its
+/// cues inside the picture, `BOTTOM_PADDING_FRACTION` of the *picture*
+/// height above the picture's bottom edge.
+///
+/// Either way the host's bottom inset (`Player::set_subtitle_safe_insets`:
+/// system bars, TV overscan) plays the role of the view's bottom padding:
+/// it raises the parent's bottom edge, and — as in `CanvasSubtitleOutput`,
+/// which resolves the text size against `viewHeightMinusPadding` — shrinks
+/// the height the text size is derived from.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CueParent {
     pub target_w: u32,
@@ -92,9 +97,14 @@ impl CueParent {
         scale_x: f32,
         scale_y: f32,
         bottom_inset_px: u32,
+        anchor: SubtitleAnchor,
     ) -> Self {
         let tw = target_w as f32;
         let th = target_h as f32;
+        let (scale_x, scale_y) = match anchor {
+            SubtitleAnchor::Screen => (1.0, 1.0),
+            SubtitleAnchor::Picture => (scale_x, scale_y),
+        };
         let sane = |s: f32| if s.is_finite() && s > 0.0 { s.min(1.0) } else { 1.0 };
         let pw = (tw * sane(scale_x)).round();
         let ph = (th * sane(scale_y)).round();
@@ -121,6 +131,7 @@ impl CueParent {
         content_w: u32,
         content_h: u32,
         bottom_inset_px: u32,
+        anchor: SubtitleAnchor,
     ) -> Self {
         let (scale_x, scale_y) = if content_w > 0 && content_h > 0 && target_w > 0 && target_h > 0 {
             let wa = target_w as f32 / target_h as f32;
@@ -133,7 +144,7 @@ impl CueParent {
         } else {
             (1.0, 1.0)
         };
-        Self::from_scale(target_w, target_h, scale_x, scale_y, bottom_inset_px)
+        Self::from_scale(target_w, target_h, scale_x, scale_y, bottom_inset_px, anchor)
     }
 
     /// Layout box size the rasterizer works in.
@@ -653,6 +664,12 @@ impl SubtitleOverlay {
             inner.ready.clear();
         });
         Ok(())
+    }
+
+    /// The layout-box anchor of the current style — the draw paths build
+    /// their `CueParent` with it.
+    pub fn anchor(&self) -> SubtitleAnchor {
+        self.shared.inner.lock().unwrap().style.anchor
     }
 
     /// Replace the visual style. Drops the cached cue bitmap so the next
@@ -1389,32 +1406,45 @@ mod tests {
     #[test]
     fn parent_is_the_aspect_fitted_picture_minus_the_bottom_inset() {
         // 16:9 content on a 16:9 surface: the whole surface.
-        let p = CueParent::fit(1920, 1080, 1920, 1080, 0);
+        let p = CueParent::fit(1920, 1080, 1920, 1080, 0, SubtitleAnchor::Picture);
         assert_eq!((p.left, p.top, p.right, p.bottom), (0.0, 0.0, 1920.0, 1080.0));
         // 2.39:1 film on 16:9: letterboxed, the parent is the picture
         // (PlayerView puts SubtitleView inside the AspectRatioFrameLayout).
-        let p = CueParent::fit(1920, 1080, 2390, 1000, 0);
+        let p = CueParent::fit(1920, 1080, 2390, 1000, 0, SubtitleAnchor::Picture);
         assert_eq!((p.left, p.right), (0.0, 1920.0));
         let pic_h = (1920.0f32 / 2.39).round();
         assert!((p.top - ((1080.0 - pic_h) / 2.0).floor()).abs() <= 1.0);
         assert!((p.bottom - (p.top + pic_h)).abs() <= 1.0);
         // Pillarboxed 4:3.
-        let p = CueParent::fit(1920, 1080, 640, 480, 0);
+        let p = CueParent::fit(1920, 1080, 640, 480, 0, SubtitleAnchor::Picture);
         assert_eq!((p.top, p.bottom), (0.0, 1080.0));
         assert_eq!(p.left, 240.0);
         assert_eq!(p.right, 1680.0);
         // The inset only raises the bottom (view padding), never below it.
-        let p = CueParent::fit(1920, 1080, 1920, 1080, 100);
+        let p = CueParent::fit(1920, 1080, 1920, 1080, 100, SubtitleAnchor::Picture);
         assert_eq!(p.bottom, 980.0);
-        let p = CueParent::fit(1920, 1080, 2390, 1000, 40);
+        let p = CueParent::fit(1920, 1080, 2390, 1000, 40, SubtitleAnchor::Picture);
         assert!((p.bottom - (p.top + pic_h)).abs() <= 1.0, "inset inside the bar changes nothing");
         // Unknown content size → whole target.
-        assert_eq!(CueParent::fit(1280, 720, 0, 0, 0), CueParent::fit(1280, 720, 1280, 720, 0));
+        assert_eq!(CueParent::fit(1280, 720, 0, 0, 0, SubtitleAnchor::Picture), CueParent::fit(1280, 720, 1280, 720, 0, SubtitleAnchor::Picture));
+    }
+
+    #[test]
+    fn screen_anchor_ignores_the_letterbox() {
+        // Same widescreen film: with the default Screen anchor the box is
+        // the whole surface (minus the inset), so the cue lands in the bar.
+        let p = CueParent::fit(1920, 1080, 2390, 1000, 0, SubtitleAnchor::Screen);
+        assert_eq!((p.left, p.top, p.right, p.bottom), (0.0, 0.0, 1920.0, 1080.0));
+        let (x, y) = place_cue(400, 60, 40, &CueLayout::DEFAULT, &p);
+        assert_eq!(x, 760.0);
+        assert_eq!(y, 1080.0 - 60.0 - 86.0);
+        let p = CueParent::fit(1920, 1080, 2390, 1000, 100, SubtitleAnchor::Screen);
+        assert_eq!(p.bottom, 980.0);
     }
 
     #[test]
     fn default_cue_sits_bottom_padding_above_the_parent_bottom_centered() {
-        let p = CueParent::fit(1920, 1080, 1920, 1080, 0);
+        let p = CueParent::fit(1920, 1080, 1920, 1080, 0, SubtitleAnchor::Picture);
         let (x, y) = place_cue(400, 60, 40, &CueLayout::DEFAULT, &p);
         assert_eq!(x, 760.0);
         // textTop = parentBottom - textHeight - (int)(parentHeight * 0.08)
@@ -1428,7 +1458,7 @@ mod tests {
 
     #[test]
     fn line_settings_place_vertically_like_subtitle_painter() {
-        let p = CueParent::fit(1000, 1000, 1000, 1000, 0);
+        let p = CueParent::fit(1000, 1000, 1000, 1000, 0, SubtitleAnchor::Picture);
         // line:10% → box top at 10% (lineAnchor start).
         assert_eq!(place_cue(100, 50, 25, &CueLayout::parse("line:10%"), &p).1, 100.0);
         // ,center / ,end move the anchored edge.
@@ -1445,14 +1475,14 @@ mod tests {
         assert_eq!(place_cue(100, 50, 25, &CueLayout::parse("line:100%"), &p).1, 950.0);
         assert_eq!(place_cue(100, 50, 25, &CueLayout::parse("line:-100"), &p).1, 0.0);
         // The bottom inset raises the parent bottom for `-1` and default alike.
-        let p = CueParent::fit(1000, 1000, 1000, 1000, 100);
+        let p = CueParent::fit(1000, 1000, 1000, 1000, 100, SubtitleAnchor::Picture);
         assert_eq!(place_cue(100, 50, 25, &CueLayout::parse("line:-1"), &p).1, 850.0);
         assert_eq!(place_cue(100, 50, 25, &CueLayout::DEFAULT, &p).1, 900.0 - 50.0 - 72.0);
     }
 
     #[test]
     fn position_and_align_place_horizontally_like_subtitle_painter() {
-        let p = CueParent::fit(1000, 1000, 1000, 1000, 0);
+        let p = CueParent::fit(1000, 1000, 1000, 1000, 0, SubtitleAnchor::Picture);
         // align:left → position 0 / anchor start → flush left; right → flush right.
         assert_eq!(place_cue(200, 50, 25, &CueLayout::parse("align:left"), &p).0, 0.0);
         assert_eq!(place_cue(200, 50, 25, &CueLayout::parse("align:right"), &p).0, 800.0);
@@ -1467,7 +1497,7 @@ mod tests {
         assert_eq!(place_cue(200, 50, 25, &CueLayout::parse("position:5%"), &p).0, 0.0);
         assert_eq!(place_cue(200, 50, 25, &CueLayout::parse("position:95%"), &p).0, 800.0);
         // Inside a pillarboxed picture the parent's own edges apply.
-        let p = CueParent::fit(1920, 1080, 640, 480, 0);
+        let p = CueParent::fit(1920, 1080, 640, 480, 0, SubtitleAnchor::Picture);
         assert_eq!(place_cue(200, 50, 25, &CueLayout::parse("align:left"), &p).0, 240.0);
         assert_eq!(place_cue(200, 50, 25, &CueLayout::parse("align:right"), &p).0, 1480.0);
     }

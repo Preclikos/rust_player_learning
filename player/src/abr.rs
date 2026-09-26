@@ -120,19 +120,32 @@ impl AbrVideoProfile {
     }
 }
 
-/// Given the available representations (sorted highest→lowest or in any
-/// order) and the current EWMA in bits per second, return the index of the
-/// representation the ABR engine wants to play, or `None` if no
-/// representation fits the budget (caller keeps the current one).
+/// hls.js `abrBandWidthFactor` (0.95): the rung being played is KEPT while
+/// its bitrate still fits this fraction of the estimate. Switching down
+/// therefore needs the estimate to fall below the rung itself, while
+/// switching up needs `bitrate × safety_factor ≤ estimate` — two different
+/// thresholds, which is what stops an estimate hovering at a rung boundary
+/// from flapping every switch interval. (Measured on the Streamer: 4K ↔
+/// 1440p every ~10 s with the estimate swinging 15.9–19.5 Mbps around
+/// 14 Mbps × 1.25; with this rule the same trace stays put.)
+pub const ABR_STAY_FACTOR: f64 = 0.95;
+
+/// Given the available representations (in any order), the current EWMA in
+/// bits per second and the index of the rung being played (`None` at start),
+/// return the index of the representation the ABR engine wants to play, or
+/// `None` on an empty list.
 ///
-/// Picks the highest `bandwidth` that satisfies
-/// `bandwidth * safety_factor <= ewma_bps`. If every representation
-/// exceeds the budget, returns the lowest-bitrate one — better to render
-/// something than nothing.
+/// Up: the highest `bandwidth` with `bandwidth * safety_factor <= ewma_bps`
+/// (`safety_factor` 1.43 ≈ hls.js `abrBandWidthUpFactor` / ExoPlayer
+/// `bandwidthFraction` 0.7). Down: only when the current rung no longer fits
+/// `ewma_bps × ABR_STAY_FACTOR`, and then to the highest rung that does fit
+/// the up-budget. If nothing fits at all, the lowest-bitrate rung — better
+/// to render something than nothing.
 pub fn pick_representation(
     bandwidths_bps: &[u64],
     ewma_bps: u64,
     safety_factor: f32,
+    current: Option<usize>,
 ) -> Option<usize> {
     if bandwidths_bps.is_empty() {
         return None;
@@ -152,7 +165,16 @@ pub fn pick_representation(
             _ => min = Some((i, bw)),
         }
     }
-    best.map(|(i, _)| i).or(min.map(|(i, _)| i))
+    let pick = best.map(|(i, _)| i).or(min.map(|(i, _)| i))?;
+    // Hysteresis: a down-switch is only taken once the current rung has
+    // genuinely stopped fitting the estimate.
+    if let Some(cur) = current.filter(|&c| c < bandwidths_bps.len()) {
+        let cur_bw = bandwidths_bps[cur];
+        if bandwidths_bps[pick] < cur_bw && (cur_bw as f64) <= ewma_bps as f64 * ABR_STAY_FACTOR {
+            return Some(cur);
+        }
+    }
+    Some(pick)
 }
 
 #[cfg(test)]
@@ -163,19 +185,50 @@ mod tests {
     fn picks_highest_within_budget() {
         let bw = [1_000_000, 3_000_000, 5_000_000, 8_000_000];
         // 5 Mbps EWMA, 1.25 safety → budget = 4 Mbps → pick 3 Mbps.
-        assert_eq!(pick_representation(&bw, 5_000_000, 1.25), Some(1));
+        assert_eq!(pick_representation(&bw, 5_000_000, 1.25, None), Some(1));
     }
 
     #[test]
     fn falls_back_to_lowest_when_starved() {
         let bw = [3_000_000, 5_000_000];
         // 1 Mbps EWMA → nothing fits → return lowest.
-        assert_eq!(pick_representation(&bw, 1_000_000, 1.25), Some(0));
+        assert_eq!(pick_representation(&bw, 1_000_000, 1.25, None), Some(0));
+        // Even when a higher rung is playing: below the stay threshold too.
+        assert_eq!(pick_representation(&bw, 1_000_000, 1.25, Some(1)), Some(0));
     }
 
     #[test]
     fn handles_empty() {
-        assert_eq!(pick_representation(&[], 5_000_000, 1.25), None);
+        assert_eq!(pick_representation(&[], 5_000_000, 1.25, None), None);
+    }
+
+    #[test]
+    fn down_switches_only_once_the_current_rung_stops_fitting() {
+        // The Streamer trace: 8 Mbps and 14 Mbps rungs, the estimate
+        // hovering around 14 × 1.25 = 17.5 Mbps. Without hysteresis every
+        // 8 s tick flipped between them.
+        let bw = [8_000_000, 14_000_000];
+        let trace = [19_532_001u64, 15_870_719, 17_603_956, 17_466_348, 19_455_411, 17_045_096, 18_604_157, 16_059_807];
+        let mut cur = pick_representation(&bw, trace[0], 1.25, None).unwrap();
+        assert_eq!(cur, 1, "19.5 Mbps takes the 14 Mbps rung");
+        let mut switches = 0;
+        for &ewma in &trace[1..] {
+            let next = pick_representation(&bw, ewma, 1.25, Some(cur)).unwrap();
+            if next != cur {
+                switches += 1;
+                cur = next;
+            }
+        }
+        // 14 Mbps fits 0.95 × every estimate in the trace (min 15.9 Mbps),
+        // so the rung is kept throughout.
+        assert_eq!(switches, 0);
+        // Once the estimate really drops below the rung, the down-switch
+        // fires (9.8 Mbps × 0.95 < 14 Mbps → 8 Mbps).
+        assert_eq!(pick_representation(&bw, 9_827_177, 1.25, Some(1)), Some(0));
+        // And the same rule on the way back up: 10.9 Mbps / 1.25 < 14 Mbps
+        // → stays on 8 Mbps; a real recovery to 20 Mbps takes 14 Mbps.
+        assert_eq!(pick_representation(&bw, 10_894_718, 1.25, Some(0)), Some(0));
+        assert_eq!(pick_representation(&bw, 20_000_000, 1.25, Some(0)), Some(1));
     }
 
     // ---- AbrVideoProfile filter tests ----

@@ -419,6 +419,13 @@ impl super::AudioSink for AudioRenderer {
         }
     }
 
+    fn consumed_since_flush_ms(&self) -> Option<u64> {
+        if let Some(pt) = self.passthrough.lock().unwrap().as_ref() {
+            return pt.consumed_ms();
+        }
+        self.played_since_flush_ms()
+    }
+
     fn output_latency_ms(&self) -> u64 {
         if let Some(pt) = self.passthrough.lock().unwrap().as_ref() {
             return pt.output_latency_ms();

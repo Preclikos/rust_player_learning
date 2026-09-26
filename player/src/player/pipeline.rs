@@ -771,12 +771,19 @@ pub(super) async fn audio_passthrough_task(
             // → head never moved → feed waited forever → the video clock (which
             // reads `played_ms`) froze and the decoder back-pressured to ~1 fps.
             //
-            // STEADY: once the head is moving, pace to keep the write at most
-            // AHEAD_MS of media ahead of the real playback position, so the head
-            // stays a usable clock and seek teardown doesn't strand seconds of
-            // queued audio. (Wall-pacing instead buffered the whole startup gap
-            // ahead — write_ahead≈1970 ms — which is why we pace on the head.)
-            const AHEAD_MS: i64 = 750;
+            // STEADY: keep writing too. The blocking `write` on the track's own
+            // buffer (256 KiB ≈ 2.7 s) is the back-pressure, exactly as
+            // ExoPlayer's DefaultAudioSink keeps a direct track's buffer full.
+            // Pacing writes to the playback head instead (the old AHEAD_MS =
+            // 750 ms rule) deadlocked every long pause: a direct track that was
+            // paused for more than a few seconds does not resume output on
+            // `play()` until its buffer is back above the start threshold, the
+            // head therefore stood, the head-paced feed wrote nothing more, and
+            // the output stayed dead for good (Streamer: consumed head flat for
+            // the rest of the title after an 8 s starvation hold; the watchdog
+            // then rebuilt into the same trap). The clock reads the presented
+            // position, so the extra buffering costs nothing for lip-sync, and
+            // a seek/switch discards the buffer with the track anyway.
             // Upper bound on PRIME (NOT while paused — see below). Catches the
             // runaway: a stale duplicate feed left over from a pipeline rebuild
             // whose sink never becomes the active output, so its head stays 0
@@ -835,14 +842,19 @@ pub(super) async fn audio_passthrough_task(
                     }
                     break;
                 }
-                // Steady phase: within the ahead budget → write; else wait for
-                // playback to drain it.
-                if au_ms - (base_pts_ms + played) <= AHEAD_MS {
-                    break;
+                // Steady phase: the head has moved at least once. While the
+                // sink is paused (user pause, starvation hold) hold the AU
+                // here — the track takes nothing meanwhile, and the stall
+                // check below must not count a pause as a wedge. Otherwise:
+                // stall check first (a wedged output gets a nudge and a log
+                // line with the ground truth), then write — blocking on a
+                // full buffer.
+                if sink.is_paused() {
+                    chk_played = played;
+                    chk_wall = Instant::now();
+                    crate::rt::sleep(Duration::from_millis(20)).await;
+                    continue;
                 }
-                // We have data buffered but the head isn't taking it. Measure the
-                // head rate over STALL_WINDOW_MS; if it's crawling (and we aren't
-                // paused) the track wedged — nudge it and log the ground truth.
                 if chk_wall.elapsed() >= Duration::from_millis(STALL_WINDOW_MS) {
                     let advanced = played - chk_played;
                     let paused = sink.is_paused();
@@ -859,7 +871,7 @@ pub(super) async fn audio_passthrough_task(
                     chk_played = played;
                     chk_wall = Instant::now();
                 }
-                crate::rt::sleep(Duration::from_millis(10)).await;
+                break;
             }
             // `block_in_place`: hand this worker's other tasks (the video decode
             // pipeline!) to a sibling worker while the JNI write runs.
@@ -873,9 +885,10 @@ pub(super) async fn audio_passthrough_task(
             }
             if au_count % 48 == 0 {
                 let head = base_pts_ms + sink.played_ms().unwrap_or(0) as i64;
+                let consumed = base_pts_ms + sink.consumed_ms().unwrap_or(0) as i64;
                 log::info!(
-                    "[audio-pt] au={}ms head={}ms write_ahead={}ms",
-                    au_ms, head, au_ms - head
+                    "[audio-pt] au={}ms head={}ms consumed={}ms write_ahead={}ms",
+                    au_ms, head, consumed, au_ms - head
                 );
             }
         }

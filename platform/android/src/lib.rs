@@ -218,12 +218,25 @@ fn init_ndk_context(env: &mut JNIEnv, context: &JObject) {
     });
 }
 
+/// `nativeSetVerboseLogging` state, kept so a call made before the first
+/// `nativeStart` (the natural place for it) survives `init_logging`.
+static VERBOSE_LOGGING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn init_logging() {
     static ONCE: OnceLock<()> = OnceLock::new();
     ONCE.get_or_init(|| {
+        // The logger itself passes everything; the effective level is the
+        // `log` crate's global max, Info by default and Debug under
+        // nativeSetVerboseLogging — configuring the logger at Info here
+        // would silently defeat that switch.
         android_logger::init_once(
-            android_logger::Config::default().with_max_level(log::LevelFilter::Info),
+            android_logger::Config::default().with_max_level(log::LevelFilter::Trace),
         );
+        log::set_max_level(if VERBOSE_LOGGING.load(std::sync::atomic::Ordering::Relaxed) {
+            log::LevelFilter::Debug
+        } else {
+            log::LevelFilter::Info
+        });
         std::panic::set_hook(Box::new(|info| {
             log::error!("rust panic: {}", info);
         }));
@@ -673,6 +686,7 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetSubtit
         text_color: argb_to_rgba(text_argb),
         outline_color: argb_to_rgba(outline_argb),
         size_scale,
+        ..SubtitleStyle::DEFAULT
     }
     .sanitised();
     h.bridge.player().set_subtitle_style(style);
@@ -685,6 +699,7 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetVerbos
     _class: JClass,
     enabled: jboolean,
 ) {
+    VERBOSE_LOGGING.store(enabled != 0, std::sync::atomic::Ordering::Relaxed);
     log::set_max_level(if enabled != 0 {
         log::LevelFilter::Debug
     } else {

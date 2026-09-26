@@ -972,6 +972,7 @@ impl VideoRenderer {
                                     f.mode,
                                     f.subtitle,
                                     f.subtitle_bottom_inset_px,
+                                    f.subtitle_anchor,
                                 )
                             } {
                                 log::warn!("[gles_oes] hook render failed: {}", e);
@@ -1499,6 +1500,7 @@ impl VideoRenderer {
         // before the pass so no await sits inside the render-pass scope.
         let cue_parent = {
             let frame = *self.frame_size.read().await;
+            let anchor = overlay_snapshot.as_ref().map(|o| o.anchor()).unwrap_or_default();
             super::subtitle::CueParent::fit(
                 target_w,
                 target_h,
@@ -1506,6 +1508,7 @@ impl VideoRenderer {
                 frame.height,
                 self.subtitle_safe_bottom_px
                     .load(std::sync::atomic::Ordering::Relaxed),
+                anchor,
             )
         };
         let mut encoder = self.device.create_command_encoder(&Default::default());
@@ -1579,18 +1582,18 @@ impl VideoRenderer {
             .load(std::sync::atomic::Ordering::Relaxed);
         let frame = *self.frame_size.read().await;
         let (scale_x, scale_y) = Self::aspect_fit_scale(size, frame);
-        let subtitle = {
-            let overlay = self.subtitle_overlay.lock().unwrap().clone();
-            overlay.and_then(|o| {
-                o.active_bitmap(&super::subtitle::CueParent::from_scale(
-                    size.width,
-                    size.height,
-                    scale_x,
-                    scale_y,
-                    inset,
-                ))
-            })
-        };
+        let overlay = self.subtitle_overlay.lock().unwrap().clone();
+        let subtitle_anchor = overlay.as_ref().map(|o| o.anchor()).unwrap_or_default();
+        let subtitle = overlay.and_then(|o| {
+            o.active_bitmap(&super::subtitle::CueParent::from_scale(
+                size.width,
+                size.height,
+                scale_x,
+                scale_y,
+                inset,
+                subtitle_anchor,
+            ))
+        });
         let gen = subtitle.as_ref().map(|b| b.generation).unwrap_or(0);
         if self
             .overlay_presented_gen
@@ -1622,6 +1625,7 @@ impl VideoRenderer {
                 mode: video_gles_egl::OesRenderMode::Sdr,
                 subtitle,
                 subtitle_bottom_inset_px: inset,
+                subtitle_anchor,
             });
         }
         self.queue.submit([]);
@@ -2785,19 +2789,19 @@ impl VideoRenderer {
 
         // Active subtitle cue for this frame (None = no cue / no track),
         // rasterized for the picture rect the hook will place it in.
-        let subtitle = {
-            let overlay = self.subtitle_overlay.lock().unwrap().clone();
-            overlay.and_then(|o| {
-                o.active_bitmap(&super::subtitle::CueParent::from_scale(
-                    window_size.width,
-                    window_size.height,
-                    scale_x,
-                    scale_y,
-                    self.subtitle_safe_bottom_px
-                        .load(std::sync::atomic::Ordering::Relaxed),
-                ))
-            })
-        };
+        let overlay = self.subtitle_overlay.lock().unwrap().clone();
+        let subtitle_anchor = overlay.as_ref().map(|o| o.anchor()).unwrap_or_default();
+        let subtitle = overlay.and_then(|o| {
+            o.active_bitmap(&super::subtitle::CueParent::from_scale(
+                window_size.width,
+                window_size.height,
+                scale_x,
+                scale_y,
+                self.subtitle_safe_bottom_px
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                subtitle_anchor,
+            ))
+        });
 
         // Publish frame data for the present hook to consume.
         {
@@ -2814,6 +2818,7 @@ impl VideoRenderer {
                 subtitle_bottom_inset_px: self
                     .subtitle_safe_bottom_px
                     .load(std::sync::atomic::Ordering::Relaxed),
+                subtitle_anchor,
             });
         }
 

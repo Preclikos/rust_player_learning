@@ -83,8 +83,16 @@ pub trait AudioPassthrough: Send + Sync {
     /// Write one compressed access unit (blocking — back-pressures the feed to
     /// the receiver's consumption rate, which makes the playback head a clock).
     fn write(&self, au: &[u8]);
-    /// Playback-head position in media ms (the passthrough clock source).
+    /// Presented position in media ms (the passthrough clock source).
     fn played_ms(&self) -> Option<u64>;
+    /// Consumed position in media ms — what the output has taken from the
+    /// track buffer, ahead of `played_ms` by the receiver's pipeline. The
+    /// liveness signal (`audio_output_watchdog`): it keeps moving while a
+    /// receiver relocks, and stops only when the output stopped draining.
+    /// Default: same as `played_ms`.
+    fn consumed_ms(&self) -> Option<u64> {
+        self.played_ms()
+    }
     fn output_latency_ms(&self) -> u64 {
         0
     }
@@ -145,6 +153,16 @@ pub trait AudioSink: Send + Sync + 'static {
     /// restart their counter per pipeline, e.g. a fresh passthrough track).
     fn played_since_flush_ms(&self) -> Option<u64> {
         self.played_ms()
+    }
+    /// Media ms of THIS pipeline's audio the output has CONSUMED — taken
+    /// from the queue/track buffer, whether or not it is audible yet. The
+    /// liveness signal for `audio_output_watchdog`: a passthrough receiver
+    /// relocking after a pause or an HDMI mode switch keeps consuming while
+    /// its presented position (`played_since_flush_ms`) stands, and must not
+    /// read as a dead output. Default: same as `played_since_flush_ms`
+    /// (PCM sinks present what they consume within one device buffer).
+    fn consumed_since_flush_ms(&self) -> Option<u64> {
+        self.played_since_flush_ms()
     }
     /// Output-path latency in ms (device output buffer + DAC) — how long
     /// after the sink consumes a sample it becomes audible. The video

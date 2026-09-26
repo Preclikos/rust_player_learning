@@ -107,6 +107,14 @@ enum Cmd {
 /// pass `StartConfig::default()` and are unchanged. A product host overrides
 /// these to drive resume, a real sink-gated passthrough decision, and its own
 /// (post-play) subtitle selection.
+/// Up-switch budget: a rung is taken when `bitrate × factor ≤ estimate`.
+/// 1.43 = 1 / 0.7 — hls.js `abrBandWidthUpFactor` and ExoPlayer
+/// `bandwidthFraction` both use 0.7 of the estimate. The previous 1.25 took
+/// 4K at a 16.8 Mbps estimate (rung 14 Mbps) and starved within a segment
+/// on the Streamer; the stay rule (`abr::ABR_STAY_FACTOR`) then keeps the
+/// rung as long as it still fits 95 % of the estimate.
+pub const ABR_SAFETY_FACTOR: f32 = 1.43;
+
 pub struct StartConfig {
     /// Absolute resume position, applied before the first `play()`. `None`
     /// starts at 0 (unless [`start_fraction`](Self::start_fraction) is set).
@@ -400,7 +408,7 @@ async fn orchestrate(
     // used. Every host renders this state as "Auto", so the engine had
     // better actually be in it. A user picking a fixed quality flips the
     // strategy back to Manual through `change_video_track`.
-    player.set_abr_strategy(AbrStrategy::BandwidthEwma { safety_factor: 1.25 });
+    player.set_abr_strategy(AbrStrategy::BandwidthEwma { safety_factor: ABR_SAFETY_FACTOR });
 
     // Initial playback. play() resolves on EndOfStream / stop / exhausted
     // retries; the event pump reports those to the host. We don't auto-loop —
@@ -469,7 +477,7 @@ fn apply_cmd(player: &Player, tracks: &Tracks, cmd: Cmd) {
             }
         }
         Cmd::VideoAuto => {
-            player.set_abr_strategy(AbrStrategy::BandwidthEwma { safety_factor: 1.25 });
+            player.set_abr_strategy(AbrStrategy::BandwidthEwma { safety_factor: ABR_SAFETY_FACTOR });
         }
         Cmd::Audio { adapt, repr } => {
             if let Some(a) = tracks.audio.get(adapt) {

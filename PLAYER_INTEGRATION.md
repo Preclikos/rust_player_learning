@@ -283,9 +283,17 @@ set** — enumerate all of `tracks.video`, not just the first.
 ## 7. ABR
 
 ```rust
-player.set_abr_strategy(AbrStrategy::BandwidthEwma { safety_factor: 1.25 });
+player.set_abr_strategy(AbrStrategy::BandwidthEwma { safety_factor: 1.43 }); // bridge default
 player.set_abr_video_profile(AbrVideoProfile::HdrPreferred); // or SdrOnly / LockedDepth(8|10) / Adaptive
 ```
+
+Selection follows hls.js: a rung is taken UP when `bitrate × safety_factor
+≤ estimate` (1.43 = 1/0.7, hls.js `abrBandWidthUpFactor` / ExoPlayer
+`bandwidthFraction`), and the playing rung is KEPT while it still fits
+`0.95 × estimate` (`abr::ABR_STAY_FACTOR`, hls.js `abrBandWidthFactor`) —
+the hysteresis that stops an estimate hovering at a rung boundary from
+flapping every switch interval (8 s, Shaka `abr.switchInterval`). Up-switches
+also wait for 4 s of buffered media.
 
 Manual `change_video_track()` wins over ABR (resets strategy to
 `Manual`). DV representations whose base layer can't play (profile 5
@@ -332,12 +340,16 @@ settings — `line:` (percentage or line number, with `,start|center|end`),
 using a port of media3's `SubtitlePainter.setupTextLayout`, with the same
 defaults as `SubtitleView`: text size 5.33 % and bottom padding 8 % of the
 layout box height, 0.125 × text size of horizontal box padding. The layout
-box is the **aspect-fitted picture** (media3 mounts `SubtitleView` inside
-`PlayerView`'s `AspectRatioFrameLayout`), so on a letterboxed film the
-cues sit inside the picture, not in the black bar, and shrink with it. The
-host's `set_subtitle_safe_insets(bottom_px)` is the equivalent of padding
-that view: it raises the box's bottom edge (system bars, TV overscan); an
-ExoPlayer app that pads its `SubtitleView` should pass the same number.
+box is chosen by `SubtitleStyle::anchor`: `Screen` (default) is the whole
+surface, so a cue without `line:` sits 8 % of the surface height above the
+bottom edge — in the letterbox bar on a widescreen film, the way most TV
+apps place it; `Picture` is the **aspect-fitted picture** (media3 mounts
+`SubtitleView` inside `PlayerView`'s `AspectRatioFrameLayout`), so the cues
+stay inside the picture and shrink with it — pick it for ExoPlayer parity.
+The host's `set_subtitle_safe_insets(bottom_px)` is the equivalent of
+padding that view: it raises the box's bottom edge (system bars, TV
+overscan); an ExoPlayer app that pads its `SubtitleView` should pass the
+same number.
 Inline tags, `region:` and `vertical:` are still ignored (vertical text
 renders horizontally).
 

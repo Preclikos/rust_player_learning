@@ -1605,7 +1605,12 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             .iter()
             .map(|&i| adaptation.representations[i].bandwidth)
             .collect();
-        let pick_local = match crate::abr::pick_representation(&bws, ewma_bps, safety) {
+        let current_local = current_id.and_then(|cid| {
+            candidate_indices
+                .iter()
+                .position(|&i| adaptation.representations[i].id == cid)
+        });
+        let pick_local = match crate::abr::pick_representation(&bws, ewma_bps, safety, current_local) {
             Some(i) => i,
             None => return,
         };

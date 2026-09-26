@@ -15,13 +15,30 @@ use crate::renderers::AudioSink;
 
 use super::{report_starvation, StallSide, StarvationTransition, StatsState};
 
-/// The audio output's reported position may stand still this long, while
+/// The audio output's CONSUMED position may stand still this long, while
 /// playback is running and nothing else has declared a stall, before the
 /// watchdog calls the output dead. Above the coarsest device update burst
 /// (~256 ms on Android deep buffer) with room to spare, and deliberately
 /// EARLIER than [`AUDIO_CLOCK_STALE_MS`] so the watchdog — which can actually
 /// fix the problem — always acts before the clock's last-resort guard.
+///
+/// Consumed, not presented: a passthrough receiver relocking after a pause
+/// or an HDMI mode switch, and a fresh direct track crossing its start
+/// threshold, both leave the PRESENTED position standing for 1.5–2.5 s while
+/// the output keeps draining the track. Judging the presented position read
+/// each of those as a death — a full pipeline rebuild on top of a working
+/// output, then "still dead" on the rebuilt track and an `AudioOutput`
+/// error while sound was playing (Streamer log, 4K HDR ladder with E-AC-3).
 const AUDIO_OUTPUT_DEAD_MS: u64 = 1_500;
+
+/// The same, right after a pause or a starvation hold released the output:
+/// a direct (passthrough) `AudioTrack` takes 1.5–2.5 s after `play()` before
+/// it consumes again (measured on the Streamer: consumed head flat for
+/// ~1.9 s after a 450 ms video-starvation hold), which is not a death. Until
+/// the head has moved once after the release, this longer threshold
+/// applies; a device that really died while paused is still caught, just
+/// a few seconds later.
+const AUDIO_OUTPUT_RESUME_DEAD_MS: u64 = 5_000;
 
 /// Pipeline rebuilds spent trying to bring the output back before the player
 /// reports the failure instead of playing on without sound.
@@ -83,6 +100,9 @@ pub(crate) async fn audio_output_watchdog<A: AudioSink>(
     // has its own guard: MediaClock holds the picture for
     // [`AUDIO_CLOCK_START_GRACE_MS`] while the position has never advanced.
     let mut ever_advanced = false;
+    // True from a pause / starvation release until the head has moved again:
+    // the resume grace (see AUDIO_OUTPUT_RESUME_DEAD_MS) is in force.
+    let mut resume_grace = false;
 
     loop {
         tokio::select! {
@@ -96,6 +116,7 @@ pub(crate) async fn audio_output_watchdog<A: AudioSink>(
         if paused.load(Ordering::Relaxed) {
             seen = None;
             live_since = None;
+            resume_grace = true;
             continue;
         }
         // Someone else already declared a stall — the consumer is seeing
@@ -113,11 +134,12 @@ pub(crate) async fn audio_output_watchdog<A: AudioSink>(
         {
             seen = None;
             live_since = None;
+            resume_grace = true;
             continue;
         }
         // No clock at all: the MediaClock is already on the wall and there is
         // no output position to watch.
-        let Some(played) = audio_sink.played_since_flush_ms() else {
+        let Some(played) = audio_sink.consumed_since_flush_ms() else {
             seen = None;
             live_since = None;
             continue;
@@ -131,6 +153,7 @@ pub(crate) async fn audio_output_watchdog<A: AudioSink>(
             Some((p0, _)) if played > p0 => {
                 seen = Some((played, crate::rt::Instant::now()));
                 ever_advanced = true;
+                resume_grace = false;
                 let since = *live_since.get_or_insert_with(crate::rt::Instant::now);
                 if stats.audio_output_rebuilds.load(Ordering::Relaxed) > 0
                     && since.elapsed() >= Duration::from_millis(AUDIO_OUTPUT_HEALTHY_MS)
@@ -146,7 +169,14 @@ pub(crate) async fn audio_output_watchdog<A: AudioSink>(
             Some(_) if !ever_advanced => {
                 continue;
             }
-            Some((_, w0)) if w0.elapsed() < Duration::from_millis(AUDIO_OUTPUT_DEAD_MS) => {
+            Some((_, w0))
+                if w0.elapsed()
+                    < Duration::from_millis(if resume_grace {
+                        AUDIO_OUTPUT_RESUME_DEAD_MS
+                    } else {
+                        AUDIO_OUTPUT_DEAD_MS
+                    }) =>
+            {
                 continue;
             }
             Some((_, w0)) => {
@@ -155,7 +185,7 @@ pub(crate) async fn audio_output_watchdog<A: AudioSink>(
                 let spent = stats.audio_output_rebuilds.load(Ordering::Relaxed);
                 if spent >= AUDIO_OUTPUT_MAX_REBUILDS {
                     log::error!(
-                        "[audio-watchdog gen {gen}] audio output still dead at {played}ms after \
+                        "[audio-watchdog gen {gen}] audio output still dead (consumed {played}ms) after \
                          {spent} rebuild(s) — giving up rather than playing on without sound"
                     );
                     let _ = events.send(PlayerEvent::Error {
@@ -168,7 +198,7 @@ pub(crate) async fn audio_output_watchdog<A: AudioSink>(
                     return;
                 }
                 log::warn!(
-                    "[audio-watchdog gen {gen}] audio output position stuck at {played}ms for \
+                    "[audio-watchdog gen {gen}] audio output stopped consuming at {played}ms for \
                      {stood_ms}ms while playing — rebuilding the pipeline to get sound back"
                 );
                 stats.audio_output_rebuilds.fetch_add(1, Ordering::Relaxed);

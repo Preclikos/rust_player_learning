@@ -22,8 +22,27 @@
 /// ```ignore
 /// let yellow = SubtitleStyle { text_color: [255, 204, 0, 255], ..SubtitleStyle::DEFAULT };
 /// ```
+/// The box cues are positioned in (`line:`/`position:` percentages, the
+/// bottom padding of a cue without `line:`, the text size). Both boxes lose
+/// the host's bottom inset (`Player::set_subtitle_safe_insets`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SubtitleAnchor {
+    /// The whole surface: a cue without `line:` sits 8 % of the surface
+    /// height above its bottom edge — in the letterbox bar on a widescreen
+    /// film, the way most TV apps place it. Default.
+    #[default]
+    Screen,
+    /// The aspect-fitted picture, as ExoPlayer's `PlayerView` does (its
+    /// `SubtitleView` lives inside the `AspectRatioFrameLayout`): cues stay
+    /// inside the picture and scale with it, 8 % of the PICTURE height above
+    /// the picture's bottom edge. Pick this for ExoPlayer parity.
+    Picture,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SubtitleStyle {
+    /// Which rectangle cues are laid out in. Default [`SubtitleAnchor::Screen`].
+    pub anchor: SubtitleAnchor,
     /// Glyph fill colour, RGBA. The alpha channel multiplies the glyph
     /// coverage (255 = fully opaque, 0 = invisible). Default: opaque
     /// white.
@@ -42,6 +61,7 @@ pub struct SubtitleStyle {
 impl SubtitleStyle {
     /// The Phase-1 look: opaque white text, black shadow, auto size.
     pub const DEFAULT: Self = Self {
+        anchor: SubtitleAnchor::Screen,
         text_color: [255, 255, 255, 255],
         outline_color: [0, 0, 0, 255],
         size_scale: 1.0,

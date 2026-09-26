@@ -436,6 +436,7 @@ pub extern "C" fn rustplayer_player_set_subtitle_style(
         text_color: argb_to_rgba(text_argb),
         outline_color: argb_to_rgba(outline_argb),
         size_scale,
+        ..SubtitleStyle::DEFAULT
     }
     .sanitised();
     h.bridge.player().set_subtitle_style(style);

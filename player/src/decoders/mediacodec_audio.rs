@@ -32,13 +32,23 @@ pub struct MediaCodecAudioDecoder {
     channels: usize,
     /// Channel count the output device takes (`AudioDecoderParams::output_channels`).
     output_channels: usize,
+    /// PCM drained by `submit` while it waited for an input buffer; handed
+    /// out by `try_recv` before anything new is dequeued.
+    pending: std::collections::VecDeque<DecodedAudioFrame>,
 }
 
 unsafe impl Send for MediaCodecAudioDecoder {}
 
 impl MediaCodecAudioDecoder {
     pub fn new() -> Self {
-        Self { codec: None, input_rate: 44100, output_rate: 44100, channels: 2, output_channels: 2 }
+        Self {
+            codec: None,
+            input_rate: 44100,
+            output_rate: 44100,
+            channels: 2,
+            output_channels: 2,
+            pending: std::collections::VecDeque::new(),
+        }
     }
 }
 
@@ -88,41 +98,71 @@ impl AudioDecoder for MediaCodecAudioDecoder {
     }
 
     fn submit(&mut self, sample: &[u8], pts_us: i64) -> Result<(), DecoderError> {
-        let codec = self
-            .codec
-            .as_ref()
-            .ok_or_else(|| -> DecoderError { "submit before configure".into() })?;
-
-        let mut input_buf = loop {
+        loop {
+            let codec = self
+                .codec
+                .as_ref()
+                .ok_or_else(|| -> DecoderError { "submit before configure".into() })?;
             match codec
                 .dequeue_input_buffer(Duration::from_millis(5))
                 .map_err(|e| -> DecoderError { format!("audio dequeue_input: {:?}", e).into() })?
             {
-                DequeuedInputBufferResult::Buffer(b) => break b,
+                DequeuedInputBufferResult::Buffer(mut input_buf) => {
+                    let dst = input_buf.buffer_mut();
+                    let copy_len = sample.len().min(dst.len());
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            sample.as_ptr(),
+                            dst.as_mut_ptr() as *mut u8,
+                            copy_len,
+                        );
+                    }
+                    codec
+                        .queue_input_buffer(input_buf, 0, copy_len, pts_us as u64, 0)
+                        .map_err(|e| -> DecoderError {
+                            format!("audio queue_input: {:?}", e).into()
+                        })?;
+                    return Ok(());
+                }
                 DequeuedInputBufferResult::TryAgainLater => {
-                    std::thread::yield_now();
+                    // No free input buffer. The codec frees one only by
+                    // decoding a queued input into a FREE output buffer, so
+                    // drain the output side while waiting. Spinning here
+                    // without draining deadlocked for good once every output
+                    // buffer was full (device-caught on a Pixel 9 Pro XL,
+                    // Codec2 AAC, 2026-09-26: audio decode stopped mid-segment,
+                    // downloads idled on a full channel, playback froze on a
+                    // Buffering spinner with 30 s of media downloaded).
+                    match self.dequeue_output()? {
+                        Some(frame) => self.pending.push_back(frame),
+                        None => std::thread::yield_now(),
+                    }
                 }
             }
-        };
-
-        let dst = input_buf.buffer_mut();
-        let copy_len = sample.len().min(dst.len());
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                sample.as_ptr(),
-                dst.as_mut_ptr() as *mut u8,
-                copy_len,
-            );
         }
-
-        codec
-            .queue_input_buffer(input_buf, 0, copy_len, pts_us as u64, 0)
-            .map_err(|e| -> DecoderError { format!("audio queue_input: {:?}", e).into() })?;
-
-        Ok(())
     }
 
     fn try_recv(&mut self) -> Result<Option<DecodedAudioFrame>, DecoderError> {
+        if let Some(frame) = self.pending.pop_front() {
+            return Ok(Some(frame));
+        }
+        self.dequeue_output()
+    }
+
+    fn flush(&mut self) -> Result<(), DecoderError> {
+        self.pending.clear();
+        if let Some(codec) = self.codec.as_ref() {
+            codec
+                .flush()
+                .map_err(|e| -> DecoderError { format!("audio flush: {:?}", e).into() })?;
+        }
+        Ok(())
+    }
+}
+
+impl MediaCodecAudioDecoder {
+    /// Dequeue one output buffer (or a format change) without waiting.
+    fn dequeue_output(&mut self) -> Result<Option<DecodedAudioFrame>, DecoderError> {
         let codec = self
             .codec
             .as_ref()
@@ -186,14 +226,5 @@ impl AudioDecoder for MediaCodecAudioDecoder {
             }
             DequeuedOutputBufferInfoResult::OutputBuffersChanged => Ok(None),
         }
-    }
-
-    fn flush(&mut self) -> Result<(), DecoderError> {
-        if let Some(codec) = self.codec.as_ref() {
-            codec
-                .flush()
-                .map_err(|e| -> DecoderError { format!("audio flush: {:?}", e).into() })?;
-        }
-        Ok(())
     }
 }

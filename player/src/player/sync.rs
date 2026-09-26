@@ -3,6 +3,56 @@
 
 use super::*;
 
+/// Start hand-off between the two sync loops of one pipeline: the video loop
+/// signals when its first at/after-target frame arrives, and the PCM output
+/// waits for that before it starts playing.
+///
+/// After a seek (or a start/resume at an offset) the decoder restarts at the
+/// segment's key frame and the video loop discards everything before the
+/// target — on 4K HEVC that is hundreds of ms of decoding. The audio, trimmed
+/// to the target, used to start as soon as its pre-roll was queued, so the
+/// clock was already 300–600 ms past the target when the first picture
+/// arrived and the LATE drain threw the first 8–13 frames away: a visible
+/// hitch at every start, seek, resume and rebuild (Crashlytics
+/// `PlaybackStall dropped_frames` / `judder`, Pixel 9 Pro XL, 2026-09-26:
+/// `f#0 pts=2689937ms elapsed=2690533ms`, then LATE #1..#8). The clock is
+/// audio-mastered and reads the frozen target until audio really plays, so
+/// holding the output until the picture is there makes both start together.
+pub(super) struct VideoAtTarget {
+    reached: AtomicBool,
+    notify: Notify,
+}
+
+impl VideoAtTarget {
+    /// Longest the audio output waits for the first picture before it starts
+    /// anyway (a video pipeline that never delivers must not mute playback).
+    const MAX_WAIT: Duration = Duration::from_secs(2);
+
+    pub(super) fn new() -> Self {
+        VideoAtTarget { reached: AtomicBool::new(false), notify: Notify::new() }
+    }
+
+    fn signal(&self) {
+        if !self.reached.swap(true, Ordering::SeqCst) {
+            // notify_one keeps a permit when nobody waits yet: no lost wakeup.
+            self.notify.notify_one();
+        }
+    }
+
+    /// `Some(true)` = picture is there, `Some(false)` = gave up after
+    /// [`Self::MAX_WAIT`], `None` = pipeline stopped.
+    async fn wait(&self, stop: &Notify) -> Option<bool> {
+        if self.reached.load(Ordering::SeqCst) {
+            return Some(true);
+        }
+        tokio::select! {
+            _ = self.notify.notified() => Some(true),
+            _ = crate::rt::sleep(Self::MAX_WAIT) => Some(false),
+            _ = stop.notified() => None,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // A/V sync loop — identical on all platforms, generic over sink traits
 // ---------------------------------------------------------------------------
@@ -76,6 +126,7 @@ pub(super) async fn video_sync_loop<V: VideoSink, A: AudioSink>(
     paused: Arc<AtomicBool>,
     pause_notify: Arc<Notify>,
     stats: Arc<StatsState>,
+    at_target: Arc<VideoAtTarget>,
 ) {
     // While paused, real time keeps advancing but media time must NOT.
     // We accumulate the wall-clock duration spent paused and subtract
@@ -323,6 +374,7 @@ pub(super) async fn video_sync_loop<V: VideoSink, A: AudioSink>(
         let mut pts_ms = crate::av_sync::media_pts_ms(frame.pts_us, origin_us);
         if !logged_first_frame {
             logged_first_frame = true;
+            at_target.signal();
             log::info!(
                 "[vsync gen {}] first frame pts={}ms target={}ms clock={}ms audio_since_flush={:?}ms {}ms after loop start",
                 gen,
@@ -681,6 +733,7 @@ pub(super) async fn video_sync_loop<V: VideoSink, A: AudioSink>(
             let a_ahead =
                 stats.audio_last_decoded_pts_ms.load(Ordering::Relaxed) - raw_pts_ms as i64;
             let _ = events.send(PlayerEvent::Stats {
+                position_ms: position_ms.load(Ordering::Relaxed),
                 video_frames_decoded: decoded_total,
                 video_frames_dropped: dropped_total,
                 video_late_frames: stats.video_late_frames.load(Ordering::Relaxed),
@@ -748,6 +801,7 @@ pub(super) async fn audio_sync_loop<A: AudioSink>(
     stats: Arc<StatsState>,
     events: Arc<broadcast::Sender<PlayerEvent>>,
     paused: Arc<AtomicBool>,
+    at_target: Arc<VideoAtTarget>,
 ) {
     // Keep the PCM handed to the sink continuous on the media axis (see
     // `crate::av_sync::AudioAligner`):
@@ -884,6 +938,19 @@ pub(super) async fn audio_sync_loop<A: AudioSink>(
                 "[async] audio pre-roll of {} ms queued — output starts",
                 crate::av_sync::PrerollGate::PREROLL_MS
             );
+            // Start with the picture, not ahead of it (see VideoAtTarget).
+            let waited = Instant::now();
+            match at_target.wait(&stop).await {
+                None => return,
+                Some(true) => log::debug!(
+                    "[async] output start waited {}ms for the first video frame",
+                    waited.elapsed().as_millis()
+                ),
+                Some(false) => log::warn!(
+                    "[async] no video frame {}ms after the audio pre-roll — starting audio anyway",
+                    waited.elapsed().as_millis()
+                ),
+            }
             if !paused.load(Ordering::Relaxed) {
                 sink.set_paused(false);
             }
@@ -1066,6 +1133,7 @@ pub(super) async fn av_sync_handler<V: VideoSink, A: AudioSink>(
     );
     let stats_audio = Arc::clone(&stats);
     let events_audio = Arc::clone(&events);
+    let at_target = Arc::new(VideoAtTarget::new());
     let paused_audio = Arc::clone(&paused);
     let end_position = Arc::clone(&position_ms);
     let (_, _) = tokio::join!(
@@ -1086,6 +1154,7 @@ pub(super) async fn av_sync_handler<V: VideoSink, A: AudioSink>(
             paused,
             pause_notify,
             stats,
+            Arc::clone(&at_target),
         )),
         crate::rt::spawn(audio_sync_loop(
             audio_rx,
@@ -1097,6 +1166,7 @@ pub(super) async fn av_sync_handler<V: VideoSink, A: AudioSink>(
             stats_audio,
             events_audio,
             paused_audio,
+            at_target,
         )),
     );
     // Both loops returning naturally (channels closed by decoder EOF) means

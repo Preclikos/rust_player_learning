@@ -48,6 +48,10 @@ pub enum PlayerEvent {
     GlitchRecovered { detail: String },
     /// Cumulative stats — emitted at ≤ 1 Hz.
     Stats {
+        /// Absolute stream position of the rendered frame, ms (same axis as
+        /// `Position.position`), so a stats sample can be placed on the
+        /// timeline without pairing it with a separate Position event.
+        position_ms: u64,
         video_frames_decoded: u64,
         video_frames_dropped: u64,
         /// Frames presented >45 ms after their master-clock time — shown,

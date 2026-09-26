@@ -243,7 +243,7 @@ Implemented exactly as originally specced — summary:
 | `EndOfStream` | natural end only (never on errors) | |
 | `Error { kind, detail }` | fatal after internal retries | `PlayerErrorKind` |
 
-`Stats` fields: `video_frames_decoded`, `video_frames_dropped`,
+`Stats` fields: `position_ms` (absolute position of the rendered frame, since 0.1.39; JSON `position_ms`), `video_frames_decoded`, `video_frames_dropped`,
 `audio_underruns`, `net_stall_ms` (blocked-on-network ms in the last
 second), `decoder_name` (e.g. `"MediaCodec"`, `"D3D11VA HEVC"`),
 `current_resolution` (post-ABR, drives Android aspect),

@@ -127,9 +127,10 @@ pub(super) async fn text_play<V: VideoSink>(
         }
         let cues = crate::parsers::vtt::parse_segment(&bytes, 0);
         log::info!(
-            "[subs] parsed {} cues from {} bytes (single VTT file)",
+            "[subs] parsed {} cues from {} bytes (single VTT file); {}",
             cues.len(),
-            bytes.len()
+            bytes.len(),
+            settings_summary(&cues)
         );
         // Diagnostic for "Czech (or any non-ASCII) renders wrong" reports:
         // if the source isn't UTF-8 (some Windows-1250 / ISO-8859-2 VTT
@@ -221,3 +222,24 @@ pub(super) async fn text_play<V: VideoSink>(
 }
 
 
+
+/// One line on the cue settings a track carries — the placement input the
+/// renderer honours and the first thing to check when "our subtitles sit
+/// higher/lower than player X" comes in: `line:`/`position:` in the file
+/// override every default, in every player.
+fn settings_summary(cues: &[crate::parsers::vtt::VttCue]) -> String {
+    let with = cues.iter().filter(|c| !c.settings.is_empty()).count();
+    if with == 0 {
+        return "no cue settings (default placement)".to_string();
+    }
+    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for c in cues {
+        if !c.settings.is_empty() {
+            *counts.entry(c.settings.as_str()).or_insert(0) += 1;
+        }
+    }
+    let mut top: Vec<(&str, usize)> = counts.into_iter().collect();
+    top.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    let shown: Vec<String> = top.iter().take(3).map(|(s, n)| format!("{:?}×{}", s, n)).collect();
+    format!("{} with settings, most common {}", with, shown.join(", "))
+}

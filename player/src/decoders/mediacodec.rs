@@ -103,6 +103,10 @@ pub struct SharedDirectCodec {
     /// Set before stop() during teardown — release handles become no-ops
     /// (their buffer indices died with the stop).
     stopped: std::sync::atomic::AtomicBool,
+    /// Our own `ANativeWindow` reference for the codec's whole life, taken
+    /// while the pipeline's lease guaranteed the window was alive and
+    /// released only after `AMediaCodec_delete`.
+    window: *mut ndk_sys::ANativeWindow,
 }
 
 unsafe impl Send for SharedDirectCodec {}
@@ -148,6 +152,7 @@ impl Drop for SharedDirectCodec {
         // Last reference (decoder + every in-flight frame) gone.
         unsafe {
             ndk_sys::AMediaCodec_delete(self.raw);
+            ndk_sys::ANativeWindow_release(self.window);
         }
         // [C2] The Surface producer connection is now released (delete is
         // synchronous) — let the next direct codec configure onto it.
@@ -394,10 +399,13 @@ impl MediaCodecDecoder {
                 return Err(format!("AMediaCodec_start(direct): {:?}", st).into());
             }
 
+            let window = self.direct_window as *mut ndk_sys::ANativeWindow;
+            ndk_sys::ANativeWindow_acquire(window);
             self.direct = Some(Arc::new(SharedDirectCodec {
                 raw: codec,
                 call_lock: std::sync::Mutex::new(()),
                 stopped: std::sync::atomic::AtomicBool::new(false),
+                window,
             }));
         }
         log::info!(

@@ -2041,19 +2041,19 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                 // a deep channel deadlocks the decoder outright. 2 in the
                 // channel + 2 in the reorder buffer + 1 rendering leaves
                 // the codec breathing room.
-                let direct_window = video_output_window.get();
+                let direct_window = video_output_window.lease();
                 // Adaptive frame rate: hint the content fps to the video plane
                 // so the display can match its refresh rate. Idempotent — fine
                 // to re-assert on every (re)build (seek / ABR swap).
                 #[cfg(target_os = "android")]
-                if direct_window != 0
+                if direct_window.raw() != 0
                     && adaptive_frame_rate.load(std::sync::atomic::Ordering::Relaxed)
                 {
                     if let Some(fps) = video_fps {
-                        set_window_frame_rate(direct_window, fps.as_f32());
+                        set_window_frame_rate(direct_window.raw(), fps.as_f32());
                     }
                 }
-                let frame_cap = if direct_window != 0 { 2 } else { 8 };
+                let frame_cap = if direct_window.raw() != 0 { 2 } else { 8 };
                 let (frame_sender, frame_receiver) =
                     mpsc::channel::<DecodedVideoFrame>(frame_cap);
                 let (sample_sender, sample_receiver) = mpsc::channel::<DecodedAudioFrame>(256);

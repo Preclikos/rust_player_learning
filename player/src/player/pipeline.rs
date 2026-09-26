@@ -348,49 +348,86 @@ pub(super) fn set_window_frame_rate(window: usize, fps: f32) {
 /// that owned ref the host's `SurfaceView` teardown could free the window — and
 /// its internal mutex — while a pipeline rebuild is still asserting AFR on it,
 /// crashing in `ANativeWindow_setFrameRate*` → `Surface::hook_query` with
-/// "pthread_mutex_lock on a destroyed mutex" (SIGABRT). Holding the ref keeps
-/// the window object alive, so a stale `setFrameRate` is at worst a no-op, not a
-/// use-after-free. The pointer is still stored as a `usize` for the lock-free
-/// reads on the build path; this type just bolts lifetime onto it.
-pub(super) struct DirectWindow(AtomicUsize);
+/// "pthread_mutex_lock on a destroyed mutex" (SIGABRT).
+///
+/// Readers never see a bare pointer: [`DirectWindow::lease`] hands out a
+/// [`WindowRef`] that holds its OWN reference, taken under the same lock
+/// `set` releases under. A pipeline keeps its lease for as long as it may
+/// configure a codec — the supervisor reuses it on ABR swaps and retries,
+/// minutes after the build. A bare `usize` there was a use-after-free: once
+/// the host swapped or dropped its Surface, the next swap configured
+/// MediaCodec on a freed window (Crashlytics: SIGSEGV 0x4 in libutils under
+/// `AMediaCodec_configure`, `configure_direct`, 2.0.35–2.0.69). With the lease
+/// the window object stays alive; a codec configured on an abandoned Surface
+/// fails with an error the supervisor retries, instead of crashing.
+pub(super) struct DirectWindow(std::sync::Mutex<usize>);
 
 impl DirectWindow {
     pub(super) fn new() -> Self {
-        DirectWindow(AtomicUsize::new(0))
+        DirectWindow(std::sync::Mutex::new(0))
     }
 
-    /// Current window pointer (0 = none / classic renderer path).
-    pub(super) fn get(&self) -> usize {
-        self.0.load(Ordering::Relaxed)
+    /// A counted reference to the current window (raw 0 = none / classic
+    /// renderer path), valid for as long as the returned value lives.
+    pub(super) fn lease(&self) -> WindowRef {
+        let w = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        WindowRef::acquire(*w)
     }
 
     /// Install `window` (0 to clear), acquiring it and releasing the previous.
     /// Balanced per call: each `set` releases exactly the ref the prior `set`
     /// acquired, so repeated identical sets don't leak or over-release.
     pub(super) fn set(&self, window: usize) {
-        #[cfg(target_os = "android")]
-        unsafe {
-            if window != 0 {
-                ndk_sys::ANativeWindow_acquire(window as *mut ndk_sys::ANativeWindow);
-            }
-            let old = self.0.swap(window, Ordering::Relaxed);
-            if old != 0 {
-                ndk_sys::ANativeWindow_release(old as *mut ndk_sys::ANativeWindow);
-            }
-        }
-        #[cfg(not(target_os = "android"))]
-        self.0.store(window, Ordering::Relaxed);
+        let mut w = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let new = WindowRef::acquire(window);
+        let old = std::mem::replace(&mut *w, window);
+        std::mem::forget(new); // the slot now owns this reference
+        drop(WindowRef(old)); // …and gives up the previous one
     }
 }
 
 impl Drop for DirectWindow {
     fn drop(&mut self) {
+        let w = *self.0.get_mut().unwrap_or_else(|e| e.into_inner());
+        drop(WindowRef(w));
+    }
+}
+
+/// One `ANativeWindow` reference (raw 0 = no window). Clone acquires, drop
+/// releases; off Android it is just the number.
+pub(crate) struct WindowRef(usize);
+
+impl WindowRef {
+    /// No window (classic renderer path).
+    #[allow(dead_code)]
+    pub(crate) const NONE: WindowRef = WindowRef(0);
+
+    fn acquire(window: usize) -> WindowRef {
         #[cfg(target_os = "android")]
-        unsafe {
-            let w = self.0.load(Ordering::Relaxed);
-            if w != 0 {
-                ndk_sys::ANativeWindow_release(w as *mut ndk_sys::ANativeWindow);
-            }
+        if window != 0 {
+            unsafe { ndk_sys::ANativeWindow_acquire(window as *mut ndk_sys::ANativeWindow) };
+        }
+        WindowRef(window)
+    }
+
+    /// The pointer, valid while `self` lives. Anything that keeps using it
+    /// beyond that must take its own `ANativeWindow_acquire` first.
+    pub(crate) fn raw(&self) -> usize {
+        self.0
+    }
+}
+
+impl Clone for WindowRef {
+    fn clone(&self) -> Self {
+        WindowRef::acquire(self.0)
+    }
+}
+
+impl Drop for WindowRef {
+    fn drop(&mut self) {
+        #[cfg(target_os = "android")]
+        if self.0 != 0 {
+            unsafe { ndk_sys::ANativeWindow_release(self.0 as *mut ndk_sys::ANativeWindow) };
         }
     }
 }
@@ -413,8 +450,9 @@ pub(super) async fn run_decode(
     decoder_stop_flag: Arc<AtomicBool>,
     // `Some(..)` on an ABR swap (splice trim + timing), `None` initially.
     splice: Option<SwapSplice>,
-    // Android direct mode video window (0 = renderer path).
-    direct_window: usize,
+    // Android direct mode video window (raw 0 = renderer path), held for
+    // as long as this pipeline may configure a codec on it.
+    direct_window: WindowRef,
     // Player-level HDR-to-8-bit decode switch, sampled here at configure
     // time so ABR swaps / retries pick up a changed value.
     hdr_decode_8bit: Arc<AtomicBool>,
@@ -426,7 +464,7 @@ pub(super) async fn run_decode(
         hvcc_nalus: pf.hvcc_nalus,
         decoder_config_record: pf.decoder_config_record,
         color: pf.color,
-        direct_window,
+        direct_window: direct_window.raw(),
         dovi_profile: pf.dovi_profile,
         force_8bit_hdr: hdr_decode_8bit.load(Ordering::Relaxed),
     })?;
@@ -496,8 +534,9 @@ pub(super) async fn video_play(
     // supervisor can softly cap an old pipeline mid-flight without
     // discarding its already-decoded tail.
     soft_end_exclusive: Arc<AtomicUsize>,
-    // Android direct mode video window (0 = renderer path).
-    direct_window: usize,
+    // Android direct mode video window (raw 0 = renderer path), held for
+    // as long as this pipeline may configure a codec on it.
+    direct_window: WindowRef,
     hdr_decode_8bit: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     // Initial pipeline: nothing to overlap with, so download and decode run

@@ -67,8 +67,9 @@ pub(super) async fn video_supervisor(
     // Content origin (first segment's absolute presentation time). position_ms
     // is 0-based, so we add this back to locate segments on a soft swap.
     origin: Duration,
-    // Android direct mode video window (0 = renderer path).
-    direct_window: usize,
+    // Android direct mode video window (raw 0 = renderer path); every
+    // pipeline this supervisor spawns takes its own counted reference.
+    direct_window: WindowRef,
     hdr_decode_8bit: Arc<AtomicBool>,
     // Resume slot written when retries are exhausted: the NEXT play() call
     // starts from this position instead of zero ("continue where we
@@ -107,7 +108,7 @@ pub(super) async fn video_supervisor(
             Arc::clone(&stats),
             segments_in_flight,
             soft_end.clone(),
-            direct_window,
+            direct_window.clone(),
             Arc::clone(&hdr_decode_8bit),
         ));
         (handle, soft_end)
@@ -261,6 +262,7 @@ const PREPARE_READY_BUDGET: Duration = Duration::from_millis(5_000);
                         let video_ready = video_ready.clone();
                         let decoder_factory = decoder_factory.clone();
                         let hdr_decode_8bit = Arc::clone(&hdr_decode_8bit);
+                        let direct_window = direct_window.clone();
                         let splice_pts_us = pos_abs.as_micros() as i64;
                         async move {
                             let pf = video_prefetch(
@@ -501,7 +503,7 @@ const PREPARE_READY_BUDGET: Duration = Duration::from_millis(5_000);
         // that needs a device on that path to verify before it is turned on,
         // so it stays off rather than assumed.
         let warm_capable =
-            cfg!(any(target_os = "windows", target_os = "linux")) && direct_window == 0;
+            cfg!(any(target_os = "windows", target_os = "linux")) && direct_window.raw() == 0;
         let warm = if warm_capable && boundary_ms != 0 {
             // Tiny gate on purpose: each held frame pins a surface from the
             // decoder's fixed hw frame pool (D3D11VA/VAAPI), and holding a
@@ -553,7 +555,7 @@ const PREPARE_READY_BUDGET: Duration = Duration::from_millis(5_000);
                     started: Instant::now(),
                     skip_below_pts_us: splice_pts_us,
                 }),
-                direct_window,
+                direct_window.clone(),
                 Arc::clone(&hdr_decode_8bit),
             ));
             Some((handle, release))
@@ -733,7 +735,7 @@ const PREPARE_READY_BUDGET: Duration = Duration::from_millis(5_000);
                         started: decode_t0,
                         skip_below_pts_us: splice_pts_us,
                     }),
-                    direct_window,
+                    direct_window.clone(),
                     Arc::clone(&hdr_decode_8bit),
                 ))
             }

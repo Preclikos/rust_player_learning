@@ -1241,6 +1241,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
     /// Takes effect on the next presented frame. Re-call it on every
     /// inset/size change.
     pub fn set_subtitle_safe_insets(&self, bottom_px: u32) {
+        log::info!("[subs] bottom safe inset {}px", bottom_px);
         self.video_renderer.set_subtitle_safe_bottom_px(bottom_px);
     }
 

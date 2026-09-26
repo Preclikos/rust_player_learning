@@ -92,6 +92,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     // Scripted scenario (see runScenarioStep) - empty = interactive app.
     private var scenario = ""
     private var manifestUrl = TEST_MANIFEST_URL
+    private var startFraction: Float? = null
     private var scenarioIterations = 5
     private var scenarioSettleMs = 12_000L
     private var scenarioWarmupMs = 12_000L
@@ -313,6 +314,9 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         // --es url <manifest>: play something other than the bundled test
         // stream (e.g. the E-AC-3 one for passthrough work).
         intent.getStringExtra("url")?.takeIf { it.isNotBlank() }?.let { manifestUrl = it }
+        // --ef start_fraction 0.5: resume at that fraction of the duration
+        // (plain path; storm mode has its own storm_fraction).
+        startFraction = intent.getFloatExtra("start_fraction", -1f).takeIf { it in 0f..1f }
         scenario = intent.getStringExtra("scenario") ?: ""
         scenarioIterations = intent.getIntExtra("iterations", 5)
         scenarioSettleMs = intent.getIntExtra("settle_ms", 8_000).toLong()
@@ -547,6 +551,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                     overlay, video, overlayW, overlayH, displayHdrTypes(),
                     manifestUrl = manifestUrl,
                     provider = TestProvider,
+                    startFraction = startFraction,
                 )
             }
         }

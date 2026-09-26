@@ -1167,6 +1167,7 @@ mod tests {
             generation: 0,
             target_w: 1920,
             target_h: 1080,
+            type_h: 1080,
             wanted: [None, None],
             shutdown: false,
             max_cue_span_ms,
@@ -1266,10 +1267,10 @@ mod tests {
         }));
         // Within 5%: keep the rasterization, a dragged window resizes by
         // a pixel at a time and re-baking each step is pure churn.
-        assert!(!inner.note_target(1940, 1080));
+        assert!(!inner.note_target(1940, 1080, 1080));
         assert!(inner.ready_for("first", &CueLayout::DEFAULT, 1940).is_some());
         // A real resize invalidates it.
-        assert!(inner.note_target(1280, 720));
+        assert!(inner.note_target(1280, 720, 720));
         assert!(inner.ready.is_empty());
     }
 
@@ -1399,7 +1400,7 @@ mod tests {
         // First draw reports a size — now it has something to do.
         {
             let mut inner = shared.inner.lock().unwrap();
-            inner.note_target(1280, 720);
+            inner.note_target(1280, 720, 720);
         }
         shared.wake.notify_one();
         run_worker_until(&shared, "bake after first draw", |i| {

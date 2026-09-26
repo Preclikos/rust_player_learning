@@ -82,7 +82,19 @@ pub(super) fn rasterize_cue(
         available_w = (available_w as f32 * layout.size) as i32;
     }
     let max_line_w = available_w.max(1);
-    let line_height = (px_size * 1.25).ceil() as i32;
+    // Line box from the font's own metrics, the way Android's StaticLayout
+    // (ExoPlayer's SubtitlePainter) lays text out: ascent above the
+    // baseline, descent below, line gap between lines — the box ends at the
+    // font descent, not at an arbitrary 1.25 em. The old fixed box (baseline
+    // at 0.9 em, 0.35 em of slack underneath) sat every cue ~0.1 em higher
+    // than ExoPlayer for the same bottom padding (measured 34 px at 1080p).
+    let (ascent, line_height) = match font.horizontal_line_metrics(px_size) {
+        Some(m) => (
+            m.ascent.round() as i32,
+            (m.ascent - m.descent + m.line_gap).ceil() as i32,
+        ),
+        None => ((px_size * 0.9) as i32, (px_size * 1.25).ceil() as i32),
+    };
 
     // Wrap each input line, then concatenate into a flat list of layout lines.
     let mut layout_lines: Vec<String> = Vec::new();
@@ -122,7 +134,7 @@ pub(super) fn rasterize_cue(
         };
         let y_start = idx as i32 * line_height + shadow;
         rasterize_line(
-            font, line, px_size, x_start, y_start, bitmap_w, bitmap_h,
+            font, line, px_size, x_start, y_start + ascent, bitmap_w, bitmap_h,
             style.text_color, style.outline_color, &mut rgba,
         );
     }
@@ -185,23 +197,22 @@ fn measure_text(font: &fontdue::Font, line: &str, px_size: f32) -> i32 {
     measure_width(font, line, px_size).ceil() as i32
 }
 
-/// Draw glyphs left-to-right starting at (x, y_baseline-ish). `text_color`
-/// is the fill, `outline_color` the drop-shadow drawn first at a (+1, +1)
-/// offset; both are RGBA with the alpha multiplying glyph coverage.
+/// Draw glyphs left-to-right from `x_start` on the `baseline` row.
+/// `text_color` is the fill, `outline_color` the drop-shadow drawn first at
+/// a (+1, +1) offset; both are RGBA with the alpha multiplying glyph coverage.
 #[allow(clippy::too_many_arguments)]
 fn rasterize_line(
     font: &fontdue::Font,
     line: &str,
     px_size: f32,
     x_start: i32,
-    y_start: i32,
+    baseline: i32,
     bitmap_w: u32,
     bitmap_h: u32,
     text_color: [u8; 4],
     outline_color: [u8; 4],
     rgba: &mut [u8],
 ) {
-    let baseline = y_start + (px_size * 0.9) as i32;
     let mut pen_x = x_start as f32;
     for ch in line.chars() {
         let (metrics, glyph_bitmap) = font.rasterize(ch, px_size);

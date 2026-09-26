@@ -374,12 +374,8 @@ mod tests {
         // Private-use code point: neither face has it -> primary's .notdef.
         assert!(std::ptr::eq(set.for_char('\u{E000}'), &*set.primary));
         // And a cue with the note rasterizes to real ink either way.
-        let r = rasterize_cue(&f_set(set), "\u{266A} la la \u{266A}", &CueLayout::DEFAULT, 1280, 720, &SubtitleStyle::DEFAULT).unwrap();
+        let r = rasterize_cue(&set, "\u{266A} la la \u{266A}", &CueLayout::DEFAULT, 1280, 720, &SubtitleStyle::DEFAULT).unwrap();
         assert!(r.rgba.chunks(4).any(|p| p[3] > 0));
-    }
-
-    fn f_set(set: FontSet) -> FontSet {
-        set
     }
 
     /// First and last bitmap column holding any ink.

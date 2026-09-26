@@ -59,7 +59,7 @@ if ! git merge-base --is-ancestor "$HEAD_SHA" FETCH_HEAD; then
 fi
 
 # 2. next version from the REMOTE tags
-MAX=$(g ls-remote --tags "$REMOTE" | sed -n 's|.*refs/tags/\(android\|ios\|web\)-v\([0-9]*\.[0-9]*\.[0-9]*\)$|\2|p' | sort -V | tail -1)
+MAX=$(g ls-remote --tags "$REMOTE" | tr -d '\r' | grep -oE 'refs/tags/(android|ios|web)-v[0-9]+\.[0-9]+\.[0-9]+$' | sed 's/.*-v//' | sort -V | tail -1)
 MAX=${MAX:-0.0.0}
 if [ -z "$VERSION" ]; then
   IFS=. read -r a b c <<<"$MAX"

@@ -431,21 +431,23 @@ pub(crate) fn apply_default_tracks(
         }
     });
 
-    // Apply the chosen text track (font + style + select) when the manifest has
-    // one. Android always has Roboto; desktop honours RUST_PLAYER_FONT. The
-    // overlay ships an embedded DejaVu Sans default so a cue renders without a
-    // host font; RUST_PLAYER_FONT only *overrides* that.
-    if let Some(text_repr) = text_pick {
-        if let Some(path) = sub_pref("RUST_PLAYER_FONT", "subtitle_font.txt") {
-            match std::fs::read(&path) {
-                Ok(bytes) => match player.set_subtitle_font(bytes) {
-                    Ok(()) => log::info!("subtitle font override: {}", path),
-                    Err(e) => log::warn!("subtitle font rejected ({}): {}", path, e),
-                },
-                Err(e) => log::warn!("subtitle font unreadable ({}): {}", path, e),
-            }
+    // Subtitle font. The overlay embeds Roboto (the face ExoPlayer's
+    // SubtitleView draws with — measured on the Streamer, DejaVu came out
+    // ~10 % smaller with tighter leading) as the primary face on every
+    // platform, with DejaVu Sans as the per-glyph fallback. RUST_PLAYER_FONT
+    // / subtitle_font.txt replaces the primary face only.
+    if let Some(path) = sub_pref("RUST_PLAYER_FONT", "subtitle_font.txt") {
+        match std::fs::read(&path) {
+            Ok(bytes) => match player.set_subtitle_font(bytes) {
+                Ok(()) => log::info!("subtitle font: {}", path),
+                Err(e) => log::warn!("subtitle font rejected ({}): {}", path, e),
+            },
+            Err(e) => log::warn!("subtitle font unreadable ({}): {}", path, e),
         }
+    }
 
+    // Apply the chosen text track (style + select) when the manifest has one.
+    if let Some(text_repr) = text_pick {
         player.set_subtitle_style(subtitle_style());
         player.set_subtitle_track(text_repr);
         log::info!("selected subtitle track {}", text_repr.id);

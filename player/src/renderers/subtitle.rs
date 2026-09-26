@@ -393,6 +393,10 @@ struct Inner {
     /// cues render without a host-supplied font; `None` only if that
     /// default somehow fails to parse, in which case render is a no-op.
     font: Option<Arc<fontdue::Font>>,
+    /// The embedded DejaVu Sans, kept as the per-glyph fallback behind
+    /// the primary (embedded Roboto, or whatever `set_font` installs) —
+    /// see `rasterizer::FontSet`.
+    fallback: Option<Arc<fontdue::Font>>,
     /// Visual style (colours + size multiplier). Swapped by `set_style`;
     /// changing it drops the cached rasterization so the next draw rebuilds.
     style: SubtitleStyle,
@@ -629,6 +633,7 @@ impl SubtitleOverlay {
                 cues: Vec::new(),
                 current_pts_ms: 0,
                 font: rasterizer::default_font().map(Arc::new),
+                fallback: rasterizer::fallback_font().map(Arc::new),
                 style: SubtitleStyle::DEFAULT,
                 ready: Vec::new(),
                 generation: 0,
@@ -688,7 +693,8 @@ impl SubtitleOverlay {
     }
 
     /// Install a TTF/OTF font for cue rasterization, replacing the
-    /// embedded DejaVu default. Invalidates any cached rasterization. On
+    /// embedded Roboto as the primary face (the embedded DejaVu stays the
+    /// per-glyph fallback). Invalidates any cached rasterization. On
     /// invalid bytes the previous font is kept and an Err is returned.
     pub fn set_font(&self, bytes: Vec<u8>) -> Result<(), String> {
         let font = fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default())
@@ -980,7 +986,7 @@ impl SubtitleOverlay {
         };
         let Some(job) = job else { return };
         let rasterized = rasterizer::rasterize_cue(
-            &job.font, &job.text, &job.layout, job.target_w, job.type_h, &job.style,
+            &job.fonts, &job.text, &job.layout, job.target_w, job.type_h, &job.style,
         );
         let mut inner = self.shared.inner.lock().unwrap();
         if inner.target_w != job.target_w || inner.target_h != job.target_h {
@@ -1045,7 +1051,7 @@ fn raster_worker(shared: Arc<Shared>) {
 
         // Lock released: this is the multi-millisecond part.
         let rasterized = rasterizer::rasterize_cue(
-            &job.font, &job.text, &job.layout, job.target_w, job.type_h, &job.style,
+            &job.fonts, &job.text, &job.layout, job.target_w, job.type_h, &job.style,
         );
 
         let mut inner = shared.inner.lock().unwrap();
@@ -1076,7 +1082,7 @@ fn raster_worker(shared: Arc<Shared>) {
 /// One cue to rasterize: everything the worker needs, copied out so the
 /// lock is not held while it works.
 struct RasterJob {
-    font: Arc<fontdue::Font>,
+    fonts: rasterizer::FontSet,
     text: String,
     layout: CueLayout,
     style: SubtitleStyle,
@@ -1100,7 +1106,10 @@ fn next_job(inner: &Inner) -> Option<RasterJob> {
         let cue = &inner.cues[idx];
         if inner.ready_for(cue.text.as_str(), &cue.layout, inner.target_w).is_none() {
             return Some(RasterJob {
-                font: Arc::clone(font),
+                fonts: rasterizer::FontSet {
+                    primary: Arc::clone(font),
+                    fallback: inner.fallback.clone(),
+                },
                 text: cue.text.clone(),
                 layout: cue.layout,
                 style: inner.style,
@@ -1162,6 +1171,7 @@ mod tests {
             cues: sorted,
             current_pts_ms: 0,
             font: None,
+            fallback: None,
             style: SubtitleStyle::DEFAULT,
             ready: Vec::new(),
             generation: 0,

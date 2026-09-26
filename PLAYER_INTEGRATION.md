@@ -377,8 +377,13 @@ the numbers, not the impression.
 Inline tags, `region:` and `vertical:` are still ignored (vertical text
 renders horizontally).
 
-On Android a system font works fine:
-`std::fs::read("/system/fonts/Roboto-Regular.ttf")`.
+**Fonts.** The overlay embeds two faces: Roboto Regular as the primary —
+what ExoPlayer's `SubtitleView` draws with, so cues look the same as in a
+media3 app on every platform — and DejaVu Sans as a per-glyph fallback
+(music note, dashes, symbols Roboto lacks), the way Android's text stack
+falls back to NotoSansSymbols. `set_subtitle_font(bytes)` /
+`RUST_PLAYER_FONT` replaces the primary face only: a glyph the host's font
+lacks still comes from DejaVu instead of a tofu box.
 
 Cue rasterization runs on the overlay's own worker thread, which keeps the
 cue under the playhead and the one after it baked ahead of time. The render

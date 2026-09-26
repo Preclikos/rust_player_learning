@@ -106,7 +106,70 @@ tasks.register<Exec>("buildRustDebug") {
 tasks.register<Exec>("buildRustRelease") {
     workingDir = workspaceDir
     resolveNdkDir()?.let { environment("ANDROID_NDK_HOME", it) }
+    // Line tables (file:line, inlined frames) in the release .so, so a native
+    // crash in Crashlytics can be symbolicated. Only this Android build gets
+    // them (env, not [profile.release]) — the desktop/iOS/web releases keep
+    // their own settings. The debug info never ships: stripRustRelease moves
+    // it into build/native-symbols (uploaded to Crashlytics only) and strips
+    // the .so in the AAR.
+    environment("CARGO_PROFILE_RELEASE_DEBUG", "line-tables-only")
+    environment("CARGO_PROFILE_RELEASE_STRIP", "none")
     commandLine = cargoNdkArgs(release = true)
+}
+
+// ----------------------------------------------------------------------------
+// Native symbols for crash reports.
+//
+// The release .so is built with line tables and a GNU build-id
+// (.cargo/config.toml). This task keeps that unstripped copy under
+// build/native-symbols/<abi>/librustplayer.so and strips the copy that goes
+// into the AAR with --strip-all: the AAR (and every APK built from it) holds
+// no symbol table and no debug info, only the JNI exports. llvm-strip keeps
+// the build-id note, so the shipped library and the unstripped one still
+// match. The unstripped set is NEVER published (this repo and its packages
+// are public): the publish workflow uploads it straight to Crashlytics and
+// deletes it (see docs/RELEASING.md, "Native crash symbols").
+// ----------------------------------------------------------------------------
+val nativeSymbolsDir = layout.buildDirectory.dir("native-symbols")
+
+fun llvmTool(name: String): File? {
+    val ndkDir = resolveNdkDir() ?: return null
+    val exe = if (System.getProperty("os.name").lowercase().contains("windows")) "$name.exe" else name
+    return listOf("windows-x86_64", "linux-x86_64", "darwin-x86_64")
+        .map { file("$ndkDir/toolchains/llvm/prebuilt/$it/bin/$exe") }
+        .firstOrNull { it.exists() }
+}
+
+fun run(vararg cmd: String) {
+    val p = ProcessBuilder(*cmd).redirectErrorStream(true).start()
+    val out = p.inputStream.bufferedReader().readText()
+    if (p.waitFor() != 0) throw GradleException("${cmd.joinToString(" ")} failed: $out")
+}
+
+tasks.register("stripRustRelease") {
+    dependsOn("buildRustRelease")
+    doLast {
+        val strip = llvmTool("llvm-strip") ?: throw GradleException("llvm-strip not found in the NDK")
+        val readelf = llvmTool("llvm-readelf") ?: throw GradleException("llvm-readelf not found in the NDK")
+        val symbolsRoot = nativeSymbolsDir.get().asFile
+        delete(symbolsRoot)
+        abis.forEach { abi ->
+            val so = file("${projectDir}/src/main/jniLibs/$abi/librustplayer.so")
+            if (!so.exists()) throw GradleException("stripRustRelease: $so missing")
+            // A symbol file without a build-id can never be matched to a crash.
+            val p = ProcessBuilder(readelf.absolutePath, "-n", so.absolutePath).start()
+            val notes = p.inputStream.bufferedReader().readText()
+            p.waitFor()
+            if (!notes.contains("Build ID")) {
+                throw GradleException("$so has no GNU build-id (check .cargo/config.toml rustflags)")
+            }
+            val keep = File(symbolsRoot, "$abi/librustplayer.so")
+            keep.parentFile.mkdirs()
+            so.copyTo(keep, overwrite = true)
+            run(strip.absolutePath, "--strip-all", so.absolutePath)
+            logger.lifecycle("rustplayer $abi: ${keep.length() / 1_048_576} MiB with symbols -> ${so.length() / 1_048_576} MiB stripped")
+        }
+    }
 }
 
 // ring/rustls drag in libc++_shared via the cc crate (NEEDED entry); bundle the
@@ -148,7 +211,7 @@ afterEvaluate {
         dependsOn("buildRustDebug", "copyLibCxxShared")
     }
     tasks.named("preReleaseBuild").configure {
-        dependsOn("buildRustRelease", "copyLibCxxShared")
+        dependsOn("buildRustRelease", "stripRustRelease", "copyLibCxxShared")
     }
 }
 
@@ -173,6 +236,7 @@ publishing {
             artifactId = "rustplayer"
             version = (project.findProperty("rustplayer.version") as String?) ?: "0.1.0"
             afterEvaluate { from(components["release"]) }
+
         }
     }
     repositories {

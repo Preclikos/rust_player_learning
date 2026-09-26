@@ -93,3 +93,42 @@ jobs:
         # :rustplayer:publish → preReleaseBuild → buildRustRelease + copyLibCxxShared.
         # The buildRust task resolves the NDK from the SDK (ndk;29.0.13113456).
         run: bash ./gradlew :rustplayer:publish -Prustplayer.version=${{ steps.ver.outputs.version }} --no-daemon --stacktrace
+
+      # Native crash symbols go to Crashlytics and nowhere else. This repo and
+      # its packages are public, so the unstripped librustplayer.so (line
+      # tables + symbol table) is never published: the AAR carries the
+      # stripped build (same GNU build-id), this step hands the unstripped
+      # twin to Crashlytics for every app listed in the CRASHLYTICS_APP_IDS
+      # repo variable, and the next step deletes it from the runner.
+      # Auth: FIREBASE_SERVICE_ACCOUNT secret = a service-account key JSON with
+      # the "Firebase Crashlytics Admin" role on the apps' Firebase project.
+      - name: Set up Node (firebase-tools)
+        if: ${{ vars.CRASHLYTICS_APP_IDS != '' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Upload native symbols to Crashlytics
+        if: ${{ vars.CRASHLYTICS_APP_IDS != '' }}
+        env:
+          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+          APP_IDS: ${{ vars.CRASHLYTICS_APP_IDS }}
+        run: |
+          set -euo pipefail
+          if [ -z "$FIREBASE_SERVICE_ACCOUNT" ]; then
+            echo "::error::FIREBASE_SERVICE_ACCOUNT secret is not set - native crash symbols for this release are NOT in Crashlytics"
+            exit 1
+          fi
+          creds="$RUNNER_TEMP/firebase-sa.json"
+          ( umask 077; printf '%s' "$FIREBASE_SERVICE_ACCOUNT" > "$creds" )
+          export GOOGLE_APPLICATION_CREDENTIALS="$creds"
+          for app in ${APP_IDS//,/ }; do
+            npx --yes firebase-tools@15 crashlytics:symbols:upload --app="$app" \
+              platform/android/android/rustplayer/build/native-symbols
+          done
+
+      - name: Delete unstripped libraries and credentials
+        if: always()
+        run: |
+          rm -rf platform/android/android/rustplayer/build/native-symbols \
+                 "$RUNNER_TEMP/firebase-sa.json" "${TMPDIR:-/tmp}"/crashlytics-*

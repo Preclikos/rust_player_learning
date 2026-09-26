@@ -446,6 +446,17 @@ player.set_subtitle_track(&track);        // same call as a manifest track
 Known gap (tracked): the **audio** pipeline has no internal retry yet —
 an audio-side death parks playback in `Buffering { Stall }`.
 
+### Native crashes (Android, Crashlytics)
+
+Since 0.1.38 the AAR's `librustplayer.so` is stripped (JNI exports only, no
+symbol table, no debug info) but carries a GNU build-id. The player's publish
+workflow uploads the matching unstripped library straight to Crashlytics for
+the apps in its `CRASHLYTICS_APP_IDS` variable; the symbols are not published
+anywhere else (see `docs/RELEASING.md`). The host app only needs
+`com.google.firebase:firebase-crashlytics-ndk` on its classpath: no
+`nativeSymbolUploadEnabled`, no symbol download. A new consuming app gets
+symbolicated native frames once its Firebase app ID is added to that variable.
+
 ## 11. Backward compatibility
 
 The original guarantees hold: `NoopInterceptor` default,

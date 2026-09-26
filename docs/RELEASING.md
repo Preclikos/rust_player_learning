@@ -72,3 +72,36 @@ cargo run --release --example conformance -p player -- `
 For an interactive desktop check on the same asset, `example-desktop` takes
 `RUST_PLAYER_URL` / `RUST_PLAYER_CLEARKEY` and `seek <ms>` / `seek ±<ms>` on
 stdin.
+
+## Native crash symbols (Android)
+
+The Android release `librustplayer.so` is built with line tables and a GNU
+build-id (`.cargo/config.toml`, `buildRustRelease`). `stripRustRelease` keeps
+the unstripped copy in `rustplayer/build/native-symbols/<abi>/` and strips the
+library that goes into the AAR with `--strip-all`, so the AAR and every APK
+built from it carry no symbol table and no debug info, only the JNI exports.
+Both copies keep the same build-id, which is how Crashlytics pairs a crash
+with its symbols.
+
+The unstripped libraries go **only to Crashlytics**. This repository and its
+GitHub Packages are public, so they are never published as an artifact,
+release asset or workflow artifact: `publish-android.yml` uploads them with
+`firebase crashlytics:symbols:upload` for every app ID in the
+`CRASHLYTICS_APP_IDS` repo variable (comma separated) and then deletes them
+from the runner.
+
+Setup, once:
+
+1. Service account with the **Firebase Crashlytics Admin** role in the apps'
+   Firebase project, JSON key downloaded.
+2. `gh secret set FIREBASE_SERVICE_ACCOUNT < key.json`, then delete the file.
+3. `CRASHLYTICS_APP_IDS` lists the Firebase app IDs of the consuming apps
+   (currently the BlackZone rust mobile and TV apps).
+
+Without the secret the upload step fails the job after the AAR is published,
+so a release without symbols is visible. Releases before 0.1.38 had no
+build-id: their native frames cannot be symbolicated.
+
+A consuming app needs nothing beyond `firebase-crashlytics-ndk` on its
+classpath; repackaging the AAR is fine as long as the `.so` bytes are not
+rebuilt (AGP stripping it again keeps the build-id).

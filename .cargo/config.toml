@@ -4,8 +4,19 @@
 # take ~4 seconds, causing the playback pipeline to stall at every segment
 # boundary. With +aes+neon, the cipher uses ARMv8 cryptographic extensions
 # and decrypts at ~1 GB/s.
+#
+# Every Android .so also gets a GNU build-id note (lld does not emit one
+# unless asked). Crashlytics matches uploaded native symbols to a crash by
+# that id; without it the librustplayer.so frames of a native crash show as
+# "(Missing)" forever, whatever symbols are uploaded. strip keeps the note.
 [target.aarch64-linux-android]
-rustflags = ["-C", "target-feature=+aes,+neon", "--cfg", "aes_armv8"]
+rustflags = ["-C", "target-feature=+aes,+neon", "--cfg", "aes_armv8", "-C", "link-arg=-Wl,--build-id=sha1"]
+
+[target.armv7-linux-androideabi]
+rustflags = ["-C", "link-arg=-Wl,--build-id=sha1"]
+
+[target.x86_64-linux-android]
+rustflags = ["-C", "link-arg=-Wl,--build-id=sha1"]
 
 # Browser build. WebCodecs (VideoDecoder / AudioDecoder / VideoFrame / …) is
 # still behind web-sys's unstable gate, so every crate compiled for this

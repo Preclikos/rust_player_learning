@@ -26,3 +26,6 @@ platform/android/src/main/jniLibs/
 
 # iOS Simulator build output (RustPlayer.app bundle assembled by build_sim.sh)
 app-ios/ios/build/
+
+# firebase crashlytics:symbols:upload tool cache (dump_syms)
+.crashlytics/

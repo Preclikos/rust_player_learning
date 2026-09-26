@@ -334,22 +334,46 @@ Text styling is white + drop shadow by default (`set_subtitle_style` for
 colours/size). The rasterizer feeds plain RGBA bitmaps into the renderers
 — a future libass backend slots in at that same boundary.
 
-**Placement (ExoPlayer parity).** Cues are positioned by their WebVTT
-settings — `line:` (percentage or line number, with `,start|center|end`),
-`position:` (with `,line-left|center|line-right`), `align:` and `size:` —
-using a port of media3's `SubtitlePainter.setupTextLayout`, with the same
-defaults as `SubtitleView`: text size 5.33 % and bottom padding 8 % of the
-layout box height, 0.125 × text size of horizontal box padding. The layout
-box is chosen by `SubtitleStyle::anchor`: `Screen` (default) is the whole
-surface, so a cue without `line:` sits 8 % of the surface height above the
-bottom edge — in the letterbox bar on a widescreen film, the way most TV
-apps place it; `Picture` is the **aspect-fitted picture** (media3 mounts
-`SubtitleView` inside `PlayerView`'s `AspectRatioFrameLayout`), so the cues
-stay inside the picture and shrink with it — pick it for ExoPlayer parity.
-The host's `set_subtitle_safe_insets(bottom_px)` is the equivalent of
-padding that view: it raises the box's bottom edge (system bars, TV
-overscan); an ExoPlayer app that pads its `SubtitleView` should pass the
-same number.
+**Placement — the model.** Cues are positioned by their WebVTT settings —
+`line:` (percentage or line number, with `,start|center|end`), `position:`
+(with `,line-left|center|line-right`), `align:` and `size:` — through a
+port of media3's `SubtitlePainter.setupTextLayout`. Everything is derived
+from two rectangles the renderer computes itself:
+
+| Quantity | Value | media3 equivalent |
+|---|---|---|
+| Layout box | `anchor = Screen` (default): the whole surface. `anchor = Picture`: the aspect-fitted picture. Either way the host's bottom inset raises the box's bottom edge. | `SubtitleView` bounds minus padding |
+| Type height | the aspect-fitted **picture** height minus the bottom inset, under both anchors | `viewHeightMinusPadding` of a `SubtitleView` inside `AspectRatioFrameLayout` |
+| Text size | 5.33 % × type height (× `SubtitleStyle::size_scale`) | `DEFAULT_TEXT_SIZE_FRACTION` |
+| Bottom padding (cue without `line:`) | 8 % × type height above the box's bottom edge | `DEFAULT_BOTTOM_PADDING_FRACTION` |
+| Line box | font ascent + descent (+ line gap), baseline at the ascent | `StaticLayout` |
+| Horizontal padding | 0.125 × text size each side | `INNER_PADDING_RATIO` |
+
+A letterbox that is **baked into the frame** (a 2.39:1 film delivered as
+1920×1080 with black bars) is not a letterbox to the renderer: the picture
+is the whole frame, type height = surface height, and the cue lands in the
+black bar 8 % of the surface height above the bottom edge. Only a real
+aspect mismatch between content and surface produces a picture rectangle
+smaller than the surface.
+
+**What the host must (not) do.** `set_subtitle_safe_insets(bottom_px)` is
+the one host input that moves cues; it is logged at Info as `[subs] bottom
+safe inset Npx`. Pass the real `WindowInsets` bottom (system bars, cutout)
+and nothing else — no TV title-safe percentage. An ExoPlayer app that pads
+its `SubtitleView` should pass exactly that padding; one that does not
+should pass 0. Wrong values here were the cause of "our subtitles sit
+higher than ExoPlayer's" reports more than once.
+
+**Matching a specific ExoPlayer app.** ExoPlayer has two common layouts and
+the anchor selects between them: `PlayerView` mounts `SubtitleView` inside
+the `AspectRatioFrameLayout` → `anchor = Picture`; an app with a
+full-screen `SubtitleView` (BlackZone's build, measured 2026-09-26 on a
+Google TV Streamer) → `anchor = Screen`, the default. With the right anchor
+and inset the residual against ExoPlayer is ~1 % of the surface height.
+To verify, park a cue on screen (pause), `adb exec-out screencap -p`, and
+compare the glyph bottom row between the two apps on the same title —
+the numbers, not the impression.
+
 Inline tags, `region:` and `vertical:` are still ignored (vertical text
 renders horizontally).
 

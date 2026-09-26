@@ -12,6 +12,10 @@ name: Publish Web npm package
 on:
   workflow_dispatch:
     inputs:
+      skip_conformance:
+        description: "Publish even without a green conformance run for this commit"
+        required: false
+        default: "false"
       version:
         description: "package version (e.g. 0.1.0). Publishes to GitHub Packages; no release asset."
         required: true
@@ -27,6 +31,17 @@ jobs:
       packages: write   # publish to GitHub Packages (npm)
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      # A tag publishes only what conformance has passed: the run for this
+      # exact commit, or — for a commit that did not touch player/** and so
+      # never triggered one — the newest green run on an ancestor with no
+      # player changes since. `skip_conformance: true` (dispatch) overrides.
+      - name: Require green conformance for this commit
+        if: ${{ github.event.inputs.skip_conformance != 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/conformance/require-green.sh "${{ github.sha }}"
 
       - name: Ensure rust toolchain
         run: |

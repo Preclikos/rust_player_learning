@@ -205,6 +205,13 @@ macOS does.
   `app-android/android/README.md` (gradle details)
 - iOS: `app-ios/ios/build_sim.sh` for the simulator xcframework build
 
+## Releasing
+
+`./scripts/release.ps1 -WaitAndBumpIos` — one shared version line for
+android/ios/web, tagged together, gated on a green conformance run for the
+commit. Details, the gate's rules and how to run conformance locally:
+`docs/RELEASING.md`.
+
 ---
 
 ## When the FFmpeg version moves

@@ -234,7 +234,23 @@ struct LipSync {
     /// Wall instants at which flash frames were presented, with their pts.
     flashes: Mutex<Vec<(u64, Instant)>>,
     beeps_detected: AtomicU64,
+    /// Wall instants of every sink flush (= every seek / hard rebuild). Each
+    /// one opens a window that must produce audible audio again.
+    rebuilds: Mutex<Vec<Instant>>,
+    /// The flush whose audio has not been heard yet, if any.
+    liveness_pending: Mutex<Option<Instant>>,
+    /// Rebuilds whose audio position never advanced within
+    /// `AUDIO_DEAD_AFTER_REBUILD` — the "picture on, no sound after a seek"
+    /// failure that every other criterion is blind to (drift is only
+    /// measured once audio moves, lip-sync coverage is a run-wide total).
+    dead_rebuilds: AtomicU64,
 }
+
+/// How long after a flush the sink's post-flush position may stay at 0
+/// before the rebuild counts as mute. Covers the seek's own buffering on a
+/// locally served asset with room to spare; a real network stall shows up
+/// as a Buffering(Stall) event too.
+const AUDIO_DEAD_AFTER_REBUILD: Duration = Duration::from_secs(6);
 
 /// Forwards everything to the stock renderer; taps `put_samples` for beep
 /// onsets and `flush` to restart the queued-position axis.
@@ -270,6 +286,24 @@ impl TapAudio {
     /// granularity (one device callback) from the measurement.
     fn poll_presented(&self) {
         let Some(played) = self.inner.played_since_flush_ms() else { return };
+        // Post-rebuild liveness: the first non-zero position after a flush
+        // clears the pending rebuild; a rebuild that stays at 0 too long is
+        // recorded as dead (once).
+        {
+            let mut pending = self.lip.liveness_pending.lock().unwrap();
+            if let Some(t) = *pending {
+                if played > 0 {
+                    *pending = None;
+                } else if t.elapsed() > AUDIO_DEAD_AFTER_REBUILD {
+                    self.lip.dead_rebuilds.fetch_add(1, Ordering::Relaxed);
+                    eprintln!(
+                        "[conformance] AUDIO DEAD after rebuild: position still 0 {} s after the flush",
+                        t.elapsed().as_secs()
+                    );
+                    *pending = None;
+                }
+            }
+        }
         let played = played as f64;
         let lat = self.inner.output_latency_ms() as f64;
         let now = Instant::now();
@@ -308,6 +342,9 @@ impl AudioSink for TapAudio {
         *self.lip.queued_ms.lock().unwrap() = 0.0;
         self.lip.pending_onsets.lock().unwrap().clear();
         self.lip.loud.store(false, Ordering::Relaxed);
+        let now = Instant::now();
+        self.lip.rebuilds.lock().unwrap().push(now);
+        *self.lip.liveness_pending.lock().unwrap() = Some(now);
         self.inner.flush()
     }
     fn stop(&self) -> impl Future<Output = ()> + Send + '_ {
@@ -401,7 +438,9 @@ impl VideoSink for TapVideo {
 
 /// Pair each presented flash with the nearest audible beep and return the
 /// offsets `flash − beep` in ms (positive = picture late / audio leads).
-fn lipsync_offsets(lip: &LipSync) -> Vec<(u64, i64)> {
+/// `(flash pts ms, flash − beep ms, flash wall instant)` for every flash that
+/// found its beep.
+fn lipsync_offsets(lip: &LipSync) -> Vec<(u64, i64, Instant)> {
     let flashes = lip.flashes.lock().unwrap();
     let beeps = lip.audible.lock().unwrap();
     let mut out = Vec::new();
@@ -420,7 +459,33 @@ fn lipsync_offsets(lip: &LipSync) -> Vec<(u64, i64)> {
         // Pair only within half a mark period; otherwise the beep for this
         // flash was not detected (or the flash landed in a seek hole).
         if let Some(d) = nearest.filter(|d| d.abs() < (MARK_PERIOD_MS / 2) as i64) {
-            out.push((pts_ms, d));
+            out.push((pts_ms, d, t_flash));
+        }
+    }
+    out
+}
+
+/// Rebuild windows (from each flush to the next one or the run's end) that
+/// are long enough to contain a mark pair yet got none: audio or picture
+/// never came back after that seek. `(window index, length s)` each.
+fn silent_rebuild_windows(
+    rebuilds: &[Instant],
+    offsets: &[(u64, i64, Instant)],
+    end: Instant,
+) -> Vec<(usize, u64)> {
+    // A window must hold a whole mark period after the seek's own settle
+    // time before a missing pair means anything.
+    let settle = Duration::from_secs(2);
+    let min_len = settle + Duration::from_millis(MARK_PERIOD_MS * 2);
+    let mut out = Vec::new();
+    for (i, &from) in rebuilds.iter().enumerate() {
+        let to = rebuilds.get(i + 1).copied().unwrap_or(end);
+        if to.saturating_duration_since(from) < min_len {
+            continue;
+        }
+        let heard = offsets.iter().any(|&(_, _, t)| t >= from + settle && t < to);
+        if !heard {
+            out.push((i, to.saturating_duration_since(from).as_secs()));
         }
     }
     out
@@ -594,7 +659,7 @@ async fn main() {
         if last_lip_report.elapsed() >= Duration::from_secs(10) {
             last_lip_report = Instant::now();
             let offs = lipsync_offsets(&lip);
-            if let Some(&(pts, d)) = offs.last() {
+            if let Some(&(pts, d, _)) = offs.last() {
                 eprintln!(
                     "[conformance] LIPSYNC pairs={} latest: flash@{}s offset={}ms (+ = picture late)",
                     offs.len(),
@@ -627,13 +692,17 @@ async fn main() {
         }
     }
 
+    let run_end = Instant::now();
     let offsets = lipsync_offsets(&lip);
-    let mut sorted: Vec<i64> = offsets.iter().map(|&(_, d)| d).collect();
+    let rebuilds = lip.rebuilds.lock().unwrap().clone();
+    let silent_windows = silent_rebuild_windows(&rebuilds, &offsets, run_end);
+    let dead_rebuilds = lip.dead_rebuilds.load(Ordering::Relaxed);
+    let mut sorted: Vec<i64> = offsets.iter().map(|&(_, d, _)| d).collect();
     sorted.sort_unstable();
     let lip_median = sorted.get(sorted.len() / 2).copied().unwrap_or(0);
     let lip_max_abs = sorted.iter().map(|d| d.abs()).max().unwrap_or(0);
     let beeps = lip.beeps_detected.load(Ordering::Relaxed);
-    for (pts, d) in &offsets {
+    for (pts, d, _) in &offsets {
         eprintln!("[conformance] lipsync flash@{}s {:+}ms", pts / 1000, d);
     }
     let late_pct = if s.video_frames_decoded > 0 {
@@ -643,7 +712,7 @@ async fn main() {
     };
 
     println!(
-        "CONFORMANCE_JSON {{\"platform\":\"{}\",\"secs\":{},\"stall_events\":{},\"stall_buffering_events\":{},\"stall_ms_total\":{},\"pipeline_retries\":{},\"render_gap_max_ms\":{},\"render_burst_frames\":{},\"judder_frames\":{},\"interval_hist\":[{},{},{},{}],\"av_drift_max_ms\":{},\"frames_decoded\":{},\"frames_dropped\":{},\"frames_late\":{},\"audio_underruns\":{},\"errors\":{},\"eos\":{},\"video_track_changes\":{},\"lipsync_pairs\":{},\"lipsync_beeps\":{},\"lipsync_median_ms\":{},\"lipsync_max_abs_ms\":{}}}",
+        "CONFORMANCE_JSON {{\"platform\":\"{}\",\"secs\":{},\"stall_events\":{},\"stall_buffering_events\":{},\"stall_ms_total\":{},\"pipeline_retries\":{},\"render_gap_max_ms\":{},\"render_burst_frames\":{},\"judder_frames\":{},\"interval_hist\":[{},{},{},{}],\"av_drift_max_ms\":{},\"frames_decoded\":{},\"frames_dropped\":{},\"frames_late\":{},\"audio_underruns\":{},\"errors\":{},\"eos\":{},\"video_track_changes\":{},\"lipsync_pairs\":{},\"lipsync_beeps\":{},\"lipsync_median_ms\":{},\"lipsync_max_abs_ms\":{},\"rebuilds\":{},\"dead_rebuilds\":{},\"silent_rebuild_windows\":{},\"clock_wall_fallbacks\":{},\"audio_output_rebuilds\":{}}}",
         std::env::consts::OS,
         args.secs,
         s.stall_events,
@@ -669,6 +738,11 @@ async fn main() {
         beeps,
         lip_median,
         lip_max_abs,
+        rebuilds.len(),
+        dead_rebuilds,
+        silent_windows.len(),
+        s.clock_wall_fallbacks,
+        s.audio_output_rebuilds,
     );
 
     let mut failed = false;
@@ -681,6 +755,36 @@ async fn main() {
         }
     };
     check("errors", errors == 0, format!("{errors} player errors"));
+    // The mute-after-seek family. Each of these is a pipeline that played
+    // picture without sound; none of the rate/drift criteria can see it.
+    check(
+        "clock-fallbacks",
+        s.clock_wall_fallbacks == 0,
+        format!("{} master-clock handovers to the wall clock", s.clock_wall_fallbacks),
+    );
+    check(
+        "audio-rebuilds",
+        s.audio_output_rebuilds == 0,
+        format!("{} audio-watchdog pipeline rebuilds", s.audio_output_rebuilds),
+    );
+    check(
+        "audio-after-rebuild",
+        dead_rebuilds == 0,
+        format!(
+            "{dead_rebuilds} of {} rebuilds never advanced the audio position (limit {} s)",
+            rebuilds.len(),
+            AUDIO_DEAD_AFTER_REBUILD.as_secs()
+        ),
+    );
+    check(
+        "lipsync-per-rebuild",
+        silent_windows.is_empty(),
+        format!(
+            "{} rebuild window(s) without a flash/beep pair: {:?}",
+            silent_windows.len(),
+            silent_windows
+        ),
+    );
     check(
         "pipeline-retries",
         s.pipeline_retries == 0,

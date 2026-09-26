@@ -125,6 +125,11 @@ pub struct ConformanceSummary {
     /// per-frame lip-sync error; the LATE drain only drops past 80 ms).
     pub video_late_frames: u64,
     pub audio_underruns: u64,
+    /// Master-clock handovers to the wall clock because the audio position
+    /// stood still while playing — a mute pipeline, never acceptable.
+    pub clock_wall_fallbacks: u64,
+    /// Pipeline rebuilds the audio-output watchdog performed.
+    pub audio_output_rebuilds: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -217,6 +222,10 @@ pub(crate) struct StatsState {
     /// Lives on the per-Player stats (not the per-generation locals) so the
     /// budget survives the very rebuild it is counting.
     audio_output_rebuilds: AtomicU32,
+    /// Times the master clock gave up on a standing audio position and
+    /// handed over to the wall clock (`MediaClock`). Zero in a healthy run:
+    /// every one of these is a pipeline that played picture without sound.
+    clock_wall_fallbacks: AtomicU64,
     /// Measured A/V clock drift in ms: how far the video wall clock has
     /// run ahead of the audio device clock since this pipeline started
     /// (negative = audio ahead). Written ~1 Hz by video_sync_loop when
@@ -1063,6 +1072,8 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             video_frames_dropped: s.video_frames_dropped.load(Ordering::Relaxed),
             video_late_frames: s.video_late_frames.load(Ordering::Relaxed),
             audio_underruns: s.audio_underruns.load(Ordering::Relaxed),
+            clock_wall_fallbacks: s.clock_wall_fallbacks.load(Ordering::Relaxed),
+            audio_output_rebuilds: s.audio_output_rebuilds.load(Ordering::Relaxed),
         }
     }
 

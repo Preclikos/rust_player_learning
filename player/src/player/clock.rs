@@ -271,6 +271,7 @@ impl<A: AudioSink> MediaClock<A> {
             let extra = since.as_millis() as u64 - stale_after;
             let handover = p0 + extra;
             st.wall_from = Some((handover, now, pause_skew));
+            self.stats.clock_wall_fallbacks.fetch_add(1, Ordering::Relaxed);
             log::warn!(
                 "[clock] audio position frozen at {}ms for {}ms while playing                  (ever_advanced={}) — master clock falls back to the wall;                  the audio output is dead or absent",
                 p0,

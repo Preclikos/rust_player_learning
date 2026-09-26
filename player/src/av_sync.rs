@@ -253,6 +253,9 @@ pub struct ChunkCursor {
     consumed: u64,
     consumed_shared: std::sync::Arc<AtomicU64>,
     closed: bool,
+    /// A live chunk `drop_stale` pulled while paused; `next_chunk` returns
+    /// it before touching the queue again.
+    pending: Option<AudioChunk>,
 }
 
 impl ChunkCursor {
@@ -269,6 +272,38 @@ impl ChunkCursor {
             consumed: 0,
             consumed_shared,
             closed: false,
+            pending: None,
+        }
+    }
+
+    /// Throw away chunks queued before the last flush WITHOUT consuming
+    /// anything live — for a paused consumer. The queue is bounded, and a
+    /// seek (flush + pause) leaves it full of the old pipeline's PCM: the
+    /// paused callback emitted silence without pulling, the new pipeline's
+    /// `put_samples` blocked on the full queue before its 120 ms pre-roll
+    /// was queued, the pre-roll gate that unpauses the output therefore
+    /// never opened, and playback continued on the wall clock without a
+    /// sound (desktop, every seek after the first). The first live chunk
+    /// met here is parked in `pending`, not consumed, so the resume still
+    /// starts exactly at the generation boundary.
+    pub fn drop_stale(&mut self) {
+        if self.pending.is_some() {
+            return;
+        }
+        let live = self.state.current_gen();
+        loop {
+            match self.rx.try_recv() {
+                Ok(chunk) if chunk.gen < live => continue,
+                Ok(chunk) => {
+                    self.pending = Some(chunk);
+                    return;
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => return,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    self.closed = true;
+                    return;
+                }
+            }
         }
     }
 
@@ -288,6 +323,11 @@ impl ChunkCursor {
 
     /// Non-blocking pull (realtime callbacks).
     pub fn next_chunk(&mut self) -> Pulled {
+        if let Some(chunk) = self.pending.take() {
+            if let Some(p) = self.classify(chunk) {
+                return p;
+            }
+        }
         loop {
             match self.rx.try_recv() {
                 Ok(chunk) => {
@@ -307,6 +347,11 @@ impl ChunkCursor {
     /// Blocking pull (plain writer threads). Never returns `Empty`.
     #[cfg_attr(not(target_os = "android"), allow(dead_code))]
     pub fn blocking_next_chunk(&mut self) -> Pulled {
+        if let Some(chunk) = self.pending.take() {
+            if let Some(p) = self.classify(chunk) {
+                return p;
+            }
+        }
         loop {
             match self.rx.blocking_recv() {
                 Some(chunk) => {
@@ -612,6 +657,44 @@ mod tests {
 
     fn chunk(gen: u64, n: usize, v: f32) -> AudioChunk {
         AudioChunk { gen, samples: vec![v; n] }
+    }
+
+    #[test]
+    fn paused_cursor_frees_the_queue_of_flushed_chunks() {
+        // The desktop seek regression: flush + pause with a FULL bounded
+        // queue. The paused callback used to consume nothing, so the new
+        // pipeline blocked on the full queue before it could queue its
+        // pre-roll and the output never unpaused again.
+        let st = Arc::new(FlushState::new());
+        let consumed = Arc::new(AtomicU64::new(0));
+        let (tx, rx) = tokio::sync::mpsc::channel(3);
+        let mut cur = ChunkCursor::new(rx, st.clone(), consumed.clone());
+        for _ in 0..3 {
+            tx.try_send(chunk(0, 4, 1.0)).unwrap();
+        }
+        assert!(tx.try_send(chunk(0, 4, 1.0)).is_err(), "queue is full");
+        st.flush();
+        // Paused: drain the superseded generation, consume nothing.
+        cur.drop_stale();
+        cur.commit();
+        assert_eq!(consumed.load(Ordering::Relaxed), 0);
+        // The new pipeline can queue again …
+        tx.try_send(chunk(1, 4, 2.0)).unwrap();
+        tx.try_send(chunk(1, 4, 2.0)).unwrap();
+        // … and a further drop_stale while still paused parks the first
+        // live chunk without playing it, leaving it for the resume.
+        cur.drop_stale();
+        cur.commit();
+        assert_eq!(consumed.load(Ordering::Relaxed), 0);
+        // Resume: the parked chunk plays first, at the generation boundary.
+        assert_eq!(cur.next_sample(), Some(2.0));
+        assert_eq!(st.boundary(), Some(0));
+        for _ in 0..7 {
+            assert_eq!(cur.next_sample(), Some(2.0));
+        }
+        assert_eq!(cur.next_sample(), None);
+        cur.commit();
+        assert_eq!(st.played_since_flush(8), 8);
     }
 
     #[test]

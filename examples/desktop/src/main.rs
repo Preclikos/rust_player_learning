@@ -273,6 +273,7 @@ async fn run_console(player: Player) {
     println!("  abr on   — enable bandwidth-EWMA ABR (safety_factor=1.25)");
     println!("  abr off  — disable ABR (Manual)");
     println!("  p        — pause / resume (also: space in the window)");
+    println!("  seek <ms>      — absolute seek; seek +<ms> / -<ms> — relative (also: arrows in the window)");
 
     let stdin = tokio::io::stdin();
     let mut reader = BufReader::new(stdin).lines();
@@ -306,6 +307,23 @@ async fn run_console(player: Player) {
             "a" => match arg.and_then(|s| s.parse::<usize>().ok()) {
                 Some(i) => pick_audio(&player, i),
                 None => println!("usage: a <index>"),
+            },
+            "seek" => match arg {
+                Some(a) if a.starts_with('+') || a.starts_with('-') => match a.parse::<i64>() {
+                    Ok(delta) => {
+                        player.seek_relative(delta);
+                        println!("seek {:+}ms", delta);
+                    }
+                    Err(_) => println!("usage: seek <ms> | seek +<ms> | seek -<ms>"),
+                },
+                Some(a) => match a.parse::<u64>().ok() {
+                    Some(ms) => {
+                        player.seek(std::time::Duration::from_millis(ms));
+                        println!("seek to {}ms", ms);
+                    }
+                    None => println!("usage: seek <ms> | seek +<ms> | seek -<ms>"),
+                },
+                None => println!("usage: seek <ms> | seek +<ms> | seek -<ms>"),
             },
             "abr" => match arg {
                 Some("on") => {

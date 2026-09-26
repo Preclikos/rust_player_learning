@@ -165,12 +165,25 @@ fn spawn_event_log(player: &Player) {
 
 pub async fn run_test_playback(mut player: Player) {
     spawn_event_log(&player);
-    if let Err(e) = player.open_url(TEST_MANIFEST_URL).await {
+    // RUST_PLAYER_URL / RUST_PLAYER_CLEARKEY (`kidhex:keyhex`, repeatable
+    // with `,`) point the fixture at another stream — e.g. the conformance
+    // asset served locally, when the public test stream is out of reach.
+    let url = std::env::var("RUST_PLAYER_URL").unwrap_or_else(|_| TEST_MANIFEST_URL.to_string());
+    let keys = match std::env::var("RUST_PLAYER_CLEARKEY") {
+        Ok(spec) => spec
+            .split(',')
+            .filter_map(|pair| pair.split_once(':'))
+            .map(|(kid, key)| (kid.trim().to_string(), key.trim().to_string()))
+            .collect(),
+        Err(_) => test_clearkeys(),
+    };
+    log::info!("[test-playback] url={} keys={}", url, keys.len());
+    if let Err(e) = player.open_url(&url).await {
         log::error!("open_url: {}", e);
         return;
     }
 
-    if let Err(e) = player.set_clearkey(test_clearkeys()) {
+    if let Err(e) = player.set_clearkey(keys) {
         log::error!("set_clearkey: {}", e);
         return;
     }

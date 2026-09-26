@@ -137,11 +137,14 @@ async fn start_audio(
         if ms > 0 && ms <= 1000 {
             output_latency_ms.store(ms, Ordering::Relaxed);
         }
-        // While paused, emit silence WITHOUT consuming — resume picks up
-        // exactly where we left off. (A flush that lands mid-pause is
-        // honoured by the cursor on the next consuming callback: the stale
-        // generation is skipped then.)
+        // While paused, emit silence WITHOUT consuming live PCM — resume
+        // picks up exactly where we left off. Chunks a flush has already
+        // superseded ARE thrown away here, or a seek (flush + pause) leaves
+        // the bounded queue full of the old pipeline's audio and the new
+        // pipeline can never queue the pre-roll that unpauses the output
+        // (see `ChunkCursor::drop_stale`).
         if paused_flag.load(Ordering::Relaxed) {
+            cursor.drop_stale();
             for sample in data.iter_mut() {
                 *sample = Sample::EQUILIBRIUM;
             }

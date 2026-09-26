@@ -34,6 +34,11 @@ class H(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/octet-stream")
         self.send_header("Accept-Ranges", "bytes")
         self.send_header("Content-Length", str(length))
+        # One request per connection: with keep-alive, a pooled connection the
+        # server side had already dropped surfaces in the client as "error
+        # sending request" (seen with reqwest on Windows, WinError 10054).
+        self.send_header("Connection", "close")
+        self.close_connection = True
         if status == 206:
             self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
         self.end_headers()

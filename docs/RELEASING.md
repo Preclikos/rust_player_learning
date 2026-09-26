@@ -7,17 +7,22 @@ workflows; nothing else needs bumping in the tree.
 
 ## The script
 
-```powershell
-./scripts/release.ps1 -WaitAndBumpIos          # next version, all platforms
-./scripts/release.ps1 -Version 0.2.0            # explicit version
-./scripts/release.ps1 -Platforms android,web    # subset
+`scripts/release.sh` is bash and runs the same way in Git Bash on Windows,
+on macOS and on Linux (needs `git`, `gh` logged in, `python3` for the gate);
+`scripts/release.ps1` is only a wrapper that calls it.
+
+```bash
+scripts/release.sh --wait-and-bump-ios          # next version, all platforms
+scripts/release.sh --version 0.2.0              # explicit version
+scripts/release.sh --platforms android,web      # subset
+scripts/release.sh --dry-run                    # every check, no tag
 ```
 
 It refuses a dirty tree or an unpushed HEAD, reads the version from the
 **remote** tags (never from memory — two sessions releasing in parallel once
 produced web-v0.1.34 on one commit and 0.1.35 on another), requires a green
 conformance run covering HEAD, tags, pushes, and lists the runs. With
-`-WaitAndBumpIos` it also waits for the iOS xcframework, reads its checksum
+`--wait-and-bump-ios` it also waits for the iOS xcframework, reads its checksum
 from the GitHub release and commits the `Package.swift` pin — the step that
 was forgotten for ios-v0.1.9, 0.1.12, 0.1.25 and 0.1.29.
 
@@ -35,7 +40,8 @@ A tag publishes only when conformance covers its commit:
 A run still in progress, a failed run, or player changes since the last
 green run refuse the publish — re-run the job once conformance is green, or
 dispatch the workflow by hand with `skip_conformance: true` when you have
-decided the risk is yours.
+decided the risk is yours (`--skip-conformance-check` on the script only
+skips the local pre-check; the workflow gate still applies).
 
 ## What conformance checks
 

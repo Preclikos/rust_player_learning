@@ -207,10 +207,10 @@ macOS does.
 
 ## Releasing
 
-`./scripts/release.ps1 -WaitAndBumpIos` — one shared version line for
-android/ios/web, tagged together, gated on a green conformance run for the
-commit. Details, the gate's rules and how to run conformance locally:
-`docs/RELEASING.md`.
+`scripts/release.sh --wait-and-bump-ios` (bash: Git Bash, macOS, Linux;
+`release.ps1` wraps it) — one shared version line for android/ios/web,
+tagged together, gated on a green conformance run for the commit. Details,
+the gate's rules and how to run conformance locally: `docs/RELEASING.md`.
 
 ---
 

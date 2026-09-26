@@ -61,7 +61,9 @@ pub(super) fn rasterize_cue(
     text: &str,
     layout: &CueLayout,
     parent_w: u32,
-    parent_h: u32,
+    // `type_h`: height the text size derives from — the picture, not the
+    // layout box. See `CueParent::picture_h`.
+    type_h: u32,
     style: &SubtitleStyle,
 ) -> Option<CueRaster> {
     if text.is_empty() {
@@ -70,7 +72,7 @@ pub(super) fn rasterize_cue(
     // The 12px floor keeps the 0.5× setting legible on tiny preview
     // windows; the cap keeps a 3× setting on a 4K surface inside texture
     // limits.
-    let px_size = (parent_h as f32 * super::TEXT_SIZE_FRACTION * style.size_scale).clamp(12.0, 160.0);
+    let px_size = (type_h as f32 * super::TEXT_SIZE_FRACTION * style.size_scale).clamp(12.0, 160.0);
     // SubtitlePainter: textPaddingX = (int)(textSize * INNER_PADDING_RATIO + 0.5)
     let shadow = 2i32;
     let pad_x = ((px_size * super::INNER_PADDING_RATIO + 0.5) as i32).max(shadow);

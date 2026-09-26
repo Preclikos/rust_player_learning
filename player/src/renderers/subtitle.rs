@@ -86,6 +86,17 @@ pub struct CueParent {
     pub top: f32,
     pub right: f32,
     pub bottom: f32,
+    /// Height the TEXT SIZE and the auto bottom padding are derived from:
+    /// always the aspect-fitted picture, whichever anchor is in use.
+    ///
+    /// The anchor decides where a cue sits; it has no business deciding how
+    /// big the glyphs are. Deriving the size from the layout box instead made
+    /// `Screen` scale the text with the surface, so a letterboxed film got
+    /// roughly twice ExoPlayer's size — 57px rather than 29px on a
+    /// 958×1064 window — and a three-line cue then grew taller than the
+    /// letterbox bar and climbed back into the picture, which is the one
+    /// thing placing it in the bar was meant to avoid.
+    picture_h: f32,
 }
 
 impl CueParent {
@@ -101,11 +112,15 @@ impl CueParent {
     ) -> Self {
         let tw = target_w as f32;
         let th = target_h as f32;
+        let picture_scale_y = scale_y;
         let (scale_x, scale_y) = match anchor {
             SubtitleAnchor::Screen => (1.0, 1.0),
             SubtitleAnchor::Picture => (scale_x, scale_y),
         };
         let sane = |s: f32| if s.is_finite() && s > 0.0 { s.min(1.0) } else { 1.0 };
+        // The picture's own height, taken before the anchor may have flattened
+        // the scale to 1.0 — see `picture_h`.
+        let picture_h = (th * sane(picture_scale_y)).round();
         let pw = (tw * sane(scale_x)).round();
         let ph = (th * sane(scale_y)).round();
         let left = ((tw - pw) / 2.0).floor();
@@ -121,6 +136,10 @@ impl CueParent {
             top,
             right: left + pw,
             bottom,
+            // The inset shrinks what the size derives from, as it does for the
+            // box itself (media3 resolves text size against
+            // `viewHeightMinusPadding`).
+            picture_h: (picture_h - inset).max(1.0),
         }
     }
 
@@ -154,6 +173,12 @@ impl CueParent {
 
     pub fn height(&self) -> u32 {
         (self.bottom - self.top).round().max(1.0) as u32
+    }
+
+    /// Height the text size and the auto bottom padding scale with. See
+    /// [`CueParent::picture_h`].
+    pub fn type_height(&self) -> u32 {
+        self.picture_h.round().max(1.0) as u32
     }
 }
 
@@ -205,7 +230,12 @@ pub fn place_cue(
         }
         CueLine::Number(n) if n >= 0 => (n as f32 * lh).round() + parent.top,
         CueLine::Number(n) => ((n + 1) as f32 * lh).round() + parent.bottom - h,
-        CueLine::Auto => parent.bottom - h - (ph * BOTTOM_PADDING_FRACTION).floor(),
+        // Padding off the picture height too: 8 % of a tall surface is a wide
+        // empty band that pushes the block up towards the picture, which is
+        // the opposite of what anchoring to the screen is for.
+        CueLine::Auto => {
+            parent.bottom - h - (parent.type_height() as f32 * BOTTOM_PADDING_FRACTION).floor()
+        }
     };
     if y + h > parent.bottom {
         y = parent.bottom - h;
@@ -377,6 +407,8 @@ struct Inner {
     /// (0×0) it has nothing to do.
     target_w: u32,
     target_h: u32,
+    /// Picture height the text size derives from — see `CueParent::picture_h`.
+    type_h: u32,
     /// Cue indices the worker was last asked to have ready — `[active,
     /// next]`. Kept so `set_pts_ms`, which runs every frame, can tell a
     /// PTS update that changes nothing from one that crosses a cue
@@ -454,7 +486,8 @@ impl Inner {
 
     /// Record the surface size the render path is drawing at. Returns
     /// true when it moved enough to invalidate what the worker produced.
-    fn note_target(&mut self, target_w: u32, target_h: u32) -> bool {
+    fn note_target(&mut self, target_w: u32, target_h: u32, type_h: u32) -> bool {
+        self.type_h = type_h;
         if self.target_h == target_h && width_close(self.target_w, target_w) {
             // Keep the exact numbers current even inside the tolerance so
             // the drift is measured against what we last drew.
@@ -601,6 +634,7 @@ impl SubtitleOverlay {
                 generation: 0,
                 target_w: 0,
                 target_h: 0,
+                type_h: 0,
                 wanted: [None, None],
                 shutdown: false,
                 max_cue_span_ms: 0,
@@ -725,9 +759,10 @@ impl SubtitleOverlay {
     /// thread for every frame.
     pub fn active_bitmap(&self, parent: &CueParent) -> Option<std::sync::Arc<SubtitleBitmap>> {
         let (target_w, target_h) = (parent.width(), parent.height());
+        let type_h = parent.type_height();
         let (bitmap, resized) = {
             let mut inner = self.shared.inner.lock().unwrap();
-            let resized = inner.note_target(target_w, target_h);
+            let resized = inner.note_target(target_w, target_h, type_h);
             let pts = inner.current_pts_ms;
             let bitmap = inner
                 .active_index(pts)
@@ -794,16 +829,17 @@ impl SubtitleOverlay {
             return;
         }
         let (target_w, target_h) = (parent.width(), parent.height());
+        let type_h = parent.type_height();
         // No rasterizer thread (the browser build, or a spawn failure):
         // bake the wanted cue right here. Cue changes are rare (seconds
         // apart) and one rasterization is a few ms, so paying it on the
         // render path beats having no subtitles at all.
         if self.worker.is_none() {
-            self.rasterize_inline(target_w, target_h);
+            self.rasterize_inline(target_w, target_h, type_h);
         }
         let (bitmap, resized) = {
             let mut inner = self.shared.inner.lock().unwrap();
-            let resized = inner.note_target(target_w, target_h);
+            let resized = inner.note_target(target_w, target_h, type_h);
             let pts = inner.current_pts_ms;
             let bitmap = inner
                 .active_index(pts)
@@ -936,15 +972,15 @@ impl SubtitleOverlay {
     /// One `raster_worker` iteration, run synchronously by the render path
     /// when there is no worker thread. Bakes at most one cue per call — the
     /// active one first, the prefetch on the next frame.
-    fn rasterize_inline(&self, target_w: u32, target_h: u32) {
+    fn rasterize_inline(&self, target_w: u32, target_h: u32, type_h: u32) {
         let job = {
             let mut inner = self.shared.inner.lock().unwrap();
-            inner.note_target(target_w, target_h);
+            inner.note_target(target_w, target_h, type_h);
             next_job(&inner)
         };
         let Some(job) = job else { return };
         let rasterized = rasterizer::rasterize_cue(
-            &job.font, &job.text, &job.layout, job.target_w, job.target_h, &job.style,
+            &job.font, &job.text, &job.layout, job.target_w, job.type_h, &job.style,
         );
         let mut inner = self.shared.inner.lock().unwrap();
         if inner.target_w != job.target_w || inner.target_h != job.target_h {
@@ -1009,7 +1045,7 @@ fn raster_worker(shared: Arc<Shared>) {
 
         // Lock released: this is the multi-millisecond part.
         let rasterized = rasterizer::rasterize_cue(
-            &job.font, &job.text, &job.layout, job.target_w, job.target_h, &job.style,
+            &job.font, &job.text, &job.layout, job.target_w, job.type_h, &job.style,
         );
 
         let mut inner = shared.inner.lock().unwrap();
@@ -1046,6 +1082,8 @@ struct RasterJob {
     style: SubtitleStyle,
     target_w: u32,
     target_h: u32,
+    /// See `CueParent::picture_h` — what the glyph size scales with.
+    type_h: u32,
 }
 
 /// The next cue that needs rasterizing, or `None` when everything wanted
@@ -1068,6 +1106,7 @@ fn next_job(inner: &Inner) -> Option<RasterJob> {
                 style: inner.style,
                 target_w: inner.target_w,
                 target_h: inner.target_h,
+                type_h: inner.type_h,
             });
         }
     }
@@ -1437,9 +1476,35 @@ mod tests {
         assert_eq!((p.left, p.top, p.right, p.bottom), (0.0, 0.0, 1920.0, 1080.0));
         let (x, y) = place_cue(400, 60, 40, &CueLayout::DEFAULT, &p);
         assert_eq!(x, 760.0);
-        assert_eq!(y, 1080.0 - 60.0 - 86.0);
+        // 8 % of the PICTURE (803px), not of the 1080px surface. Taking it
+        // from the surface left a 86px gap under the cue and pushed the block
+        // up towards the picture — on a tall window far enough that a
+        // three-line cue ended up back inside it.
+        let pic_h = (1080.0f32 * (1920.0 / 1080.0) / 2.39).round();
+        assert_eq!(pic_h, 803.0);
+        assert_eq!(y, 1080.0 - 60.0 - (pic_h * BOTTOM_PADDING_FRACTION).floor());
         let p = CueParent::fit(1920, 1080, 2390, 1000, 100, SubtitleAnchor::Screen);
         assert_eq!(p.bottom, 980.0);
+    }
+
+    #[test]
+    fn text_size_tracks_the_picture_not_the_surface() {
+        // 16:9 film on a nearly-portrait window — the shape that exposed this.
+        // With the Screen anchor the box is the whole surface, so the cue
+        // lands in the letterbox bar; but the glyphs must still scale with the
+        // picture, or the block grows taller than the bar and climbs into the
+        // picture it was deliberately placed below.
+        let p = CueParent::fit(958, 1064, 1920, 1080, 0, SubtitleAnchor::Screen);
+        assert_eq!(p.height(), 1064, "box is the surface");
+        assert_eq!(p.type_height(), 539, "size comes from the picture");
+
+        // Picture anchor: the two agree, which is ExoPlayer's geometry.
+        let p = CueParent::fit(958, 1064, 1920, 1080, 0, SubtitleAnchor::Picture);
+        assert_eq!(p.height(), p.type_height());
+
+        // The inset shrinks what the size derives from, like view padding.
+        let p = CueParent::fit(958, 1064, 1920, 1080, 39, SubtitleAnchor::Screen);
+        assert_eq!(p.type_height(), 500);
     }
 
     #[test]

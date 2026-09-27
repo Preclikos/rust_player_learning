@@ -117,6 +117,18 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         // --ez verbose true: engine debug lines (audio clock internals etc.).
         if (intent.getBooleanExtra("verbose", false)) player.setVerboseLogging(true)
         keepAlive = intent.getBooleanExtra("keep_alive", false)
+        // --ez overlay_twice true: hand the SAME overlay Surface to the player
+        // again a few seconds into playback — what a host does on
+        // surfaceChanged after a rotation (no surfaceDestroyed in between).
+        if (intent.getBooleanExtra("overlay_twice", false)) {
+            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                overlaySurface?.let { s ->
+                    traceMark("overlay_twice")
+                    player.setOverlaySurface(s)
+                    player.setSize(overlayW, overlayH)
+                }
+            }, 6_000)
+        }
         if (stormMode) {
             android.util.Log.i(
                 "rustplayer_repro",

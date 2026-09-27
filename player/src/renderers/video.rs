@@ -749,6 +749,14 @@ impl VideoRenderer {
             })
             .await
             .unwrap();
+        // wgpu's default handler for an uncaptured error is panic!(), which
+        // on Android aborts the whole app (SIGABRT) for what is often a
+        // recoverable presentation hiccup — a rotation once killed BlackZone
+        // mobile over one invalid Surface::configure. Log it and carry on;
+        // the call sites that can act on a failure use error scopes.
+        device.on_uncaptured_error(std::sync::Arc::new(|e: wgpu::Error| {
+            log::error!("[renderer] wgpu error (continuing): {e}");
+        }));
 
         let preferred_formats = vec![
             TextureFormat::Rgb10a2Unorm,
@@ -1843,26 +1851,11 @@ impl VideoRenderer {
             return; // offscreen renderer: nothing to re-target
         };
         let mut surface = slot.lock().await;
-        let Some(window) = std::ptr::NonNull::new(native_window as *mut std::ffi::c_void) else {
+        if native_window == 0 {
             self.surface_attached.store(false, Ordering::Release);
             self.android_window.store(0, Ordering::Release);
             log::info!("[renderer] overlay window detached");
             return;
-        };
-        let Some(instance) = &self.instance else { return };
-        let raw = RawWindowHandle::AndroidNdk(AndroidNdkWindowHandle::new(window));
-        let created = unsafe {
-            instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
-                raw_display_handle: Some(RawDisplayHandle::Android(AndroidDisplayHandle::new())),
-                raw_window_handle: raw,
-            })
-        };
-        let new_surface = match created {
-            Ok(s) => s,
-            Err(e) => {
-                log::error!("[renderer] new overlay surface: {}", e);
-                return;
-            }
         };
         let size = *self.surface_size.read().unwrap();
         let cfg = {
@@ -1873,7 +1866,47 @@ impl VideoRenderer {
             }
             c.clone()
         };
+        // The SAME window again (surfaceChanged without surfaceDestroyed: a
+        // rotation, a resize): the existing EGL surface is still connected to
+        // it, and a second eglCreateWindowSurface on an already-connected
+        // window fails (native_window_api_connect: already connected,
+        // EGL_BAD_ALLOC). Reconfigure what we have instead.
+        if native_window == self.android_window.load(Ordering::Acquire) {
+            surface.configure(&self.device, &cfg);
+            self.surface_attached.store(true, Ordering::Release);
+            self.overlay_presented_gen.store(u64::MAX, Ordering::Relaxed);
+            log::info!("[renderer] overlay window unchanged — reconfigured ({}x{})", cfg.width, cfg.height);
+            return;
+        }
+        let Some(instance) = &self.instance else { return };
+        let created = {
+            let Some(window) = std::ptr::NonNull::new(native_window as *mut std::ffi::c_void) else {
+                return;
+            };
+            let raw = RawWindowHandle::AndroidNdk(AndroidNdkWindowHandle::new(window));
+            unsafe {
+                instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
+                    raw_display_handle: Some(RawDisplayHandle::Android(AndroidDisplayHandle::new())),
+                    raw_window_handle: raw,
+                })
+            }
+        };
+        let new_surface = match created {
+            Ok(s) => s,
+            Err(e) => {
+                log::error!("[renderer] new overlay surface: {}", e);
+                return;
+            }
+        };
+        // A surface that could not be created on the window (EGL refused it)
+        // surfaces as a validation error here: keep the old surface rather
+        // than swap in a dead one.
+        let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         new_surface.configure(&self.device, &cfg);
+        if let Some(e) = scope.pop().await {
+            log::error!("[renderer] new overlay surface rejected, keeping the previous one: {e}");
+            return;
+        }
         if let Some(oes) = &self.gles_oes_renderer {
             Self::install_gles_present_hook(&new_surface, oes, &self.gles_oes_pending);
         }

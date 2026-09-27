@@ -2157,7 +2157,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                     Arc::clone(&events),
                     seg_in_flight,
                     origin,
-                    direct_window,
+                    Arc::clone(&video_output_window),
                     Arc::clone(&hdr_decode_8bit),
                     Arc::clone(&pending_resume),
                 ));

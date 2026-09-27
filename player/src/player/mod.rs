@@ -1316,6 +1316,19 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             log::info!("[player] video window changed under a live codec — rebuilding at the current position");
             self.seek_internal(self.position());
         }
+        // Adaptive frame rate is a per-Surface hint: a new window starts
+        // without it. It used to be set only at pipeline build, so after
+        // Home -> back (codec moved, no rebuild) the display stayed on the
+        // system rate and the refresh-rate match was lost for the rest of
+        // the title.
+        #[cfg(target_os = "android")]
+        if self.adaptive_frame_rate.load(Ordering::Relaxed) {
+            let fps = self.video_adaptation.lock().unwrap().as_ref().and_then(|a| a.fps());
+            if let Some(fps) = fps {
+                log::info!("[player] AFR: re-applying {:.3} fps on the new video window", fps.as_f32());
+                set_window_frame_rate(window as usize, fps.as_f32());
+            }
+        }
         self.surface_back(SurfacePlane::Video);
     }
 

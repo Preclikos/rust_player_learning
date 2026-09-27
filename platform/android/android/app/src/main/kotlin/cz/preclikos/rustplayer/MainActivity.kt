@@ -97,6 +97,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     // survives surfaceDestroyed (Home) paused, and the new surfaces are handed
     // back on return instead of restarting the stream.
     private var keepAlive = false
+    private var overlayOnChange = false
     private var scenarioIterations = 5
     private var scenarioSettleMs = 12_000L
     private var scenarioWarmupMs = 12_000L
@@ -117,6 +118,10 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         // --ez verbose true: engine debug lines (audio clock internals etc.).
         if (intent.getBooleanExtra("verbose", false)) player.setVerboseLogging(true)
         keepAlive = intent.getBooleanExtra("keep_alive", false)
+        // --ez overlay_on_change true: BlackZone mobile behaviour — hand the
+        // overlay Surface to the player on EVERY surfaceChanged, including a
+        // 180-degree rotation that changes nothing but the transform.
+        overlayOnChange = intent.getBooleanExtra("overlay_on_change", false)
         // --ez overlay_twice true: hand the SAME overlay Surface to the player
         // again a few seconds into playback — what a host does on
         // surfaceChanged after a rotation (no surfaceDestroyed in between).
@@ -527,6 +532,10 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         overlayW = width
         overlayH = height
         if (player.isStarted) {
+            if (overlayOnChange && !overlayDetached) {
+                traceMark("overlay_on_change", "w" to width, "h" to height)
+                player.setOverlaySurface(holder.surface)
+            }
             if (keepAlive && overlayDetached) {
                 overlayDetached = false
                 player.setOverlaySurface(holder.surface)

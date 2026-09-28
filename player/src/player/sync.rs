@@ -61,14 +61,18 @@ impl VideoAtTarget {
 /// the COMBINED `video_starving || audio_starving` state. Callers use
 /// the returned transition to decide whether to pause / unpause the
 /// audio sink and emit a `PlayerEvent::Buffering` or `Playing` to the
-/// consumer. The transition is computed read-modify-read-style (no
-/// CAS) because each side only writes its own flag, so there's a
-/// single writer per atomic.
+/// consumer. The read of the other side's flag and the swap of this side's
+/// run under `starvation_gate`: without it, audio and video recovering at
+/// the same moment could each still see the other as starving, both
+/// returned Unchanged, and nobody sent Playing or unpaused the sink (a
+/// player stuck in Buffering after a network outage). Transitions are rare,
+/// so the lock costs nothing; readers keep using the atomics.
 pub(super) fn report_starvation(
     stats: &StatsState,
     side: StallSide,
     starving: bool,
 ) -> StarvationTransition {
+    let _gate = stats.starvation_gate.lock().unwrap_or_else(|e| e.into_inner());
     let other_starving = match side {
         StallSide::Video => stats.audio_starving.load(Ordering::Relaxed),
         StallSide::Audio => stats.video_starving.load(Ordering::Relaxed),
@@ -687,7 +691,9 @@ pub(super) async fn video_sync_loop<V: VideoSink, A: AudioSink>(
             let video_decoded = stats.last_decoded_pts_ms.load(Ordering::Relaxed);
             let audio_decoded = stats.audio_last_decoded_pts_ms.load(Ordering::Relaxed);
             let bottleneck = video_decoded.min(audio_decoded);
-            let ahead_ms = (bottleneck - pts_ms as i64).max(0);
+            // The gauges are absolute pts: compare with the frame's absolute
+            // pts (as the Stats event does), not the 0-based position.
+            let ahead_ms = (bottleneck - raw_pts_ms as i64).max(0);
             let _ = events.send(PlayerEvent::Position {
                 position: Duration::from_millis(pts_ms),
                 duration: media_duration,

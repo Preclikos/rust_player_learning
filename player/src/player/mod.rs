@@ -186,6 +186,13 @@ pub(crate) struct StatsState {
     /// 24 fps), regardless of how large the consumer set
     /// `buffer_target_secs`.
     last_decoded_pts_ms: std::sync::atomic::AtomicI64,
+    /// Content origin (first segment's absolute start) of the current
+    /// pipeline, ms. The decoded/downloaded gauges are ABSOLUTE pts while
+    /// `position_ms` is 0-based (pts - origin): readers that compare the two
+    /// add this back.
+    content_origin_ms: std::sync::atomic::AtomicI64,
+    /// Serialises `report_starvation` transitions (see there).
+    starvation_gate: std::sync::Mutex<()>,
     /// Same as `last_decoded_pts_ms` but for the audio pipeline.
     /// Read together with the video field to compute
     /// `Position.buffered_ahead_secs = min(video, audio)` — whichever
@@ -385,6 +392,11 @@ pub struct Player<V: VideoSink = VideoRenderer, A: AudioSink = AudioRenderer> {
     stop_flag: Arc<AtomicBool>,
 
     seek_target: Arc<RwLock<Option<Duration>>>,
+    /// Bumped by every stop(). A seek captures it when called and writes its
+    /// target only if no stop happened since (the write runs in a spawned
+    /// task, so without this a seek() just before stop() could land after
+    /// the stop and restart playback).
+    stop_epoch: Arc<AtomicU64>,
     /// Why the NEXT pipeline build is happening, so its opening `Buffering`
     /// can say so. Every rebuild goes through `seek_target` regardless of
     /// cause — a user seek, a track switch, a stall recovery — and a consumer
@@ -528,6 +540,7 @@ impl<V: VideoSink, A: AudioSink> Clone for Player<V, A> {
             stop: Arc::clone(&self.stop),
             stop_flag: Arc::clone(&self.stop_flag),
             seek_target: Arc::clone(&self.seek_target),
+            stop_epoch: Arc::clone(&self.stop_epoch),
             rebuild_reason: Arc::clone(&self.rebuild_reason),
             position_ms: Arc::clone(&self.position_ms),
             decryptor: Arc::clone(&self.decryptor),
@@ -721,6 +734,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             start_time,
 
             seek_target: Arc::new(RwLock::new(None)),
+            stop_epoch: Arc::new(AtomicU64::new(0)),
             rebuild_reason: Arc::new(StdMutex::new(BufferingReason::Initial)),
             position_ms: Arc::new(AtomicU64::new(0)),
 
@@ -1594,14 +1608,13 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         // clear_subtitle_track flips subtitle_representation to None
         // the running task checks the flag between segments and exits.
         let repr = representation.clone();
-        let stop = self.stop.clone();
-        let stop_flag = self.stop_flag.clone();
+        let stop_epoch = Arc::clone(&self.stop_epoch);
         let http = Arc::clone(&self.http);
         let sink = self.video_renderer.clone();
         let active = Arc::clone(&self.subtitle_representation);
         let target_id = representation.id;
         self.rt.spawn(async move {
-            let res = text_play(repr, stop, stop_flag, http, sink, active, target_id).await;
+            let res = text_play(repr, stop_epoch, http, sink, active, target_id).await;
             if let Err(e) = res {
                 log::warn!("[subs] text_play exited: {}", e);
             }
@@ -1741,7 +1754,11 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             // (`minDurationForQualityIncreaseMs`, 10 s against its 50 s
             // buffer); ours is scaled to the 8 s buffer target.
             const MIN_UPSWITCH_BUFFER_MS: i64 = 4_000;
-            let pos = self.position_ms.load(Ordering::Relaxed) as i64;
+            // position_ms is 0-based, the decoded gauge absolute: compare on
+            // the absolute axis, or the origin inflates the buffer and the
+            // gate never holds an up-switch back.
+            let pos = self.position_ms.load(Ordering::Relaxed) as i64
+                + self.stats.content_origin_ms.load(Ordering::Relaxed);
             let decoded = self.stats.last_decoded_pts_ms.load(Ordering::Relaxed);
             let buffered_ahead_ms = (decoded - pos).max(0);
             if buffered_ahead_ms < MIN_UPSWITCH_BUFFER_MS {
@@ -1977,15 +1994,25 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             // the consumer to call play() again in a loop. A real stop() (no
             // seek_target) or a natural EndOfStream (stop_flag stays false)
             // leaves seek_target None after the pipeline ends → we exit.
+            let mut first_generation = true;
             loop {
                 let seek_offset = {
                     let mut target = seek_target.write().await;
+                    let requested = target.take();
+                    // A restart comes here only because the tail saw a seek
+                    // target. If it is gone now, stop() cleared it in between:
+                    // honour the stop instead of restarting from the resume
+                    // position or from zero.
+                    if requested.is_none() && !first_generation {
+                        log::info!("[player] stop() arrived before the rebuild — not restarting");
+                        break;
+                    }
+                    first_generation = false;
                     stop_flag.store(false, Ordering::Relaxed);
                     // Priority: explicit seek > resume position parked by an
                     // exhausted-retries stop ("continue where we stopped" on
                     // the consumer's next play()) > start of content.
-                    target
-                        .take()
+                    requested
                         .or_else(|| pending_resume.lock().unwrap().take())
                         .unwrap_or(Duration::ZERO)
                 };
@@ -2082,12 +2109,17 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                 // Anchor position/clock to the TARGET (video discards to it,
                 // audio trims to it) — not the segment start.
                 position_ms.store(seek_offset.as_millis() as u64, Ordering::Relaxed);
+                // The decoded gauges are ABSOLUTE pts (frame / segment end
+                // times): seed them on that axis, not with the 0-based target.
+                stats
+                    .content_origin_ms
+                    .store(origin.as_millis() as i64, Ordering::Relaxed);
                 stats
                     .last_decoded_pts_ms
-                    .store(seek_offset.as_millis() as i64, Ordering::Relaxed);
+                    .store(abs_offset.as_millis() as i64, Ordering::Relaxed);
                 stats
                     .audio_last_decoded_pts_ms
-                    .store(seek_offset.as_millis() as i64, Ordering::Relaxed);
+                    .store(abs_offset.as_millis() as i64, Ordering::Relaxed);
                 // Clear stale starvation state so the fresh pipeline can emit
                 // its initial Playing event.
                 stats.video_starving.store(false, Ordering::Relaxed);
@@ -2351,9 +2383,15 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         let stop = self.stop.clone();
         let stop_flag = self.stop_flag.clone();
         let audio_sink = self.audio_renderer.clone();
+        let stop_epoch = Arc::clone(&self.stop_epoch);
+        let epoch_at_call = stop_epoch.load(Ordering::SeqCst);
         self.rt.spawn(async move {
             {
                 let mut slot = seek_target.write().await;
+                if stop_epoch.load(Ordering::SeqCst) != epoch_at_call {
+                    log::info!("[player] seek to {}ms dropped: stop() came after it", target.as_millis());
+                    return;
+                }
                 *slot = Some(target);
                 stop_flag.store(true, Ordering::Relaxed);
             }
@@ -2404,7 +2442,14 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         // Cancel any pending seek/track-switch FIRST: a `Some` seek_target at the
         // play loop's tail makes it rebuild a fresh pipeline instead of ending.
         // Clearing it (with stop_flag set) makes the loop break and play() return.
-        *self.seek_target.write().await = None;
+        {
+            let mut target = self.seek_target.write().await;
+            // Under the same lock the spawned seek writes under, so a seek
+            // issued before this stop either landed already (cleared here)
+            // or sees the new epoch and gives up.
+            self.stop_epoch.fetch_add(1, Ordering::SeqCst);
+            *target = None;
+        }
         self.stop_flag.store(true, Ordering::Relaxed);
         self.stop.notify_waiters();
         // Stop audible output immediately — with passthrough engaged this pauses

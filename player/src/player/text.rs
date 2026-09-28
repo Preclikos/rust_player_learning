@@ -68,15 +68,21 @@ pub(super) fn external_track(
 /// representation. If the consumer flips it (via clear_subtitle_track
 /// or set_subtitle_track to a different track) the task notices between
 /// operations and exits so stale downloads stop wasting bandwidth.
+///
+/// Only a real `Player::stop()` (a new `stop_epoch`) ends the task. It used
+/// to share the player's per-pipeline stop signal, which every seek and
+/// audio switch fires: a seek during the single-file download, or any seek
+/// during CMAF streaming, ended the subtitles for good.
 pub(super) async fn text_play<V: VideoSink>(
     text_representation: crate::tracks::text::TextRepresenation,
-    stop: Arc<Notify>,
-    stop_flag: Arc<AtomicBool>,
+    stop_epoch: Arc<AtomicU64>,
     http: Arc<HttpClient>,
     video_sink: Arc<V>,
     active: Arc<StdMutex<Option<crate::tracks::text::TextRepresenation>>>,
     target_id: u32,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let epoch_at_start = stop_epoch.load(Ordering::SeqCst);
+    let stopped = || stop_epoch.load(Ordering::SeqCst) != epoch_at_start;
     // Helper: did the consumer change subtitle selection out from under us?
     let still_selected = |active: &Arc<StdMutex<Option<crate::tracks::text::TextRepresenation>>>| -> bool {
         active
@@ -111,18 +117,14 @@ pub(super) async fn text_play<V: VideoSink>(
     // ---- single-file delivery ----
     if let Some(url) = &text_representation.single_file_url {
         log::info!("[subs] downloading single-file VTT: {}", url);
-        let dl_fut = http.get(url.clone(), RequestKind::InitSegment);
-        let bytes = tokio::select! {
-            r = dl_fut => match r {
-                Ok(b) => b,
-                Err(e) => {
-                    log::warn!("[subs] single-file download failed: {}", e);
-                    return Ok(());
-                }
-            },
-            _ = stop.notified() => return Ok(()),
+        let bytes = match http.get(url.clone(), RequestKind::InitSegment).await {
+            Ok(b) => b,
+            Err(e) => {
+                log::warn!("[subs] single-file download failed: {}", e);
+                return Ok(());
+            }
         };
-        if !still_selected(&active) {
+        if stopped() || !still_selected(&active) {
             return Ok(());
         }
         let cues = crate::parsers::vtt::parse_segment(&bytes, 0);
@@ -196,14 +198,10 @@ pub(super) async fn text_play<V: VideoSink>(
     let _ = init.download(&http, RequestKind::InitSegment).await;
 
     for (i, seg) in text_representation.segments.iter().enumerate() {
-        if stop_flag.load(Ordering::Relaxed) || !still_selected(&active) {
+        if stopped() || !still_selected(&active) {
             break;
         }
-        let dl_fut = seg.download(&http, RequestKind::Segment);
-        let dl = tokio::select! {
-            r = dl_fut => r,
-            _ = stop.notified() => break,
-        };
+        let dl = seg.download(&http, RequestKind::Segment).await;
         match dl {
             Ok(d) => {
                 let pts_ms = seg.start_time().as_millis() as i64;

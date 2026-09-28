@@ -273,7 +273,13 @@ pub(super) async fn video_sync_loop<V: VideoSink, A: AudioSink>(
                     _ = crate::rt::sleep(Duration::from_millis(100)) => {}
                     _ = stop.notified() => return,
                 }
-                pause_skew += park_started.elapsed();
+                // While VIDEO is starving too, `starvation_started` already
+                // spans this park and is added in full on recovery; adding
+                // the park here as well counted it twice, pushed the wall
+                // clock behind and underflowed the frame-interval math.
+                if starvation_started.is_none() {
+                    pause_skew += park_started.elapsed();
+                }
                 continue;
             }
             let starvation_wait = crate::rt::sleep(Duration::from_millis(300));
@@ -590,7 +596,11 @@ pub(super) async fn video_sync_loop<V: VideoSink, A: AudioSink>(
                 }
             }
         }
-        let interval_ms = if last_render_elapsed > 0 { render_start - last_render_elapsed } else { 0 };
+        let interval_ms = if last_render_elapsed > 0 {
+            render_start.saturating_sub(last_render_elapsed)
+        } else {
+            0
+        };
         let delta_pts = pts_ms.saturating_sub(last_pts_ms);
         // Conformance cadence gauges: max render gap = freeze/swap-hole depth,
         // sub-5ms renders = catch-up bursts (a few per LATE drain are normal,
@@ -1001,15 +1011,32 @@ pub(super) async fn av_sync_handler<V: VideoSink, A: AudioSink>(
     // that logs the per-stage progress counters every 3 s. When playback stalls,
     // the first counter that stops advancing names the wedged stage directly —
     // no more guessing which of download/decode/sync/sink/render died.
+    //
+    // It lives exactly as long as this handler: `stop_flag` alone could not
+    // end it, because the play loop resets that shared flag to false at every
+    // rebuild (usually within the 3 s poll), so each seek or rebuild used to
+    // leave one more thread logging a dead generation forever.
+    let watchdog_alive = Arc::new(AtomicBool::new(true));
+    struct WatchdogGuard(Arc<AtomicBool>);
+    impl Drop for WatchdogGuard {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Relaxed);
+        }
+    }
+    let _watchdog_guard = WatchdogGuard(Arc::clone(&watchdog_alive));
     {
         let stats = Arc::clone(&stats);
         let stop_flag = Arc::clone(&stop_flag);
+        let alive = Arc::clone(&watchdog_alive);
         let position = Arc::clone(&position_ms);
         std::thread::Builder::new()
             .name("bz-watchdog".into())
             .spawn(move || {
-                while !stop_flag.load(Ordering::Relaxed) {
+                while alive.load(Ordering::Relaxed) && !stop_flag.load(Ordering::Relaxed) {
                     std::thread::sleep(Duration::from_secs(3));
+                    if !alive.load(Ordering::Relaxed) {
+                        break;
+                    }
                     log::info!(
                         "[watchdog gen {}] a_seg={} a_dec={} a_sync={} a_sunk={} | v_seg={} v_dec={} v_ren={} | pos={}ms",
                         gen,

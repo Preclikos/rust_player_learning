@@ -128,10 +128,9 @@ pub fn downmix_to_stereo(input: &[f32], channels: usize) -> Vec<f32> {
     out
 }
 
-/// Linear-interpolation resample of interleaved PCM. Good enough for the
-/// 44.1 ↔ 48 kHz device-rate mismatch it exists for; a proper windowed-sinc
-/// resampler would be the upgrade if aliasing ever becomes audible.
-#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+/// Stateless linear resample of one chunk, kept as the reference the tests
+/// compare [`LinearResampler`] against: every chunk is rounded up on its own.
+#[cfg(test)]
 pub fn resample_linear(input: &[f32], channels: usize, from_rate: u32, to_rate: u32) -> Vec<f32> {
     if from_rate == to_rate || input.is_empty() {
         return input.to_vec();
@@ -159,7 +158,7 @@ pub fn resample_linear(input: &[f32], channels: usize, from_rate: u32, to_rate: 
 /// overall. [`resample_linear`] rounds each chunk UP on its own: at
 /// 96 → 44.1 kHz a 1024-frame AU gives 471 frames instead of 470.4, a
 /// +0.13 % speed error that made the A/V aligner trim 10 ms every ~8 s.
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+#[cfg_attr(not(any(target_arch = "wasm32", target_os = "android")), allow(dead_code))]
 pub struct LinearResampler {
     channels: usize,
     /// Input frames per output frame.
@@ -173,7 +172,7 @@ pub struct LinearResampler {
     tail: Vec<f32>,
 }
 
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+#[cfg_attr(not(any(target_arch = "wasm32", target_os = "android")), allow(dead_code))]
 impl LinearResampler {
     pub fn new(channels: usize, from_rate: u32, to_rate: u32) -> Self {
         Self {
@@ -284,6 +283,29 @@ mod tests {
         // Documents the drift the stateful version exists to remove.
         let chunk = vec![0.5f32; 1024 * 2];
         assert_eq!(resample_linear(&chunk, 2, 96_000, 44_100).len() / 2, 471);
+    }
+
+    #[test]
+    fn stateful_resampler_is_seamless_across_chunks_at_44_1_to_48() {
+        // A 1 kHz stereo sine in 1024-frame buffers must come out exactly as
+        // if it had been resampled in one piece: no restart at the edges.
+        let frames = 1024 * 40;
+        let sine: Vec<f32> = (0..frames)
+            .flat_map(|i| {
+                let v = (i as f32 * 2.0 * std::f32::consts::PI * 1000.0 / 44_100.0).sin();
+                [v, -v]
+            })
+            .collect();
+        let whole = LinearResampler::new(2, 44_100, 48_000).process(&sine);
+        let mut rs = LinearResampler::new(2, 44_100, 48_000);
+        let chunked: Vec<f32> = sine.chunks(1024 * 2).flat_map(|c| rs.process(c)).collect();
+        assert_eq!(chunked.len(), whole.len());
+        let max_diff = chunked.iter().zip(&whole).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+        assert!(max_diff < 1e-4, "chunk edges differ by {max_diff}");
+        // And the length follows the exact ratio (within the one frame past
+        // the last input frame), not a round-up per buffer.
+        let exact = frames as f64 * 48_000.0 / 44_100.0;
+        assert!(((whole.len() / 2) as f64 - exact).abs() <= 1.0);
     }
 
     #[test]

@@ -35,6 +35,10 @@ pub struct MediaCodecAudioDecoder {
     /// PCM drained by `submit` while it waited for an input buffer; handed
     /// out by `try_recv` before anything new is dequeued.
     pending: std::collections::VecDeque<DecodedAudioFrame>,
+    /// Keeps the resampling phase from one output buffer to the next. Built
+    /// on the first buffer that needs it; dropped when the rates, channels or
+    /// stream position change.
+    resampler: Option<LinearResampler>,
 }
 
 unsafe impl Send for MediaCodecAudioDecoder {}
@@ -48,11 +52,12 @@ impl MediaCodecAudioDecoder {
             channels: 2,
             output_channels: 2,
             pending: std::collections::VecDeque::new(),
+            resampler: None,
         }
     }
 }
 
-use super::pcm::{remix, resample_linear};
+use super::pcm::{remix, LinearResampler};
 
 
 impl AudioDecoder for MediaCodecAudioDecoder {
@@ -94,6 +99,7 @@ impl AudioDecoder for MediaCodecAudioDecoder {
         self.output_rate = params.output_sample_rate;
         self.channels = params.input_channels as usize;
         self.output_channels = params.output_channels.max(1) as usize;
+        self.resampler = None;
         Ok(())
     }
 
@@ -151,6 +157,7 @@ impl AudioDecoder for MediaCodecAudioDecoder {
 
     fn flush(&mut self) -> Result<(), DecoderError> {
         self.pending.clear();
+        self.resampler = None;
         if let Some(codec) = self.codec.as_ref() {
             codec
                 .flush()
@@ -191,7 +198,18 @@ impl MediaCodecAudioDecoder {
                     let raw_f32: Vec<f32> =
                         pcm_i16.iter().map(|&s| s as f32 / 32768.0_f32).collect();
                     let mixed = remix(&raw_f32, self.channels, self.output_channels);
-                    resample_linear(&mixed, self.output_channels, self.input_rate, self.output_rate)
+                    if self.input_rate == self.output_rate {
+                        mixed
+                    } else {
+                        // Stateless per-buffer resampling rounded every buffer
+                        // up and restarted the interpolation at its edge: +0.04 %
+                        // speed and a click per buffer for 44.1 kHz content on a
+                        // 48 kHz output.
+                        let (channels, from, to) = (self.output_channels, self.input_rate, self.output_rate);
+                        self.resampler
+                            .get_or_insert_with(|| LinearResampler::new(channels, from, to))
+                            .process(&mixed)
+                    }
                 };
 
                 codec
@@ -218,6 +236,7 @@ impl MediaCodecAudioDecoder {
                     // Trust what the codec just told us.
                     self.channels = ch as usize;
                 }
+                self.resampler = None;
                 log::info!(
                     "audio output format: {}Hz {}ch (decoder-reported)",
                     self.input_rate, self.channels

@@ -377,7 +377,27 @@ impl HttpClient {
                 let status = resp.status();
                 if status.is_success() {
                     match resp.bytes().await {
-                        Ok(b) => Attempt::Ok(b),
+                        Ok(b) => match range.and_then(range_len) {
+                            // A server or CDN that ignores Range answers 200
+                            // with the WHOLE resource: taken as one segment
+                            // that can be the entire SegmentBase file. 206,
+                            // or a 200 whose body is exactly the range, is fine.
+                            Some(want)
+                                if status != reqwest::StatusCode::PARTIAL_CONTENT
+                                    && b.len() as u64 != want =>
+                            {
+                                Attempt::Fatal(
+                                    format!(
+                                        "http {} ignored Range: got {} bytes, asked for {}",
+                                        status.as_u16(),
+                                        b.len(),
+                                        want
+                                    )
+                                    .into(),
+                                )
+                            }
+                            _ => Attempt::Ok(b),
+                        },
                         Err(e) => Attempt::Retry(format!("body read: {}", e).into()),
                     }
                 } else if is_retryable_status(status) {
@@ -393,6 +413,14 @@ impl HttpClient {
             }
         }
     }
+}
+
+/// Byte count of a closed `bytes=a-b` Range header (`None` for open or
+/// unparsable ranges, which are not checked).
+fn range_len(range: &str) -> Option<u64> {
+    let (a, b) = range.strip_prefix("bytes=")?.split_once('-')?;
+    let (a, b) = (a.trim().parse::<u64>().ok()?, b.trim().parse::<u64>().ok()?);
+    b.checked_sub(a).map(|d| d + 1)
 }
 
 impl Default for HttpClient {
@@ -434,3 +462,17 @@ fn scale_delay(current: Duration, multiplier: f32, cap: Duration) -> Duration {
 // Suppress unused-import warnings on platforms where Instant isn't needed.
 #[allow(dead_code)]
 fn _instant_marker(_: Instant) {}
+
+#[cfg(test)]
+mod range_tests {
+    use super::range_len;
+
+    #[test]
+    fn closed_ranges_are_measured_open_ones_are_not() {
+        assert_eq!(range_len("bytes=0-99"), Some(100));
+        assert_eq!(range_len("bytes=1000-1000"), Some(1));
+        assert_eq!(range_len("bytes=500-"), None);
+        assert_eq!(range_len("bytes=9-3"), None);
+        assert_eq!(range_len("items=0-1"), None);
+    }
+}

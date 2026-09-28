@@ -421,13 +421,16 @@ pub fn find_top_box<'a>(data: &'a [u8], target: &[u8; 4]) -> Option<&'a [u8]> {
     while i + 8 <= data.len() {
         let size = u32::from_be_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]) as usize;
         let bt = &data[i + 4..i + 8];
-        if size < 8 || i + size > data.len() {
-            return None;
-        }
+        // checked_add: on 32-bit targets a hostile size could wrap past the
+        // bounds check and panic on the slice below.
+        let end = match i.checked_add(size) {
+            Some(end) if size >= 8 && end <= data.len() => end,
+            _ => return None,
+        };
         if bt == target {
-            return Some(&data[i + 8..i + size]);
+            return Some(&data[i + 8..end]);
         }
-        i += size;
+        i = end;
     }
     None
 }
@@ -440,8 +443,10 @@ pub fn find_descendant<'a>(data: &'a [u8], target: &[u8; 4]) -> Option<&'a [u8]>
     while i + 8 <= data.len() {
         if &data[i + 4..i + 8] == target {
             let size = u32::from_be_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]) as usize;
-            if size >= 8 && i + size <= data.len() {
-                return Some(&data[i + 8..i + size]);
+            if let Some(end) = i.checked_add(size) {
+                if size >= 8 && end <= data.len() {
+                    return Some(&data[i + 8..end]);
+                }
             }
         }
         i += 1;
@@ -491,8 +496,15 @@ pub fn parse_senc(segment_data: &[u8], iv_size: usize) -> Option<Vec<SencEntry>>
     let has_subsamples = flags & 0x0000_0002 != 0;
     let sample_count = u32::from_be_bytes([senc[4], senc[5], senc[6], senc[7]]) as usize;
 
+    // The IV is copied into a 16-byte array: a larger size from a malformed
+    // tenc would panic on the slice.
+    if iv_size > 16 {
+        return None;
+    }
     let mut d = &senc[8..];
-    let mut entries = Vec::with_capacity(sample_count);
+    // sample_count is untrusted: reserve a bounded amount and let the vector
+    // grow if the box really holds more (a huge count could abort on OOM).
+    let mut entries = Vec::with_capacity(sample_count.min(4096));
     for _ in 0..sample_count {
         if d.len() < iv_size {
             return None;

@@ -99,7 +99,8 @@ impl Tracks {
 
         let mut start_byte = offset + sidx.first_offset;
         for entry in entires.iter() {
-            let end = start_byte + (entry.reference_size - 1);
+            // saturating: a zero-size reference (malformed sidx) must not underflow.
+            let end = start_byte + entry.reference_size.saturating_sub(1);
 
             let end_time = start + u64::from(entry.subsegment_duration);
 

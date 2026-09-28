@@ -1,23 +1,26 @@
 use std::error::Error;
 
-fn read_u32(data: &mut &[u8]) -> u32 {
-    let result = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
-    *data = &data[4..]; // Move the slice forward
-    result
+/// Take the next `N` bytes off the front of `data`. The sidx comes from the
+/// network: a truncated box must be a parse error, not an index panic.
+fn take<const N: usize>(data: &mut &[u8]) -> Result<[u8; N], Box<dyn Error>> {
+    if data.len() < N {
+        return Err(format!("sidx truncated: need {} more bytes, have {}", N, data.len()).into());
+    }
+    let (head, rest) = data.split_at(N);
+    *data = rest;
+    Ok(head.try_into().expect("split_at(N) yields N bytes"))
 }
 
-fn read_u16(data: &mut &[u8]) -> u16 {
-    let result = u16::from_be_bytes([data[0], data[1]]);
-    *data = &data[2..]; // Move the slice forward
-    result
+fn read_u32(data: &mut &[u8]) -> Result<u32, Box<dyn Error>> {
+    Ok(u32::from_be_bytes(take::<4>(data)?))
 }
 
-fn read_u64(data: &mut &[u8]) -> u64 {
-    let result = u64::from_be_bytes([
-        data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
-    ]);
-    *data = &data[8..]; // Move the slice forward
-    result
+fn read_u16(data: &mut &[u8]) -> Result<u16, Box<dyn Error>> {
+    Ok(u16::from_be_bytes(take::<2>(data)?))
+}
+
+fn read_u64(data: &mut &[u8]) -> Result<u64, Box<dyn Error>> {
+    Ok(u64::from_be_bytes(take::<8>(data)?))
 }
 
 // SidxEntry / SidxBox carry every field defined by ISO/IEC 14496-12 §8.16.3
@@ -57,12 +60,11 @@ pub struct SidxBox {
 
 pub fn parse_sidx(data: &mut &[u8]) -> Result<SidxBox, Box<dyn Error>> {
     // Read the size of the box (we ignore the size field here)
-    let size = read_u32(data);
+    let size = read_u32(data)?;
 
     // Read the box type (should be "sidx")
-    let type_str = &data[0..4];
-    let type_str = String::from_utf8_lossy(type_str);
-    *data = &data[4..]; // Move the slice forward
+    let type_bytes = take::<4>(data)?;
+    let type_str = String::from_utf8_lossy(&type_bytes);
 
     if type_str != "sidx" {
         return Err("Not a valid sidx box!".into());
@@ -70,39 +72,39 @@ pub fn parse_sidx(data: &mut &[u8]) -> Result<SidxBox, Box<dyn Error>> {
 
     // 64-bit box: `size == 1` means an 8-byte largesize follows the type.
     if size == 1 {
-        let _largesize = read_u64(data);
+        let _largesize = read_u64(data)?;
     }
 
     // Read version and flags
-    let version_flags = read_u32(data);
+    let version_flags = read_u32(data)?;
     let version = (version_flags >> 24) as u8;
     let flags = version_flags & 0x00FFFFFF;
 
-    let reference_id = read_u32(data);
-    let timescale = read_u32(data);
+    let reference_id = read_u32(data)?;
+    let timescale = read_u32(data)?;
     // version 1 widens earliest_presentation_time + first_offset to 64-bit
     // (ISO/IEC 14496-12 §8.16.3). Reading them as u32 on a version-1 box was
     // the bug: every later field shifted by 8 bytes, so `entry_count` came out
     // garbage (often 0) → empty segment list → the player scheduled no media
     // segments and buffered forever, with no parse error.
     let (earliest_presentation_time, first_offset) = if version >= 1 {
-        (read_u64(data), read_u64(data))
+        (read_u64(data)?, read_u64(data)?)
     } else {
-        (read_u32(data) as u64, read_u32(data) as u64)
+        (read_u32(data)? as u64, read_u32(data)? as u64)
     };
 
-    *data = &data[2..]; // Move the slice forward reserved 16bits
+    let _reserved = read_u16(data)?;
 
-    let entry_count = read_u16(data); // Number of entries in the sidx
+    let entry_count = read_u16(data)?; // Number of entries in the sidx
     let mut entries = Vec::new();
 
     // Parse the entries and generate segments
     for _ in 0..entry_count {
-        let chunk = read_u32(data);
+        let chunk = read_u32(data)?;
         let reference_type = (chunk >> 31) as u8;
         let reference_size = u64::from(chunk & 0x7FFFFFFF);
-        let subsegment_duration = read_u32(data);
-        let chunk = read_u32(data);
+        let subsegment_duration = read_u32(data)?;
+        let chunk = read_u32(data)?;
         let starts_with_sap = (chunk >> 31) as u8;
         let sap_type = ((chunk >> 28) & 0x7) as u8;
         let sap_delta = chunk & 0x0FFFFFFF;
@@ -149,37 +151,33 @@ pub fn append_hevc_header(mut nalu_data: Vec<u8>) -> Vec<u8> {
     nalu
 }
 
+/// Split a length-prefixed (4-byte, big-endian) HEVC sample into Annex-B
+/// NALUs, each returned with its `00 00 00 01` start code.
+///
+/// The sample comes from the network. A length that runs past the end is an
+/// error; 1-3 trailing bytes too short to hold a length prefix (padding) are
+/// ignored. Both used to panic on the slice index and kill the decode task.
 pub fn parse_hevc_nalu(data: &[u8]) -> Result<Vec<Vec<u8>>, Box<dyn Error>> {
-    let mut nalus: Vec<Vec<u8>> = vec![];
-
-    let nalu_header: Vec<u8> = vec![0x00, 0x00, 0x00, 0x01];
-
-    let mut index = 0;
-    while index < data.len() {
-        let byte_array: [u8; 4] = match data[index..index + 4].try_into() {
-            Ok(success) => success,
-            Err(e) => return Err(format!("Failed to convert {}", e).into()),
-        };
-
-        let length_u32 = u32::from_be_bytes(byte_array);
-        let length = usize::try_from(length_u32).unwrap();
-
-        index += 4;
-
-        if index + length > data.len() {
+    const START_CODE: [u8; 4] = [0x00, 0x00, 0x00, 0x01];
+    let mut nalus: Vec<Vec<u8>> = Vec::new();
+    let mut rest = data;
+    while rest.len() >= 4 {
+        let (prefix, body) = rest.split_at(4);
+        let length = u32::from_be_bytes(prefix.try_into().expect("4-byte prefix")) as usize;
+        if length > body.len() {
             return Err("Invalid length: Not enough bytes in the vector".into());
         }
-
-        let chunk: Vec<u8> = data[index..index + length].to_vec();
-        let mut chunk_mut = chunk.clone();
-        index += length;
-
-        let mut nalu = nalu_header.clone();
-        nalu.append(&mut chunk_mut);
-
+        let (nal, after) = body.split_at(length);
+        // One allocation per NALU: start code + body.
+        let mut nalu = Vec::with_capacity(START_CODE.len() + nal.len());
+        nalu.extend_from_slice(&START_CODE);
+        nalu.extend_from_slice(nal);
         nalus.push(nalu);
+        rest = after;
     }
-
+    if !rest.is_empty() {
+        log::trace!("[mp4] ignoring {} trailing byte(s) after the last NALU", rest.len());
+    }
     Ok(nalus)
 }
 
@@ -199,5 +197,41 @@ pub fn aac_sampling_frequency_index_to_u32(index: u8) -> u32 {
         11 => 8000,
         12 => 7350,
         _ => 44100,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nalus_get_start_codes_and_trailing_padding_is_ignored() {
+        // Two NALUs (3 and 1 bytes), then 2 bytes of padding.
+        let sample = [0, 0, 0, 3, 0xAA, 0xBB, 0xCC, 0, 0, 0, 1, 0xDD, 0, 0];
+        let nalus = parse_hevc_nalu(&sample).unwrap();
+        assert_eq!(nalus, vec![vec![0, 0, 0, 1, 0xAA, 0xBB, 0xCC], vec![0, 0, 0, 1, 0xDD]]);
+    }
+
+    #[test]
+    fn nalu_length_past_the_end_is_an_error_not_a_panic() {
+        assert!(parse_hevc_nalu(&[0, 0, 0, 9, 1, 2]).is_err());
+    }
+
+    #[test]
+    fn truncated_sidx_is_an_error_not_a_panic() {
+        let full: Vec<u8> = [
+            &[0u8, 0, 0, 44][..], b"sidx", &[0, 0, 0, 0], &[0, 0, 0, 1], &[0, 0, 0x3E, 0x80],
+            &[0, 0, 0, 0], &[0, 0, 0, 0], &[0, 0], &[0, 1],
+            &[0, 0, 0x10, 0], &[0, 0, 0x3E, 0x80], &[0x90, 0, 0, 0],
+        ]
+        .concat();
+        let mut ok = full.as_slice();
+        let sidx = parse_sidx(&mut ok).unwrap();
+        assert_eq!(sidx.entries.len(), 1);
+        assert_eq!(sidx.entries[0].reference_size, 0x1000);
+        for cut in 0..full.len() {
+            let mut short = &full[..cut];
+            assert!(parse_sidx(&mut short).is_err(), "cut at {cut} must be an error");
+        }
     }
 }

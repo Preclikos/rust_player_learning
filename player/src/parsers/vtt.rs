@@ -541,7 +541,8 @@ fn parse_vtt_sample(sample: &[u8], start_ms: i64, end_ms: i64, out: &mut Vec<Vtt
             sample[i], sample[i + 1], sample[i + 2], sample[i + 3],
         ]) as usize;
         let kind = &sample[i + 4..i + 8];
-        if size < 8 || i + size > sample.len() {
+        // checked_add: a hostile size must not wrap on 32-bit targets.
+        if size < 8 || i.checked_add(size).map_or(true, |end| end > sample.len()) {
             break;
         }
         let body = &sample[i + 8..i + size];
@@ -568,7 +569,8 @@ fn parse_vttc(body: &[u8], start_ms: i64, end_ms: i64) -> Option<VttCue> {
             body[i], body[i + 1], body[i + 2], body[i + 3],
         ]) as usize;
         let kind = &body[i + 4..i + 8];
-        if size < 8 || i + size > body.len() {
+        // checked_add: a hostile size must not wrap on 32-bit targets.
+        if size < 8 || i.checked_add(size).map_or(true, |end| end > body.len()) {
             break;
         }
         let child = &body[i + 8..i + size];

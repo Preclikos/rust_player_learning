@@ -1,5 +1,6 @@
 #![cfg(any(target_os = "windows", target_os = "linux"))]
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use ffmpeg_next::Packet;
@@ -22,6 +23,9 @@ pub struct FfmpegHwDecoder {
     shared_device: Option<Arc<SharedHwDevice>>,
     /// Stamped onto every decoded frame (from configure params).
     color: crate::decoders::VideoColorInfo,
+    /// Frames taken out of the decoder inside `submit` (to make room when
+    /// `send_packet` said EAGAIN), handed out by `try_recv` first.
+    pending: VecDeque<ffmpeg_next::util::frame::Video>,
 }
 
 unsafe impl Send for FfmpegHwDecoder {}
@@ -103,6 +107,7 @@ impl FfmpegHwDecoder {
             hw_device_ctx: std::ptr::null_mut(),
             shared_device: None,
             color: Default::default(),
+            pending: VecDeque::new(),
         }
     }
 
@@ -114,6 +119,7 @@ impl FfmpegHwDecoder {
             hw_device_ctx: std::ptr::null_mut(),
             shared_device: Some(device),
             color: Default::default(),
+            pending: VecDeque::new(),
         }
     }
 
@@ -240,44 +246,66 @@ impl HwVideoDecoder for FfmpegHwDecoder {
         }
 
         self.decoder = Some(decoder);
+        self.pending.clear();
         self.color = params.color;
         Ok(())
     }
 
     fn submit(&mut self, sample: &[u8], pts_us: i64) -> Result<(), DecoderError> {
-        let decoder = self
-            .decoder
+        let Self { decoder, pending, .. } = self;
+        let decoder = decoder
             .as_mut()
             .ok_or_else(|| -> DecoderError { "submit before configure".into() })?;
 
         let nalus = parse_hevc_nalu(sample)
             .map_err(|e| -> DecoderError { format!("sample NALU parse: {}", e).into() })?;
 
-        for nalu in nalus {
-            let mut packet = Packet::new(nalu.len());
-            // Store pts in milliseconds — FFmpeg's time base for this decoder is 1ms.
-            packet.set_pts(Some(pts_us / 1000));
-            packet.data_mut().unwrap().clone_from_slice(&nalu);
-            decoder.send_packet(&packet).map_err(|e| -> DecoderError {
-                // Include errno + Debug repr so opaque strerror strings like
-                // "Not enough space" (Windows-localised ENOSPC?
-                // AVERROR_BUFFER_TOO_SMALL?) can be cross-referenced against
-                // FFmpeg's error codes during triage.
-                let errno = match &e {
-                    ffmpeg_next::Error::Other { errno } => Some(*errno),
-                    _ => None,
-                };
-                format!(
-                    "send_packet: {} (errno={:?}, nalu_len={}, pts_ms={})",
-                    e,
-                    errno,
-                    nalu.len(),
-                    pts_us / 1000
-                )
-                .into()
-            })?;
+        // The whole access unit as ONE Annex-B packet: FFmpeg's decoders take
+        // a packet as a full picture (no parser in front of them), so one
+        // packet per NALU split a multi-slice picture across packets.
+        let size = nalus.iter().map(Vec::len).sum();
+        let mut packet = Packet::new(size);
+        let mut at = 0;
+        for nalu in &nalus {
+            packet.data_mut().unwrap()[at..at + nalu.len()].copy_from_slice(nalu);
+            at += nalu.len();
         }
-        Ok(())
+        // Store pts in milliseconds — FFmpeg's time base for this decoder is 1ms.
+        packet.set_pts(Some(pts_us / 1000));
+
+        loop {
+            match decoder.send_packet(&packet) {
+                Ok(()) => return Ok(()),
+                // The decoder holds output it wants taken before it accepts
+                // more input: take a frame and send again.
+                Err(ffmpeg_next::Error::Other { errno }) if errno == ffmpeg_sys_next::EAGAIN => {
+                    let mut frame = ffmpeg_next::util::frame::Video::empty();
+                    decoder.receive_frame(&mut frame).map_err(|e| -> DecoderError {
+                        format!("send_packet EAGAIN, then receive_frame: {}", e).into()
+                    })?;
+                    pending.push_back(frame);
+                }
+                Err(e) => {
+                    // Include errno + Debug repr so opaque strerror strings like
+                    // "Not enough space" (Windows-localised ENOSPC?
+                    // AVERROR_BUFFER_TOO_SMALL?) can be cross-referenced against
+                    // FFmpeg's error codes during triage.
+                    let errno = match &e {
+                        ffmpeg_next::Error::Other { errno } => Some(*errno),
+                        _ => None,
+                    };
+                    return Err(format!(
+                        "send_packet: {} (errno={:?}, au_len={}, nalus={}, pts_ms={})",
+                        e,
+                        errno,
+                        size,
+                        nalus.len(),
+                        pts_us / 1000
+                    )
+                    .into());
+                }
+            }
+        }
     }
 
     fn try_recv(&mut self) -> Result<Option<DecodedVideoFrame>, DecoderError> {
@@ -287,7 +315,14 @@ impl HwVideoDecoder for FfmpegHwDecoder {
             .ok_or_else(|| -> DecoderError { "try_recv before configure".into() })?;
 
         let mut frame = ffmpeg_next::util::frame::Video::empty();
-        match decoder.receive_frame(&mut frame) {
+        let received = match self.pending.pop_front() {
+            Some(held) => {
+                frame = held;
+                Ok(())
+            }
+            None => decoder.receive_frame(&mut frame),
+        };
+        match received {
             Ok(()) => {
                 // pts was stored in milliseconds; convert back to microseconds for the trait.
                 let pts_us = frame.pts().unwrap_or(0) * 1000;

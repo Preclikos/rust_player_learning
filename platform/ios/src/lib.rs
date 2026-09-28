@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use std::ffi::{c_void, CStr, CString};
 use std::os::raw::{c_char, c_int};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use bridge::{
     self, BoxError, BridgeHandle, BridgeHost, PreparedRequest, RequestKind, StartConfig,
@@ -43,7 +43,8 @@ type ResolveKeyCb = extern "C" fn(*mut c_void, *const u8, u64);
 type EventCb = extern "C" fn(*mut c_void, *const c_char);
 
 /// Opaque host pointer (e.g. the Swift/ObjC controller). Raw pointers aren't
-/// `Send`/`Sync`; the host guarantees it outlives the player, so we assert it.
+/// `Send`/`Sync`; the host keeps it valid until `rustplayer_player_destroy`
+/// returns, and [`IosHost`] never touches it after that, so we assert it.
 struct UserPtr(*mut c_void);
 unsafe impl Send for UserPtr {}
 unsafe impl Sync for UserPtr {}
@@ -52,14 +53,39 @@ struct IosHost {
     intercept_cb: InterceptCb,
     resolve_key_cb: ResolveKeyCb,
     event_cb: EventCb,
-    user: UserPtr,
+    /// `None` once the host has destroyed the player. The orchestrator, the
+    /// event pump and in-flight fetches outlive `rustplayer_player_destroy`
+    /// and keep calling in; every call into the host holds the read lock,
+    /// so [`IosHost::close`] (write lock) returns only after the last
+    /// callback has left the host, and no later one reaches `user`.
+    user: RwLock<Option<UserPtr>>,
+}
+
+impl IosHost {
+    /// Call `f` with the host `user` pointer unless the host is gone.
+    /// Returns `false` when the call was skipped.
+    fn with_user(&self, f: impl FnOnce(*mut c_void)) -> bool {
+        let guard = self.user.read().unwrap_or_else(|e| e.into_inner());
+        match guard.as_ref() {
+            Some(u) => {
+                f(u.0);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Stop all further callbacks into the host, waiting for running ones.
+    fn close(&self) {
+        *self.user.write().unwrap_or_else(|e| e.into_inner()) = None;
+    }
 }
 
 #[async_trait]
 impl BridgeHost for IosHost {
     fn on_event(&self, json: String) {
         if let Ok(c) = CString::new(json) {
-            (self.event_cb)(self.user.0, c.as_ptr());
+            self.with_user(|user| (self.event_cb)(user, c.as_ptr()));
         }
     }
 
@@ -71,8 +97,17 @@ impl BridgeHost for IosHost {
         let (tx, rx) = oneshot::channel();
         let token = next_token();
         intercept_registry().lock().unwrap().insert(token, tx);
-        let c_url = CString::new(url).map_err(|e| Box::new(e) as BoxError)?;
-        (self.intercept_cb)(self.user.0, c_url.as_ptr(), kind_to_int(kind), token);
+        let c_url = match CString::new(url) {
+            Ok(c) => c,
+            Err(e) => {
+                intercept_registry().lock().unwrap().remove(&token);
+                return Err(Box::new(e));
+            }
+        };
+        if !self.with_user(|user| (self.intercept_cb)(user, c_url.as_ptr(), kind_to_int(kind), token)) {
+            intercept_registry().lock().unwrap().remove(&token);
+            return Err("player destroyed".into());
+        }
         match rx.await {
             Ok(Ok(p)) => Ok(p),
             Ok(Err(m)) => Err(m.into()),
@@ -84,7 +119,10 @@ impl BridgeHost for IosHost {
         let (tx, rx) = oneshot::channel();
         let token = next_token();
         resolve_registry().lock().unwrap().insert(token, tx);
-        (self.resolve_key_cb)(self.user.0, kid.as_ptr(), token);
+        if !self.with_user(|user| (self.resolve_key_cb)(user, kid.as_ptr(), token)) {
+            resolve_registry().lock().unwrap().remove(&token);
+            return Err("player destroyed".into());
+        }
         match rx.await {
             Ok(Ok(k)) => Ok(k),
             Ok(Err(m)) => Err(m.into()),
@@ -236,7 +274,7 @@ pub extern "C" fn rustplayer_player_create(
         intercept_cb,
         resolve_key_cb,
         event_cb,
-        user: UserPtr(user),
+        user: RwLock::new(Some(UserPtr(user))),
     });
 
     let _guard = runtime().enter();
@@ -479,6 +517,9 @@ pub extern "C" fn rustplayer_player_destroy(handle: *mut c_void) {
     let _guard = runtime().enter();
     let h = unsafe { Box::from_raw(handle as *mut Handle) };
     h.bridge.shutdown();
+    // The Swift side frees `user` right after this returns, while the
+    // orchestrator is still stopping. Close the host first.
+    h._host.close();
     drop(h);
 }
 

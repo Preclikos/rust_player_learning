@@ -80,6 +80,11 @@ public final class RustPlayer {
     public weak var provider: RustPlayerProvider?
 
     private var handle: UnsafeMutableRawPointer?
+    /// The callback `user` pointer: a +1 box holding `self` weakly, released
+    /// only after `rustplayer_player_destroy` has returned (from then on Rust
+    /// makes no further callback). A callback racing `deinit` reads nil
+    /// instead of a freed `RustPlayer`.
+    private var callbackBox: Unmanaged<CallbackBox>?
     private var lastSize: CGSize = .zero
 
     public init() {}
@@ -105,7 +110,8 @@ public final class RustPlayer {
         let scale = layer.contentsScale > 0 ? layer.contentsScale : 1
         let w = UInt32(layer.bounds.width * scale)
         let h = UInt32(layer.bounds.height * scale)
-        let user = Unmanaged.passUnretained(self).toOpaque()
+        let box = Unmanaged.passRetained(CallbackBox(self))
+        let user = box.toOpaque()
         let ap: Int32 = audioPassthrough == nil ? -1 : (audioPassthrough! ? 1 : 0)
         handle = manifestURL.withCString { urlPtr in
             rustplayer_player_create(
@@ -116,6 +122,7 @@ public final class RustPlayer {
                 user
             )
         }
+        if handle != nil { callbackBox = box } else { box.release() }
     }
 
     public func setSize(_ size: CGSize, scale: CGFloat) {
@@ -187,6 +194,8 @@ public final class RustPlayer {
 
     public func destroy() {
         if let handle { rustplayer_player_destroy(handle); self.handle = nil }
+        callbackBox?.release()
+        callbackBox = nil
     }
 
     // Decode one unified-JSON event and dispatch to the delegate (main thread).
@@ -229,24 +238,35 @@ public final class RustPlayer {
 // They recover the `RustPlayer` from the `user` pointer and bridge provider
 // hooks to the async token completions.
 
+/// What the `user` pointer points at. Weak, so a callback never extends or
+/// resurrects a player that is being deinitialised.
+private final class CallbackBox {
+    weak var player: RustPlayer?
+    init(_ player: RustPlayer) { self.player = player }
+}
+
+private func livePlayer(_ user: UnsafeMutableRawPointer) -> RustPlayer? {
+    Unmanaged<CallbackBox>.fromOpaque(user).takeUnretainedValue().player
+}
+
 private let eventCallback: rustplayer_event_cb = { user, json in
-    guard let user, let json else { return }
-    let player = Unmanaged<RustPlayer>.fromOpaque(user).takeUnretainedValue()
+    guard let user, let json, let player = livePlayer(user) else { return }
     let s = String(cString: json)
     // Hop to the main actor: handleEvent (and the @MainActor delegate it calls)
     // is main-isolated. `Task { @MainActor in }` keeps this iOS 15-compatible
     // (MainActor.assumeIsolated is iOS 17+).
-    Task { @MainActor in player.handleEvent(s) }
+    Task { @MainActor [weak player] in player?.handleEvent(s) }
 }
 
 private let interceptCallback: rustplayer_intercept_cb = { user, url, kind, token in
     guard let user, let url else { rustplayer_intercept_fail(token, "null intercept args"); return }
-    let player = Unmanaged<RustPlayer>.fromOpaque(user).takeUnretainedValue()
+    guard let player = livePlayer(user) else { rustplayer_intercept_fail(token, "player destroyed"); return }
+    let provider = player.providerRef
     let urlStr = String(cString: url)
     let reqKind = RustPlayerRequestKind(rawValue: UInt32(bitPattern: kind))
     Task {
         do {
-            guard let provider = player.providerRef else {
+            guard let provider else {
                 completeIntercept(token, RustPreparedRequest(url: urlStr))
                 return
             }
@@ -303,11 +323,12 @@ private func completeIntercept(_ token: UInt64, _ prepared: RustPreparedRequest)
 
 private let resolveKeyCallback: rustplayer_resolve_key_cb = { user, kid, token in
     guard let user, let kid else { rustplayer_resolve_key_fail(token, "null kid"); return }
-    let player = Unmanaged<RustPlayer>.fromOpaque(user).takeUnretainedValue()
+    guard let player = livePlayer(user) else { rustplayer_resolve_key_fail(token, "player destroyed"); return }
+    let provider = player.providerRef
     let kidData = Data(bytes: kid, count: 16)
     Task {
         do {
-            guard let provider = player.providerRef else { throw RustPlayerError.noProvider }
+            guard let provider else { throw RustPlayerError.noProvider }
             let key = try await provider.resolveKey(kid: kidData)
             guard key.count == 16 else { throw RustPlayerError.badKeyLength(key.count) }
             key.withUnsafeBytes { raw in

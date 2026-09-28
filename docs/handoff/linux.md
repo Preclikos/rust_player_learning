@@ -157,8 +157,8 @@ binary against the fix, same scenario (60 s, 3 switches, 2 seeks).
 | 1. Vulkan memory freed in use | f93c862 | `VUID-vkFreeMemory-memory-00677` ("can't be called on VkDeviceMemory ... in use by VkCommandBuffer") 2900 -> 0. Conformance 17/17 PASS both; judder 14 -> 16, late 7 -> 7, lip-sync max 37 -> 39 ms, render gap max 107 -> 53 ms. RSS 210 / 209 MB and 42 / 42 fds at 60 s: the deferred release does not accumulate. No device-lost in either build. |
 | 2. VAAPI surface back to the pool | f93c862 | Same fix: `render` drops `(VideoFrame, Arc<Video>)` from `queue.on_submitted_work_done`, the contract the Apple path uses. Not verified visually (no scene-cut recording); covered only by the reasoning and the task 1 numbers. |
 | 3. VAAPI export / DMA-BUF import | 6fb5ac4 + wgpu fork e4729c2 | `VUID-VkImageCreateInfo-pNext-00990` 2902 -> 0 and `VUID-VkImportMemoryWin32HandleInfoKHR-handleType-09861` (misnamed by the layer; it is the DMA-BUF import) 2902 -> 0. Conformance 17/17 PASS; 28 flash/beep pairs before and after, so the picture content is right; lip-sync max 39 -> 38 ms, judder 16 -> 15. fds stay at 42 (VA exports one object per surface here). Long run, 500 s, `--switches 0 --seeks 40` (the seeks loop the 60 s asset; 11995 frames, no EndOfStream), sampled every 50 s, old -> new: 17/17 PASS both; fds 42 at every sample in both; RSS 184 -> 205 MB old, 183 -> 204 MB new, flat from ~5 min in both. |
-| 4. cpal device loss / format | not done | See open findings. |
-| 5. FFmpeg HW submit | not done | |
+| 4. cpal device loss / format | 24a89b7 | Baseline: a PipeWire restart stops the cpal callbacks with no error callback; the watchdog rebuilt the pipeline, but the pipeline reuses the output stream, so sound never came back (3 wall-clock fallbacks, lip-sync 9 pairs from 11 beeps). Fix: the output thread rebuilds the stream on the default device when it errors or has not called back for 1 s, the queue and consumed count carry over; format from `default_output_config`; open failures retry instead of panicking. `systemctl --user restart pipewire pipewire-pulse wireplumber` at 20 s, old -> new: sound back never -> after ~1.1 s; watchdog rebuilds 1 -> 0, wall-clock fallbacks 3 -> 0, stalls 1 -> 0, render gap max 658 -> 287 ms, judder 56 -> 19, lip-sync pairs 9 -> 27 (median -26 -> -24 ms, max 36 -> 38). Two restarts in one run: both healed. Without a restart: 17/17 PASS both. `av-drift` FAILs after a restart (1078 ms), see open findings. i16-only device and hot-unplug not exercised. |
+| 5. FFmpeg HW submit | 4ce2d35 | One Annex-B packet per access unit; on `EAGAIN` a frame is received into a queue `try_recv` drains first and the packet is resent. Conformance, two runs each, old -> new: 17/17 PASS all; frames 1448 / 1451 -> 1451 / 1450, lip-sync max 35 / 39 -> 36 / 35 ms, `video_submit` ~462 ms per ~1690 calls both, 0 `send_packet` errors. The asset is single-slice and never returns EAGAIN, so neither changed path is exercised; not run on Windows (shared code). |
 | (hashes) | | The 6fb5ac4 message calls its baseline "41711aa": that is f93c862 before a rebase onto 8234e84. |
 
 Notes on task 3:
@@ -191,13 +191,16 @@ Notes on task 3:
   really uses the vendored build (the `|| true` after `build-ffmpeg.sh`
   hides a failed build; the script also exits 1 here after a successful
   install).
-- **Task 4.** The platform-wide `audio_output_watchdog` rebuilds the pipeline
-  (and with it the cpal stream) when the consumed position stands for
-  1.5 s, so a dead stream may already recover on Linux; this was not tested
-  yet (`systemctl --user restart pipewire` during playback). The macOS agent
-  found no change needed there. The i16 `.expect()` is real but only hits a
-  default device without float support (bare ALSA `hw:`); PipeWire/Pulse
-  take f32.
+- **`av-drift` after the output stream is rebuilt.** The gauge compares
+  video and audio clock advances from a baseline; the second without
+  callbacks reads as a permanent 1078 ms drift until the next seek resets
+  the baseline, while lip-sync (measured from PCM content and the device
+  position) stays at -24 ms. Same class as the macOS note about latency
+  changes; the gauge is shared by all platforms, so it was left alone. A
+  conformance run with a device loss will FAIL `av-drift` until it is.
+- **cpal i16-only device.** The format now comes from the device, but no
+  such device was available: PipeWire/Pulse take f32, and the Intel HDA
+  `hw:` device is held by PipeWire.
 - **`asset/`** (the conformance download) is not in `.gitignore`.
 - **Conformance on a short asset.** The asset is ~60 s; `--secs` beyond that
   ends in EndOfStream unless seeks keep landing before the end (the harness

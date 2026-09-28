@@ -341,7 +341,11 @@ impl BridgeHandle {
     /// Signal the orchestrator to stop playback and tear the pipeline down.
     /// The shell drops the handle and releases its surfaces afterwards.
     pub fn shutdown(&self) {
-        self.shutdown.notify_waiters();
+        // notify_one, not notify_waiters: the orchestrator may still be in
+        // open_url / prepare and not waiting yet. notify_one keeps a permit
+        // for it; notify_waiters dropped the signal and playback started
+        // anyway after the host had shut the handle down.
+        self.shutdown.notify_one();
     }
 }
 
@@ -356,11 +360,30 @@ async fn orchestrate(
     shutdown: Arc<Notify>,
     config: StartConfig,
 ) {
-    if let Err(e) = player.open_url(&manifest_url).await {
+    // Startup races the shutdown signal: a host that shuts the handle down
+    // while the manifest or init segments are still loading must not get a
+    // playback started afterwards.
+    let opened = tokio::select! {
+        // To a String at once: Box<dyn Error> is not Send across the next await.
+        r = player.open_url(&manifest_url) => r.map_err(|e| e.to_string()),
+        _ = shutdown.notified() => {
+            log::info!("[bridge] shutdown during open_url — not starting");
+            return;
+        }
+    };
+    if let Err(e) = opened {
         host.on_event(error_json("other", &format!("open_url: {e}")));
         return;
     }
-    if let Err(e) = player.prepare().await {
+    let prepared = tokio::select! {
+        // To a String at once: Box<dyn Error> is not Send across the next await.
+        r = player.prepare() => r.map_err(|e| e.to_string()),
+        _ = shutdown.notified() => {
+            log::info!("[bridge] shutdown during prepare — not starting");
+            return;
+        }
+    };
+    if let Err(e) = prepared {
         host.on_event(error_json("other", &format!("prepare: {e}")));
         return;
     }
@@ -436,6 +459,13 @@ async fn orchestrate(
             _ = shutdown.notified() => break,
             cmd = cmd_rx.recv() => match cmd {
                 None => break,
+                Some(Cmd::Replay) if !ended.load(Ordering::Relaxed) => {
+                    // A second Replay queued before the first one cleared
+                    // `ended` (play() then seek_ms(), a double click): the
+                    // replay is already running. Waiting on its task here
+                    // would block every later command until it ended.
+                    log::info!("[bridge] replay already running — ignoring the duplicate request");
+                }
                 Some(Cmd::Replay) => {
                     // EndOfStream is emitted just before the finished play()
                     // resolves; let its task complete, then start a fresh one.

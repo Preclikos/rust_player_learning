@@ -58,7 +58,9 @@ impl DirectX11Fence {
             let device = device.cast::<ID3D11Device5>()?;
             let mut fence: Option<ID3D11Fence> = None;
 
-            device.CreateFence(0, D3D11_FENCE_FLAG_NONE, &mut fence)?;
+            // SHARED so the D3D12 queue can wait on it on the GPU
+            // (`open_on_d3d12`); the CPU wait below stays as the fallback.
+            device.CreateFence(0, D3D11_FENCE_FLAG_SHARED, &mut fence)?;
             let fence = fence.ok_or(windows::core::Error::new(E_FAIL, "Failed to create fence"))?;
 
             let event = CreateEventA(None, false, false, windows::core::PCSTR::null())?;
@@ -70,6 +72,36 @@ impl DirectX11Fence {
             })
         }
     }
+    /// This fence as a D3D12 fence on `device`, for [`Self::signal`] +
+    /// `ID3D12CommandQueue::Wait`.
+    pub fn open_on_d3d12(&self, device: &Direct3D12::ID3D12Device) -> windows::core::Result<Direct3D12::ID3D12Fence> {
+        unsafe {
+            let handle = self.fence.CreateSharedHandle(None, GENERIC_ALL.0, windows::core::PCWSTR::null())?;
+            let mut fence = None::<Direct3D12::ID3D12Fence>;
+            let opened = device.OpenSharedHandle(handle, &mut fence);
+            let _ = CloseHandle(handle);
+            opened?;
+            fence.ok_or_else(|| windows::core::Error::new(E_FAIL, "OpenSharedHandle returned no fence"))
+        }
+    }
+
+    /// Signal the next value after the work queued on `context` and flush,
+    /// without waiting: the consumer waits for the returned value on the GPU.
+    pub fn signal(&self, context: &ID3D11DeviceContext) -> windows::core::Result<u64> {
+        let context4 = context.cast::<ID3D11DeviceContext4>()?;
+        let v = self
+            .fence_value
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        unsafe {
+            context4.Signal(&self.fence, v)?;
+            // A queued Signal the driver never submits would leave the D3D12
+            // wait hanging.
+            context.Flush();
+        }
+        Ok(v)
+    }
+
     pub fn synchronize(&self, context: &ID3D11DeviceContext) -> windows::core::Result<()> {
         let context = context.cast::<ID3D11DeviceContext4>()?;
         let v = self
@@ -112,6 +144,36 @@ impl DirectX11SharedTexture {
     ) -> windows::core::Result<()> {
         self.synchronized_copy(context, tex, true, width, height, region)
     }
+    /// [`Self::synchronized_copy_from`] without the CPU wait: returns the fence
+    /// value the copy signals, for a GPU wait on the consumer queue.
+    pub fn signalled_copy_from(
+        &self,
+        context: &ID3D11DeviceContext,
+        tex: &ID3D11Texture2D,
+        width: u32,
+        height: u32,
+        region: Option<u32>,
+    ) -> windows::core::Result<u64> {
+        unsafe {
+            let mutex = self.intermediate_texture.cast::<IDXGIKeyedMutex>()?;
+            mutex.AcquireSync(0, 500)?;
+            self.copy(context, tex, width, height, region);
+            let signalled = self.fence.signal(context);
+            mutex.ReleaseSync(0)?;
+            signalled
+        }
+    }
+
+    fn copy(&self, context: &ID3D11DeviceContext, texture: &ID3D11Texture2D, width: u32, height: u32, region: Option<u32>) {
+        let crop = D3D11_BOX { left: 0, top: 0, front: 0, right: width, bottom: height, back: 1 };
+        unsafe {
+            match region {
+                Some(region) => context.CopySubresourceRegion(&self.intermediate_texture, 0, 0, 0, 0, texture, region, Some(&crop)),
+                None => context.CopyResource(&self.intermediate_texture, texture),
+            }
+        }
+    }
+
     // Mirror of synchronized_copy_from; consumed by the DX12 interop branch
     // that wgpu currently doesn't take for FFmpeg-imported D3D11 textures.
     #[allow(dead_code)]
@@ -593,7 +655,7 @@ pub fn create_dx12_resource_from_d3d11_texture(
 /// side: 12-24 MB allocated and freed per 4K frame plus four kernel objects.
 /// Measured on an Intel UHD at 720p: 2.15 ms per frame in the import. The
 /// pool creates a few slots once per (devices, format, size) and only copies
-/// into the next one. The copy, keyed mutex and fence wait are unchanged.
+/// into the next one; the D3D12 queue waits for the copy's fence on the GPU.
 ///
 /// Reuse is safe because a slot comes round again only after `SLOTS` frames:
 /// the renderer keeps at most two frames in flight
@@ -601,7 +663,9 @@ pub fn create_dx12_resource_from_d3d11_texture(
 /// slot before the next copy into it.
 struct Dx12ImportPool {
     key: (usize, usize, i32, u32, u32),
-    slots: Vec<(DirectX11SharedTexture, Direct3D12::ID3D12Resource)>,
+    /// Intermediate texture, its D3D12 view, and its fence opened on D3D12
+    /// (`None`: sharing the fence failed, the copy waits on the CPU).
+    slots: Vec<(DirectX11SharedTexture, Direct3D12::ID3D12Resource, Option<Direct3D12::ID3D12Fence>)>,
     next: usize,
 }
 
@@ -661,13 +725,33 @@ pub fn import_d3d11_texture_pooled(
                 return Err(Box::new(e));
             }
             let resource = resource.ok_or("OpenSharedHandle returned no resource")?;
-            pool.slots.push((shared, resource));
+            let fence12 = match shared.fence.open_on_d3d12(raw_device) {
+                Ok(f) => Some(f),
+                Err(e) => {
+                    log::warn!(
+                        "[dx12_import] sharing the copy fence failed (hr=0x{:08x}); waiting on the CPU instead",
+                        e.code().0 as u32
+                    );
+                    None
+                }
+            };
+            pool.slots.push((shared, resource, fence12));
         }
         let idx = pool.next % pool.slots.len();
         pool.next = (idx + 1) % DX12_IMPORT_SLOTS;
-        let (shared, resource) = &pool.slots[idx];
+        let (shared, resource, fence12) = &pool.slots[idx];
 
-        if let Err(e) = shared.synchronized_copy_from(d3d11_device_context, texture, width, height, region) {
+        // The D3D12 queue waits for the copy on the GPU: before, the render
+        // thread blocked in WaitForSingleObject (0.78 of the 1.19 ms per
+        // frame the import cost on an Intel UHD). The wait is queued ahead of
+        // the draw that samples `resource`, which wgpu submits later.
+        let copied = match fence12 {
+            Some(fence12) => shared
+                .signalled_copy_from(d3d11_device_context, texture, width, height, region)
+                .and_then(|v| hdevice.raw_queue().Wait(fence12, v)),
+            None => shared.synchronized_copy_from(d3d11_device_context, texture, width, height, region),
+        };
+        if let Err(e) = copied {
             log::error!(
                 "[dx12_import] synchronized_copy_from failed: hr=0x{:08x} ({})",
                 e.code().0 as u32,

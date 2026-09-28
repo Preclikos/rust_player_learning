@@ -413,6 +413,13 @@ struct Inner {
     target_h: u32,
     /// Picture height the text size derives from — see `CueParent::picture_h`.
     type_h: u32,
+    /// Bumped whenever finished bitmaps go stale: a new style, a new font,
+    /// a new layout box or text size. A raster job carries the epoch it was
+    /// cut under, and a result from an older epoch is dropped. The size
+    /// check alone let a job that was in flight during `set_style` or
+    /// `set_font` store a bitmap in the OLD look, which then stayed on
+    /// screen until the cue changed.
+    epoch: u64,
     /// Cue indices the worker was last asked to have ready — `[active,
     /// next]`. Kept so `set_pts_ms`, which runs every frame, can tell a
     /// PTS update that changes nothing from one that crosses a cue
@@ -491,8 +498,9 @@ impl Inner {
     /// Record the surface size the render path is drawing at. Returns
     /// true when it moved enough to invalidate what the worker produced.
     fn note_target(&mut self, target_w: u32, target_h: u32, type_h: u32) -> bool {
+        let type_changed = self.type_h != type_h;
         self.type_h = type_h;
-        if self.target_h == target_h && width_close(self.target_w, target_w) {
+        if !type_changed && self.target_h == target_h && width_close(self.target_w, target_w) {
             // Keep the exact numbers current even inside the tolerance so
             // the drift is measured against what we last drew.
             self.target_w = target_w;
@@ -500,8 +508,14 @@ impl Inner {
         }
         self.target_w = target_w;
         self.target_h = target_h;
-        self.ready.clear();
+        self.invalidate();
         true
+    }
+
+    /// Drop every finished bitmap and make results still in flight stale.
+    fn invalidate(&mut self) {
+        self.ready.clear();
+        self.epoch += 1;
     }
 }
 
@@ -640,6 +654,7 @@ impl SubtitleOverlay {
                 target_w: 0,
                 target_h: 0,
                 type_h: 0,
+                epoch: 0,
                 wanted: [None, None],
                 shutdown: false,
                 max_cue_span_ms: 0,
@@ -701,7 +716,7 @@ impl SubtitleOverlay {
             .map_err(|e| e.to_string())?;
         self.with_inner_notify(|inner| {
             inner.font = Some(Arc::new(font));
-            inner.ready.clear();
+            inner.invalidate();
         });
         Ok(())
     }
@@ -718,7 +733,7 @@ impl SubtitleOverlay {
     pub fn set_style(&self, style: SubtitleStyle) {
         self.with_inner_notify(|inner| {
             inner.style = style;
-            inner.ready.clear();
+            inner.invalidate();
         });
     }
 
@@ -750,7 +765,7 @@ impl SubtitleOverlay {
         self.with_inner_notify(|inner| {
             inner.cues.clear();
             inner.max_cue_span_ms = 0;
-            inner.ready.clear();
+            inner.invalidate();
             inner.wanted = [None, None];
         });
     }
@@ -989,7 +1004,7 @@ impl SubtitleOverlay {
             &job.fonts, &job.text, &job.layout, job.target_w, job.type_h, &job.style,
         );
         let mut inner = self.shared.inner.lock().unwrap();
-        if inner.target_w != job.target_w || inner.target_h != job.target_h {
+        if inner.epoch != job.epoch {
             return;
         }
         inner.generation += 1;
@@ -1061,7 +1076,7 @@ fn raster_worker(shared: Arc<Shared>) {
         // A resize or a restyle while we were working invalidates the
         // result — `ready` was cleared, and storing this would hand the
         // render path a bitmap for the wrong geometry.
-        if inner.target_w != job.target_w || inner.target_h != job.target_h {
+        if inner.epoch != job.epoch {
             continue;
         }
         inner.generation += 1;
@@ -1090,6 +1105,8 @@ struct RasterJob {
     target_h: u32,
     /// See `CueParent::picture_h` — what the glyph size scales with.
     type_h: u32,
+    /// `Inner::epoch` when the job was cut.
+    epoch: u64,
 }
 
 /// The next cue that needs rasterizing, or `None` when everything wanted
@@ -1116,6 +1133,7 @@ fn next_job(inner: &Inner) -> Option<RasterJob> {
                 target_w: inner.target_w,
                 target_h: inner.target_h,
                 type_h: inner.type_h,
+                epoch: inner.epoch,
             });
         }
     }
@@ -1178,6 +1196,7 @@ mod tests {
             target_w: 1920,
             target_h: 1080,
             type_h: 1080,
+            epoch: 0,
             wanted: [None, None],
             shutdown: false,
             max_cue_span_ms,

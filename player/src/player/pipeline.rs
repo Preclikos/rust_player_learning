@@ -743,9 +743,15 @@ pub(super) async fn audio_passthrough_play(
         pipeline_live,
     ));
     let (dl_res, feed_res) = join!(download, feed);
-    log_task_result("audio download_task (passthrough)", dl_res);
-    log_task_result("audio passthrough_task", feed_res);
-    Ok(())
+    // Same as audio_play: surface a failure. Returning Ok here swallowed the
+    // download task's give-up (30 s without a segment), so a dead audio
+    // stream just went quiet with no error for the audio side to act on.
+    let dl_err = flatten_task_result("audio download_task (passthrough)", dl_res);
+    let feed_err = flatten_task_result("audio passthrough_task", feed_res);
+    match dl_err.or(feed_err) {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 #[cfg(target_os = "android")]

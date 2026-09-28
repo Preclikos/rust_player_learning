@@ -401,11 +401,15 @@ pub(super) async fn video_decoder_task(
 
     // Flush remaining frames in PTS order.
     reorder_buf.sort_by_key(|f| f.pts_us);
+    let discard_below = stats.video_discard_below_us.load(Ordering::Relaxed);
     for frame in reorder_buf.drain(..) {
         if let Some(sp) = &splice {
             if frame.pts_us <= sp.skip_below_pts_us {
                 continue;
             }
+        }
+        if !first_frame_signaled && discard_below > 0 && frame.pts_us < discard_below {
+            continue;
         }
         if !first_frame_signaled {
             video_ready.notify_one();
@@ -414,6 +418,11 @@ pub(super) async fn video_decoder_task(
         if sender.send(frame).await.is_err() {
             return Ok(());
         }
+    }
+    // A seek past the last frame drops everything: still release av_sync's
+    // first-frame wait, or the pipeline would sit there instead of ending.
+    if !first_frame_signaled {
+        video_ready.notify_one();
     }
 
     Ok(())
@@ -456,7 +465,18 @@ pub(super) async fn drain_video_decoder(
                 // to `splice.is_none()`: an ABR swap mid-play needs the full
                 // reorder discipline (its first kept frame is mid-GOP, not an
                 // IDR) and doesn't show startup latency anyway.
-                let ready = if !*first_frame_signaled && splice.is_none() {
+                // Seek pre-roll (frames before the target) is dropped here, in
+                // the decoder, instead of by the sync loop: the decoder can then
+                // run ahead to the target while the pipeline is still starting
+                // (a passthrough track takes 1-2 s to begin playing), and
+                // `video_ready` fires on the first frame that will really be
+                // shown. The sync loop used to discard them after the audio
+                // clock had already started, so the first picture came 300-700
+                // ms late and the LATE drain threw frames away. While dropping,
+                // the start fast-path is off: the first kept frame is mid-GOP.
+                let discard_below = stats.video_discard_below_us.load(Ordering::Relaxed);
+                let discarding = discard_below > 0 && !*first_frame_signaled;
+                let ready = if !*first_frame_signaled && splice.is_none() && !discarding {
                     !reorder_buf.is_empty()
                 } else {
                     reorder_buf.len() > reorder_depth
@@ -469,6 +489,10 @@ pub(super) async fn drain_video_decoder(
                         .map(|(i, _)| i)
                         .unwrap();
                     let to_send = reorder_buf.swap_remove(min_idx);
+                    if discarding && to_send.pts_us < discard_below {
+                        // Dropping the frame hands its buffer back to the codec.
+                        continue;
+                    }
                     // ABR splice trim: drop NEW frames at/below the PTS OLD last
                     // rendered so NEW joins forward-contiguous (no rewind, no
                     // future-PTS frame av_sync would sit waiting for).

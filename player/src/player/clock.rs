@@ -281,10 +281,20 @@ impl<A: AudioSink> MediaClock<A> {
             return Some(to_media_us(handover as i64));
         }
 
-        // Interpolate with wall time between the sink's ~per-callback updates;
-        // if it hasn't ticked for >80ms the audio is paused/starving — freeze.
-        let pos_us = if since < Duration::from_millis(80) {
+        // Interpolate with wall time between the sink's position updates, up
+        // to INTERP_CAP; past that the audio is paused/starving, so hold. Hold
+        // at p0 + CAP, not p0: returning to p0 made the clock step BACK by up
+        // to 80 ms whenever the sink updates more slowly than the cap (Android
+        // deep-buffer tracks report every ~100-250 ms), a sawtooth the
+        // pictures paced on it followed.
+        // Only while really playing: paused / starving, or before the audio has
+        // ever advanced (start-up: not audible yet), the clock must read p0
+        // exactly, or video would run ahead of sound.
+        const INTERP_CAP: Duration = Duration::from_millis(80);
+        let pos_us = if since < INTERP_CAP {
             p0 as i64 * 1_000 + since.as_micros() as i64
+        } else if !held && st.ever_advanced {
+            p0 as i64 * 1_000 + INTERP_CAP.as_micros() as i64
         } else {
             p0 as i64 * 1_000
         };

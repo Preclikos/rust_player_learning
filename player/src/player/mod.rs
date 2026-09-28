@@ -193,6 +193,10 @@ pub(crate) struct StatsState {
     content_origin_ms: std::sync::atomic::AtomicI64,
     /// Serialises `report_starvation` transitions (see there).
     starvation_gate: std::sync::Mutex<()>,
+    /// Absolute pts (us) below which the current generation's video frames
+    /// are seek pre-roll: the decoder drops them itself (see
+    /// `drain_video_decoder`). 0 = nothing to drop.
+    video_discard_below_us: std::sync::atomic::AtomicI64,
     /// Same as `last_decoded_pts_ms` but for the audio pipeline.
     /// Read together with the video field to compute
     /// `Position.buffered_ahead_secs = min(video, audio)` — whichever
@@ -1671,13 +1675,6 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             return;
         }
 
-        let adaptation = match self.video_adaptation.lock().unwrap().clone() {
-            Some(a) => a,
-            None => return,
-        };
-        if adaptation.representations.len() < 2 {
-            return;
-        }
         let current_id = self
             .video_representation
             .lock()
@@ -1703,6 +1700,18 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             if at.elapsed() < ABR_SWITCH_INTERVAL {
                 return;
             }
+        }
+
+        // The adaptation (every representation with its full segment list:
+        // thousands of segments and strings on a film) is cloned only once a
+        // decision is actually due. Taken before the cheap checks above, it
+        // was deep-copied on every 1 s tick although most ticks return early.
+        let adaptation = match self.video_adaptation.lock().unwrap().clone() {
+            Some(a) => a,
+            None => return,
+        };
+        if adaptation.representations.len() < 2 {
+            return;
         }
 
         // Stage 1: filter by HDR / bit-depth policy.
@@ -2120,6 +2129,9 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                 stats
                     .audio_last_decoded_pts_ms
                     .store(abs_offset.as_millis() as i64, Ordering::Relaxed);
+                stats
+                    .video_discard_below_us
+                    .store(discard_below_us, Ordering::Relaxed);
                 // Clear stale starvation state so the fresh pipeline can emit
                 // its initial Playing event.
                 stats.video_starving.store(false, Ordering::Relaxed);

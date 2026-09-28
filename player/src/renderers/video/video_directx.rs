@@ -21,6 +21,31 @@ pub struct AVD3D11VADeviceContext {
     lock_ctx: *mut std::ffi::c_void,
 }
 
+impl AVD3D11VADeviceContext {
+    /// Run `f` holding FFmpeg's lock on the shared D3D11 immediate context.
+    ///
+    /// The decoder thread drives the same `ID3D11DeviceContext` (FFmpeg takes
+    /// this lock around its own calls), and the import copies on it from the
+    /// render thread. An immediate context is not thread-safe, and FFmpeg's
+    /// API contract is that every user takes `lock`/`unlock`; the import did
+    /// not. `lock` is set by `av_hwdevice_ctx_init` (a default mutex when
+    /// the app gives none).
+    ///
+    /// # Safety
+    /// `this` must point at the live `hwctx` of an initialised D3D11VA device.
+    pub unsafe fn with_lock<R>(this: *mut Self, f: impl FnOnce() -> R) -> R {
+        let (lock, unlock, ctx) = ((*this).lock, (*this).unlock, (*this).lock_ctx);
+        if let Some(lock) = lock {
+            lock(ctx);
+        }
+        let r = f();
+        if let Some(unlock) = unlock {
+            unlock(ctx);
+        }
+        r
+    }
+}
+
 pub struct DirectX11Fence {
     fence: ID3D11Fence,
     event: HANDLE,
@@ -54,7 +79,12 @@ impl DirectX11Fence {
         unsafe {
             context.Signal(&self.fence, v)?;
             self.fence.SetEventOnCompletion(v, self.event)?;
-            WaitForSingleObject(self.event, 5000);
+            let waited = WaitForSingleObject(self.event, 5000);
+            if waited != windows::Win32::Foundation::WAIT_OBJECT_0 {
+                // Not an error for the caller yet (an Err here would panic the
+                // render task via the frame import's unwrap); make it visible.
+                log::warn!("[d3d11_fence] copy not signalled within 5 s ({:?}); the frame may be incomplete", waited);
+            }
         }
         Ok(())
     }
@@ -674,8 +704,13 @@ pub fn create_texture_from_dx12_resource(
             1,
             1,
         );
-        log::trace!("[dx12_wrap] texture_from_raw OK; device pre-check:");
-        log_dx12_device_removed_reason(device);
+        // Device-removed checks are diagnostics: GetDeviceRemovedReason on
+        // every frame is not free, so only when tracing.
+        let trace = log::log_enabled!(log::Level::Trace);
+        if trace {
+            log::trace!("[dx12_wrap] texture_from_raw OK; device pre-check:");
+            log_dx12_device_removed_reason(device);
+        }
 
         log::trace!("[dx12_wrap] before create_texture_from_hal");
         // wgpu 29.0.3: create_texture_from_hal derives HAL usage from the
@@ -684,8 +719,10 @@ pub fn create_texture_from_dx12_resource(
         let mut desc = desc.clone();
         desc.usage |= wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC;
         let result = device.create_texture_from_hal::<Dx12>(texture, &desc);
-        log::trace!("[dx12_wrap] create_texture_from_hal returned; device post-check:");
-        log_dx12_device_removed_reason(device);
+        if trace {
+            log::trace!("[dx12_wrap] create_texture_from_hal returned; device post-check:");
+            log_dx12_device_removed_reason(device);
+        }
         result
     }
 }

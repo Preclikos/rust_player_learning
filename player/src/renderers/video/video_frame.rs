@@ -161,15 +161,17 @@ impl VideoFrame {
             match wgpu_backend {
                 Backend::Dx12 => {
                     let _t = crate::prof::Timer::new(&crate::prof::VIDEO_IMPORT);
-                    let raw_image = import_d3d11_texture_pooled(
-                        &wgpu_device,
-                        d3d11_device,
-                        d3d11_device_context,
-                        frame_texture,
-                        frame.width(),
-                        frame.height(),
-                        Some(index as u32),
-                    )
+                    let raw_image = AVD3D11VADeviceContext::with_lock(hwctx, || {
+                        import_d3d11_texture_pooled(
+                            &wgpu_device,
+                            d3d11_device,
+                            d3d11_device_context,
+                            frame_texture,
+                            frame.width(),
+                            frame.height(),
+                            Some(index as u32),
+                        )
+                    })
                     .unwrap();
 
                     let texture = create_texture_from_dx12_resource(&wgpu_device, raw_image, &desc);

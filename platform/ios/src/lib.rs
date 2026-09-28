@@ -193,6 +193,23 @@ struct Handle {
     _host: Arc<IosHost>,
 }
 
+/// Run an FFI export body, turning a Rust panic into `default`.
+///
+/// Unwinding out of an `extern "C"` function aborts the process, so any
+/// panic (a failed GPU adapter in `rustplayer_player_create`, an unexpected
+/// unwrap deeper down) killed the host app. The panic hook set in
+/// `init_once` still logs the message and location. Mirrors the Android
+/// shell's guard.
+fn ffi_guard<R>(name: &str, default: R, body: impl FnOnce() -> R) -> R {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+        Ok(r) => r,
+        Err(_) => {
+            log::error!("[ffi] {} panicked; returning a default instead of aborting", name);
+            default
+        }
+    }
+}
+
 unsafe fn handle_ref<'a>(handle: *mut c_void) -> Option<&'a Handle> {
     if handle.is_null() {
         None
@@ -258,102 +275,118 @@ pub extern "C" fn rustplayer_player_create(
     event_cb: EventCb,
     user: *mut c_void,
 ) -> *mut c_void {
-    init_once();
-    if metal_layer.is_null() {
-        log::error!("rustplayer_player_create: null metal_layer");
-        return std::ptr::null_mut();
-    }
-    let manifest = unsafe { cstr(manifest_url) };
-    if manifest.is_empty() {
-        log::error!("rustplayer_player_create: empty manifest_url");
-        return std::ptr::null_mut();
-    }
-    log::info!("rustplayer_player_create: {}x{} url={}", width, height, manifest);
+    ffi_guard("rustplayer_player_create", std::ptr::null_mut(), move || {
+        init_once();
+        if metal_layer.is_null() {
+            log::error!("rustplayer_player_create: null metal_layer");
+            return std::ptr::null_mut();
+        }
+        let manifest = unsafe { cstr(manifest_url) };
+        if manifest.is_empty() {
+            log::error!("rustplayer_player_create: empty manifest_url");
+            return std::ptr::null_mut();
+        }
+        log::info!("rustplayer_player_create: {}x{} url={}", width, height, manifest);
 
-    let host = Arc::new(IosHost {
-        intercept_cb,
-        resolve_key_cb,
-        event_cb,
-        user: RwLock::new(Some(UserPtr(user))),
-    });
+        let host = Arc::new(IosHost {
+            intercept_cb,
+            resolve_key_cb,
+            event_cb,
+            user: RwLock::new(Some(UserPtr(user))),
+        });
 
-    let _guard = runtime().enter();
-    let player = Player::new_from_metal_layer(metal_layer, width.max(1), height.max(1));
-    let config = StartConfig {
-        start_position: None,
-        start_fraction: if start_fraction >= 0.0 {
-            Some(start_fraction)
-        } else {
-            None
-        },
-        audio_passthrough: match audio_passthrough {
-            0 => Some(false),
-            1 => Some(true),
-            _ => None,
-        },
-        auto_select_subtitle,
-        // iOS bridge does not yet expose language prefs; wire when needed.
-        ..Default::default()
-    };
-    let bridge = bridge::start(player, manifest, host.clone(), config);
+        let _guard = runtime().enter();
+        let player = Player::new_from_metal_layer(metal_layer, width.max(1), height.max(1));
+        let config = StartConfig {
+            start_position: None,
+            start_fraction: if start_fraction >= 0.0 {
+                Some(start_fraction)
+            } else {
+                None
+            },
+            audio_passthrough: match audio_passthrough {
+                0 => Some(false),
+                1 => Some(true),
+                _ => None,
+            },
+            auto_select_subtitle,
+            // iOS bridge does not yet expose language prefs; wire when needed.
+            ..Default::default()
+        };
+        let bridge = bridge::start(player, manifest, host.clone(), config);
 
-    Box::into_raw(Box::new(Handle {
-        bridge,
-        _host: host,
-    })) as *mut c_void
+        Box::into_raw(Box::new(Handle {
+            bridge,
+            _host: host,
+        })) as *mut c_void
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn rustplayer_player_set_size(handle: *mut c_void, width: u32, height: u32, _scale: f32) {
-    if let Some(h) = unsafe { handle_ref(handle) } {
-        let _guard = runtime().enter();
-        h.bridge.resize(width.max(1), height.max(1));
-    }
+    ffi_guard("rustplayer_player_set_size", (), move || {
+        if let Some(h) = unsafe { handle_ref(handle) } {
+            let _guard = runtime().enter();
+            h.bridge.resize(width.max(1), height.max(1));
+        }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn rustplayer_player_play(handle: *mut c_void) {
-    if let Some(h) = unsafe { handle_ref(handle) } {
-        let _guard = runtime().enter();
-        h.bridge.play();
-    }
+    ffi_guard("rustplayer_player_play", (), move || {
+        if let Some(h) = unsafe { handle_ref(handle) } {
+            let _guard = runtime().enter();
+            h.bridge.play();
+        }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn rustplayer_player_pause(handle: *mut c_void) {
-    if let Some(h) = unsafe { handle_ref(handle) } {
-        let _guard = runtime().enter();
-        h.bridge.pause();
-    }
+    ffi_guard("rustplayer_player_pause", (), move || {
+        if let Some(h) = unsafe { handle_ref(handle) } {
+            let _guard = runtime().enter();
+            h.bridge.pause();
+        }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn rustplayer_player_is_paused(handle: *mut c_void) -> bool {
-    unsafe { handle_ref(handle) }
-        .map(|h| h.bridge.is_paused())
-        .unwrap_or(false)
+    ffi_guard("rustplayer_player_is_paused", false, move || {
+        unsafe { handle_ref(handle) }
+            .map(|h| h.bridge.is_paused())
+            .unwrap_or(false)
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn rustplayer_player_seek_ms(handle: *mut c_void, position_ms: i64) {
-    if let Some(h) = unsafe { handle_ref(handle) } {
-        let _guard = runtime().enter();
-        h.bridge.seek_ms(position_ms);
-    }
+    ffi_guard("rustplayer_player_seek_ms", (), move || {
+        if let Some(h) = unsafe { handle_ref(handle) } {
+            let _guard = runtime().enter();
+            h.bridge.seek_ms(position_ms);
+        }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn rustplayer_player_position_ms(handle: *mut c_void) -> i64 {
-    unsafe { handle_ref(handle) }
-        .map(|h| h.bridge.position_ms())
-        .unwrap_or(0)
+    ffi_guard("rustplayer_player_position_ms", 0, move || {
+        unsafe { handle_ref(handle) }
+            .map(|h| h.bridge.position_ms())
+            .unwrap_or(0)
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn rustplayer_player_duration_ms(handle: *mut c_void) -> i64 {
-    unsafe { handle_ref(handle) }
-        .map(|h| h.bridge.duration_ms())
-        .unwrap_or(0)
+    ffi_guard("rustplayer_player_duration_ms", 0, move || {
+        unsafe { handle_ref(handle) }
+            .map(|h| h.bridge.duration_ms())
+            .unwrap_or(0)
+    })
 }
 
 /// Wrapped ClearKey licence endpoint (docs/CLEARKEY_WRAPPED_LICENCE.md);
@@ -364,88 +397,106 @@ pub extern "C" fn rustplayer_player_set_wrapped_licence(
     url: *const c_char,
     hkdf_info: *const c_char,
 ) {
-    if let Some(h) = unsafe { handle_ref(handle) } {
-        let url = unsafe { cstr(url) };
-        if url.is_empty() {
-            log::error!("rustplayer_player_set_wrapped_licence: empty url");
-            return;
+    ffi_guard("rustplayer_player_set_wrapped_licence", (), move || {
+        if let Some(h) = unsafe { handle_ref(handle) } {
+            let url = unsafe { cstr(url) };
+            if url.is_empty() {
+                log::error!("rustplayer_player_set_wrapped_licence: empty url");
+                return;
+            }
+            let info = if hkdf_info.is_null() {
+                None
+            } else {
+                Some(unsafe { cstr(hkdf_info) }).filter(|s| !s.is_empty())
+            };
+            let _guard = runtime().enter();
+            h.bridge.set_wrapped_licence(url, info);
         }
-        let info = if hkdf_info.is_null() {
-            None
-        } else {
-            Some(unsafe { cstr(hkdf_info) }).filter(|s| !s.is_empty())
-        };
-        let _guard = runtime().enter();
-        h.bridge.set_wrapped_licence(url, info);
-    }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn rustplayer_player_set_volume(handle: *mut c_void, volume: f32) {
-    if let Some(h) = unsafe { handle_ref(handle) } {
-        let _guard = runtime().enter();
-        h.bridge.set_volume(volume);
-    }
+    ffi_guard("rustplayer_player_set_volume", (), move || {
+        if let Some(h) = unsafe { handle_ref(handle) } {
+            let _guard = runtime().enter();
+            h.bridge.set_volume(volume);
+        }
+    })
 }
 
 /// Returns a heap C string the caller MUST free with [`rustplayer_string_free`].
 #[no_mangle]
 pub extern "C" fn rustplayer_player_tracks_json(handle: *mut c_void) -> *mut c_char {
-    let json = unsafe { handle_ref(handle) }
-        .map(|h| h.bridge.tracks_json())
-        .unwrap_or_else(|| "{}".to_string());
-    match CString::new(json) {
-        Ok(c) => c.into_raw(),
-        Err(_) => std::ptr::null_mut(),
-    }
+    ffi_guard("rustplayer_player_tracks_json", std::ptr::null_mut(), move || {
+        let json = unsafe { handle_ref(handle) }
+            .map(|h| h.bridge.tracks_json())
+            .unwrap_or_else(|| "{}".to_string());
+        match CString::new(json) {
+            Ok(c) => c.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn rustplayer_string_free(s: *mut c_char) {
-    if !s.is_null() {
-        unsafe {
-            drop(CString::from_raw(s));
+    ffi_guard("rustplayer_string_free", (), move || {
+        if !s.is_null() {
+            unsafe {
+                drop(CString::from_raw(s));
+            }
         }
-    }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn rustplayer_player_select_video(handle: *mut c_void, adapt: u32, repr: u32, soft: bool) {
-    if let Some(h) = unsafe { handle_ref(handle) } {
-        if soft {
-            h.bridge.set_video_track_soft(adapt as usize, repr as usize);
-        } else {
-            h.bridge.set_video_track(adapt as usize, repr as usize);
+    ffi_guard("rustplayer_player_select_video", (), move || {
+        if let Some(h) = unsafe { handle_ref(handle) } {
+            if soft {
+                h.bridge.set_video_track_soft(adapt as usize, repr as usize);
+            } else {
+                h.bridge.set_video_track(adapt as usize, repr as usize);
+            }
         }
-    }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn rustplayer_player_select_video_auto(handle: *mut c_void) {
-    if let Some(h) = unsafe { handle_ref(handle) } {
-        h.bridge.set_video_auto();
-    }
+    ffi_guard("rustplayer_player_select_video_auto", (), move || {
+        if let Some(h) = unsafe { handle_ref(handle) } {
+            h.bridge.set_video_auto();
+        }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn rustplayer_player_select_audio(handle: *mut c_void, adapt: u32, repr: u32) {
-    if let Some(h) = unsafe { handle_ref(handle) } {
-        h.bridge.set_audio_track(adapt as usize, repr as usize);
-    }
+    ffi_guard("rustplayer_player_select_audio", (), move || {
+        if let Some(h) = unsafe { handle_ref(handle) } {
+            h.bridge.set_audio_track(adapt as usize, repr as usize);
+        }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn rustplayer_player_select_subtitle(handle: *mut c_void, adapt: u32, repr: u32) {
-    if let Some(h) = unsafe { handle_ref(handle) } {
-        h.bridge.set_subtitle_track(adapt as usize, repr as usize);
-    }
+    ffi_guard("rustplayer_player_select_subtitle", (), move || {
+        if let Some(h) = unsafe { handle_ref(handle) } {
+            h.bridge.set_subtitle_track(adapt as usize, repr as usize);
+        }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn rustplayer_player_clear_subtitles(handle: *mut c_void) {
-    if let Some(h) = unsafe { handle_ref(handle) } {
-        h.bridge.clear_subtitles();
-    }
+    ffi_guard("rustplayer_player_clear_subtitles", (), move || {
+        if let Some(h) = unsafe { handle_ref(handle) } {
+            h.bridge.clear_subtitles();
+        }
+    })
 }
 
 // --- generic player knobs ---
@@ -458,33 +509,37 @@ pub extern "C" fn rustplayer_player_set_subtitle_style(
     outline_argb: i32,
     size_scale: f32,
 ) {
-    let Some(h) = (unsafe { handle_ref(handle) }) else {
-        return;
-    };
-    fn argb_to_rgba(c: i32) -> [u8; 4] {
-        let c = c as u32;
-        [
-            ((c >> 16) & 0xff) as u8,
-            ((c >> 8) & 0xff) as u8,
-            (c & 0xff) as u8,
-            ((c >> 24) & 0xff) as u8,
-        ]
-    }
-    let style = SubtitleStyle {
-        text_color: argb_to_rgba(text_argb),
-        outline_color: argb_to_rgba(outline_argb),
-        size_scale,
-        ..SubtitleStyle::DEFAULT
-    }
-    .sanitised();
-    h.bridge.player().set_subtitle_style(style);
+    ffi_guard("rustplayer_player_set_subtitle_style", (), move || {
+        let Some(h) = (unsafe { handle_ref(handle) }) else {
+            return;
+        };
+        fn argb_to_rgba(c: i32) -> [u8; 4] {
+            let c = c as u32;
+            [
+                ((c >> 16) & 0xff) as u8,
+                ((c >> 8) & 0xff) as u8,
+                (c & 0xff) as u8,
+                ((c >> 24) & 0xff) as u8,
+            ]
+        }
+        let style = SubtitleStyle {
+            text_color: argb_to_rgba(text_argb),
+            outline_color: argb_to_rgba(outline_argb),
+            size_scale,
+            ..SubtitleStyle::DEFAULT
+        }
+        .sanitised();
+        h.bridge.player().set_subtitle_style(style);
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn rustplayer_player_set_subtitle_safe_inset_bottom(handle: *mut c_void, bottom_px: u32) {
-    if let Some(h) = unsafe { handle_ref(handle) } {
-        h.bridge.player().set_subtitle_safe_insets(bottom_px);
-    }
+    ffi_guard("rustplayer_player_set_subtitle_safe_inset_bottom", (), move || {
+        if let Some(h) = unsafe { handle_ref(handle) } {
+            h.bridge.player().set_subtitle_safe_insets(bottom_px);
+        }
+    })
 }
 
 /// Debug/compat: force HDR (PQ/HLG) video to decode to an 8-bit
@@ -494,33 +549,39 @@ pub extern "C" fn rustplayer_player_set_subtitle_safe_inset_bottom(handle: *mut 
 /// (play / retry / ABR swap). See player/HDR_TONEMAP.md.
 #[no_mangle]
 pub extern "C" fn rustplayer_player_set_hdr_decode_8bit(handle: *mut c_void, enabled: bool) {
-    if let Some(h) = unsafe { handle_ref(handle) } {
-        h.bridge.player().set_hdr_decode_8bit(enabled);
-    }
+    ffi_guard("rustplayer_player_set_hdr_decode_8bit", (), move || {
+        if let Some(h) = unsafe { handle_ref(handle) } {
+            h.bridge.player().set_hdr_decode_8bit(enabled);
+        }
+    })
 }
 
 /// Verbose logging toggle (default off → per-frame spam gated).
 #[no_mangle]
 pub extern "C" fn rustplayer_player_set_verbose_logging(enabled: bool) {
-    log::set_max_level(if enabled {
-        log::LevelFilter::Debug
-    } else {
-        log::LevelFilter::Info
-    });
+    ffi_guard("rustplayer_player_set_verbose_logging", (), move || {
+        log::set_max_level(if enabled {
+            log::LevelFilter::Debug
+        } else {
+            log::LevelFilter::Info
+        });
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn rustplayer_player_destroy(handle: *mut c_void) {
-    if handle.is_null() {
-        return;
-    }
-    let _guard = runtime().enter();
-    let h = unsafe { Box::from_raw(handle as *mut Handle) };
-    h.bridge.shutdown();
-    // The Swift side frees `user` right after this returns, while the
-    // orchestrator is still stopping. Close the host first.
-    h._host.close();
-    drop(h);
+    ffi_guard("rustplayer_player_destroy", (), move || {
+        if handle.is_null() {
+            return;
+        }
+        let _guard = runtime().enter();
+        let h = unsafe { Box::from_raw(handle as *mut Handle) };
+        h.bridge.shutdown();
+        // The Swift side frees `user` right after this returns, while the
+        // orchestrator is still stopping. Close the host first.
+        h._host.close();
+        drop(h);
+    })
 }
 
 // --- host → Rust completion callbacks (async token bridge) -------------------
@@ -539,67 +600,75 @@ pub struct RustPlayerPreparedRequest {
 
 #[no_mangle]
 pub extern "C" fn rustplayer_intercept_complete(token: u64, prepared: *const RustPlayerPreparedRequest) {
-    if prepared.is_null() {
-        rustplayer_intercept_fail(token, std::ptr::null());
-        return;
-    }
-    // SAFETY: the host keeps `prepared` and everything it points at alive for
-    // the duration of this call (see the header contract).
-    let p = unsafe { &*prepared };
-    let url = unsafe { cstr(p.url) };
-    let headers = unsafe { read_flat_headers(p.headers) };
-    let method = if p.method.is_null() {
-        None
-    } else {
-        // Unparseable method strings fall back to the kind default rather than
-        // failing the request.
-        Method::from_bytes(unsafe { cstr(p.method) }.as_bytes()).ok()
-    };
-    let body = if p.body.is_null() || p.body_len == 0 {
-        None
-    } else {
-        let slice = unsafe { std::slice::from_raw_parts(p.body, p.body_len) };
-        Some(Bytes::copy_from_slice(slice))
-    };
-    if let Some(tx) = intercept_registry().lock().unwrap().remove(&token) {
-        let _ = tx.send(Ok(PreparedRequest {
-            url,
-            headers,
-            method,
-            body,
-        }));
-    }
+    ffi_guard("rustplayer_intercept_complete", (), move || {
+        if prepared.is_null() {
+            rustplayer_intercept_fail(token, std::ptr::null());
+            return;
+        }
+        // SAFETY: the host keeps `prepared` and everything it points at alive for
+        // the duration of this call (see the header contract).
+        let p = unsafe { &*prepared };
+        let url = unsafe { cstr(p.url) };
+        let headers = unsafe { read_flat_headers(p.headers) };
+        let method = if p.method.is_null() {
+            None
+        } else {
+            // Unparseable method strings fall back to the kind default rather than
+            // failing the request.
+            Method::from_bytes(unsafe { cstr(p.method) }.as_bytes()).ok()
+        };
+        let body = if p.body.is_null() || p.body_len == 0 {
+            None
+        } else {
+            let slice = unsafe { std::slice::from_raw_parts(p.body, p.body_len) };
+            Some(Bytes::copy_from_slice(slice))
+        };
+        if let Some(tx) = intercept_registry().lock().unwrap().remove(&token) {
+            let _ = tx.send(Ok(PreparedRequest {
+                url,
+                headers,
+                method,
+                body,
+            }));
+        }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn rustplayer_intercept_fail(token: u64, message: *const c_char) {
-    let m = unsafe { cstr(message) };
-    if let Some(tx) = intercept_registry().lock().unwrap().remove(&token) {
-        let _ = tx.send(Err(m));
-    }
+    ffi_guard("rustplayer_intercept_fail", (), move || {
+        let m = unsafe { cstr(message) };
+        if let Some(tx) = intercept_registry().lock().unwrap().remove(&token) {
+            let _ = tx.send(Err(m));
+        }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn rustplayer_resolve_key_complete(token: u64, key16: *const u8) {
-    if key16.is_null() {
-        rustplayer_resolve_key_fail(token, std::ptr::null());
-        return;
-    }
-    let mut key = [0u8; 16];
-    unsafe { std::ptr::copy_nonoverlapping(key16, key.as_mut_ptr(), 16) };
-    if let Some(tx) = resolve_registry().lock().unwrap().remove(&token) {
-        let _ = tx.send(Ok(key));
-    }
+    ffi_guard("rustplayer_resolve_key_complete", (), move || {
+        if key16.is_null() {
+            rustplayer_resolve_key_fail(token, std::ptr::null());
+            return;
+        }
+        let mut key = [0u8; 16];
+        unsafe { std::ptr::copy_nonoverlapping(key16, key.as_mut_ptr(), 16) };
+        if let Some(tx) = resolve_registry().lock().unwrap().remove(&token) {
+            let _ = tx.send(Ok(key));
+        }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn rustplayer_resolve_key_fail(token: u64, message: *const c_char) {
-    let m = unsafe { cstr(message) };
-    if let Some(tx) = resolve_registry().lock().unwrap().remove(&token) {
-        let _ = tx.send(Err(if m.is_empty() {
-            "resolve_key failed".to_string()
-        } else {
-            m
-        }));
-    }
+    ffi_guard("rustplayer_resolve_key_fail", (), move || {
+        let m = unsafe { cstr(message) };
+        if let Some(tx) = resolve_registry().lock().unwrap().remove(&token) {
+            let _ = tx.send(Err(if m.is_empty() {
+                "resolve_key failed".to_string()
+            } else {
+                m
+            }));
+        }
+    })
 }

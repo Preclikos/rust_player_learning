@@ -707,6 +707,22 @@ pub struct GlesOesRenderer {
     /// Static HDR metadata has been attached to the draw surface (set once
     /// per surface on the first PassthroughPq frame).
     hdr_metadata_set: std::sync::atomic::AtomicBool,
+    /// EGL images of the AHBs drawn recently (see `EglImageCache`).
+    egl_images: std::sync::Mutex<super::egl_image_cache::EglImageCache>,
+}
+
+impl Drop for GlesOesRenderer {
+    fn drop(&mut self) {
+        let images = self.egl_images.get_mut().map(|c| c.drain()).unwrap_or_default();
+        if images.is_empty() {
+            return;
+        }
+        // eglDestroyImageKHR needs the display only, no current context.
+        let egl_destroy: FnEglDestroyImageKHR = unsafe { std::mem::transmute(self.fn_egl_destroy_image) };
+        for image in images {
+            unsafe { egl_destroy(self.egl_display as *mut c_void, image as *mut c_void) };
+        }
+    }
 }
 
 unsafe impl Send for GlesOesRenderer {}
@@ -991,6 +1007,7 @@ impl GlesOesRenderer {
             fn_egl_surface_attrib: fn_surface_attrib,
             egl_display: display,
             hdr_metadata_set: std::sync::atomic::AtomicBool::new(false),
+            egl_images: std::sync::Mutex::new(super::egl_image_cache::EglImageCache::default()),
         })
     }
 
@@ -1067,8 +1084,15 @@ impl GlesOesRenderer {
         // import/draw on this surface, transparent clear + subtitle quad.
         let overlay_only = ahb_ptr.is_null();
 
+        let cached = if overlay_only {
+            None
+        } else {
+            self.egl_images.lock().unwrap().get(ahb_ptr as usize)
+        };
         let egl_image = if overlay_only {
             std::ptr::null_mut()
+        } else if let Some(image) = cached {
+            image as *mut c_void
         } else {
             // Step 1: AHardwareBuffer* → EGLClientBuffer
             // eglCreateImageKHR with EGL_NATIVE_BUFFER_ANDROID expects an EGLClientBuffer,
@@ -1099,7 +1123,8 @@ impl GlesOesRenderer {
                     egl_err
                 ));
             }
-            log::debug!("[gles_oes] EGLImage={:?}", egl_image);
+            log::debug!("[gles_oes] EGLImage={:?} for ahb={:?}", egl_image, ahb_ptr);
+            self.egl_images.lock().unwrap().insert(ahb_ptr as usize, egl_image as usize);
             egl_image
         };
 
@@ -1297,9 +1322,14 @@ impl GlesOesRenderer {
         }
 
         // Step 5: cleanup. eglSwapBuffers (called by wgpu right after the hook returns)
-        // handles GPU sync; no explicit gl.finish() needed here.
+        // handles GPU sync; no explicit gl.finish() needed here. The image
+        // stays cached for the buffer's next turn; only images idle long
+        // enough to belong to a replaced ImageReader are destroyed.
         gl.bind_texture(GL_TEXTURE_EXTERNAL_OES, None);
-        egl_destroy(display, egl_image);
+        let _ = egl_image;
+        for image in self.egl_images.lock().unwrap().end_frame() {
+            egl_destroy(display, image as *mut c_void);
+        }
 
         Ok(())
     }
@@ -1413,3 +1443,4 @@ unsafe fn link_program(
     }
     Ok(program)
 }
+

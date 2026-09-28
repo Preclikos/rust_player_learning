@@ -26,6 +26,7 @@ mod video_vaapi;
 // Linux (DMA-BUF/VAAPI), and Android (AHardwareBuffer).
 #[cfg(any(target_os = "windows", target_os = "linux", target_os = "android"))]
 mod video_vulkan;
+mod egl_image_cache;
 #[cfg(target_os = "android")]
 mod video_gles_egl;
 #[cfg(target_os = "android")]

@@ -40,6 +40,10 @@ void *rustplayer_player_create(void *metal_layer, uint32_t width, uint32_t heigh
                        rustplayer_event_cb event_cb, void *user);
 void rustplayer_player_set_size(void *handle, uint32_t width, uint32_t height, float scale);
 void rustplayer_player_destroy(void *handle);
+// Optional: start the one-time process setup (runtime, TLS) on a background
+// thread, e.g. at app launch, so the first create does not block the caller
+// for it. Returns immediately; safe to call repeatedly.
+void rustplayer_prewarm(void);
 
 // Playback control.
 void rustplayer_player_play(void *handle);

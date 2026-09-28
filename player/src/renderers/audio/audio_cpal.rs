@@ -228,7 +228,10 @@ fn start_null_sink(
         while let Some(command) = command_receiver.recv().await {
             match command {
                 AudioRendererCommand::Stop => {
-                    stop.notify_waiters();
+                    // notify_one keeps the permit: a Stop arriving while the
+                    // output thread is still inside build_output_stream (up
+                    // to 20 s) used to be lost, leaking the thread + stream.
+                    stop.notify_one();
                     break;
                 }
             }
@@ -338,7 +341,10 @@ pub(super) fn start_thread(
         while let Some(command) = command_receiver.recv().await {
             match command {
                 AudioRendererCommand::Stop => {
-                    stop.notify_waiters();
+                    // notify_one keeps the permit: a Stop arriving while the
+                    // output thread is still inside build_output_stream (up
+                    // to 20 s) used to be lost, leaking the thread + stream.
+                    stop.notify_one();
                     break;
                 }
             }

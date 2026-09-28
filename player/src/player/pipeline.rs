@@ -468,8 +468,8 @@ pub(super) async fn run_decode(
         dovi_profile: pf.dovi_profile,
         force_8bit_hdr: hdr_decode_8bit.load(Ordering::Relaxed),
     })?;
-    // Direct mode: let the input-buffer spin observe teardown so a seek /
-    // track-switch can't strand the decode task in the spin (see [B] in
+    // Let the decoder's input-buffer and image waits observe teardown so a
+    // seek / track-switch can't strand the decode task in them (see [B] in
     // mediacodec submit_direct).
     decoder.set_stop_signal(decoder_stop_flag.clone());
 

@@ -72,9 +72,9 @@ pub struct MediaCodecDecoder {
     /// decoder configured — it needs them). False = strip them (plain
     /// HEVC decoders may choke on unspecified NAL types).
     keep_dv_nalus: bool,
-    /// Pipeline stop signal (direct mode). The `submit_direct` input-buffer
-    /// spin checks it so a teardown (seek/track-switch) doesn't leave the
-    /// decode task wedged in the spin when the codec is being torn down.
+    /// Pipeline stop signal. The input-buffer and image waits check it so a
+    /// teardown (seek/track-switch) doesn't leave the decode task wedged in
+    /// them while the codec is being torn down.
     stop_signal: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
@@ -320,6 +320,13 @@ impl Drop for DirectVideoFrame {
 unsafe impl Send for MediaCodecDecoder {}
 
 impl MediaCodecDecoder {
+    /// The pipeline asked this decoder's task to stop (seek, switch, teardown).
+    fn stop_requested(&self) -> bool {
+        self.stop_signal
+            .as_ref()
+            .is_some_and(|s| s.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
     pub fn new() -> Self {
         Self {
             reader: None,
@@ -562,6 +569,7 @@ impl MediaCodecDecoder {
         unsafe {
             let idx = {
                 let mut retries = 0u32;
+                let waiting_since = std::time::Instant::now();
                 loop {
                     // [B] Bail promptly on teardown (seek/track-switch) instead
                     // of spinning a codec that's being torn down — otherwise
@@ -573,9 +581,14 @@ impl MediaCodecDecoder {
                             return Err("submit_direct: stop signalled".into());
                         }
                     }
+                    // Poll without waiting and sleep OUTSIDE the lock. A 5 ms
+                    // blocking dequeue held `call_lock` the whole time, and the
+                    // render thread's releaseOutputBufferAtTime needs the same
+                    // lock: while the input was full (start, seek, buffer fill)
+                    // presenting a frame waited up to 28 ms on the Streamer.
                     let idx = {
                         let _l = direct.call_lock.lock().unwrap();
-                        ndk_sys::AMediaCodec_dequeueInputBuffer(direct.raw, 5_000)
+                        ndk_sys::AMediaCodec_dequeueInputBuffer(direct.raw, 0)
                     };
                     if idx >= 0 {
                         break idx as usize;
@@ -585,6 +598,7 @@ impl MediaCodecDecoder {
                         return Err(format!("dequeueInputBuffer(direct): {}", idx).into());
                     }
                     retries += 1;
+                    let waited_ms = waiting_since.elapsed().as_millis() as u64;
                     // [A] produced==0 watchdog: a freshly (re)configured codec
                     // that accepts no more input AND has never emitted output is
                     // wedged (the lifecycle/Surface race — produced=0). Bail
@@ -592,10 +606,10 @@ impl MediaCodecDecoder {
                     // spinning forever. produced>0 is ordinary backpressure (it
                     // recovers once the renderer drains output buffers) → keep
                     // waiting; don't false-trip on it.
-                    if produced == 0 && retries >= 400 {
+                    if produced == 0 && waited_ms >= 2_000 {
                         return Err(format!(
                             "submit_direct: codec produced no output {}ms after configure (wedged Surface)",
-                            retries * 5
+                            waited_ms
                         )
                         .into());
                     }
@@ -605,23 +619,23 @@ impl MediaCodecDecoder {
                     // exhausted, e.g. buffers stuck awaiting present). Bail (~3s,
                     // before the 5s input-ANR) so the supervisor rebuilds onto a
                     // fresh codec + pool instead of spinning forever.
-                    if retries >= 600 {
+                    if waited_ms >= 3_000 {
                         return Err(format!(
                             "submit_direct: input-buffer stall {}ms (backpressure deadlock, produced={})",
-                            retries * 5,
+                            waited_ms,
                             produced
                         )
                         .into());
                     }
-                    if retries % 200 == 0 {
+                    if retries % 500 == 0 {
                         log::warn!(
-                            "[mc-direct] dequeue_input stall {}x5ms pts={} produced={} (produced=0 => codec emits no output after this seek/start)",
-                            retries,
+                            "[mc-direct] dequeue_input stall {}ms pts={} produced={} (produced=0 => codec emits no output after this seek/start)",
+                            waited_ms,
                             pts_us / 1000,
                             produced
                         );
                     }
-                    std::thread::yield_now();
+                    std::thread::sleep(Duration::from_millis(2));
                 }
             };
             let mut cap: usize = 0;
@@ -1011,11 +1025,13 @@ impl HwVideoDecoder for MediaCodecDecoder {
                 {
                     DequeuedInputBufferResult::Buffer(b) => break b,
                     DequeuedInputBufferResult::TryAgainLater => {
+                        if self.stop_requested() {
+                            return Err("submit: stop signalled".into());
+                        }
                         retries += 1;
                         if retries % 20 == 0 {
                             log::warn!("[mc] dequeue_input stall {}x5ms={} ms pts={}", retries, retries * 5, pts_us / 1000);
                         }
-                        std::thread::yield_now();
                     }
                 }
             }
@@ -1118,13 +1134,19 @@ impl HwVideoDecoder for MediaCodecDecoder {
                 AcquireResult::MaxImagesAcquired => {
                     // All surfaces are held by AHB refs in the video channel.
                     // The sync producer (on another thread) must render+drop frames
-                    // to free slots. Yield and retry — do NOT return None, which
+                    // to free slots. Wait and retry — do NOT return None, which
                     // would strand this rendered frame and cause PTS/content mismatch.
-                    acquire_retries += 1;
-                    if acquire_retries % 100 == 0 {
-                        log::warn!("[mc] MAX_IMAGES_ACQUIRED spin {}x pts={}", acquire_retries, pts_us / 1000);
+                    // No time limit: a paused player legitimately holds every
+                    // image. A teardown ends the wait instead; a 1 ms sleep
+                    // (not yield_now) keeps it off a whole core on a TV SoC.
+                    if self.stop_requested() {
+                        return Err("try_recv: stop signalled while all images are held".into());
                     }
-                    std::thread::yield_now();
+                    acquire_retries += 1;
+                    if acquire_retries % 1000 == 0 {
+                        log::warn!("[mc] MAX_IMAGES_ACQUIRED wait {}x1ms pts={}", acquire_retries, pts_us / 1000);
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
                 }
                 AcquireResult::NoBufferAvailable => {
                     if acquire_started.elapsed() > Duration::from_secs(2) {

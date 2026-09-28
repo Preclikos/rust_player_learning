@@ -154,11 +154,12 @@ binary against the fix, same scenario (60 s, 3 switches, 2 seeks).
 
 | Task | Commit | Result |
 | --- | --- | --- |
-| 1. Vulkan memory freed in use | 41711aa | `VUID-vkFreeMemory-memory-00677` ("can't be called on VkDeviceMemory ... in use by VkCommandBuffer") 2900 -> 0. Conformance 17/17 PASS both; judder 14 -> 16, late 7 -> 7, lip-sync max 37 -> 39 ms, render gap max 107 -> 53 ms. RSS 210 / 209 MB and 42 / 42 fds at 60 s: the deferred release does not accumulate. No device-lost in either build. |
-| 2. VAAPI surface back to the pool | 41711aa | Same fix: `render` drops `(VideoFrame, Arc<Video>)` from `queue.on_submitted_work_done`, the contract the Apple path uses. Not verified visually (no scene-cut recording); covered only by the reasoning and the task 1 numbers. |
-| 3. VAAPI export / DMA-BUF import | 82abc20 + wgpu fork e4729c2 | `VUID-VkImageCreateInfo-pNext-00990` 2902 -> 0 and `VUID-VkImportMemoryWin32HandleInfoKHR-handleType-09861` (misnamed by the layer; it is the DMA-BUF import) 2902 -> 0. Conformance 17/17 PASS; 28 flash/beep pairs before and after, so the picture content is right; lip-sync max 39 -> 38 ms, judder 16 -> 15. fds stay at 42 (VA exports one object per surface here). |
+| 1. Vulkan memory freed in use | f93c862 | `VUID-vkFreeMemory-memory-00677` ("can't be called on VkDeviceMemory ... in use by VkCommandBuffer") 2900 -> 0. Conformance 17/17 PASS both; judder 14 -> 16, late 7 -> 7, lip-sync max 37 -> 39 ms, render gap max 107 -> 53 ms. RSS 210 / 209 MB and 42 / 42 fds at 60 s: the deferred release does not accumulate. No device-lost in either build. |
+| 2. VAAPI surface back to the pool | f93c862 | Same fix: `render` drops `(VideoFrame, Arc<Video>)` from `queue.on_submitted_work_done`, the contract the Apple path uses. Not verified visually (no scene-cut recording); covered only by the reasoning and the task 1 numbers. |
+| 3. VAAPI export / DMA-BUF import | 6fb5ac4 + wgpu fork e4729c2 | `VUID-VkImageCreateInfo-pNext-00990` 2902 -> 0 and `VUID-VkImportMemoryWin32HandleInfoKHR-handleType-09861` (misnamed by the layer; it is the DMA-BUF import) 2902 -> 0. Conformance 17/17 PASS; 28 flash/beep pairs before and after, so the picture content is right; lip-sync max 39 -> 38 ms, judder 16 -> 15. fds stay at 42 (VA exports one object per surface here). |
 | 4. cpal device loss / format | not done | See open findings. |
 | 5. FFmpeg HW submit | not done | |
+| (hashes) | | The 6fb5ac4 message calls its baseline "41711aa": that is f93c862 before a rebase onto 8234e84. |
 
 Notes on task 3:
 - The wgpu fork did not enable `VK_EXT_image_drm_format_modifier`;
@@ -200,6 +201,14 @@ Notes on task 3:
 - **`asset/`** (the conformance download) is not in `.gitignore`.
 - **Conformance on a short asset.** The asset is ~60 s; `--secs` beyond that
   ends in EndOfStream unless seeks keep landing before the end (the harness
-  seeks back to 0 when the remaining scenario exceeds the asset).
+  seeks back to 0 when the remaining scenario exceeds the asset). Actions
+  are not interleaved: all switches come first, then all seeks, so a long
+  run needs `--switches 0` (or few) for the first seek to land before 60 s.
+- **A seek after EndOfStream does not resume playback** (suspected bug, both
+  builds alike). 500 s, 8 switches then 32 seeks: EndOfStream at 60 s, then
+  every `seek(0)` rebuilt the pipeline but the audio position never moved
+  again ("32 of 34 rebuilds never advanced the audio position"), 1450
+  frames decoded in 500 s. Not chased; could be the harness's expectation
+  rather than the player's.
 - Unrelated validation noise left alone: 4x `VUID-StandaloneSpirv-None-10684`
   (a shader variable without an explicit layout decoration).

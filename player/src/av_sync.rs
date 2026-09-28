@@ -403,6 +403,13 @@ impl ChunkCursor {
     pub fn is_closed(&self) -> bool {
         self.closed
     }
+
+    /// The producer is gone (every sender dropped), even if chunks are still
+    /// queued. Lets a consumer that is waiting without pulling, like the PCM
+    /// writer holding a chunk through a pause, notice the shutdown.
+    pub fn sender_gone(&self) -> bool {
+        self.closed || self.rx.is_closed()
+    }
 }
 
 /// 0-based media time of a frame/sample in ms (`raw_pts − origin`, clamped).
@@ -761,6 +768,18 @@ mod tests {
         drop(tx);
         assert!(matches!(cur.next_chunk(), Pulled::Closed));
         assert!(cur.is_closed());
+    }
+
+    #[test]
+    fn cursor_sees_the_sender_gone_without_pulling() {
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let cur = ChunkCursor::new(rx, Arc::new(FlushState::new()), Arc::new(AtomicU64::new(0)));
+        tx.try_send(chunk(0, 2, 0.0)).unwrap();
+        assert!(!cur.sender_gone());
+        // A chunk is still queued, but nobody will send more.
+        drop(tx);
+        assert!(cur.sender_gone());
+        assert!(!cur.is_closed());
     }
 
     // ---------------- AudioAligner ----------------

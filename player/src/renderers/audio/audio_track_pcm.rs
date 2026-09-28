@@ -1211,10 +1211,17 @@ pub(super) fn start_output(
                         // the chunk's generation — it is dropped and the loop
                         // moves on to the new pipeline's content.
                         if host_paused.load(Ordering::Relaxed) {
+                            // Also ends when the renderer is dropped during the
+                            // pause: the thread used to sleep here until a flush
+                            // that never came, holding the sink and its track.
                             while host_paused.load(Ordering::Relaxed)
                                 && flush_state.current_gen() == gen
+                                && !cursor.sender_gone()
                             {
                                 std::thread::sleep(std::time::Duration::from_millis(15));
+                            }
+                            if cursor.sender_gone() {
+                                break;
                             }
                             if flush_state.current_gen() != gen {
                                 continue;

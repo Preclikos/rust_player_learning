@@ -226,17 +226,26 @@ impl VideoToolboxDecoder {
     }
 }
 
-impl Drop for VideoToolboxDecoder {
-    fn drop(&mut self) {
+impl VideoToolboxDecoder {
+    /// Invalidate and release the session and its format description.
+    fn release_session(&mut self) {
         unsafe {
             if !self.session.is_null() {
                 VTDecompressionSessionInvalidate(self.session);
                 CFRelease(self.session as CFTypeRef);
+                self.session = ptr::null_mut();
             }
             if !self.format_desc.is_null() {
                 CFRelease(self.format_desc as CFTypeRef);
+                self.format_desc = ptr::null_mut();
             }
         }
+    }
+}
+
+impl Drop for VideoToolboxDecoder {
+    fn drop(&mut self) {
+        self.release_session();
     }
 }
 
@@ -284,6 +293,9 @@ impl HwVideoDecoder for VideoToolboxDecoder {
         if params.hvcc_nalus.is_empty() {
             return Err("hvcc_nalus is empty — need VPS/SPS/PPS".into());
         }
+        // A reconfigure replaces both below; without this the previous
+        // session kept decoding threads and IOSurfaces alive until drop.
+        self.release_session();
 
         // CMVideoFormatDescription wants C arrays of (ptr, size). Build
         // them from the Vec<Vec<u8>> input; the NALUs themselves are kept

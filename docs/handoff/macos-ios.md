@@ -199,23 +199,35 @@ which 4 are not built on macOS was not checked).
 - **Destroy does not wait for the orchestrator.** Callbacks are now gated,
   but `player.stop()` still runs after `rustplayer_player_destroy`
   returns. Harmless for the host now, and not the cause of the memory growth.
-- **`rustplayer_player_create` blocks the main thread, briefly.** Measured
-  on the iPhone SE (release build, no ASan): 220 ms for the first player in
-  an app launch (`HttpClient::new` 155 ms: one-time rustls/aws-lc setup;
-  wgpu device + pipelines ~45 ms; audio ~10 ms), ~20 ms for every later
-  player. Right after install or an OS update the Metal shader cache is
-  cold and the first create takes ~700 ms (device 167 ms, pipelines
-  362 ms, TLS 155 ms). The "several seconds" seen earlier came from the
-  ASan + debug harness, not from the player.
-- **Slow start to first frame is the first segment, not the main thread.**
-  On the iPhone SE over Wi-Fi, prepare/tracks take 150-500 ms, then the
-  player waits for the whole first video segment (1080p rung, 6 Mb/s,
-  6 s = 3.9 MB) before decoding: 3.0-6.6 s (`segment 0 boundary stall`),
-  so 3.5-7 s to the first frame. Downloads are sequential, so segment 0
-  already gets the full bandwidth. Options: start on a lower rung and let
-  ABR climb, pick the first rung from the bandwidth measured on the
-  manifest / init / sidx fetches, or decode segment 0 while it downloads.
-  All of them change behaviour on every platform; not done.
+- **`rustplayer_player_create` blocks the main thread, briefly.** iPhone
+  SE, release build: ~200 ms for the first player in an app launch, ~20 ms
+  for every later one; ~700 ms right after install or an OS update (cold
+  Metal shader cache: device 167 ms, pipelines 362 ms). Of the ~200 ms,
+  ~50 ms is real work (wgpu device + pipelines, audio unit) and ~100-130 ms
+  is the main thread losing the CPU to the render, audio and runtime
+  threads that create itself starts (2 cores). That time lands in whatever
+  runs next: the rustls config build (134 ms in create vs 23 ms on an idle
+  thread), or with prewarm `spawn_event_pump` (102 ms for a spawn). The
+  "several seconds" seen earlier came from the ASan + debug harness.
+  `RustPlayer.prewarm()` (ab9088f) moves the one-time
+  setup off the main thread: 198-206 ms -> 179-195 ms. Open: start the
+  background threads at a lower QoS, or build the player off the main
+  thread; neither done.
+- **Slow start to first frame is the first segment.** The player waits
+  for the whole first video segment before decoding; downloads are
+  sequential, so it already gets the full bandwidth. The default start
+  rung is now the highest at or below 720p (149bec5):
+  first segment 3.9 MB -> 2.0 MB on the test stream. 6 launches each on
+  a ~10 Mb/s Wi-Fi: time to first frame median 3.0 s -> 2.7 s, first
+  segment median 2.2 s -> 1.9 s, with large overlap from Wi-Fi variance;
+  on the slower link earlier (1080p segment 3.0-6.6 s) the gain is larger.
+  Not done: picking the first rung from measured bandwidth, decoding
+  segment 0 while it downloads.
+- **ABR climbs to 2160p on the iPhone SE, which cannot decode it.** From
+  either start rung, ABR reaches 3840x2160 in ~18 s; the A9 then decodes
+  ~13 fps and drops 10-14 frames/s for the rest of playback. ABR looks at
+  bandwidth only, not at dropped frames, decoder capability or the 640x1136
+  display. Pre-existing; not fixed.
 - **cpal with no output device at all** (cpal pauses the stream and
   reports DeviceNotAvailable) would still freeze the audio clock. Not
   reproducible on a Mac with built-in output.

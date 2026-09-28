@@ -191,6 +191,9 @@ fn start_null_sink(
     paused_flag: Arc<AtomicBool>,
     samples_consumed: Arc<AtomicU64>,
 ) {
+    // The thread polls this instead of `stop` (it has no async context).
+    let ended = Arc::new(AtomicBool::new(false));
+    let ended_thread = ended.clone();
     std::thread::Builder::new()
         .name("bz-audio-null".into())
         .spawn(move || {
@@ -201,6 +204,9 @@ fn start_null_sink(
             let mut last = std::time::Instant::now();
             loop {
                 std::thread::sleep(tick);
+                if ended_thread.load(Ordering::Relaxed) {
+                    return;
+                }
                 let now = std::time::Instant::now();
                 if paused_flag.load(Ordering::Relaxed) {
                     last = now;
@@ -227,15 +233,14 @@ fn start_null_sink(
         #[allow(clippy::never_loop)]
         while let Some(command) = command_receiver.recv().await {
             match command {
-                AudioRendererCommand::Stop => {
-                    // notify_one keeps the permit: a Stop arriving while the
-                    // output thread is still inside build_output_stream (up
-                    // to 20 s) used to be lost, leaking the thread + stream.
-                    stop.notify_one();
-                    break;
-                }
+                AudioRendererCommand::Stop => break,
             }
         }
+        // Stop, or the AudioRenderer was dropped (sender closed). A paused
+        // sink never reads the closed sample channel, so without this the
+        // thread outlived the player.
+        stop.notify_one();
+        ended.store(true, Ordering::Relaxed);
     });
 }
 
@@ -340,15 +345,17 @@ pub(super) fn start_thread(
         #[allow(clippy::never_loop)]
         while let Some(command) = command_receiver.recv().await {
             match command {
-                AudioRendererCommand::Stop => {
-                    // notify_one keeps the permit: a Stop arriving while the
-                    // output thread is still inside build_output_stream (up
-                    // to 20 s) used to be lost, leaking the thread + stream.
-                    stop.notify_one();
-                    break;
-                }
+                AudioRendererCommand::Stop => break,
             }
         }
+        // Stop, or the AudioRenderer was dropped (sender closed): end the
+        // stream either way. Only an explicit Stop used to, so every dropped
+        // player left its output thread, cpal stream and OS audio unit
+        // (AURemoteIO on iOS) running, with its queued PCM, for good.
+        // notify_one keeps the permit: a stop arriving while the output
+        // thread is still inside build_output_stream (up to 20 s) used to be
+        // lost, leaking the thread + stream.
+        stop.notify_one();
     });
 
     (sample_sender, out_rate, out_channels)

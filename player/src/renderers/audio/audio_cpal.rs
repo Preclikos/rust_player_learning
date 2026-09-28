@@ -11,13 +11,13 @@
 
 use std::sync::{
     atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
-    Arc,
+    Arc, Mutex,
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
-    Device, Sample, StreamConfig,
+    Device, FromSample, SampleFormat, SizedSample, StreamConfig,
 };
 #[cfg(not(target_os = "ios"))]
 use cpal::SupportedStreamConfig;
@@ -88,8 +88,143 @@ fn ios_output_channels() -> Option<u16> {
     }
 }
 
+/// The device may go this long without calling back before the stream is
+/// taken for dead and rebuilt. The callback runs while paused too (it
+/// writes silence), so only a dead stream is ever this quiet. Well above a
+/// device period (tens of ms), and below `AUDIO_OUTPUT_DEAD_MS` (1.5 s), so
+/// the stream is usually back before the watchdog rebuilds the pipeline —
+/// which cannot help here anyway: the output stream outlives pipelines.
+#[cfg(not(target_os = "ios"))]
+const STREAM_DEAD_MS: u64 = 1_000;
+
+/// Retry period while no stream can be opened (device gone, server down).
+const STREAM_RETRY: Duration = Duration::from_secs(1);
+
+/// State the output callback shares with the thread that owns the stream,
+/// kept across stream rebuilds so the queue and the clock carry on.
+struct OutputShared {
+    cursor: Mutex<ChunkCursor>,
+    volume: Arc<AtomicU32>,
+    paused_flag: Arc<AtomicBool>,
+    output_latency_ms: Arc<AtomicU64>,
+    epoch: Instant,
+    /// `epoch`-relative ms of the latest callback (or of the stream build).
+    last_callback_ms: AtomicU64,
+    /// Set by the error callback: the stream reported itself broken.
+    failed: AtomicBool,
+}
+
+impl OutputShared {
+    fn now_ms(&self) -> u64 {
+        self.epoch.elapsed().as_millis() as u64
+    }
+}
+
+/// Build and start an output stream in the device's own sample format.
+fn open_stream(
+    device: &Device,
+    config: StreamConfig,
+    shared: &Arc<OutputShared>,
+) -> Result<cpal::Stream, Box<dyn std::error::Error>> {
+    // iOS: RemoteIO always takes f32, and querying the device's formats
+    // there hangs a second playback (see `start_thread`).
+    #[cfg(target_os = "ios")]
+    let format = SampleFormat::F32;
+    #[cfg(not(target_os = "ios"))]
+    let format = device
+        .default_output_config()
+        .map(|c| c.sample_format())
+        .unwrap_or(SampleFormat::F32);
+    let stream = match format {
+        SampleFormat::I16 => build_stream::<i16>(device, config, shared)?,
+        SampleFormat::I32 => build_stream::<i32>(device, config, shared)?,
+        SampleFormat::U16 => build_stream::<u16>(device, config, shared)?,
+        _ => build_stream::<f32>(device, config, shared)?,
+    };
+    shared.last_callback_ms.store(shared.now_ms(), Ordering::Relaxed);
+    shared.failed.store(false, Ordering::Relaxed);
+    stream.play()?;
+    Ok(stream)
+}
+
+fn build_stream<T: SizedSample + FromSample<f32>>(
+    device: &Device,
+    config: StreamConfig,
+    shared: &Arc<OutputShared>,
+) -> Result<cpal::Stream, cpal::Error> {
+    let cb = Arc::clone(shared);
+    let callback = move |data: &mut [T], info: &cpal::OutputCallbackInfo| {
+        cb.last_callback_ms.store(cb.now_ms(), Ordering::Relaxed);
+        // Output latency = (when this buffer's first sample is AUDIBLE)
+        // − (now). The device buffer + DAC delay everything the callback
+        // hands over by this much, so video paced to the wall clock
+        // would lead audio by it. Captured here (stable per stream),
+        // consumed by the video sync loop to delay video into alignment.
+        // Backend may not support the timestamp (returns None / 0) — then
+        // it stays 0 and behaviour is unchanged.
+        let ts = info.timestamp();
+        // cpal 0.18: duration_since takes StreamInstant by value and
+        // saturates to a Duration. playback − callback = how long until
+        // this buffer is audible (CoreAudio/WASAPI now fold in hardware
+        // latency). Only adopt a real (nonzero, sane) reading — backends
+        // that don't implement the playback timestamp give 0, which must
+        // not clobber an earlier good value.
+        let ms = ts.playback.duration_since(ts.callback).as_millis() as u64;
+        if ms > 0 && ms <= 1000 {
+            cb.output_latency_ms.store(ms, Ordering::Relaxed);
+        }
+        // Only this callback locks the cursor, one stream at a time.
+        let mut cursor = cb.cursor.lock().unwrap();
+        // While paused, emit silence WITHOUT consuming live PCM — resume
+        // picks up exactly where we left off. Chunks a flush has already
+        // superseded ARE thrown away here, or a seek (flush + pause) leaves
+        // the bounded queue full of the old pipeline's audio and the new
+        // pipeline can never queue the pre-roll that unpauses the output
+        // (see `ChunkCursor::drop_stale`).
+        if cb.paused_flag.load(Ordering::Relaxed) {
+            cursor.drop_stale();
+            for sample in data.iter_mut() {
+                *sample = T::EQUILIBRIUM;
+            }
+            return;
+        }
+        let vol = f32::from_bits(cb.volume.load(Ordering::Relaxed));
+        for sample in data.iter_mut() {
+            *sample = T::from_sample(cursor.next_sample().unwrap_or(0.0) * vol);
+        }
+        // Publish the consumed-sample count once per callback (the clock).
+        cursor.commit();
+    };
+
+    // RealtimeDenied (AAudio couldn't grant the low-latency/realtime
+    // path) is informational, not fatal — the stream falls back to the
+    // normal mode and keeps playing. Log it quieter than real errors.
+    let err = Arc::clone(shared);
+    let err_fn = move |e: cpal::Error| {
+        if e.to_string().contains("Realtime") {
+            log::info!("audio: realtime/low-latency not granted, using normal mode");
+        } else {
+            log::error!("audio stream error: {}", e);
+            err.failed.store(true, Ordering::Relaxed);
+        }
+    };
+
+    device.build_output_stream(config, callback, err_fn, Some(Duration::from_secs(20)))
+}
+
+/// Owns the cpal output stream for the whole playback, on its own thread.
+///
+/// A stream can die under a running player without cpal saying so: a
+/// PipeWire restart or an unplugged USB / Bluetooth headset just stops the
+/// callbacks. The consumed position then stands, the audio-disciplined
+/// clock stands with it, and a pipeline rebuild does not help because it
+/// reuses this stream. So the stream is rebuilt here — on the current
+/// default device — when it reports an error or stops calling back; the
+/// queue and the consumed count carry over. A stream that cannot be opened
+/// (no device right now, a format the device refuses) is retried instead of
+/// panicking the thread.
 #[allow(clippy::too_many_arguments)]
-async fn start_audio(
+fn start_audio(
     sample_receiver: Receiver<AudioChunk>,
     device: Device,
     // Rate + channel count to open the device at, resolved in `start_thread`
@@ -107,7 +242,16 @@ async fn start_audio(
     // Generation-filtering cursor over the chunk queue: drops PCM queued
     // before the last flush and records the consumed-sample position at which
     // each new generation begins (the post-flush clock boundary).
-    let mut cursor = ChunkCursor::new(sample_receiver, flush_state, samples_consumed);
+    let cursor = ChunkCursor::new(sample_receiver, flush_state, samples_consumed);
+    let shared = Arc::new(OutputShared {
+        cursor: Mutex::new(cursor),
+        volume,
+        paused_flag,
+        output_latency_ms,
+        epoch: Instant::now(),
+        last_callback_ms: AtomicU64::new(0),
+        failed: AtomicBool::new(false),
+    });
     // The decoders mix to exactly `out_channels` (AudioSink::channels()), so
     // the callback copies 1:1 whatever the device layout — stereo, mono, 5.1.
     // (Before, a stereo stream was copied 1:1 into a 6-channel device buffer:
@@ -118,64 +262,71 @@ async fn start_audio(
         buffer_size: cpal::BufferSize::Default,
     };
 
-    let callback = move |data: &mut [f32], info: &cpal::OutputCallbackInfo| {
-        // Output latency = (when this buffer's first sample is AUDIBLE)
-        // − (now). The device buffer + DAC delay everything the callback
-        // hands over by this much, so video paced to the wall clock
-        // would lead audio by it. Captured here (stable per stream),
-        // consumed by the video sync loop to delay video into alignment.
-        // Backend may not support the timestamp (returns None / 0) — then
-        // it stays 0 and behaviour is unchanged.
-        let ts = info.timestamp();
-        // cpal 0.18: duration_since takes StreamInstant by value and
-        // saturates to a Duration. playback − callback = how long until
-        // this buffer is audible (CoreAudio/WASAPI now fold in hardware
-        // latency). Only adopt a real (nonzero, sane) reading — backends
-        // that don't implement the playback timestamp give 0, which must
-        // not clobber an earlier good value.
-        let ms = ts.playback.duration_since(ts.callback).as_millis() as u64;
-        if ms > 0 && ms <= 1000 {
-            output_latency_ms.store(ms, Ordering::Relaxed);
-        }
-        // While paused, emit silence WITHOUT consuming live PCM — resume
-        // picks up exactly where we left off. Chunks a flush has already
-        // superseded ARE thrown away here, or a seek (flush + pause) leaves
-        // the bounded queue full of the old pipeline's audio and the new
-        // pipeline can never queue the pre-roll that unpauses the output
-        // (see `ChunkCursor::drop_stale`).
-        if paused_flag.load(Ordering::Relaxed) {
-            cursor.drop_stale();
-            for sample in data.iter_mut() {
-                *sample = Sample::EQUILIBRIUM;
+    // `stop` is async; wait for it on a helper thread that wakes this one.
+    let stopped = Arc::new(AtomicBool::new(false));
+    {
+        let stopped = Arc::clone(&stopped);
+        let owner = std::thread::current();
+        std::thread::Builder::new()
+            .name("bz-audio-stop".into())
+            .spawn(move || {
+                stop.notified().block_on();
+                stopped.store(true, Ordering::Relaxed);
+                owner.unpark();
+            })
+            .expect("spawn audio stop thread");
+    }
+
+    let mut device = Some(device);
+    let mut stream: Option<cpal::Stream> = None;
+    let mut failures = 0u32;
+    while !stopped.load(Ordering::Relaxed) {
+        if stream.is_none() {
+            let opened = device
+                .take()
+                .or_else(|| cpal::default_host().default_output_device())
+                .ok_or_else(|| "no output device".into())
+                .and_then(|d| open_stream(&d, stream_config, &shared));
+            match opened {
+                Ok(s) => {
+                    if failures > 0 {
+                        log::info!(
+                            "[audio] output stream reopened after {failures} failed attempt(s)"
+                        );
+                    }
+                    failures = 0;
+                    stream = Some(s);
+                }
+                Err(e) => {
+                    if failures == 0 {
+                        log::warn!("[audio] cannot open the output stream, retrying: {e}");
+                    }
+                    failures += 1;
+                    std::thread::park_timeout(STREAM_RETRY);
+                    continue;
+                }
             }
-            return;
         }
-        let vol = f32::from_bits(volume.load(Ordering::Relaxed));
-        for sample in data.iter_mut() {
-            *sample = cursor.next_sample().unwrap_or(Sample::EQUILIBRIUM) * vol;
+        std::thread::park_timeout(Duration::from_millis(250));
+
+        #[cfg(not(target_os = "ios"))]
+        {
+            let quiet_ms = shared
+                .now_ms()
+                .saturating_sub(shared.last_callback_ms.load(Ordering::Relaxed));
+            let failed = shared.failed.load(Ordering::Relaxed);
+            if failed || quiet_ms > STREAM_DEAD_MS {
+                let why = if failed {
+                    "stream error".to_string()
+                } else {
+                    format!("no callback for {quiet_ms} ms")
+                };
+                log::warn!("[audio] output stream dead ({why}) — rebuilding it on the default device");
+                stream = None;
+            }
         }
-        // Publish the consumed-sample count once per callback (the clock).
-        cursor.commit();
-    };
-
-    // RealtimeDenied (AAudio couldn't grant the low-latency/realtime
-    // path) is informational, not fatal — the stream falls back to the
-    // normal mode and keeps playing. Log it quieter than real errors.
-    let err_fn = |err: cpal::Error| {
-        if err.to_string().contains("Realtime") {
-            log::info!("audio: realtime/low-latency not granted, using normal mode");
-        } else {
-            log::error!("audio stream error: {}", err);
-        }
-    };
-
-    let stream = device
-        .build_output_stream(stream_config, callback, err_fn, Some(Duration::from_secs(20)))
-        .expect("Failed to build audio stream");
-
-    stream.play().expect("Failed to start audio stream");
-
-    stop.notified().block_on();
+    }
+    drop(stream);
 }
 
 /// Device-less audio path: a plain thread drains the sample channel at
@@ -312,8 +463,8 @@ pub(super) fn start_thread(
 
     let stop_cpal = stop.clone();
     // Run the cpal output stream on a DEDICATED OS thread, NOT a tokio
-    // worker. `start_audio` parks (pollster `block_on`) on `stop` for the
-    // whole playback; doing that on a tokio worker permanently consumes it.
+    // worker. `start_audio` blocks for the whole playback (it owns the
+    // stream and waits on `stop`); doing that on a tokio worker permanently consumes it.
     // On a low-core device (2-core iPhone SE) the pool is then exhausted
     // after the first play: the command loop that fires the stop
     // notification can't get a worker, so the previous stream never tears
@@ -321,21 +472,22 @@ pub(super) fn start_thread(
     // never get scheduled → stuck on "Loading…" forever. A plain thread
     // keeps the blocking wait off the async runtime entirely. (Multi-core
     // simulators have spare workers, which is why it only bit on device.)
-    let audio_fut = start_audio(
-        sample_receiver,
-        device,
-        out_rate,
-        out_channels,
-        volume,
-        stop_cpal,
-        flush_state,
-        paused_flag,
-        samples_consumed,
-        output_latency_ms,
-    );
     std::thread::Builder::new()
         .name("bz-audio-out".into())
-        .spawn(move || audio_fut.block_on())
+        .spawn(move || {
+            start_audio(
+                sample_receiver,
+                device,
+                out_rate,
+                out_channels,
+                volume,
+                stop_cpal,
+                flush_state,
+                paused_flag,
+                samples_consumed,
+                output_latency_ms,
+            )
+        })
         .expect("spawn audio output thread");
 
     crate::rt::spawn(async move {

@@ -744,6 +744,8 @@ async fn main() {
         s.clock_wall_fallbacks,
         s.audio_output_rebuilds,
     );
+    // Where the time went, per subsystem (player::prof counters).
+    println!("PROF_JSON {}", player::prof::json());
 
     let mut failed = false;
     let mut check = |name: &str, ok: bool, detail: String| {

@@ -160,7 +160,8 @@ impl VideoFrame {
 
             match wgpu_backend {
                 Backend::Dx12 => {
-                    let raw_image = create_dx12_resource_from_d3d11_texture(
+                    let _t = crate::prof::Timer::new(&crate::prof::VIDEO_IMPORT);
+                    let raw_image = import_d3d11_texture_pooled(
                         &wgpu_device,
                         d3d11_device,
                         d3d11_device_context,

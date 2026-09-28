@@ -61,6 +61,7 @@ counters! {
     VIDEO_DRAIN    => "video_drain",
     SEGMENT_PREP   => "segment_prep",
     DECRYPT        => "decrypt",
+    VIDEO_IMPORT   => "video_import",
 }
 
 /// Times from construction to drop. For `async fn`s, where wrapping the body

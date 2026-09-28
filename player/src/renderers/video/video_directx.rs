@@ -555,6 +555,104 @@ pub fn create_dx12_resource_from_d3d11_texture(
     }
 }
 
+/// Intermediate shared textures for the D3D11 -> D3D12 import, reused frame
+/// after frame.
+///
+/// Each frame used to create a new shared texture (visible size, NT handle +
+/// keyed mutex), a D3D11 fence, an event, then OpenSharedHandle on the D3D12
+/// side: 12-24 MB allocated and freed per 4K frame plus four kernel objects.
+/// Measured on an Intel UHD at 720p: 2.15 ms per frame in the import. The
+/// pool creates a few slots once per (devices, format, size) and only copies
+/// into the next one. The copy, keyed mutex and fence wait are unchanged.
+///
+/// Reuse is safe because a slot comes round again only after `SLOTS` frames:
+/// the renderer keeps at most two frames in flight
+/// (`desired_maximum_frame_latency: 2`), so the GPU has finished sampling a
+/// slot before the next copy into it.
+struct Dx12ImportPool {
+    key: (usize, usize, i32, u32, u32),
+    slots: Vec<(DirectX11SharedTexture, Direct3D12::ID3D12Resource)>,
+    next: usize,
+}
+
+// COM pointers used only under the pool mutex.
+unsafe impl Send for Dx12ImportPool {}
+
+const DX12_IMPORT_SLOTS: usize = 4;
+
+static DX12_IMPORT_POOL: std::sync::Mutex<Option<Dx12ImportPool>> = std::sync::Mutex::new(None);
+
+/// [`create_dx12_resource_from_d3d11_texture`] with the intermediate texture
+/// taken from [`Dx12ImportPool`]. Same result, same synchronisation.
+pub fn import_d3d11_texture_pooled(
+    device: &wgpu::Device,
+    d3d11_device: &ID3D11Device,
+    d3d11_device_context: &ID3D11DeviceContext,
+    texture: &ID3D11Texture2D,
+    width: u32,
+    height: u32,
+    region: Option<u32>,
+) -> Result<Direct3D12::ID3D12Resource, Box<dyn std::error::Error>> {
+    unsafe {
+        let hdevice = device.as_hal::<Dx12>().ok_or("wgpu backend is not DX12")?;
+        let raw_device = hdevice.raw_device();
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        texture.GetDesc(&mut desc);
+        let key = (
+            d3d11_device.as_raw() as usize,
+            raw_device.as_raw() as usize,
+            desc.Format.0,
+            width,
+            height,
+        );
+
+        let mut guard = DX12_IMPORT_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.as_ref().map(|p| p.key) != Some(key) {
+            if guard.is_some() {
+                log::debug!("[dx12_import] pool rebuilt for {}x{} format={:?}", width, height, desc.Format);
+            }
+            *guard = Some(Dx12ImportPool { key, slots: Vec::new(), next: 0 });
+        }
+        let pool = guard.as_mut().expect("pool set above");
+
+        if pool.slots.len() < DX12_IMPORT_SLOTS {
+            let (handle, shared) = get_shared_texture_d3d11(d3d11_device, texture, width, height)?;
+            let mut resource = None::<Direct3D12::ID3D12Resource>;
+            let opened = raw_device.OpenSharedHandle(handle, &mut resource);
+            let _ = CloseHandle(handle);
+            if let Err(e) = opened {
+                log::error!(
+                    "[dx12_import] OpenSharedHandle failed: hr=0x{:08x} ({})",
+                    e.code().0 as u32,
+                    e.message(),
+                );
+                log_d3d11_device_removed_reason(d3d11_device);
+                log_dx12_device_removed_reason(device);
+                return Err(Box::new(e));
+            }
+            let resource = resource.ok_or("OpenSharedHandle returned no resource")?;
+            pool.slots.push((shared, resource));
+        }
+        let idx = pool.next % pool.slots.len();
+        pool.next = (idx + 1) % DX12_IMPORT_SLOTS;
+        let (shared, resource) = &pool.slots[idx];
+
+        if let Err(e) = shared.synchronized_copy_from(d3d11_device_context, texture, width, height, region) {
+            log::error!(
+                "[dx12_import] synchronized_copy_from failed: hr=0x{:08x} ({})",
+                e.code().0 as u32,
+                e.message(),
+            );
+            log_d3d11_device_removed_reason(d3d11_device);
+            log_dx12_device_removed_reason(device);
+            // A failed slot may be in a bad state: start over next frame.
+            *guard = None;
+            return Err(Box::new(e));
+        }
+        Ok(resource.clone())
+    }
+}
+
 pub fn create_texture_from_dx12_resource(
     device: &wgpu::Device,
     resource: Direct3D12::ID3D12Resource,

@@ -1,5 +1,5 @@
 use std::mem::MaybeUninit;
-use std::os::fd::RawFd;
+use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 
 use ash::vk::{self, ImageCreateInfo};
 use wgpu::hal::api::Vulkan;
@@ -8,6 +8,7 @@ pub type VADisplay = *mut std::ffi::c_void;
 pub type VASurfaceID = u32;
 
 extern "C" {
+    fn vaSyncSurface(dpy: VADisplay, render_target: VASurfaceID) -> i32;
     fn vaExportSurfaceHandle(
         dpy: VADisplay,
         surface_id: VASurfaceID,
@@ -16,6 +17,13 @@ extern "C" {
         descriptor: *mut std::ffi::c_void,
     ) -> i32;
 }
+
+// libva va.h
+const VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2: u32 = 0x4000_0000;
+const VA_EXPORT_SURFACE_READ_ONLY: u32 = 0x0001;
+const VA_EXPORT_SURFACE_COMPOSED_LAYERS: u32 = 0x0008;
+// drm_fourcc.h
+const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
 
 use super::video_vulkan::VkImageMemory;
 
@@ -153,30 +161,56 @@ const fn f(fourcc: &[u8; 4]) -> PixelFormat {
     PixelFormat::from_bytes(*fourcc)
 }
 
+/// An exported VAAPI surface. Owns the DMA-BUF fds in `objects`: every fd
+/// still set is closed on drop. An import that hands an fd to Vulkan (which
+/// then owns it) sets it to -1 first.
+pub struct PrimeSurface(pub PrimeSurfaceDescriptor);
+
+impl Drop for PrimeSurface {
+    fn drop(&mut self) {
+        let n = (self.0.num_objects as usize).min(self.0.objects.len());
+        for object in &mut self.0.objects[..n] {
+            if object.fd >= 0 {
+                drop(unsafe { OwnedFd::from_raw_fd(object.fd) });
+                object.fd = -1;
+            }
+        }
+    }
+}
+
 pub unsafe fn export_shared_handle(
     va_display: VADisplay,
     va_surface_id: VASurfaceID,
-) -> PrimeSurfaceDescriptor {
-    let mut descriptor: MaybeUninit<PrimeSurfaceDescriptor> = MaybeUninit::uninit();
+) -> Result<PrimeSurface, String> {
+    // The decode into this surface can still be in flight on the GPU;
+    // FFmpeg only syncs when it maps or downloads a surface itself.
+    let status = vaSyncSurface(va_display, va_surface_id);
+    if status != 0 {
+        return Err(format!("vaSyncSurface failed: VAStatus {status}"));
+    }
 
+    let mut descriptor: MaybeUninit<PrimeSurfaceDescriptor> = MaybeUninit::zeroed();
+
+    // Composed layers: one layer carrying both planes, the layout a single
+    // multi-planar VkImage imports.
     let status = vaExportSurfaceHandle(
         va_display,
         va_surface_id,
-        0x40000000, //For DMA-BUF
-        0x1000,     // Optional flag for read-only access
+        VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
+        VA_EXPORT_SURFACE_READ_ONLY | VA_EXPORT_SURFACE_COMPOSED_LAYERS,
         descriptor.as_mut_ptr().cast(),
     );
 
-    if (status != 0) {
-        panic!("Cannot create va shared handle")
+    if status != 0 {
+        return Err(format!("vaExportSurfaceHandle failed: VAStatus {status}"));
     }
 
-    descriptor.assume_init()
+    Ok(PrimeSurface(descriptor.assume_init()))
 }
 
 pub fn create_vk_image_from_dma_fd(
     device: &wgpu::Device,
-    va_shared_prime_descriptor: PrimeSurfaceDescriptor,
+    surface: &mut PrimeSurface,
 ) -> Result<VkImageMemory, Box<dyn std::error::Error>> {
     unsafe {
         let raw_dev = device
@@ -187,70 +221,196 @@ pub fn create_vk_image_from_dma_fd(
         let physical_device = raw_dev.raw_physical_device();
         let instance = raw_dev.shared_instance().raw_instance();
 
-        let handle_type = vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT;
+        let descriptor = &surface.0;
 
-        let mut import_memory_info = vk::ImportMemoryFdInfoKHR::default()
-            .handle_type(handle_type)
-            .fd(va_shared_prime_descriptor.objects[0].fd);
+        let vk_format = descriptor.fourcc.vk_format().ok_or_else(|| {
+            format!(
+                "unsupported VAAPI surface fourcc {:?} (only NV12 / P010 are mapped)",
+                descriptor.fourcc.to_bytes(),
+            )
+        })?;
+        let plane_formats = match descriptor.fourcc {
+            PixelFormat::P010 => [vk::Format::R16_UNORM, vk::Format::R16G16_UNORM],
+            _ => [vk::Format::R8_UNORM, vk::Format::R8G8_UNORM],
+        };
+
+        let layer = &descriptor.layers[0];
+        if descriptor.num_layers != 1 || layer.num_planes != 2 {
+            return Err(format!(
+                "VAAPI export has {} layer(s) / {} plane(s), expected 1 / 2",
+                descriptor.num_layers, layer.num_planes,
+            )
+            .into());
+        }
+        let object_index = layer.object_index[0] as usize;
+        if layer.object_index[1] as usize != object_index
+            || object_index >= (descriptor.num_objects as usize).min(descriptor.objects.len())
+        {
+            return Err("VAAPI export puts the planes in separate objects (not supported)".into());
+        }
+        let object = &descriptor.objects[object_index];
+        let fd = object.fd;
+
+        let handle_type = vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT;
+        let usage = vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC;
+        // MUTABLE_FORMAT with a modifier needs the view formats listed; the
+        // renderer views the planes as R8/RG8 (R16/RG16 for P010).
+        let view_formats = [vk_format, plane_formats[0], plane_formats[1]];
+
+        // The surface is laid out by its DRM format modifier and the plane
+        // offsets / pitches in the descriptor. When the driver can't import
+        // that (no extension, no modifier reported, or a format it has no
+        // modifiers for — P010 on Intel ANV), fall back to the previous
+        // OPTIMAL-tiling import, which the driver happens to match on Intel.
+        let use_modifier = object.drm_format_modifier != DRM_FORMAT_MOD_INVALID
+            && raw_dev
+                .enabled_device_extensions()
+                .contains(&ash::ext::image_drm_format_modifier::NAME)
+            && modifier_importable(
+                instance,
+                physical_device,
+                vk_format,
+                usage,
+                object.drm_format_modifier,
+                &view_formats,
+            );
 
         let mut ext_create_info =
             vk::ExternalMemoryImageCreateInfo::default().handle_types(handle_type);
 
-        let vk_format = va_shared_prime_descriptor
-            .fourcc
-            .vk_format()
-            .ok_or_else(|| {
-                format!(
-                    "unsupported VAAPI surface fourcc {:?} (only NV12 / P010 are mapped)",
-                    va_shared_prime_descriptor.fourcc.to_bytes(),
-                )
-            })?;
+        let plane_layouts = [0, 1].map(|plane| vk::SubresourceLayout {
+            offset: layer.offset[plane] as u64,
+            size: 0,
+            row_pitch: layer.pitch[plane] as u64,
+            array_pitch: 0,
+            depth_pitch: 0,
+        });
+        let mut modifier_info = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
+            .drm_format_modifier(object.drm_format_modifier)
+            .plane_layouts(&plane_layouts);
+        let mut format_list = vk::ImageFormatListCreateInfo::default().view_formats(&view_formats);
 
-        let image_create_info = ImageCreateInfo::default()
+        let mut image_create_info = ImageCreateInfo::default()
             .push_next(&mut ext_create_info)
             .image_type(vk::ImageType::TYPE_2D)
             .format(vk_format)
             .extent(vk::Extent3D {
-                width: va_shared_prime_descriptor.width,
-                height: va_shared_prime_descriptor.height,
+                width: descriptor.width,
+                height: descriptor.height,
                 depth: 1,
             })
             .mip_levels(1)
-            .flags(vk::ImageCreateFlags::ALIAS | vk::ImageCreateFlags::MUTABLE_FORMAT)
             .array_layers(1)
             .samples(vk::SampleCountFlags::TYPE_1)
-            .tiling(vk::ImageTiling::OPTIMAL)
-            .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC)
+            .usage(usage)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        // ALIAS is not supported with tiled modifiers (ANV) and nothing
+        // aliases this memory; the fallback keeps its previous flags.
+        image_create_info = if use_modifier {
+            image_create_info
+                .push_next(&mut modifier_info)
+                .push_next(&mut format_list)
+                .flags(vk::ImageCreateFlags::MUTABLE_FORMAT)
+                .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+        } else {
+            image_create_info
+                .flags(vk::ImageCreateFlags::ALIAS | vk::ImageCreateFlags::MUTABLE_FORMAT)
+                .tiling(vk::ImageTiling::OPTIMAL)
+        };
 
         let raw_image = raw_device.create_image(&image_create_info, None)?;
 
         let mem_requirements = raw_device.get_image_memory_requirements(raw_image);
 
+        let mut fd_properties = vk::MemoryFdPropertiesKHR::default();
+        ash::khr::external_memory_fd::Device::new(instance, raw_device)
+            .get_memory_fd_properties(handle_type, fd, &mut fd_properties)
+            .map_err(|e| {
+                raw_device.destroy_image(raw_image, None);
+                e
+            })?;
+
         let mem_properties = instance.get_physical_device_memory_properties(physical_device);
 
-        let index = mem_properties
+        let memory_type_bits = mem_requirements.memory_type_bits & fd_properties.memory_type_bits;
+        let Some(index) = mem_properties
             .memory_types
             .iter()
             .enumerate()
             .position(|(i, t)| {
-                ((1 << i) & mem_requirements.memory_type_bits) != 0
+                ((1 << i) & memory_type_bits) != 0
                     && t.property_flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
             })
-            .ok_or("Failed to get DEVICE_LOCAL memory index")?;
+        else {
+            raw_device.destroy_image(raw_image, None);
+            return Err("Failed to get DEVICE_LOCAL memory index".into());
+        };
+
+        let mut import_memory_info = vk::ImportMemoryFdInfoKHR::default()
+            .handle_type(handle_type)
+            .fd(fd);
 
         let allocate_info = vk::MemoryAllocateInfo::default()
             .allocation_size(mem_requirements.size)
             .push_next(&mut import_memory_info)
             .memory_type_index(index as u32);
 
-        let allocated_memory = raw_device.allocate_memory(&allocate_info, None)?;
+        let allocated_memory = match raw_device.allocate_memory(&allocate_info, None) {
+            Ok(memory) => memory,
+            Err(e) => {
+                raw_device.destroy_image(raw_image, None);
+                return Err(e.into());
+            }
+        };
+        // A successful import owns the fd; the rest close with `surface`.
+        surface.0.objects[object_index].fd = -1;
 
-        raw_device.bind_image_memory(raw_image, allocated_memory, 0)?;
+        if let Err(e) = raw_device.bind_image_memory(raw_image, allocated_memory, 0) {
+            raw_device.destroy_image(raw_image, None);
+            raw_device.free_memory(allocated_memory, None);
+            return Err(e.into());
+        }
 
         Ok(VkImageMemory {
             raw_image,
             memory: allocated_memory,
         })
     }
+}
+
+/// Whether the driver can import a DMA-BUF with this modifier as the image
+/// the renderer samples.
+unsafe fn modifier_importable(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    format: vk::Format,
+    usage: vk::ImageUsageFlags,
+    modifier: u64,
+    view_formats: &[vk::Format],
+) -> bool {
+    let mut external_info = vk::PhysicalDeviceExternalImageFormatInfo::default()
+        .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+    let mut modifier_info = vk::PhysicalDeviceImageDrmFormatModifierInfoEXT::default()
+        .drm_format_modifier(modifier)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+    let mut format_list = vk::ImageFormatListCreateInfo::default().view_formats(view_formats);
+    let info = vk::PhysicalDeviceImageFormatInfo2::default()
+        .format(format)
+        .ty(vk::ImageType::TYPE_2D)
+        .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+        .usage(usage)
+        .flags(vk::ImageCreateFlags::MUTABLE_FORMAT)
+        .push_next(&mut external_info)
+        .push_next(&mut modifier_info)
+        .push_next(&mut format_list);
+
+    let mut external_props = vk::ExternalImageFormatProperties::default();
+    let mut props = vk::ImageFormatProperties2::default().push_next(&mut external_props);
+    instance
+        .get_physical_device_image_format_properties2(physical_device, &info, &mut props)
+        .is_ok()
+        && external_props
+            .external_memory_properties
+            .external_memory_features
+            .contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE)
 }

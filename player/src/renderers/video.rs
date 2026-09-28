@@ -2118,7 +2118,13 @@ impl VideoRenderer {
     /// CVPixelBuffer → MTLTexture).
     #[cfg(any(target_os = "windows", target_os = "linux"))]
     pub async fn render(&self, frame: Arc<Video>) {
-        let video_frame = VideoFrame::new(self.device.clone(), self.backend, frame.clone());
+        let video_frame = match VideoFrame::new(self.device.clone(), self.backend, frame.clone()) {
+            Ok(f) => f,
+            Err(e) => {
+                log::warn!("[renderer] HW frame import failed, dropping frame: {}", e);
+                return;
+            }
+        };
 
         // Granular checkpoint logging — Intel UHD reports INVALID_CALL → device-removed
         // somewhere after a successful D3D11→DX12 P010 import. The cheap calls below

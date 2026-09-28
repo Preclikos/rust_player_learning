@@ -31,7 +31,11 @@ pub struct VideoFrame {
 
 impl VideoFrame {
     #[cfg(target_os = "linux")]
-    pub fn new(wgpu_device: wgpu::Device, wgpu_backend: wgpu::Backend, frame: Arc<Video>) -> Self {
+    pub fn new(
+        wgpu_device: wgpu::Device,
+        wgpu_backend: wgpu::Backend,
+        frame: Arc<Video>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         unsafe {
             let frame_ptr = frame.as_ptr();
 
@@ -51,7 +55,7 @@ impl VideoFrame {
             let va_display = (*hwctx).display as *mut _;
             let va_surface_id = (*frame_ptr).data[3] as VASurfaceID;
 
-            let descriptor = export_shared_handle(va_display, va_surface_id);
+            let mut surface = export_shared_handle(va_display, va_surface_id)?;
 
             // Driven entirely by the VAAPI surface fourcc: NV12 → 8-bit SDR,
             // P010 → 10-bit HDR10. The wgpu descriptor format MUST agree with
@@ -59,14 +63,14 @@ impl VideoFrame {
             // pick (both derive from fourcc), otherwise stride math diverges
             // and the driver tears the device down on first draw.
             // See feedback_wgpu_external_texture_descriptor.md.
-            let wgpu_format = descriptor.fourcc.wgpu_format().unwrap_or_else(|| {
-                panic!(
+            let wgpu_format = surface.0.fourcc.wgpu_format().ok_or_else(|| {
+                format!(
                     "VAAPI exported surface with unsupported fourcc {:?}",
-                    descriptor.fourcc.to_bytes(),
+                    surface.0.fourcc.to_bytes(),
                 )
-            });
+            })?;
 
-            let image_with_memory = create_vk_image_from_dma_fd(&wgpu_device, descriptor).unwrap();
+            let image_with_memory = create_vk_image_from_dma_fd(&wgpu_device, &mut surface)?;
 
             let desc = wgpu::TextureDescriptor {
                 label: None,
@@ -93,17 +97,21 @@ impl VideoFrame {
                 true,
             );
 
-            VideoFrame {
+            Ok(VideoFrame {
                 wgpu_device,
                 wgpu_backend,
                 memory: Some(image_with_memory.memory),
                 texture,
-            }
+            })
         }
     }
 
     #[cfg(target_os = "windows")]
-    pub fn new(wgpu_device: wgpu::Device, wgpu_backend: wgpu::Backend, frame: Arc<Video>) -> Self {
+    pub fn new(
+        wgpu_device: wgpu::Device,
+        wgpu_backend: wgpu::Backend,
+        frame: Arc<Video>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         use wgpu::Backend;
 
         unsafe {
@@ -176,12 +184,12 @@ impl VideoFrame {
 
                     let texture = create_texture_from_dx12_resource(&wgpu_device, raw_image, &desc);
 
-                    VideoFrame {
+                    Ok(VideoFrame {
                         wgpu_device,
                         wgpu_backend,
                         memory: None,
                         texture,
-                    }
+                    })
                 }
                 Backend::Vulkan => {
                     let image_with_memory = create_vk_image_from_d3d11_texture(
@@ -205,12 +213,12 @@ impl VideoFrame {
                         true,
                     );
 
-                    VideoFrame {
+                    Ok(VideoFrame {
                         wgpu_device,
                         wgpu_backend,
                         memory: Some(image_with_memory.memory),
                         texture,
-                    }
+                    })
                 }
                 _ => panic!("Cannot select HW texture conversion"),
             }

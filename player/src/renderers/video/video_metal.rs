@@ -268,10 +268,10 @@ impl MetalNV12Frame {
 
 impl Drop for MetalNV12Frame {
     fn drop(&mut self) {
-        // CFRelease the two CVMetalTextures. The wgpu::Textures (and their
-        // hal::metal::Texture wrappers) hold their own +1 retain on the
-        // MTLTexture, so the GPU side keeps a live reference until wgpu's
-        // own command buffer is finalised and the wgpu::Texture is dropped.
+        // CFRelease the two CVMetalTextures. Only do this once the GPU is
+        // done sampling them: the MTLTexture retain held by the
+        // wgpu::Textures does not keep the IOSurface out of the decoder's
+        // pool (see render_cv_pixel_buffer, which defers this drop).
         unsafe {
             if !self._cv_y.is_null() {
                 CFRelease(self._cv_y);

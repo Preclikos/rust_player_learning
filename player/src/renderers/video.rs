@@ -2403,10 +2403,9 @@ impl VideoRenderer {
     }
 
     /// Shared Apple Metal render path: draws an NV12 frame from two
-    /// single-plane textures (Y = R8Unorm, UV = Rg8Unorm). Takes ownership
-    /// of `metal_frame` and drops it after queue.submit — that's when the
-    /// wgpu::Textures' MTLTexture retains are the only thing keeping the
-    /// IOSurface alive through the in-flight GPU pass.
+    /// single-plane textures (Y = R8Unorm, UV = Rg8Unorm) and hands
+    /// `metal_frame` back once the pass is submitted. The caller keeps it
+    /// (with its CVPixelBuffer) alive until the GPU is done with it.
     ///
     /// MetalNV12Frame is `Send` but not `Sync` (raw CFTypeRef), so we
     /// take it by value instead of `&` to keep `render_frame`'s
@@ -2416,7 +2415,7 @@ impl VideoRenderer {
         &self,
         metal_frame: MetalNV12Frame,
         color: crate::decoders::VideoColorInfo,
-    ) {
+    ) -> MetalNV12Frame {
         let y_plane_view = metal_frame.y_texture.create_view(&Default::default());
         let uv_plane_view = metal_frame.uv_texture.create_view(&Default::default());
 
@@ -2457,6 +2456,7 @@ impl VideoRenderer {
             if is_hdr { PlaneDraw::Hdr } else { PlaneDraw::Sdr },
         )
         .await;
+        metal_frame
     }
 
     /// Draw one frame given its two plane views (Y, interleaved UV) — the
@@ -2698,12 +2698,13 @@ impl VideoRenderer {
                 return;
             }
         };
-        // The wgpu::Textures inside `mf` hold a +1 retain on the MTLTexture,
-        // so dropping `buf` early (the +1 from VTDecompressionSession) is
-        // fine — Metal still has a live reference until queue.submit's
-        // command buffer completes.
-        drop(buf);
-        self.render_metal_nv12(mf, color).await;
+        let mf = self.render_metal_nv12(mf, color).await;
+        // Apple requires the CVMetalTextures and the CVPixelBuffer to stay
+        // alive until the command buffer that samples them completes. A
+        // retained MTLTexture alone does not stop the decoder pool from
+        // recycling the IOSurface, which would show a later frame's picture.
+        // The callback fires from the maintain() of a later submit.
+        self.queue.on_submitted_work_done(move || drop((mf, buf)));
     }
 
     /// GLES zero-copy path: stores per-frame AHB data then calls queue.present().

@@ -142,3 +142,64 @@ can A/B it there (local Windows conformance works).
 
 Append to this file: what was done, commit hashes, the A/B numbers, and
 anything found but not fixed.
+
+## Outcome (2026-09-28, Intel UHD 630, Manjaro, kernel 7.1, iHD 26.2.4, Mesa ANV)
+
+Test setup: vendored FFmpeg from `player/scripts/build-ffmpeg.sh linux`,
+the conformance harness above, `VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation`
+with `VK_LAYER_ENABLE_MESSAGE_LIMIT=false` (the default limit caps each
+message at 20, which hides the real counts). A/B = the previous commit's
+binary against the fix, same scenario (60 s, 3 switches, 2 seeks).
+`cargo test -p player --lib`: 186 passed.
+
+| Task | Commit | Result |
+| --- | --- | --- |
+| 1. Vulkan memory freed in use | 41711aa | `VUID-vkFreeMemory-memory-00677` ("can't be called on VkDeviceMemory ... in use by VkCommandBuffer") 2900 -> 0. Conformance 17/17 PASS both; judder 14 -> 16, late 7 -> 7, lip-sync max 37 -> 39 ms, render gap max 107 -> 53 ms. RSS 210 / 209 MB and 42 / 42 fds at 60 s: the deferred release does not accumulate. No device-lost in either build. |
+| 2. VAAPI surface back to the pool | 41711aa | Same fix: `render` drops `(VideoFrame, Arc<Video>)` from `queue.on_submitted_work_done`, the contract the Apple path uses. Not verified visually (no scene-cut recording); covered only by the reasoning and the task 1 numbers. |
+| 3. VAAPI export / DMA-BUF import | 82abc20 + wgpu fork e4729c2 | `VUID-VkImageCreateInfo-pNext-00990` 2902 -> 0 and `VUID-VkImportMemoryWin32HandleInfoKHR-handleType-09861` (misnamed by the layer; it is the DMA-BUF import) 2902 -> 0. Conformance 17/17 PASS; 28 flash/beep pairs before and after, so the picture content is right; lip-sync max 39 -> 38 ms, judder 16 -> 15. fds stay at 42 (VA exports one object per surface here). |
+| 4. cpal device loss / format | not done | See open findings. |
+| 5. FFmpeg HW submit | not done | |
+
+Notes on task 3:
+- The wgpu fork did not enable `VK_EXT_image_drm_format_modifier`;
+  e4729c2 on `Preclikos/wgpu` `trunk` enables it (optional, needs Vulkan 1.1
+  and `VK_KHR_image_format_list` / 1.2). The player's `Cargo.lock` now points
+  at it, so every platform picks up the extra optional extension.
+  `cargo ndk ... check -p bridge-android` was NOT run: no Android NDK or
+  cargo-ndk on this machine. The change has no `cfg` and builds on Linux.
+- ANV exposes NV12 with modifiers 0x0 (linear), X- and Y-tiled; with Y-tiled
+  (what iHD exports, 0x0100000000000002) `ALIAS` makes the combination
+  unsupported, so the modifier image is created without it.
+- ANV exposes no modifiers for P010 at all. The import asks
+  `vkGetPhysicalDeviceImageFormatProperties2` first and falls back to the
+  previous OPTIMAL import when the modifier is not importable, so P010 keeps
+  working exactly as before. The conformance asset is 8-bit, so that path
+  was not exercised here.
+- Not tried on AMD.
+
+### Open findings
+
+- **Build on a machine with a system FFmpeg.** `alsa-sys` emits
+  `-L /usr/lib` ahead of the vendored FFmpeg, so a box with FFmpeg 9 installed
+  links against it and fails (`undefined symbol: avcodec_close`). Workaround:
+  `RUSTFLAGS="-L native=$PWD/player/vendor/linux-x64/lib"` (what the macOS
+  CI job already does). CI has no system FFmpeg, so it does not see this.
+- **AAC on the CI box.** With the vendored FFmpeg here AAC decodes cleanly
+  (`resampler 48000Hz 2ch -> 48000Hz 2ch`); the CI's `send_packet ... Invalid
+  data` / `0Hz 0ch` did not reproduce. Worth checking whether the CI job
+  really uses the vendored build (the `|| true` after `build-ffmpeg.sh`
+  hides a failed build; the script also exits 1 here after a successful
+  install).
+- **Task 4.** The platform-wide `audio_output_watchdog` rebuilds the pipeline
+  (and with it the cpal stream) when the consumed position stands for
+  1.5 s, so a dead stream may already recover on Linux; this was not tested
+  yet (`systemctl --user restart pipewire` during playback). The macOS agent
+  found no change needed there. The i16 `.expect()` is real but only hits a
+  default device without float support (bare ALSA `hw:`); PipeWire/Pulse
+  take f32.
+- **`asset/`** (the conformance download) is not in `.gitignore`.
+- **Conformance on a short asset.** The asset is ~60 s; `--secs` beyond that
+  ends in EndOfStream unless seeks keep landing before the end (the harness
+  seeks back to 0 when the remaining scenario exceeds the asset).
+- Unrelated validation noise left alone: 4x `VUID-StandaloneSpirv-None-10684`
+  (a shader variable without an explicit layout decoration).

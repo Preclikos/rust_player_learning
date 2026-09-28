@@ -72,9 +72,7 @@ pub(super) fn prepare_segment(
     {
         crate::rt::spawn(async move {
             let t_copy = Instant::now();
-            let mut data_vec = Vec::with_capacity(init_data.len() + segment.data.len());
-            data_vec.extend_from_slice(&init_data);
-            data_vec.extend_from_slice(&segment.data[..]);
+            let mut data_vec = with_init(&init_data, &segment.data);
             let copy_ms = t_copy.elapsed().as_millis();
             crate::prof::SEGMENT_PREP.add(t_copy.elapsed().as_micros() as u64);
             let t_dec = Instant::now();
@@ -104,6 +102,19 @@ pub(super) fn prepare_segment(
     }
 }
 
+/// The init segment followed by a media segment, in one exactly-sized buffer.
+///
+/// This is the one copy of a segment the pipeline makes: the mp4 parser wants
+/// init + media contiguous and CENC decrypts in place, so the segment needs a
+/// writable buffer of its own. (The audio path used to clone the init and
+/// extend it, which reallocated and copied the whole segment a second time.)
+fn with_init(init_data: &[u8], segment: &[u8]) -> Vec<u8> {
+    let mut data = Vec::with_capacity(init_data.len() + segment.len());
+    data.extend_from_slice(init_data);
+    data.extend_from_slice(segment);
+    data
+}
+
 /// The blocking-thread body of [`prepare_segment`] (native).
 #[cfg(not(target_arch = "wasm32"))]
 fn prepare_blocking(
@@ -112,9 +123,7 @@ fn prepare_blocking(
     segment: DataSegment,
 ) -> Result<PreparedSegment, Box<dyn Error + Send + Sync>> {
     let t_copy = Instant::now();
-    let mut data_vec = Vec::with_capacity(init_data.len() + segment.data.len());
-    data_vec.extend_from_slice(init_data);
-    data_vec.extend_from_slice(&segment.data[..]);
+    let mut data_vec = with_init(init_data, &segment.data);
     let copy_ms = t_copy.elapsed().as_millis();
     let t_dec = Instant::now();
     decrypt_segment_in_place(&mut data_vec, crypto)?;
@@ -299,7 +308,8 @@ pub(super) async fn video_decoder_task(
             break;
         }
         // Kick off the NEXT segment's preparation before feeding this one
-        // — downloads run ~4 segments ahead, so it's normally buffered.
+        // when it is already downloaded (the sample loop below catches one
+        // that arrives later).
         if let Ok(next) = receiver.try_recv() {
             pending_prepare = Some(prepare(next));
         }
@@ -331,6 +341,15 @@ pub(super) async fn video_decoder_task(
             if stop_flag.load(Ordering::Relaxed) {
                 log::debug!("[dec] stop signal received mid-segment; aborting drain");
                 return Ok(());
+            }
+            // Nothing was queued at the boundary (thin buffer): start the next
+            // segment's preparation the moment its download lands, instead of
+            // at the next boundary, where it ran inline (~0.7 s of software
+            // AES on a TV SoC) exactly when the buffer was already thin.
+            if pending_prepare.is_none() {
+                if let Ok(next) = receiver.try_recv() {
+                    pending_prepare = Some(prepare(next));
+                }
             }
             if offset + size > data_vec.len() {
                 continue;
@@ -560,8 +579,7 @@ pub(super) async fn audio_decoder_task(
         #[cfg(not(target_arch = "wasm32"))]
         let (data_vec, sample_info) = crate::rt::block_in_place(
             || -> Result<(Vec<u8>, Vec<(usize, usize, i64, u64)>), Box<dyn Error + Send + Sync>> {
-                let mut data_vec = init_data.clone();
-                data_vec.extend_from_slice(&segment.data[..]);
+                let mut data_vec = with_init(&init_data, &segment.data);
                 decrypt_segment_in_place(&mut data_vec, track_crypto.as_ref())?;
 
                 let sample_info = mp4_sample_table(&data_vec)?;
@@ -573,8 +591,7 @@ pub(super) async fn audio_decoder_task(
         // sliced software AES otherwise. There is no blocking pool here.
         #[cfg(target_arch = "wasm32")]
         let (data_vec, sample_info) = {
-            let mut data_vec = init_data.clone();
-            data_vec.extend_from_slice(&segment.data[..]);
+            let mut data_vec = with_init(&init_data, &segment.data);
             decrypt_segment_in_place_cooperative(&mut data_vec, track_crypto.as_ref()).await?;
             let sample_info = mp4_sample_table(&data_vec)?;
             (data_vec, sample_info)

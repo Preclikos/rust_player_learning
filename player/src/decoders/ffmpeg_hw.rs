@@ -8,7 +8,7 @@ use ffmpeg_sys_next::{
     av_buffer_ref, av_buffer_unref, av_hwdevice_ctx_create, AVBufferRef, AVCodecContext,
     AVHWDeviceType, AVPixelFormat,
 };
-use crate::parsers::mp4::{append_hevc_header, parse_hevc_nalu};
+use crate::parsers::mp4::{append_hevc_header, hevc_nalu_bodies};
 
 use super::{DecodedVideoFrame, DecoderError, HwVideoDecoder, PlatformFrame, VideoCodec, VideoDecoderParams};
 
@@ -257,17 +257,24 @@ impl HwVideoDecoder for FfmpegHwDecoder {
             .as_mut()
             .ok_or_else(|| -> DecoderError { "submit before configure".into() })?;
 
-        let nalus = parse_hevc_nalu(sample)
+        let nalus = hevc_nalu_bodies(sample)
             .map_err(|e| -> DecoderError { format!("sample NALU parse: {}", e).into() })?;
 
         // The whole access unit as ONE Annex-B packet: FFmpeg's decoders take
         // a packet as a full picture (no parser in front of them), so one
-        // packet per NALU split a multi-slice picture across packets.
-        let size = nalus.iter().map(Vec::len).sum();
+        // packet per NALU split a multi-slice picture across packets. Each
+        // NALU body is copied once, straight from the sample into the packet.
+        const START_CODE: [u8; 4] = [0, 0, 0, 1];
+        let size = nalus.iter().map(|n| START_CODE.len() + n.len()).sum();
         let mut packet = Packet::new(size);
+        let data = packet
+            .data_mut()
+            .ok_or_else(|| -> DecoderError { "packet has no data buffer".into() })?;
         let mut at = 0;
         for nalu in &nalus {
-            packet.data_mut().unwrap()[at..at + nalu.len()].copy_from_slice(nalu);
+            data[at..at + START_CODE.len()].copy_from_slice(&START_CODE);
+            at += START_CODE.len();
+            data[at..at + nalu.len()].copy_from_slice(nalu);
             at += nalu.len();
         }
         // Store pts in milliseconds — FFmpeg's time base for this decoder is 1ms.

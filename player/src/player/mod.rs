@@ -86,10 +86,31 @@ use crate::manifest::Manifest;
 /// Configurable per Player via `set_buffer_target_secs`.
 const DEFAULT_BUFFER_TARGET_SECS: u32 = 8;
 
-/// Assumed average segment duration when converting buffer-target-seconds
-/// into segments-in-flight capacity. DASH segments are typically 2-4 s;
-/// 2 is a conservative floor that biases the cap upward.
-const ASSUMED_SEGMENT_SECS: u32 = 2;
+/// Segment duration assumed when the selected representation has no timed
+/// segments yet (converting buffer-target-seconds into segments in flight).
+const ASSUMED_SEGMENT_SECS: f64 = 2.0;
+
+/// Typical segment duration of a representation: the median of its first
+/// segments (the last one of a title is often short). `None` without timing.
+fn typical_segment_secs(segments: &[crate::tracks::segment::Segment]) -> Option<f64> {
+    let mut secs: Vec<f64> = segments
+        .iter()
+        .take(16)
+        .map(|s| s.end_time().saturating_sub(s.start_time()).as_secs_f64())
+        .filter(|d| *d > 0.0)
+        .collect();
+    if secs.is_empty() {
+        return None;
+    }
+    secs.sort_by(|a, b| a.total_cmp(b));
+    Some(secs[secs.len() / 2])
+}
+
+/// Segments in flight for a buffer target: enough whole segments to cover it,
+/// at least 2 so the decoder always has the next one behind the current.
+fn segments_for_target(target_secs: u32, segment_secs: f64) -> usize {
+    ((target_secs.max(2) as f64 / segment_secs.max(0.5)).ceil() as usize).max(2)
+}
 
 /// Result of a starvation-state update — exposed by the helper so the
 /// caller can react to combined-state transitions (the moment EITHER
@@ -383,7 +404,9 @@ pub struct Player<V: VideoSink = VideoRenderer, A: AudioSink = AudioRenderer> {
     surface_hold: Arc<SurfaceHold>,
     pause_notify: Arc<Notify>,
 
-    video_adaptation: Arc<StdMutex<Option<VideoAdaptation>>>,
+    /// Shared, never mutated in place: the ABR tick takes an `Arc` clone
+    /// instead of deep-copying every representation's segment list.
+    video_adaptation: Arc<StdMutex<Option<Arc<VideoAdaptation>>>>,
     video_representation: Arc<StdMutex<Option<VideoRepresenation>>>,
 
     audio_adaptation: Arc<StdMutex<Option<AudioAdaptation>>>,
@@ -1062,7 +1085,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         adaptation: &VideoAdaptation,
         representation: &VideoRepresenation,
     ) {
-        *self.video_adaptation.lock().unwrap() = Some(adaptation.clone());
+        *self.video_adaptation.lock().unwrap() = Some(Arc::new(adaptation.clone()));
         *self.video_representation.lock().unwrap() = Some(representation.clone());
         let size = PhysicalSize::new(representation.width, representation.height);
         self.change_frame_size(size);
@@ -1639,12 +1662,20 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
     }
 
     /// Convert the configured `buffer_target_secs` into a channel capacity
-    /// (segments-in-flight) using the conservative segment-duration estimate.
-    /// Floored at 2 so even with a tiny buffer target the decoder has room
-    /// for the next segment behind the one currently being processed.
+    /// (segments in flight) from the selected video representation's real
+    /// segment duration. With the old fixed 2 s estimate, 6 s segments made
+    /// the 8 s target 4 segments (~24-30 s, ~40 MB at 14 Mbps, twice that
+    /// during an ABR swap); it is now 2 (~12-18 s).
     fn segments_in_flight(&self) -> usize {
-        let secs = self.buffer_target_secs.load(Ordering::Relaxed).max(2);
-        ((secs / ASSUMED_SEGMENT_SECS) as usize).max(2)
+        let target = self.buffer_target_secs.load(Ordering::Relaxed);
+        let segment_secs = self
+            .video_representation
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|r| typical_segment_secs(&r.segments))
+            .unwrap_or(ASSUMED_SEGMENT_SECS);
+        segments_for_target(target, segment_secs)
     }
 
     /// One ABR reconsideration. Called from the per-second tick spawned in
@@ -1703,10 +1734,9 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             }
         }
 
-        // The adaptation (every representation with its full segment list:
-        // thousands of segments and strings on a film) is cloned only once a
-        // decision is actually due. Taken before the cheap checks above, it
-        // was deep-copied on every 1 s tick although most ticks return early.
+        // A reference to the shared adaptation. It used to be deep-copied (every
+        // representation with its full segment list: thousands of segments and
+        // strings on a film) on every tick.
         let adaptation = match self.video_adaptation.lock().unwrap().clone() {
             Some(a) => a,
             None => return,
@@ -1950,7 +1980,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         // the consumer flips set_buffer_target_secs mid-play.
         let seg_in_flight = self.segments_in_flight();
         log::info!(
-            "play(): buffer target {}s -> {} segments in flight",
+            "play(): buffer target {}s -> {} segments in flight (from the video segment duration)",
             self.buffer_target_secs.load(Ordering::Relaxed), seg_in_flight
         );
         // Oneshot used to kill the abr_tick task when this play() invocation
@@ -2546,6 +2576,26 @@ use net_io::*;
 
 #[cfg(test)]
 mod tests {
+    use super::{segments_for_target, typical_segment_secs};
+
+    fn seg(start_s: u64, end_s: u64) -> Segment {
+        Segment::new(&"http://x/".to_string(), &"s.m4s".to_string(), 0, 0, Some(start_s * 1000), Some(end_s * 1000), Some(1000)).unwrap()
+    }
+
+    #[test]
+    fn buffer_capacity_follows_the_real_segment_duration() {
+        // 6 s segments, short last one: the median ignores it.
+        let six: Vec<Segment> = (0..5).map(|i| seg(i * 6, i * 6 + 6)).chain([seg(30, 31)]).collect();
+        assert_eq!(typical_segment_secs(&six), Some(6.0));
+        assert_eq!(segments_for_target(8, 6.0), 2);
+        assert_eq!(segments_for_target(30, 6.0), 5);
+        // 2 s segments keep the old 8 s -> 4 segments.
+        assert_eq!(segments_for_target(8, 2.0), 4);
+        // Never below 2, and untimed segments fall back to the estimate.
+        assert_eq!(segments_for_target(1, 10.0), 2);
+        assert_eq!(typical_segment_secs(&[seg(0, 0)]), None);
+    }
+
     use super::*;
     use crate::crypto::SencEntry;
     use crate::tracks::segment::Segment;

@@ -155,8 +155,8 @@ pub fn append_hevc_header(mut nalu_data: Vec<u8>) -> Vec<u8> {
 /// slices into it (no copy, no start codes). Same validation as
 /// [`parse_hevc_nalu`]: a length past the end is an error, 1-3 trailing bytes
 /// are ignored.
-// Only the Android MediaCodec path splits this way; the tests cover it everywhere.
-#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+// Used by the MediaCodec (Android) and FFmpeg HW (Windows, Linux) decoders.
+#[cfg_attr(not(any(target_os = "android", target_os = "windows", target_os = "linux")), allow(dead_code))]
 pub fn hevc_nalu_bodies(data: &[u8]) -> Result<Vec<&[u8]>, Box<dyn Error>> {
     let mut bodies = Vec::new();
     let mut rest = data;
@@ -179,6 +179,10 @@ pub fn hevc_nalu_bodies(data: &[u8]) -> Result<Vec<&[u8]>, Box<dyn Error>> {
 /// The sample comes from the network. A length that runs past the end is an
 /// error; 1-3 trailing bytes too short to hold a length prefix (padding) are
 /// ignored. Both used to panic on the slice index and kill the decode task.
+///
+/// The decoders use [`hevc_nalu_bodies`] (no copy); this stays as the tests'
+/// reference for the same split.
+#[cfg(test)]
 pub fn parse_hevc_nalu(data: &[u8]) -> Result<Vec<Vec<u8>>, Box<dyn Error>> {
     const START_CODE: [u8; 4] = [0x00, 0x00, 0x00, 0x01];
     let mut nalus: Vec<Vec<u8>> = Vec::new();

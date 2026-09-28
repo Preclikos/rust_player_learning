@@ -177,7 +177,16 @@ impl Handle {
 
 /// A future that resolves when a JS promise settles (either way). Used for
 /// `setTimeout` sleeps and the event-loop trampoline below.
-pub struct Sleep(JsFuture);
+/// A `setTimeout`-backed sleep. Dropping it before it fires clears the timer:
+/// `select!` loops (the AudioWorklet feeder, the sync loops) create a fresh
+/// sleep on every pass and drop the loser, and without the clear every one
+/// of those timers still fired later and called back into wasm (about 100
+/// dead timers per second in the audio feeder alone).
+pub struct Sleep {
+    fut: JsFuture,
+    timer: Option<i32>,
+    done: bool,
+}
 
 // Single thread: see the module docs.
 unsafe impl Send for Sleep {}
@@ -187,30 +196,56 @@ impl Future for Sleep {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        match Pin::new(&mut self.get_mut().0).poll(cx) {
+        let this = self.get_mut();
+        match Pin::new(&mut this.fut).poll(cx) {
             Poll::Pending => Poll::Pending,
-            Poll::Ready(_) => Poll::Ready(()),
+            Poll::Ready(_) => {
+                this.done = true;
+                Poll::Ready(())
+            }
+        }
+    }
+}
+
+impl Drop for Sleep {
+    fn drop(&mut self) {
+        if !self.done {
+            if let Some(id) = self.timer {
+                clear_timeout(id);
+            }
         }
     }
 }
 
 /// `setTimeout` on whichever global scope we run in (window or worker).
-fn set_timeout(cb: &js_sys::Function, ms: i32) {
+/// Returns the timer id when there is a timer facility.
+fn set_timeout(cb: &js_sys::Function, ms: i32) -> Option<i32> {
     let global = js_sys::global();
     if let Some(win) = global.dyn_ref::<web_sys::Window>() {
-        let _ = win.set_timeout_with_callback_and_timeout_and_arguments_0(cb, ms);
+        win.set_timeout_with_callback_and_timeout_and_arguments_0(cb, ms).ok()
     } else if let Some(scope) = global.dyn_ref::<web_sys::WorkerGlobalScope>() {
-        let _ = scope.set_timeout_with_callback_and_timeout_and_arguments_0(cb, ms);
+        scope.set_timeout_with_callback_and_timeout_and_arguments_0(cb, ms).ok()
     } else {
         // No timer facility: resolve immediately rather than hang forever.
         let _ = cb.call0(&JsValue::UNDEFINED);
+        None
+    }
+}
+
+fn clear_timeout(id: i32) {
+    let global = js_sys::global();
+    if let Some(win) = global.dyn_ref::<web_sys::Window>() {
+        win.clear_timeout_with_handle(id);
+    } else if let Some(scope) = global.dyn_ref::<web_sys::WorkerGlobalScope>() {
+        scope.clear_timeout_with_handle(id);
     }
 }
 
 pub fn sleep(duration: Duration) -> Sleep {
     let ms = duration.as_millis().min(i32::MAX as u128) as i32;
-    let promise = js_sys::Promise::new(&mut |resolve, _reject| set_timeout(&resolve, ms));
-    Sleep(JsFuture::from(promise))
+    let mut timer = None;
+    let promise = js_sys::Promise::new(&mut |resolve, _reject| timer = set_timeout(&resolve, ms));
+    Sleep { fut: JsFuture::from(promise), timer, done: false }
 }
 
 /// The future did not complete within the timeout.
@@ -261,7 +296,7 @@ pub fn animation_frame() -> AnimationFrame {
                 return;
             }
         }
-        set_timeout(&resolve, 16);
+        let _ = set_timeout(&resolve, 16);
     });
     AnimationFrame(JsFuture::from(promise))
 }
@@ -331,8 +366,9 @@ pub fn cooperative_yield() -> Sleep {
     let promise = js_sys::Promise::new(&mut |resolve, _reject| {
         let bounced = TRAMPOLINE.with(|t| t.as_ref().map(|t| t.bounce(&resolve)).unwrap_or(false));
         if !bounced {
-            set_timeout(&resolve, 0);
+            let _ = set_timeout(&resolve, 0);
         }
     });
-    Sleep(JsFuture::from(promise))
+    // Never cleared: a yield is a macrotask bounce that always completes.
+    Sleep { fut: JsFuture::from(promise), timer: None, done: false }
 }

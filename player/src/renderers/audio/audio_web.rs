@@ -109,6 +109,7 @@ struct WebAudioOutput {
     context: web_sys::AudioContext,
     node: web_sys::AudioWorkletNode,
     _onmessage: Closure<dyn FnMut(web_sys::MessageEvent)>,
+    _onstatechange: Closure<dyn FnMut()>,
 }
 
 impl Drop for WebAudioOutput {
@@ -116,6 +117,7 @@ impl Drop for WebAudioOutput {
         if let Ok(port) = self.node.port() {
             port.set_onmessage(None);
         }
+        self.context.set_onstatechange(None);
         let _ = self.node.disconnect();
         let _ = self.context.close();
     }
@@ -178,9 +180,14 @@ fn start_null_sink(
     flush_state: Arc<FlushState>,
     paused_flag: Arc<AtomicBool>,
     samples_consumed: Arc<AtomicU64>,
+    // Interleaved samples per second the decoders produce for this sink:
+    // the rate x channels the renderer reported. A fixed 48 kHz stereo drain
+    // after a worklet failure on, say, a 44.1 kHz 5.1 context ran the silent
+    // clock at the wrong speed.
+    samples_per_sec: f64,
 ) {
     crate::rt::spawn(async move {
-        const RATE: f64 = 48_000.0 * 2.0; // samples/sec, packed stereo
+        let rate = samples_per_sec.max(1.0);
         let tick = Duration::from_millis(10);
         let mut credit = 0f64;
         let mut consumed = 0u64;
@@ -193,9 +200,9 @@ fn start_null_sink(
                 last = now;
                 continue;
             }
-            credit += now.duration_since(last).as_secs_f64() * RATE;
+            credit += now.duration_since(last).as_secs_f64() * rate;
             last = now;
-            credit = credit.min(RATE);
+            credit = credit.min(rate);
             while credit >= 1.0 {
                 if cur.as_ref().map(|(b, o)| *o >= b.len()).unwrap_or(true) {
                     cur = None;
@@ -260,7 +267,7 @@ pub(super) fn start_thread(
             );
             // The null sink drains at real-time pace from the start: it IS the clock.
             output_running.store(true, Ordering::Relaxed);
-            start_null_sink(sample_receiver, command_receiver, stop, flush_state, paused_flag, samples_consumed);
+            start_null_sink(sample_receiver, command_receiver, stop, flush_state, paused_flag, samples_consumed, 48_000.0 * 2.0);
             return (sample_sender, 48_000, 2);
         }
     };
@@ -334,7 +341,7 @@ async fn pump(
             log::warn!("[audio] AudioWorklet unavailable ({e}) — NULL audio sink (silent playback, real-time drain)");
             let _ = context.close();
             output_running.store(true, Ordering::Relaxed);
-            start_null_sink(rx, command_receiver, stop, flush_state, paused_flag, samples_consumed);
+            start_null_sink(rx, command_receiver, stop, flush_state, paused_flag, samples_consumed, (out_rate as u64 * ch) as f64);
             return;
         }
     };
@@ -344,7 +351,7 @@ async fn pump(
             log::warn!("[audio] worklet port unavailable ({}) — NULL audio sink", describe(&e));
             let _ = context.close();
             output_running.store(true, Ordering::Relaxed);
-            start_null_sink(rx, command_receiver, stop, flush_state, paused_flag, samples_consumed);
+            start_null_sink(rx, command_receiver, stop, flush_state, paused_flag, samples_consumed, (out_rate as u64 * ch) as f64);
             return;
         }
     };
@@ -412,6 +419,29 @@ async fn pump(
         })
     };
     port.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
+    // The context can stop rendering mid-play (output device change, a
+    // Safari interruption, tab suspension). `output_running` used to stay
+    // true, so the audio clock stood still and the picture froze with it.
+    // Clear it (the clock falls back until the next worklet report flips it
+    // back) and try to resume unless the host paused.
+    let onstatechange = {
+        let output_running = Arc::clone(&output_running);
+        let paused_flag = Arc::clone(&paused_flag);
+        let ctx = context.clone();
+        Closure::<dyn FnMut()>::new(move || {
+            let state = ctx.state();
+            if state == web_sys::AudioContextState::Running {
+                return;
+            }
+            if output_running.swap(false, Ordering::Relaxed) {
+                log::warn!("[audio] Web Audio context {:?}: clock falls back until it runs again", state);
+            }
+            if state == web_sys::AudioContextState::Suspended && !paused_flag.load(Ordering::Relaxed) {
+                let _ = ctx.resume();
+            }
+        })
+    };
+    context.set_onstatechange(Some(onstatechange.as_ref().unchecked_ref()));
     if let Err(e) = node.connect_with_audio_node(&context.destination()) {
         log::warn!("[audio] connect to destination failed: {:?}", e);
     }
@@ -420,6 +450,7 @@ async fn pump(
         context: context.clone(),
         node,
         _onmessage: onmessage,
+        _onstatechange: onstatechange,
     });
     LIVE.with(|l| *l.borrow_mut() = Some(Rc::clone(&output)));
 

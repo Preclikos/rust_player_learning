@@ -157,3 +157,41 @@ output device in System Settings). Playback must continue.
 
 Append to this file what was done, with commit hashes and the A/B numbers.
 Also list anything found but not fixed.
+
+## Outcome (2026-09-28, Intel Mac Pro, macOS 14.6, Xcode 16.1)
+
+Test setups: macOS conformance run from a GUI session; iOS Simulator
+(iPhone 16 Pro, iOS 18.1, x86_64); iPhone SE 1st gen (iPhone8,4, iOS
+15.8.8). For iOS a throwaway Swift harness (the packaged `RustPlayer.swift`
++ `librustplayer.a`, built with `-sanitize=address`) creates a player on a
+`CAMetalLayer`, plays for PLAY_SECS, drops it, and repeats. A/B = the same
+harness against a staticlib and Swift file built from the stashed tree.
+
+| Task | Commit | Result |
+| --- | --- | --- |
+| 1. callbacks after destroy | bedd460 | Destroy after 20 ms, 100 iterations. Simulator: old heap-use-after-free (in `providerRef`, from the intercept callback) in 2 of 3 runs, new 0 of 3. iPhone SE: old heap-use-after-free at iteration 2-3 in 2 of 2 runs, new 0 over 25 and 40 iterations (the runs hit the 240 s limit; create takes a few seconds on an A9). 50 x 1 s plays: 50/50 playing, no ASan report in either build. |
+| 2. panic aborts the host | 0ea142f | Temporary forced panic in `rustplayer_player_create` (not committed). Old: "panic in a function that cannot unwind", app aborted. New: `isStarted == false`, log `[ffi] rustplayer_player_create panicked`, the app keeps running. |
+| 3. CVMetalTexture lifetime | 544e0b1 | Conformance (Metal NV12 path, 8-bit SDR), 60 s, 3 switches, 2 seeks, old -> new: all PASS; render gap 62 -> 63 ms, judder 13 -> 11, late 3 -> 3, lip-sync max 33 -> 36 ms, frames 1435 -> 1434. Phys footprint over 50 s flat in both (17-18 MB vs 18-19 MB). A visual check for wrong-frame flashes on a scene-cut clip was not done. |
+| 4. VT reconfigure leak | 0a99599 | Build + conformance only. `configure` is called once per decoder today (pipeline.rs `run_decode`), so there is no observable A/B. |
+| 5. cpal device loss / format | not done | Same file as the Linux brief's task 4. Left open so only one agent edits `audio_cpal.rs`; see below. |
+
+`cargo test -p player --lib` on macOS: 182 passed (the brief's 186 counts
+tests that do not build on macOS).
+
+### Found, not fixed
+
+- **Memory grows per create/destroy on iOS, in the old build too.** With
+  ASan quarantine off, about 0.9 MB per 1 s create/destroy cycle in the
+  simulator (78 -> 110 MB over 30 cycles old, 78 -> 101 MB over 20 new);
+  on the iPhone SE the footprint also climbs across iterations. Not caused
+  by these fixes; not yet traced (candidates: one wgpu instance/device per
+  player, Metal pipeline caches, the global tokio runtime's tasks that
+  outlive destroy).
+- **Destroy does not wait for the orchestrator.** Callbacks are now gated,
+  but `player.stop()` still runs after `rustplayer_player_destroy`
+  returns. Harmless for the host now; relevant to the leak above.
+- **`rustplayer_player_create` blocks the main thread** for the whole wgpu
+  setup (several seconds on an iPhone SE). Optional follow-up from task 2.
+- **Task 5 (cpal)** is still open. Decide who takes it with the Linux
+  agent; on this Mac it can be verified by switching the output device in
+  System Settings during the conformance run.

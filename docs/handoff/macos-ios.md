@@ -199,8 +199,23 @@ which 4 are not built on macOS was not checked).
 - **Destroy does not wait for the orchestrator.** Callbacks are now gated,
   but `player.stop()` still runs after `rustplayer_player_destroy`
   returns. Harmless for the host now, and not the cause of the memory growth.
-- **`rustplayer_player_create` blocks the main thread** for the whole wgpu
-  setup (several seconds on an iPhone SE). Optional follow-up from task 2.
+- **`rustplayer_player_create` blocks the main thread, briefly.** Measured
+  on the iPhone SE (release build, no ASan): 220 ms for the first player in
+  an app launch (`HttpClient::new` 155 ms: one-time rustls/aws-lc setup;
+  wgpu device + pipelines ~45 ms; audio ~10 ms), ~20 ms for every later
+  player. Right after install or an OS update the Metal shader cache is
+  cold and the first create takes ~700 ms (device 167 ms, pipelines
+  362 ms, TLS 155 ms). The "several seconds" seen earlier came from the
+  ASan + debug harness, not from the player.
+- **Slow start to first frame is the first segment, not the main thread.**
+  On the iPhone SE over Wi-Fi, prepare/tracks take 150-500 ms, then the
+  player waits for the whole first video segment (1080p rung, 6 Mb/s,
+  6 s = 3.9 MB) before decoding: 3.0-6.6 s (`segment 0 boundary stall`),
+  so 3.5-7 s to the first frame. Downloads are sequential, so segment 0
+  already gets the full bandwidth. Options: start on a lower rung and let
+  ABR climb, pick the first rung from the bandwidth measured on the
+  manifest / init / sidx fetches, or decode segment 0 while it downloads.
+  All of them change behaviour on every platform; not done.
 - **cpal with no output device at all** (cpal pauses the stream and
   reports DeviceNotAvailable) would still freeze the audio clock. Not
   reproducible on a Mac with built-in output.

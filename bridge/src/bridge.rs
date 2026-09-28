@@ -487,7 +487,7 @@ async fn orchestrate(
     // thing that ever armed it was an explicit `Cmd::VideoAuto` from the
     // host -- so a stream that nobody touched stayed pinned to the default
     // pick for its whole runtime. That default is "highest rung at or below
-    // 1080p", chosen precisely so ABR could climb from there; it never did,
+    // 720p", chosen precisely so ABR could climb from there; it never did,
     // and a 2160p rung the connection could easily carry was simply never
     // used. Every host renders this state as "Auto", so the engine had
     // better actually be in it. A user picking a fixed quality flips the

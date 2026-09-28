@@ -19,9 +19,10 @@ use bridge::{
     self, BoxError, BridgeHandle, BridgeHost, PreparedRequest, RequestKind, StartConfig,
 };
 use async_trait::async_trait;
-use jni::objects::{GlobalRef, JByteArray, JClass, JObject, JObjectArray, JString, JValue};
+use jni::objects::{JByteArray, JClass, JObject, JObjectArray, JString, JValue};
+use jni::refs::Global;
 use jni::sys::{jboolean, jfloat, jint, jlong, jstring};
-use jni::{JNIEnv, JavaVM};
+use jni::{jni_sig, jni_str, Env, EnvUnowned, JavaVM, Outcome};
 use player::{Player, SubtitleStyle};
 
 /// Player bridge + the `ANativeWindow` refs it renders into.
@@ -42,8 +43,9 @@ struct Handle {
 /// headers), `resolveKey([B)->[B` (DRM key). All generic — no app knowledge.
 struct AndroidHost {
     vm: JavaVM,
-    /// Global ref to the Kotlin provider bridge passed to `nativeStart`.
-    cb: GlobalRef,
+    /// Global ref to the Kotlin provider bridge passed to `nativeStart`. Shared
+    /// with the blocking-pool upcalls, which need an owned `'static` handle.
+    cb: Arc<Global<JObject<'static>>>,
 }
 
 fn request_kind_int(kind: RequestKind) -> i32 {
@@ -58,17 +60,19 @@ fn request_kind_int(kind: RequestKind) -> i32 {
 #[async_trait]
 impl BridgeHost for AndroidHost {
     fn on_event(&self, json: String) {
-        let Ok(mut env) = self.vm.attach_current_thread() else {
-            return;
-        };
-        if let Ok(jstr) = env.new_string(&json) {
-            let _ = env.call_method(
+        // The callback runs in its own local frame, so the event string is
+        // freed per event. Before, on a runtime worker that stays attached,
+        // every event's string stayed referenced until the thread ended.
+        let _ = self.vm.attach_current_thread(|env| -> jni::errors::Result<()> {
+            let jstr = env.new_string(&json)?;
+            env.call_method(
                 self.cb.as_obj(),
-                "onEvent",
-                "(Ljava/lang/String;)V",
+                jni_str!("onEvent"),
+                jni_sig!("(Ljava/lang/String;)V"),
                 &[JValue::Object(&jstr)],
-            );
-        }
+            )?;
+            Ok(())
+        });
     }
 
     async fn intercept(
@@ -85,83 +89,73 @@ impl BridgeHost for AndroidHost {
         // watchdogs) freezes into the ~1 fps startup convoy documented in
         // docs/handoffs/AUDIO_PAUSE_WEDGE_AND_STARTUP_CONVOY.md.
         let cb = self.cb.clone();
-        tokio::task::spawn_blocking(move || -> Result<PreparedRequest, String> {
-            let vm = vm_from_ndk_context();
-            let mut env = vm.attach_current_thread().map_err(|e| e.to_string())?;
-            let jurl = env.new_string(&url).map_err(|e| e.to_string())?;
-            let res = env
-                .call_method(
-                    cb.as_obj(),
-                    "onRequest",
-                    "(Ljava/lang/String;I)[Ljava/lang/String;",
-                    &[JValue::Object(&jurl), JValue::Int(request_kind_int(kind))],
-                )
-                .map_err(|e| e.to_string())?;
-            let obj = res.l().map_err(|e| e.to_string())?;
-            if obj.is_null() {
-                return Ok(PreparedRequest { url, ..Default::default() });
-            }
-            let arr = JObjectArray::from(obj);
-            let len = env.get_array_length(&arr).map_err(|e| e.to_string())?;
-            if len < 1 {
-                return Ok(PreparedRequest { url, ..Default::default() });
-            }
-            let mut elem = |env: &mut JNIEnv, i: i32| -> Result<String, String> {
-                let o = env
-                    .get_object_array_element(&arr, i)
-                    .map_err(|e| e.to_string())?;
-                Ok(env
-                    .get_string(&JString::from(o))
-                    .map_err(|e| e.to_string())?
-                    .into())
-            };
-            let new_url = elem(&mut env, 0)?;
-            let mut headers = Vec::new();
-            let mut i = 1;
-            while i + 1 < len {
-                let k = elem(&mut env, i)?;
-                let v = elem(&mut env, i + 1)?;
-                headers.push((k, v));
-                i += 2;
-            }
-            Ok(PreparedRequest {
-                url: new_url,
-                headers,
-                ..Default::default()
+        tokio::task::spawn_blocking(move || -> Result<PreparedRequest, BoxError> {
+            vm_from_ndk_context().attach_current_thread(|env| -> Result<PreparedRequest, BoxError> {
+                let jurl = env.new_string(&url)?;
+                let obj = env
+                    .call_method(
+                        cb.as_obj(),
+                        jni_str!("onRequest"),
+                        jni_sig!("(Ljava/lang/String;I)[Ljava/lang/String;"),
+                        &[JValue::Object(&jurl), JValue::Int(request_kind_int(kind))],
+                    )?
+                    .l()?;
+                if obj.is_null() {
+                    return Ok(PreparedRequest { url, ..Default::default() });
+                }
+                let arr = env.cast_local::<JObjectArray<JString>>(obj)?;
+                let len = arr.len(env)?;
+                if len < 1 {
+                    return Ok(PreparedRequest { url, ..Default::default() });
+                }
+                let elem = |env: &mut Env, i: usize| -> jni::errors::Result<String> {
+                    arr.get_element(env, i)?.try_to_string(env)
+                };
+                let new_url = elem(env, 0)?;
+                let mut headers = Vec::new();
+                let mut i = 1;
+                while i + 1 < len {
+                    headers.push((elem(env, i)?, elem(env, i + 1)?));
+                    i += 2;
+                }
+                Ok(PreparedRequest {
+                    url: new_url,
+                    headers,
+                    ..Default::default()
+                })
             })
         })
         .await
         .map_err(|e| -> BoxError { format!("intercept join: {e}").into() })?
-        .map_err(|e| -> BoxError { e.into() })
     }
 
     async fn resolve_key(&self, kid: [u8; 16]) -> Result<[u8; 16], BoxError> {
         // Blocking pool for the same reason as `intercept`: the licence upcall
         // does a synchronous HTTP POST in the host.
         let cb = self.cb.clone();
-        tokio::task::spawn_blocking(move || -> Result<[u8; 16], String> {
-            let vm = vm_from_ndk_context();
-            let mut env = vm.attach_current_thread().map_err(|e| e.to_string())?;
-            let jkid = env.byte_array_from_slice(&kid).map_err(|e| e.to_string())?;
-            let res = env
-                .call_method(cb.as_obj(), "resolveKey", "([B)[B", &[JValue::Object(&jkid)])
-                .map_err(|e| e.to_string())?;
-            let obj = res.l().map_err(|e| e.to_string())?;
-            if obj.is_null() {
-                return Err("provider.resolveKey returned null (no key)".into());
-            }
-            let arr = JByteArray::from(obj);
-            let bytes = env.convert_byte_array(&arr).map_err(|e| e.to_string())?;
-            if bytes.len() != 16 {
-                return Err(format!("resolveKey returned {} bytes, expected 16", bytes.len()));
-            }
-            let mut key = [0u8; 16];
-            key.copy_from_slice(&bytes);
-            Ok(key)
+        tokio::task::spawn_blocking(move || -> Result<[u8; 16], BoxError> {
+            vm_from_ndk_context().attach_current_thread(|env| -> Result<[u8; 16], BoxError> {
+                let jkid = env.byte_array_from_slice(&kid)?;
+                let obj = env
+                    .call_method(
+                        cb.as_obj(),
+                        jni_str!("resolveKey"),
+                        jni_sig!("([B)[B"),
+                        &[JValue::Object(&jkid)],
+                    )?
+                    .l()?;
+                if obj.is_null() {
+                    return Err("provider.resolveKey returned null (no key)".into());
+                }
+                let arr = env.cast_local::<JByteArray>(obj)?;
+                let bytes = env.convert_byte_array(&arr)?;
+                <[u8; 16]>::try_from(bytes.as_slice()).map_err(|_| {
+                    format!("resolveKey returned {} bytes, expected 16", bytes.len()).into()
+                })
+            })
         })
         .await
         .map_err(|e| -> BoxError { format!("resolve_key join: {e}").into() })?
-        .map_err(|e| -> BoxError { e.into() })
     }
 }
 
@@ -170,7 +164,7 @@ impl BridgeHost for AndroidHost {
 /// `spawn_blocking` 'static boundary.
 fn vm_from_ndk_context() -> JavaVM {
     let ctx = ndk_context::android_context();
-    unsafe { JavaVM::from_raw(ctx.vm().cast()) }.expect("JavaVM from ndk_context")
+    unsafe { JavaVM::from_raw(ctx.vm().cast()) }
 }
 
 /// Dedicated multi-thread Tokio runtime (the host owns the UI looper).
@@ -204,17 +198,17 @@ fn runtime() -> &'static tokio::runtime::Runtime {
 }
 
 /// Seed `ndk_context` with (JavaVM, Context) so cpal et al. resolve the runtime.
-fn init_ndk_context(env: &mut JNIEnv, context: &JObject) {
+fn init_ndk_context(env: &mut Env, context: &JObject) {
     static ONCE: OnceLock<()> = OnceLock::new();
     ONCE.get_or_init(|| {
         let vm = env.get_java_vm().expect("get_java_vm");
-        let ctx_global = env
+        // Leaked on purpose: ndk_context holds the Context for the process.
+        let ctx_raw = env
             .new_global_ref(context)
-            .expect("new_global_ref(context)");
-        let ctx_raw = ctx_global.as_raw() as *mut c_void;
-        std::mem::forget(ctx_global);
+            .expect("new_global_ref(context)")
+            .into_raw() as *mut c_void;
         unsafe {
-            ndk_context::initialize_android_context(vm.get_java_vm_pointer() as *mut c_void, ctx_raw);
+            ndk_context::initialize_android_context(vm.get_raw() as *mut c_void, ctx_raw);
         }
     });
 }
@@ -261,6 +255,27 @@ fn ffi_guard<R>(name: &str, default: R, body: impl FnOnce() -> R) -> R {
     }
 }
 
+/// [`ffi_guard`] for an export that needs the `Env`: the body gets it and
+/// handles its own JNI errors; a panic returns `default`.
+fn with_env_or<'local, R>(
+    name: &str,
+    env: &mut EnvUnowned<'local>,
+    default: R,
+    body: impl FnOnce(&mut Env<'local>) -> R,
+) -> R {
+    match env.with_env(|env| -> jni::errors::Result<R> { Ok(body(env)) }).into_outcome() {
+        Outcome::Ok(r) => r,
+        Outcome::Err(e) => {
+            log::error!("[jni] {}: {}", name, e);
+            default
+        }
+        Outcome::Panic(_) => {
+            log::error!("[jni] {} panicked; returning a default instead of aborting", name);
+            default
+        }
+    }
+}
+
 unsafe fn handle_ref<'a>(handle: jlong) -> Option<&'a Handle> {
     if handle == 0 {
         None
@@ -276,29 +291,29 @@ unsafe fn handle_ref<'a>(handle: jlong) -> Option<&'a Handle> {
 /// starts `manifestUrl`. `startFraction` < 0 = no resume; `audioPassthrough`
 /// -1 = library default, 0/1 = off/on. Returns an opaque handle or 0.
 #[no_mangle]
-pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeStart(
-    mut env: JNIEnv,
-    _class: JClass,
-    context: JObject,
-    bridge_cb: JObject,
-    surface: JObject,
-    video_surface: JObject,
+pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeStart<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    context: JObject<'local>,
+    bridge_cb: JObject<'local>,
+    surface: JObject<'local>,
+    video_surface: JObject<'local>,
     width: jint,
     height: jint,
     display_hdr_types: jint,
-    manifest_url: JString,
+    manifest_url: JString<'local>,
     start_fraction: jfloat,
     audio_passthrough: jint,
     auto_select_subtitle: jboolean,
-    preferred_audio_lang: JString,
-    preferred_subtitle_lang: JString,
+    preferred_audio_lang: JString<'local>,
+    preferred_subtitle_lang: JString<'local>,
 ) -> jlong {
-    ffi_guard("nativeStart", 0, move || {
+    with_env_or("nativeStart", &mut env, 0, move |env| {
         init_logging();
-        init_ndk_context(&mut env, &context);
+        init_ndk_context(env, &context);
 
-        let manifest: String = match env.get_string(&manifest_url) {
-            Ok(s) => s.into(),
+        let manifest: String = match manifest_url.try_to_string(env) {
+            Ok(s) => s,
             Err(_) => {
                 log::error!("nativeStart: manifestUrl missing");
                 return 0;
@@ -307,14 +322,11 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeStart(
 
         // Optional BCP-47 language prefs (null / "" → None). Applied during default
         // selection so no post-start selectAudio/selectSubtitle rebuild is needed.
-        let opt_lang = |env: &mut JNIEnv, s: &JString| -> Option<String> {
-            env.get_string(s)
-                .ok()
-                .map(Into::into)
-                .filter(|s: &String| !s.is_empty())
+        let opt_lang = |env: &Env, s: &JString| -> Option<String> {
+            s.try_to_string(env).ok().filter(|s| !s.is_empty())
         };
-        let preferred_audio_language = opt_lang(&mut env, &preferred_audio_lang);
-        let preferred_subtitle_language = opt_lang(&mut env, &preferred_subtitle_lang);
+        let preferred_audio_language = opt_lang(env, &preferred_audio_lang);
+        let preferred_subtitle_language = opt_lang(env, &preferred_subtitle_lang);
 
         let native_window = unsafe {
             ndk_sys::ANativeWindow_fromSurface(env.get_raw() as *mut _, surface.as_raw() as *mut _)
@@ -358,7 +370,7 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeStart(
                 return 0;
             }
         };
-        let host = Arc::new(AndroidHost { vm, cb });
+        let host = Arc::new(AndroidHost { vm, cb: Arc::new(cb) });
 
         let _guard = runtime().enter();
         let player = Player::new_from_android_surface(native_window as *mut c_void, w, h);
@@ -382,7 +394,7 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeStart(
                 1 => Some(true),
                 _ => None,
             },
-            auto_select_subtitle: auto_select_subtitle != 0,
+            auto_select_subtitle,
             preferred_audio_language,
             preferred_subtitle_language,
             // Set after create via nativeSetWrappedLicence (fixed create signature).
@@ -404,7 +416,7 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeStart(
 
 #[no_mangle]
 pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetSize(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _class: JClass,
     handle: jlong,
     width: jint,
@@ -421,7 +433,7 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetSize(
 
 #[no_mangle]
 pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativePlay(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _class: JClass,
     handle: jlong,
 ) {
@@ -435,7 +447,7 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativePlay(
 
 #[no_mangle]
 pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativePause(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _class: JClass,
     handle: jlong,
 ) {
@@ -449,21 +461,18 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativePause(
 
 #[no_mangle]
 pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeIsPaused(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _class: JClass,
     handle: jlong,
 ) -> jboolean {
-    ffi_guard("nativeIsPaused", 0, move || {
-        match unsafe { handle_ref(handle) } {
-            Some(h) if h.bridge.is_paused() => 1,
-            _ => 0,
-        }
+    ffi_guard("nativeIsPaused", false, move || {
+        unsafe { handle_ref(handle) }.is_some_and(|h| h.bridge.is_paused())
     })
 }
 
 #[no_mangle]
 pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSeekMs(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _class: JClass,
     handle: jlong,
     position_ms: jlong,
@@ -478,7 +487,7 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSeekMs(
 
 #[no_mangle]
 pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativePositionMs(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _class: JClass,
     handle: jlong,
 ) -> jlong {
@@ -491,7 +500,7 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativePositionM
 
 #[no_mangle]
 pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeDurationMs(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _class: JClass,
     handle: jlong,
 ) -> jlong {
@@ -504,7 +513,7 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeDurationM
 
 #[no_mangle]
 pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetVolume(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _class: JClass,
     handle: jlong,
     volume: jfloat,
@@ -519,24 +528,24 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetVolume
 
 #[no_mangle]
 pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeGetTracksJson<'local>(
-    env: JNIEnv<'local>,
+    mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
     handle: jlong,
 ) -> jstring {
-    ffi_guard("nativeGetTracksJson", std::ptr::null_mut(), move || {
+    with_env_or("nativeGetTracksJson", &mut env, std::ptr::null_mut(), move |env| {
         let json = unsafe { handle_ref(handle) }
             .map(|h| h.bridge.tracks_json())
             .unwrap_or_else(|| "{}".to_string());
         match env.new_string(json) {
             Ok(s) => s.into_raw(),
-            Err(_) => JObject::null().into_raw() as jstring,
+            Err(_) => std::ptr::null_mut(),
         }
     })
 }
 
 #[no_mangle]
 pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetVideoTrack(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _class: JClass,
     handle: jlong,
     adapt: jint,
@@ -556,7 +565,7 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetVideoT
 /// estimator into doing it.
 #[no_mangle]
 pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetVideoTrackSoft(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _class: JClass,
     handle: jlong,
     adapt: jint,
@@ -573,17 +582,17 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetVideoT
 /// Wrapped ClearKey licence endpoint (docs/CLEARKEY_WRAPPED_LICENCE.md).
 /// `info` may be null for the default HKDF info. Call right after nativeStart.
 #[no_mangle]
-pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetWrappedLicence(
-    mut env: JNIEnv,
-    _class: JClass,
+pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetWrappedLicence<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
     handle: jlong,
-    url: JString,
-    info: JString,
+    url: JString<'local>,
+    info: JString<'local>,
 ) {
-    ffi_guard("nativeSetWrappedLicence", (), move || {
+    with_env_or("nativeSetWrappedLicence", &mut env, (), move |env| {
         let Some(h) = (unsafe { handle_ref(handle) }) else { return };
-        let url: String = match env.get_string(&url) {
-            Ok(s) => s.into(),
+        let url: String = match url.try_to_string(env) {
+            Ok(s) => s,
             Err(e) => {
                 log::error!("nativeSetWrappedLicence: url: {}", e);
                 return;
@@ -592,7 +601,7 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetWrappe
         let info: Option<String> = if info.is_null() {
             None
         } else {
-            env.get_string(&info).ok().map(|s| s.into()).filter(|s: &String| !s.is_empty())
+            info.try_to_string(env).ok().filter(|s| !s.is_empty())
         };
         let _guard = runtime().enter();
         h.bridge.set_wrapped_licence(url, info);
@@ -601,7 +610,7 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetWrappe
 
 #[no_mangle]
 pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetVideoAuto(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _class: JClass,
     handle: jlong,
 ) {
@@ -614,7 +623,7 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetVideoA
 
 #[no_mangle]
 pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetAudioTrack(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _class: JClass,
     handle: jlong,
     adapt: jint,
@@ -629,7 +638,7 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetAudioT
 
 #[no_mangle]
 pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetSubtitleTrack(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _class: JClass,
     handle: jlong,
     adapt: jint,
@@ -644,7 +653,7 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetSubtit
 
 #[no_mangle]
 pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeClearSubtitles(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _class: JClass,
     handle: jlong,
 ) {
@@ -662,7 +671,7 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeClearSubt
 /// abandoned window.
 #[no_mangle]
 pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetVideoOutputWindow(
-    env: JNIEnv,
+    env: EnvUnowned,
     _class: JClass,
     handle: jlong,
     surface: JObject,
@@ -675,7 +684,7 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetVideoO
             std::ptr::null_mut()
         } else {
             unsafe {
-                ndk_sys::ANativeWindow_fromSurface(env.get_raw() as *mut _, surface.as_raw() as *mut _)
+                ndk_sys::ANativeWindow_fromSurface(env.as_raw() as *mut _, surface.as_raw() as *mut _)
             }
         };
         let _guard = runtime().enter();
@@ -696,7 +705,7 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetVideoO
 /// `surfaceCreated`, e.g. after Home → back with the player kept alive.
 #[no_mangle]
 pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetOverlayWindow(
-    env: JNIEnv,
+    env: EnvUnowned,
     _class: JClass,
     handle: jlong,
     surface: JObject,
@@ -709,7 +718,7 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetOverla
             std::ptr::null_mut()
         } else {
             unsafe {
-                ndk_sys::ANativeWindow_fromSurface(env.get_raw() as *mut _, surface.as_raw() as *mut _)
+                ndk_sys::ANativeWindow_fromSurface(env.as_raw() as *mut _, surface.as_raw() as *mut _)
             }
         };
         let _guard = runtime().enter();
@@ -727,7 +736,7 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetOverla
 
 #[no_mangle]
 pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetSubtitleSafeInsetBottom(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _class: JClass,
     handle: jlong,
     bottom_px: jint,
@@ -741,14 +750,14 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetSubtit
 
 #[no_mangle]
 pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetAdaptiveFrameRate(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _class: JClass,
     handle: jlong,
     enabled: jboolean,
 ) {
     ffi_guard("nativeSetAdaptiveFrameRate", (), move || {
         if let Some(h) = unsafe { handle_ref(handle) } {
-            h.bridge.player().set_adaptive_frame_rate(enabled != 0);
+            h.bridge.player().set_adaptive_frame_rate(enabled);
         }
     })
 }
@@ -756,7 +765,7 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetAdapti
 /// ARGB ints (Android `Color`), like ExoPlayer `CaptionStyleCompat`.
 #[no_mangle]
 pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetSubtitleStyle(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _class: JClass,
     handle: jlong,
     text_argb: jint,
@@ -790,13 +799,13 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetSubtit
 /// Verbose logging toggle (default off → per-frame vsync/HEALTH spam gated).
 #[no_mangle]
 pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetVerboseLogging(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _class: JClass,
     enabled: jboolean,
 ) {
     ffi_guard("nativeSetVerboseLogging", (), move || {
-        VERBOSE_LOGGING.store(enabled != 0, std::sync::atomic::Ordering::Relaxed);
-        log::set_max_level(if enabled != 0 {
+        VERBOSE_LOGGING.store(enabled, std::sync::atomic::Ordering::Relaxed);
+        log::set_max_level(if enabled {
             log::LevelFilter::Debug
         } else {
             log::LevelFilter::Info
@@ -807,7 +816,7 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetVerbos
 /// `nativeDestroy(long)` — tear down and release the window refs.
 #[no_mangle]
 pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeDestroy(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _class: JClass,
     handle: jlong,
 ) {

@@ -266,10 +266,19 @@ impl HwVideoDecoder for WebCodecsVideoDecoder {
         } else {
             web_sys::EncodedVideoChunkType::Delta
         };
-        let data = Uint8Array::from(sample);
-        let init = web_sys::EncodedVideoChunkInit::new(&data, 0, ty);
-        init.set_timestamp_f64(pts_us as f64);
-        let chunk = web_sys::EncodedVideoChunk::new(&init).map_err(|e| js_err("EncodedVideoChunk", e))?;
+        let chunk = {
+            // A view over wasm memory, not a copy: the EncodedVideoChunk
+            // constructor copies the bytes itself, so `Uint8Array::from` was
+            // a second copy of every sample. SAFETY: nothing between creating
+            // the view and constructing the chunk allocates in wasm memory
+            // (growth would detach the view), and the view is dropped with
+            // this block.
+            let data = unsafe { Uint8Array::view(sample) };
+            let init = web_sys::EncodedVideoChunkInit::new(&data, 0, ty);
+            init.set_timestamp_f64(pts_us as f64);
+            web_sys::EncodedVideoChunk::new(&init)
+        }
+        .map_err(|e| js_err("EncodedVideoChunk", e))?;
         decoder.decode(&chunk).map_err(|e| js_err("VideoDecoder::decode", e))?;
         self.submitted.set(self.submitted.get() + 1);
         Ok(())
@@ -445,14 +454,20 @@ fn on_audio_output_inner(shared: &AudioShared, data: web_sys::AudioData) {
         // converting to it, whatever the decoder's native layout.
         let opts = web_sys::AudioDataCopyToOptions::new(c as u32);
         opts.set_format(web_sys::AudioSampleFormat::F32Planar);
-        let js = Float32Array::new_with_length(frames as u32);
-        if let Err(e) = data.copy_to_with_buffer_source(&js, &opts) {
+        // copyTo writes straight into the Vec through a view of wasm memory
+        // (it used to fill a JS array that was then copied again).
+        let mut v = vec![0f32; frames];
+        // SAFETY: `v` is allocated above and nothing allocates in wasm memory
+        // until copyTo returns and the view is dropped.
+        let copied = {
+            let view = unsafe { Float32Array::view_mut_raw(v.as_mut_ptr(), frames) };
+            data.copy_to_with_buffer_source(&view, &opts)
+        };
+        if let Err(e) = copied {
             data.close();
             shared.fail(format!("AudioData.copyTo: {}", describe(&e)));
             return;
         }
-        let mut v = vec![0f32; frames];
-        js.copy_to(&mut v);
         planes.push(v);
     }
     data.close();
@@ -521,10 +536,15 @@ impl AudioDecoder for WebCodecsAudioDecoder {
             .decoder
             .as_ref()
             .ok_or_else(|| -> DecoderError { "webcodecs: submit before configure".into() })?;
-        let data = Uint8Array::from(sample);
-        let init = web_sys::EncodedAudioChunkInit::new(&data, 0, web_sys::EncodedAudioChunkType::Key);
-        init.set_timestamp_f64(pts_us as f64);
-        let chunk = web_sys::EncodedAudioChunk::new(&init).map_err(|e| js_err("EncodedAudioChunk", e))?;
+        let chunk = {
+            // View, not copy: see the video submit. SAFETY: no wasm
+            // allocation until the chunk has copied the bytes.
+            let data = unsafe { Uint8Array::view(sample) };
+            let init = web_sys::EncodedAudioChunkInit::new(&data, 0, web_sys::EncodedAudioChunkType::Key);
+            init.set_timestamp_f64(pts_us as f64);
+            web_sys::EncodedAudioChunk::new(&init)
+        }
+        .map_err(|e| js_err("EncodedAudioChunk", e))?;
         decoder.decode(&chunk).map_err(|e| js_err("AudioDecoder::decode", e))?;
         self.submitted.set(self.submitted.get() + 1);
         Ok(())

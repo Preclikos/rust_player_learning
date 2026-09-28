@@ -254,7 +254,7 @@ pub struct VideoRenderer {
     /// `std::sync::Mutex` — touched only inside the (single-threaded) render
     /// path, never held across an await.
     #[cfg(target_arch = "wasm32")]
-    web_rgba: std::sync::Mutex<Option<(u32, u32, wgpu::Texture)>>,
+    web_rgba: std::sync::Mutex<Option<WebFrameTarget>>,
     /// Browser: textured-quad pipeline over the browser-converted frame
     /// (shader_rgba.wgsl), same bind-group layout as the NV12 pipelines.
     #[cfg(target_arch = "wasm32")]
@@ -405,6 +405,17 @@ const HDR_DETECT_BUFFER_SIZE: u64 = (64 + 64 + 4 + 2) * 4;
 /// native P010 path — the browser shows the PC picture. Built only when
 /// the start-up calibration (`web_hdr_calib`) verified the conversion is
 /// the one the shader inverts.
+/// Browser: the texture a `VideoFrame` is copied into, with the view and bind
+/// group that sample it. Built together when the frame size changes and
+/// reused for every frame after (the bind group used to be created per frame).
+#[cfg(target_arch = "wasm32")]
+struct WebFrameTarget {
+    width: u32,
+    height: u32,
+    texture: wgpu::Texture,
+    bind_group: wgpu::BindGroup,
+}
+
 #[cfg(target_arch = "wasm32")]
 struct WebHdr {
     /// Tonemap render pipeline (group 0 = shared layout, group 1 = the
@@ -414,7 +425,7 @@ struct WebHdr {
     /// native `HdrDetect` kernels (same buffer, same layout).
     accumulate: wgpu::ComputePipeline,
     /// rgba16float copy destination, reused while the frame size holds.
-    texture: std::sync::Mutex<Option<(u32, u32, wgpu::Texture)>>,
+    texture: std::sync::Mutex<Option<WebFrameTarget>>,
     /// Which inverse the calibration selected (`u_tm.web_inverse`).
     inverse: super::web_hdr_calib::Inverse,
     /// Host request to show the browser's own picture instead (comparison,
@@ -2044,9 +2055,9 @@ impl VideoRenderer {
         } else {
             (&self.web_rgba, TextureFormat::Rgba8Unorm, "SDR, browser conversion")
         };
-        let texture = {
+        let (texture, bind_group) = {
             let mut guard = slot.lock().unwrap();
-            let stale = guard.as_ref().map(|(tw, th, _)| *tw != w || *th != h).unwrap_or(true);
+            let stale = guard.as_ref().map(|t| t.width != w || t.height != h).unwrap_or(true);
             if stale {
                 log::info!("[renderer] web frame texture {}x{} {:?} ({})", w, h, format, label);
                 let tex = self.device.create_texture(&wgpu::TextureDescriptor {
@@ -2067,9 +2078,12 @@ impl VideoRenderer {
                         | wgpu::TextureUsages::RENDER_ATTACHMENT,
                     view_formats: &[],
                 });
-                *guard = Some((w, h, tex));
+                let view = tex.create_view(&Default::default());
+                let bind_group = self.plane_bind_group(&view, &view);
+                *guard = Some(WebFrameTarget { width: w, height: h, texture: tex, bind_group });
             }
-            guard.as_ref().unwrap().2.clone()
+            let target = guard.as_ref().expect("set above");
+            (target.texture.clone(), target.bind_group.clone())
         };
         self.queue.copy_external_image_to_texture(
             &wgpu::CopyExternalImageSourceInfo {
@@ -2093,7 +2107,7 @@ impl VideoRenderer {
         );
         let view = texture.create_view(&Default::default());
         let mode = if engine_hdr { PlaneDraw::WebHdr } else { PlaneDraw::WebRgba };
-        self.draw_planes(&view, &view, w, h, mode).await;
+        self.draw_planes(&view, &view, w, h, mode, Some(&bind_group)).await;
     }
 
     /// Browser: whether PQ frames run through the engine's own PQ → SDR
@@ -2469,6 +2483,7 @@ impl VideoRenderer {
             frame_w,
             frame_h,
             if is_hdr { PlaneDraw::Hdr } else { PlaneDraw::Sdr },
+            None,
         )
         .await;
         metal_frame
@@ -2480,6 +2495,36 @@ impl VideoRenderer {
     /// bind groups, the surface acquire / present. `mode` picks the pipeline
     /// set; `Hdr` follows the frame's signalled transfer and degrades to the
     /// SDR pipeline when the device built none (WebGL2).
+    /// The plane bind group `draw_planes` samples through: Y and UV views,
+    /// the sampler, and the tonemap uniform (same shape as Win/Linux).
+    #[cfg(any(target_os = "macos", target_os = "ios", target_arch = "wasm32"))]
+    fn plane_bind_group(&self, y_plane_view: &wgpu::TextureView, uv_plane_view: &wgpu::TextureView) -> wgpu::BindGroup {
+        let layout = self.texture_bind_group_layout.as_ref().expect("no bind group layout");
+        let tonemap_uniform = self.hdr_tonemap_uniform.as_ref().expect("no HDR tonemap uniform");
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(y_plane_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(uv_plane_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: tonemap_uniform.as_entire_binding(),
+                },
+            ],
+            label: Some("metal_nv12_bind_group"),
+        })
+    }
+
     #[cfg(any(target_os = "macos", target_os = "ios", target_arch = "wasm32"))]
     async fn draw_planes(
         &self,
@@ -2488,6 +2533,9 @@ impl VideoRenderer {
         frame_w: u32,
         frame_h: u32,
         mode: PlaneDraw,
+        // A bind group over these same views kept by the caller (the web's
+        // persistent copy target); `None` = build one for this frame.
+        cached_bind_group: Option<&wgpu::BindGroup>,
     ) {
         let sdr = || self.render_pipeline.as_ref().expect("no render pipeline");
         let (render_pipeline, is_hdr, accumulate, web_inverse): (
@@ -2518,7 +2566,6 @@ impl VideoRenderer {
         let (uv_w, uv_h) = (frame_w.div_ceil(2), frame_h.div_ceil(2));
         let (wg_x, wg_y) = (uv_w.div_ceil(16), uv_h.div_ceil(16));
 
-        let layout = self.texture_bind_group_layout.as_ref().expect("no bind group layout");
         // The shared layout includes the tonemap uniform binding so the
         // bind group has the same shape as Win/Linux. The SDR shader
         // doesn't reference binding 3; for HDR frames the uniform is
@@ -2546,28 +2593,14 @@ impl VideoRenderer {
                 bytemuck::cast_slice(&[wg_x * wg_y, frame_w, frame_h, web_inverse]),
             );
         }
-        let texture_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(y_plane_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(uv_plane_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: tonemap_uniform.as_entire_binding(),
-                },
-            ],
-            label: Some("metal_nv12_bind_group"),
-        });
+        let built;
+        let texture_bind_group = match cached_bind_group {
+            Some(bg) => bg,
+            None => {
+                built = self.plane_bind_group(y_plane_view, uv_plane_view);
+                &built
+            }
+        };
 
         // HDR-only: per-frame bind group for the detection compute passes
         // (same layout/dispatch as the desktop p010_render).
@@ -2611,7 +2644,7 @@ impl VideoRenderer {
                 &view,
                 sz.width,
                 sz.height,
-                &texture_bind_group,
+                texture_bind_group,
                 render_pipeline,
                 is_hdr,
                 detect_bind_group.as_ref(),

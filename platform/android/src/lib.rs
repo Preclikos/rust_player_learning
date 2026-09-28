@@ -245,6 +245,22 @@ fn init_logging() {
     });
 }
 
+/// Run a JNI export body, turning a Rust panic into `default`.
+///
+/// Unwinding out of an `extern "system"` function aborts the whole process, so
+/// before this guard any panic (a failed GPU adapter in nativeStart, an
+/// unexpected unwrap deeper down) killed the host app with no Java exception.
+/// The panic hook set in JNI_OnLoad still logs the message and location.
+fn ffi_guard<R>(name: &str, default: R, body: impl FnOnce() -> R) -> R {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+        Ok(r) => r,
+        Err(_) => {
+            log::error!("[jni] {} panicked; returning a default instead of aborting", name);
+            default
+        }
+    }
+}
+
 unsafe fn handle_ref<'a>(handle: jlong) -> Option<&'a Handle> {
     if handle == 0 {
         None
@@ -277,111 +293,113 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeStart(
     preferred_audio_lang: JString,
     preferred_subtitle_lang: JString,
 ) -> jlong {
-    init_logging();
-    init_ndk_context(&mut env, &context);
+    ffi_guard("nativeStart", 0, move || {
+        init_logging();
+        init_ndk_context(&mut env, &context);
 
-    let manifest: String = match env.get_string(&manifest_url) {
-        Ok(s) => s.into(),
-        Err(_) => {
-            log::error!("nativeStart: manifestUrl missing");
-            return 0;
-        }
-    };
-
-    // Optional BCP-47 language prefs (null / "" → None). Applied during default
-    // selection so no post-start selectAudio/selectSubtitle rebuild is needed.
-    let opt_lang = |env: &mut JNIEnv, s: &JString| -> Option<String> {
-        env.get_string(s)
-            .ok()
-            .map(Into::into)
-            .filter(|s: &String| !s.is_empty())
-    };
-    let preferred_audio_language = opt_lang(&mut env, &preferred_audio_lang);
-    let preferred_subtitle_language = opt_lang(&mut env, &preferred_subtitle_lang);
-
-    let native_window = unsafe {
-        ndk_sys::ANativeWindow_fromSurface(env.get_raw() as *mut _, surface.as_raw() as *mut _)
-    };
-    if native_window.is_null() {
-        log::error!("nativeStart: ANativeWindow_fromSurface returned null");
-        return 0;
-    }
-    let video_window = unsafe {
-        ndk_sys::ANativeWindow_fromSurface(env.get_raw() as *mut _, video_surface.as_raw() as *mut _)
-    };
-    if video_window.is_null() {
-        log::error!("nativeStart: video ANativeWindow_fromSurface returned null");
-        unsafe { ndk_sys::ANativeWindow_release(native_window) };
-        return 0;
-    }
-
-    let w = width.max(1) as u32;
-    let h = height.max(1) as u32;
-    log::info!("nativeStart: {}x{} hdr={:#06b} url={}", w, h, display_hdr_types, manifest);
-
-    let vm = match env.get_java_vm() {
-        Ok(vm) => vm,
-        Err(e) => {
-            log::error!("nativeStart: get_java_vm: {}", e);
-            unsafe {
-                ndk_sys::ANativeWindow_release(native_window);
-                ndk_sys::ANativeWindow_release(video_window);
+        let manifest: String = match env.get_string(&manifest_url) {
+            Ok(s) => s.into(),
+            Err(_) => {
+                log::error!("nativeStart: manifestUrl missing");
+                return 0;
             }
+        };
+
+        // Optional BCP-47 language prefs (null / "" → None). Applied during default
+        // selection so no post-start selectAudio/selectSubtitle rebuild is needed.
+        let opt_lang = |env: &mut JNIEnv, s: &JString| -> Option<String> {
+            env.get_string(s)
+                .ok()
+                .map(Into::into)
+                .filter(|s: &String| !s.is_empty())
+        };
+        let preferred_audio_language = opt_lang(&mut env, &preferred_audio_lang);
+        let preferred_subtitle_language = opt_lang(&mut env, &preferred_subtitle_lang);
+
+        let native_window = unsafe {
+            ndk_sys::ANativeWindow_fromSurface(env.get_raw() as *mut _, surface.as_raw() as *mut _)
+        };
+        if native_window.is_null() {
+            log::error!("nativeStart: ANativeWindow_fromSurface returned null");
             return 0;
         }
-    };
-    let cb = match env.new_global_ref(&bridge_cb) {
-        Ok(g) => g,
-        Err(e) => {
-            log::error!("nativeStart: new_global_ref(provider): {}", e);
-            unsafe {
-                ndk_sys::ANativeWindow_release(native_window);
-                ndk_sys::ANativeWindow_release(video_window);
+        let video_window = unsafe {
+            ndk_sys::ANativeWindow_fromSurface(env.get_raw() as *mut _, video_surface.as_raw() as *mut _)
+        };
+        if video_window.is_null() {
+            log::error!("nativeStart: video ANativeWindow_fromSurface returned null");
+            unsafe { ndk_sys::ANativeWindow_release(native_window) };
+            return 0;
+        }
+
+        let w = width.max(1) as u32;
+        let h = height.max(1) as u32;
+        log::info!("nativeStart: {}x{} hdr={:#06b} url={}", w, h, display_hdr_types, manifest);
+
+        let vm = match env.get_java_vm() {
+            Ok(vm) => vm,
+            Err(e) => {
+                log::error!("nativeStart: get_java_vm: {}", e);
+                unsafe {
+                    ndk_sys::ANativeWindow_release(native_window);
+                    ndk_sys::ANativeWindow_release(video_window);
+                }
+                return 0;
             }
-            return 0;
+        };
+        let cb = match env.new_global_ref(&bridge_cb) {
+            Ok(g) => g,
+            Err(e) => {
+                log::error!("nativeStart: new_global_ref(provider): {}", e);
+                unsafe {
+                    ndk_sys::ANativeWindow_release(native_window);
+                    ndk_sys::ANativeWindow_release(video_window);
+                }
+                return 0;
+            }
+        };
+        let host = Arc::new(AndroidHost { vm, cb });
+
+        let _guard = runtime().enter();
+        let player = Player::new_from_android_surface(native_window as *mut c_void, w, h);
+
+        if display_hdr_types != 0 {
+            player.set_display_hdr_types(display_hdr_types as u32);
         }
-    };
-    let host = Arc::new(AndroidHost { vm, cb });
+        // Direct MediaCodec→Surface mode is the production path (HW video plane →
+        // native HDR/DV). Always on; the host detaches via setVideoSurface(null).
+        player.set_video_output_window(video_window as *mut c_void);
 
-    let _guard = runtime().enter();
-    let player = Player::new_from_android_surface(native_window as *mut c_void, w, h);
+        let config = StartConfig {
+            start_position: None,
+            start_fraction: if start_fraction >= 0.0 {
+                Some(start_fraction)
+            } else {
+                None
+            },
+            audio_passthrough: match audio_passthrough {
+                0 => Some(false),
+                1 => Some(true),
+                _ => None,
+            },
+            auto_select_subtitle: auto_select_subtitle != 0,
+            preferred_audio_language,
+            preferred_subtitle_language,
+            // Set after create via nativeSetWrappedLicence (fixed create signature).
+            wrapped_licence_url: None,
+            wrapped_licence_hkdf_info: None,
+        };
 
-    if display_hdr_types != 0 {
-        player.set_display_hdr_types(display_hdr_types as u32);
-    }
-    // Direct MediaCodec→Surface mode is the production path (HW video plane →
-    // native HDR/DV). Always on; the host detaches via setVideoSurface(null).
-    player.set_video_output_window(video_window as *mut c_void);
+        let bridge = bridge::start(player, manifest, host.clone(), config);
 
-    let config = StartConfig {
-        start_position: None,
-        start_fraction: if start_fraction >= 0.0 {
-            Some(start_fraction)
-        } else {
-            None
-        },
-        audio_passthrough: match audio_passthrough {
-            0 => Some(false),
-            1 => Some(true),
-            _ => None,
-        },
-        auto_select_subtitle: auto_select_subtitle != 0,
-        preferred_audio_language,
-        preferred_subtitle_language,
-        // Set after create via nativeSetWrappedLicence (fixed create signature).
-        wrapped_licence_url: None,
-        wrapped_licence_hkdf_info: None,
-    };
-
-    let bridge = bridge::start(player, manifest, host.clone(), config);
-
-    let handle = Box::new(Handle {
-        bridge,
-        _host: host,
-        native_window: AtomicPtr::new(native_window),
-        video_window: AtomicPtr::new(video_window),
-    });
-    Box::into_raw(handle) as jlong
+        let handle = Box::new(Handle {
+            bridge,
+            _host: host,
+            native_window: AtomicPtr::new(native_window),
+            video_window: AtomicPtr::new(video_window),
+        });
+        Box::into_raw(handle) as jlong
+    })
 }
 
 #[no_mangle]
@@ -392,11 +410,13 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetSize(
     width: jint,
     height: jint,
 ) {
-    let Some(h) = (unsafe { handle_ref(handle) }) else {
-        return;
-    };
-    let _guard = runtime().enter();
-    h.bridge.resize(width.max(1) as u32, height.max(1) as u32);
+    ffi_guard("nativeSetSize", (), move || {
+        let Some(h) = (unsafe { handle_ref(handle) }) else {
+            return;
+        };
+        let _guard = runtime().enter();
+        h.bridge.resize(width.max(1) as u32, height.max(1) as u32);
+    })
 }
 
 #[no_mangle]
@@ -405,10 +425,12 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativePlay(
     _class: JClass,
     handle: jlong,
 ) {
-    if let Some(h) = unsafe { handle_ref(handle) } {
-        let _guard = runtime().enter();
-        h.bridge.play();
-    }
+    ffi_guard("nativePlay", (), move || {
+        if let Some(h) = unsafe { handle_ref(handle) } {
+            let _guard = runtime().enter();
+            h.bridge.play();
+        }
+    })
 }
 
 #[no_mangle]
@@ -417,10 +439,12 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativePause(
     _class: JClass,
     handle: jlong,
 ) {
-    if let Some(h) = unsafe { handle_ref(handle) } {
-        let _guard = runtime().enter();
-        h.bridge.pause();
-    }
+    ffi_guard("nativePause", (), move || {
+        if let Some(h) = unsafe { handle_ref(handle) } {
+            let _guard = runtime().enter();
+            h.bridge.pause();
+        }
+    })
 }
 
 #[no_mangle]
@@ -429,10 +453,12 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeIsPaused(
     _class: JClass,
     handle: jlong,
 ) -> jboolean {
-    match unsafe { handle_ref(handle) } {
-        Some(h) if h.bridge.is_paused() => 1,
-        _ => 0,
-    }
+    ffi_guard("nativeIsPaused", 0, move || {
+        match unsafe { handle_ref(handle) } {
+            Some(h) if h.bridge.is_paused() => 1,
+            _ => 0,
+        }
+    })
 }
 
 #[no_mangle]
@@ -442,10 +468,12 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSeekMs(
     handle: jlong,
     position_ms: jlong,
 ) {
-    if let Some(h) = unsafe { handle_ref(handle) } {
-        let _guard = runtime().enter();
-        h.bridge.seek_ms(position_ms);
-    }
+    ffi_guard("nativeSeekMs", (), move || {
+        if let Some(h) = unsafe { handle_ref(handle) } {
+            let _guard = runtime().enter();
+            h.bridge.seek_ms(position_ms);
+        }
+    })
 }
 
 #[no_mangle]
@@ -454,9 +482,11 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativePositionM
     _class: JClass,
     handle: jlong,
 ) -> jlong {
-    unsafe { handle_ref(handle) }
-        .map(|h| h.bridge.position_ms())
-        .unwrap_or(0)
+    ffi_guard("nativePositionMs", 0, move || {
+        unsafe { handle_ref(handle) }
+            .map(|h| h.bridge.position_ms())
+            .unwrap_or(0)
+    })
 }
 
 #[no_mangle]
@@ -465,9 +495,11 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeDurationM
     _class: JClass,
     handle: jlong,
 ) -> jlong {
-    unsafe { handle_ref(handle) }
-        .map(|h| h.bridge.duration_ms())
-        .unwrap_or(0)
+    ffi_guard("nativeDurationMs", 0, move || {
+        unsafe { handle_ref(handle) }
+            .map(|h| h.bridge.duration_ms())
+            .unwrap_or(0)
+    })
 }
 
 #[no_mangle]
@@ -477,10 +509,12 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetVolume
     handle: jlong,
     volume: jfloat,
 ) {
-    if let Some(h) = unsafe { handle_ref(handle) } {
-        let _guard = runtime().enter();
-        h.bridge.set_volume(volume);
-    }
+    ffi_guard("nativeSetVolume", (), move || {
+        if let Some(h) = unsafe { handle_ref(handle) } {
+            let _guard = runtime().enter();
+            h.bridge.set_volume(volume);
+        }
+    })
 }
 
 #[no_mangle]
@@ -489,13 +523,15 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeGetTracks
     _class: JClass<'local>,
     handle: jlong,
 ) -> jstring {
-    let json = unsafe { handle_ref(handle) }
-        .map(|h| h.bridge.tracks_json())
-        .unwrap_or_else(|| "{}".to_string());
-    match env.new_string(json) {
-        Ok(s) => s.into_raw(),
-        Err(_) => JObject::null().into_raw() as jstring,
-    }
+    ffi_guard("nativeGetTracksJson", std::ptr::null_mut(), move || {
+        let json = unsafe { handle_ref(handle) }
+            .map(|h| h.bridge.tracks_json())
+            .unwrap_or_else(|| "{}".to_string());
+        match env.new_string(json) {
+            Ok(s) => s.into_raw(),
+            Err(_) => JObject::null().into_raw() as jstring,
+        }
+    })
 }
 
 #[no_mangle]
@@ -506,9 +542,11 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetVideoT
     adapt: jint,
     repr: jint,
 ) {
-    if let Some(h) = unsafe { handle_ref(handle) } {
-        h.bridge.set_video_track(adapt.max(0) as usize, repr.max(0) as usize);
-    }
+    ffi_guard("nativeSetVideoTrack", (), move || {
+        if let Some(h) = unsafe { handle_ref(handle) } {
+            h.bridge.set_video_track(adapt.max(0) as usize, repr.max(0) as usize);
+        }
+    })
 }
 
 /// Soft (ABR-style) video switch: the running supervisor swaps the
@@ -524,10 +562,12 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetVideoT
     adapt: jint,
     repr: jint,
 ) {
-    if let Some(h) = unsafe { handle_ref(handle) } {
-        h.bridge
-            .set_video_track_soft(adapt.max(0) as usize, repr.max(0) as usize);
-    }
+    ffi_guard("nativeSetVideoTrackSoft", (), move || {
+        if let Some(h) = unsafe { handle_ref(handle) } {
+            h.bridge
+                .set_video_track_soft(adapt.max(0) as usize, repr.max(0) as usize);
+        }
+    })
 }
 
 /// Wrapped ClearKey licence endpoint (docs/CLEARKEY_WRAPPED_LICENCE.md).
@@ -540,21 +580,23 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetWrappe
     url: JString,
     info: JString,
 ) {
-    let Some(h) = (unsafe { handle_ref(handle) }) else { return };
-    let url: String = match env.get_string(&url) {
-        Ok(s) => s.into(),
-        Err(e) => {
-            log::error!("nativeSetWrappedLicence: url: {}", e);
-            return;
-        }
-    };
-    let info: Option<String> = if info.is_null() {
-        None
-    } else {
-        env.get_string(&info).ok().map(|s| s.into()).filter(|s: &String| !s.is_empty())
-    };
-    let _guard = runtime().enter();
-    h.bridge.set_wrapped_licence(url, info);
+    ffi_guard("nativeSetWrappedLicence", (), move || {
+        let Some(h) = (unsafe { handle_ref(handle) }) else { return };
+        let url: String = match env.get_string(&url) {
+            Ok(s) => s.into(),
+            Err(e) => {
+                log::error!("nativeSetWrappedLicence: url: {}", e);
+                return;
+            }
+        };
+        let info: Option<String> = if info.is_null() {
+            None
+        } else {
+            env.get_string(&info).ok().map(|s| s.into()).filter(|s: &String| !s.is_empty())
+        };
+        let _guard = runtime().enter();
+        h.bridge.set_wrapped_licence(url, info);
+    })
 }
 
 #[no_mangle]
@@ -563,9 +605,11 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetVideoA
     _class: JClass,
     handle: jlong,
 ) {
-    if let Some(h) = unsafe { handle_ref(handle) } {
-        h.bridge.set_video_auto();
-    }
+    ffi_guard("nativeSetVideoAuto", (), move || {
+        if let Some(h) = unsafe { handle_ref(handle) } {
+            h.bridge.set_video_auto();
+        }
+    })
 }
 
 #[no_mangle]
@@ -576,9 +620,11 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetAudioT
     adapt: jint,
     repr: jint,
 ) {
-    if let Some(h) = unsafe { handle_ref(handle) } {
-        h.bridge.set_audio_track(adapt.max(0) as usize, repr.max(0) as usize);
-    }
+    ffi_guard("nativeSetAudioTrack", (), move || {
+        if let Some(h) = unsafe { handle_ref(handle) } {
+            h.bridge.set_audio_track(adapt.max(0) as usize, repr.max(0) as usize);
+        }
+    })
 }
 
 #[no_mangle]
@@ -589,9 +635,11 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetSubtit
     adapt: jint,
     repr: jint,
 ) {
-    if let Some(h) = unsafe { handle_ref(handle) } {
-        h.bridge.set_subtitle_track(adapt.max(0) as usize, repr.max(0) as usize);
-    }
+    ffi_guard("nativeSetSubtitleTrack", (), move || {
+        if let Some(h) = unsafe { handle_ref(handle) } {
+            h.bridge.set_subtitle_track(adapt.max(0) as usize, repr.max(0) as usize);
+        }
+    })
 }
 
 #[no_mangle]
@@ -600,9 +648,11 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeClearSubt
     _class: JClass,
     handle: jlong,
 ) {
-    if let Some(h) = unsafe { handle_ref(handle) } {
-        h.bridge.clear_subtitles();
-    }
+    ffi_guard("nativeClearSubtitles", (), move || {
+        if let Some(h) = unsafe { handle_ref(handle) } {
+            h.bridge.clear_subtitles();
+        }
+    })
 }
 
 // --- generic player knobs (parity with ExoPlayer surface/track/format API) ---
@@ -617,24 +667,26 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetVideoO
     handle: jlong,
     surface: JObject,
 ) {
-    let Some(h) = (unsafe { handle_ref(handle) }) else {
-        return;
-    };
-    let new_window = if surface.is_null() {
-        std::ptr::null_mut()
-    } else {
-        unsafe {
-            ndk_sys::ANativeWindow_fromSurface(env.get_raw() as *mut _, surface.as_raw() as *mut _)
+    ffi_guard("nativeSetVideoOutputWindow", (), move || {
+        let Some(h) = (unsafe { handle_ref(handle) }) else {
+            return;
+        };
+        let new_window = if surface.is_null() {
+            std::ptr::null_mut()
+        } else {
+            unsafe {
+                ndk_sys::ANativeWindow_fromSurface(env.get_raw() as *mut _, surface.as_raw() as *mut _)
+            }
+        };
+        let _guard = runtime().enter();
+        h.bridge
+            .player()
+            .set_video_output_window(new_window as *mut c_void);
+        let old = h.video_window.swap(new_window, Ordering::AcqRel);
+        if !old.is_null() {
+            unsafe { ndk_sys::ANativeWindow_release(old) };
         }
-    };
-    let _guard = runtime().enter();
-    h.bridge
-        .player()
-        .set_video_output_window(new_window as *mut c_void);
-    let old = h.video_window.swap(new_window, Ordering::AcqRel);
-    if !old.is_null() {
-        unsafe { ndk_sys::ANativeWindow_release(old) };
-    }
+    })
 }
 
 /// Re-point (or detach with a null surface) the overlay / presentation window
@@ -649,26 +701,28 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetOverla
     handle: jlong,
     surface: JObject,
 ) {
-    let Some(h) = (unsafe { handle_ref(handle) }) else {
-        return;
-    };
-    let new_window = if surface.is_null() {
-        std::ptr::null_mut()
-    } else {
-        unsafe {
-            ndk_sys::ANativeWindow_fromSurface(env.get_raw() as *mut _, surface.as_raw() as *mut _)
+    ffi_guard("nativeSetOverlayWindow", (), move || {
+        let Some(h) = (unsafe { handle_ref(handle) }) else {
+            return;
+        };
+        let new_window = if surface.is_null() {
+            std::ptr::null_mut()
+        } else {
+            unsafe {
+                ndk_sys::ANativeWindow_fromSurface(env.get_raw() as *mut _, surface.as_raw() as *mut _)
+            }
+        };
+        let _guard = runtime().enter();
+        // Blocks until the renderer has left the previous window, so it can be
+        // released right after.
+        h.bridge
+            .player()
+            .set_android_overlay_window(new_window as *mut c_void);
+        let old = h.native_window.swap(new_window, Ordering::AcqRel);
+        if !old.is_null() {
+            unsafe { ndk_sys::ANativeWindow_release(old) };
         }
-    };
-    let _guard = runtime().enter();
-    // Blocks until the renderer has left the previous window, so it can be
-    // released right after.
-    h.bridge
-        .player()
-        .set_android_overlay_window(new_window as *mut c_void);
-    let old = h.native_window.swap(new_window, Ordering::AcqRel);
-    if !old.is_null() {
-        unsafe { ndk_sys::ANativeWindow_release(old) };
-    }
+    })
 }
 
 #[no_mangle]
@@ -678,9 +732,11 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetSubtit
     handle: jlong,
     bottom_px: jint,
 ) {
-    if let Some(h) = unsafe { handle_ref(handle) } {
-        h.bridge.player().set_subtitle_safe_insets(bottom_px.max(0) as u32);
-    }
+    ffi_guard("nativeSetSubtitleSafeInsetBottom", (), move || {
+        if let Some(h) = unsafe { handle_ref(handle) } {
+            h.bridge.player().set_subtitle_safe_insets(bottom_px.max(0) as u32);
+        }
+    })
 }
 
 #[no_mangle]
@@ -690,9 +746,11 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetAdapti
     handle: jlong,
     enabled: jboolean,
 ) {
-    if let Some(h) = unsafe { handle_ref(handle) } {
-        h.bridge.player().set_adaptive_frame_rate(enabled != 0);
-    }
+    ffi_guard("nativeSetAdaptiveFrameRate", (), move || {
+        if let Some(h) = unsafe { handle_ref(handle) } {
+            h.bridge.player().set_adaptive_frame_rate(enabled != 0);
+        }
+    })
 }
 
 /// ARGB ints (Android `Color`), like ExoPlayer `CaptionStyleCompat`.
@@ -705,26 +763,28 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetSubtit
     outline_argb: jint,
     size_scale: jfloat,
 ) {
-    let Some(h) = (unsafe { handle_ref(handle) }) else {
-        return;
-    };
-    fn argb_to_rgba(c: jint) -> [u8; 4] {
-        let c = c as u32;
-        [
-            ((c >> 16) & 0xff) as u8, // R
-            ((c >> 8) & 0xff) as u8,  // G
-            (c & 0xff) as u8,         // B
-            ((c >> 24) & 0xff) as u8, // A
-        ]
-    }
-    let style = SubtitleStyle {
-        text_color: argb_to_rgba(text_argb),
-        outline_color: argb_to_rgba(outline_argb),
-        size_scale,
-        ..SubtitleStyle::DEFAULT
-    }
-    .sanitised();
-    h.bridge.player().set_subtitle_style(style);
+    ffi_guard("nativeSetSubtitleStyle", (), move || {
+        let Some(h) = (unsafe { handle_ref(handle) }) else {
+            return;
+        };
+        fn argb_to_rgba(c: jint) -> [u8; 4] {
+            let c = c as u32;
+            [
+                ((c >> 16) & 0xff) as u8, // R
+                ((c >> 8) & 0xff) as u8,  // G
+                (c & 0xff) as u8,         // B
+                ((c >> 24) & 0xff) as u8, // A
+            ]
+        }
+        let style = SubtitleStyle {
+            text_color: argb_to_rgba(text_argb),
+            outline_color: argb_to_rgba(outline_argb),
+            size_scale,
+            ..SubtitleStyle::DEFAULT
+        }
+        .sanitised();
+        h.bridge.player().set_subtitle_style(style);
+    })
 }
 
 /// Verbose logging toggle (default off → per-frame vsync/HEALTH spam gated).
@@ -734,12 +794,14 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetVerbos
     _class: JClass,
     enabled: jboolean,
 ) {
-    VERBOSE_LOGGING.store(enabled != 0, std::sync::atomic::Ordering::Relaxed);
-    log::set_max_level(if enabled != 0 {
-        log::LevelFilter::Debug
-    } else {
-        log::LevelFilter::Info
-    });
+    ffi_guard("nativeSetVerboseLogging", (), move || {
+        VERBOSE_LOGGING.store(enabled != 0, std::sync::atomic::Ordering::Relaxed);
+        log::set_max_level(if enabled != 0 {
+            log::LevelFilter::Debug
+        } else {
+            log::LevelFilter::Info
+        });
+    })
 }
 
 /// `nativeDestroy(long)` — tear down and release the window refs.
@@ -749,28 +811,30 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeDestroy(
     _class: JClass,
     handle: jlong,
 ) {
-    if handle == 0 {
-        return;
-    }
-    let _guard = runtime().enter();
-    let h = unsafe { Box::from_raw(handle as *mut Handle) };
-    let Handle {
-        bridge,
-        _host,
-        native_window,
-        video_window,
-    } = *h;
-    bridge.shutdown();
-    drop(bridge);
-    drop(_host);
-    let vwin = video_window.load(Ordering::Acquire);
-    let native_window = native_window.load(Ordering::Acquire);
-    unsafe {
-        if !native_window.is_null() {
-            ndk_sys::ANativeWindow_release(native_window);
+    ffi_guard("nativeDestroy", (), move || {
+        if handle == 0 {
+            return;
         }
-        if !vwin.is_null() {
-            ndk_sys::ANativeWindow_release(vwin);
+        let _guard = runtime().enter();
+        let h = unsafe { Box::from_raw(handle as *mut Handle) };
+        let Handle {
+            bridge,
+            _host,
+            native_window,
+            video_window,
+        } = *h;
+        bridge.shutdown();
+        drop(bridge);
+        drop(_host);
+        let vwin = video_window.load(Ordering::Acquire);
+        let native_window = native_window.load(Ordering::Acquire);
+        unsafe {
+            if !native_window.is_null() {
+                ndk_sys::ANativeWindow_release(native_window);
+            }
+            if !vwin.is_null() {
+                ndk_sys::ANativeWindow_release(vwin);
+            }
         }
-    }
+    })
 }

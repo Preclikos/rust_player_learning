@@ -173,25 +173,36 @@ harness against a staticlib and Swift file built from the stashed tree.
 | 2. panic aborts the host | 0ea142f | Temporary forced panic in `rustplayer_player_create` (not committed). Old: "panic in a function that cannot unwind", app aborted. New: `isStarted == false`, log `[ffi] rustplayer_player_create panicked`, the app keeps running. |
 | 3. CVMetalTexture lifetime | 544e0b1 | Conformance (Metal NV12 path, 8-bit SDR), 60 s, 3 switches, 2 seeks, old -> new: all PASS; render gap 62 -> 63 ms, judder 13 -> 11, late 3 -> 3, lip-sync max 33 -> 36 ms, frames 1435 -> 1434. Phys footprint over 50 s flat in both (17-18 MB vs 18-19 MB). A visual check for wrong-frame flashes on a scene-cut clip was not done. |
 | 4. VT reconfigure leak | 0a99599 | Build + conformance only. `configure` is called once per decoder today (pipeline.rs `run_decode`), so there is no observable A/B. |
-| 5. cpal device loss / format | not done | Same file as the Linux brief's task 4. Left open so only one agent edits `audio_cpal.rs`; see below. |
+| 5. cpal device loss / format | not needed on macOS | Device loss simulated with a public aggregate output device made the default and destroyed at 20 s (the system falls back to HDMI). cpal 0.18 plays through the DefaultOutput unit, which reroutes by itself and refreshes the latency: no freeze, no stall, render gap 194 ms, lip-sync unchanged (-9 to -26 ms before and after, max 36 ms). f32 is always offered by CoreAudio, so the i16 panic cannot happen here. Only `av-drift` FAILs (300 ms): see below. Linux still needs its own check. |
+| Memory growth (found while verifying 1) | 2758c5e | A dropped `AudioRenderer` never stopped its cpal output thread: every destroyed player kept a thread, the cpal stream, an AURemoteIO unit and its queued PCM. Simulator, settled after 10 -> 70 cycles: footprint 28.9 -> 46.5 MB before, 27.3 -> 28.7 MB after; heap 4.1 -> 16.7 MB before, 2.07 -> 2.46 MB after; stack regions 32 -> 152 before, 13 -> 12 after. iPhone SE, 25 cycles: +0.3 MB/cycle before, flat from cycle 10 after; settled 19.5 -> 15.5 MB. Shared with Linux/Windows. |
 
-`cargo test -p player --lib` on macOS: 182 passed (the brief's 186 counts
-tests that do not build on macOS).
+`cargo test -p player --lib` on macOS: 182 passed (the brief says 186;
+which 4 are not built on macOS was not checked).
 
-### Found, not fixed
+### Notes and open findings
 
-- **Memory grows per create/destroy on iOS, in the old build too.** With
-  ASan quarantine off, about 0.9 MB per 1 s create/destroy cycle in the
-  simulator (78 -> 110 MB over 30 cycles old, 78 -> 101 MB over 20 new);
-  on the iPhone SE the footprint also climbs across iterations. Not caused
-  by these fixes; not yet traced (candidates: one wgpu instance/device per
-  player, Metal pipeline caches, the global tokio runtime's tasks that
-  outlive destroy).
+- **How the memory growth was traced.** The growth first seen under ASan
+  (~0.9 MB/cycle) was mostly ASan's allocator; without ASan, `heap` /
+  `vmmap` / `leaks` on the simulator process after the last destroy showed
+  no leaks but ~60 extra of each per 60 cycles: cpal render callbacks,
+  AURemoteIO factories, AudioConverters, `mpsc` blocks of `AudioChunk`,
+  and two thread stacks per cycle. Fixed in 2758c5e. What remains is ~19
+  `MTLTextureDescriptor` + label strings (~4 KB) per create, not per frame
+  (30 after 5 s of playback and 30 after 40 s). Not chased.
+- **`av_drift` does not correct for an output latency change.** It
+  compares video time with raw `played_ms`, while the media clock
+  subtracts `output_latency_ms`. After a reroute to a device with more
+  latency (HDMI) the gauge reads the latency difference as a permanent
+  drift (300 ms) although the picture follows the corrected clock and
+  lip-sync is unchanged. It is a stats/conformance artifact, not an
+  audible fault; left alone because the gauge is shared by all platforms.
 - **Destroy does not wait for the orchestrator.** Callbacks are now gated,
   but `player.stop()` still runs after `rustplayer_player_destroy`
-  returns. Harmless for the host now; relevant to the leak above.
+  returns. Harmless for the host now, and not the cause of the memory growth.
 - **`rustplayer_player_create` blocks the main thread** for the whole wgpu
   setup (several seconds on an iPhone SE). Optional follow-up from task 2.
-- **Task 5 (cpal)** is still open. Decide who takes it with the Linux
-  agent; on this Mac it can be verified by switching the output device in
-  System Settings during the conformance run.
+- **cpal with no output device at all** (cpal pauses the stream and
+  reports DeviceNotAvailable) would still freeze the audio clock. Not
+  reproducible on a Mac with built-in output.
+- **Linux task 4 (cpal)**: the macOS side needs no change; the Linux agent
+  should still check device loss and i16-only devices there.

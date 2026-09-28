@@ -427,10 +427,33 @@ const PREPARE_READY_BUDGET: Duration = Duration::from_millis(5_000);
             }
             res = &mut cur_handle => {
                 // OLD ended before NEW even started; nothing to swap into.
-                if let Ok(Err(e)) = res {
-                    log::error!("[video] supervisor: pipeline failed during prefetch: {}", e);
+                let detail = match res {
+                    // Natural EOF during the prefetch: close as usual.
+                    Ok(Ok(())) => return Ok(()),
+                    Ok(Err(e)) => e.to_string(),
+                    Err(e) => format!("pipeline task panicked: {}", e),
+                };
+                signal_stop(&new_flag, &new_stop);
+                if stop_flag.load(Ordering::Relaxed) {
+                    return Ok(());
                 }
-                return Ok(());
+                // A failure here used to return Ok, which closed the channel
+                // and av_sync reported EndOfStream: the viewer saw the film
+                // "end" mid-way with no error. Surface it like exhausted
+                // retries instead: park the position and report the error,
+                // so the host can resume where playback stopped.
+                let pos_now = position_ms.load(Ordering::Relaxed);
+                log::error!(
+                    "[video] supervisor: pipeline failed during an ABR prefetch at {}ms: {}",
+                    pos_now, detail
+                );
+                *pending_resume.lock().unwrap() = Some(Duration::from_millis(pos_now));
+                let _ = events.send(PlayerEvent::Error {
+                    kind: PlayerErrorKind::Decoder,
+                    detail,
+                });
+                signal_stop(&stop_flag, &stop);
+                return Err("video pipeline failed during an ABR prefetch".into());
             }
         };
 

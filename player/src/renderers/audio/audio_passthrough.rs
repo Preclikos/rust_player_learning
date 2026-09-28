@@ -12,7 +12,7 @@
 //! already attached); writes happen at the audio access-unit rate (~30/s).
 
 use jni::objects::JObject;
-use jni::refs::GlobalRef;
+use jni::refs::Global;
 
 // android.media.AudioFormat
 pub const ENCODING_AC3: i32 = 5;
@@ -48,8 +48,19 @@ fn clock_monotonic_ns() -> i64 {
 }
 
 /// A compressed-bitstream `AudioTrack`. The clock source for passthrough.
+/// How long a clock read is reused. The sync loop asks for the audio position
+/// three or four times per video frame within microseconds; every ask was a
+/// JNI round trip (attach, getPlaybackHeadPosition, a new AudioTimestamp,
+/// getTimestamp, two field reads) under the track mutex, about 240 per second
+/// at 60 fps. Within this window the previous answer is returned: the media
+/// clock interpolates between sink updates anyway, so the value it sees is
+/// the same.
+const CLOCK_MEMO_NS: i64 = 2_000_000;
+
 pub struct AudioTrackSink {
-    track: GlobalRef<JObject<'static>>,
+    /// Last `played_ms` answer and when it was read (see CLOCK_MEMO_NS).
+    played_memo: std::sync::Mutex<Option<(i64, Option<u64>)>>,
+    track: Global<JObject<'static>>,
     sample_rate: u32,
     /// Set in Drop before stop/release; write/played_ms/lifecycle become no-ops
     /// so a feed or the clock touching the track mid-teardown can't hit a
@@ -75,7 +86,7 @@ pub struct AudioTrackSink {
     paused: std::sync::atomic::AtomicBool,
 }
 
-// The GlobalRef + VM handle are thread-safe to use from the audio task.
+// The Global ref + VM handle are thread-safe to use from the audio task.
 unsafe impl Send for AudioTrackSink {}
 unsafe impl Sync for AudioTrackSink {}
 
@@ -90,7 +101,7 @@ impl AudioTrackSink {
             CHANNEL_OUT_STEREO
         };
         let vm = android_vm();
-        let res: Result<GlobalRef<JObject<'static>>, jni::errors::Error> = vm.attach_current_thread(|env| {
+        let res: Result<Global<JObject<'static>>, jni::errors::Error> = vm.attach_current_thread(|env| {
             // AudioFormat.Builder().setEncoding(enc).setSampleRate(sr).setChannelMask(mask).build()
             let fb = env.new_object(
                 jni::jni_str!("android/media/AudioFormat$Builder"),
@@ -229,6 +240,7 @@ impl AudioTrackSink {
                     encoding, sample_rate, channels
                 );
                 Some(Self {
+                    played_memo: std::sync::Mutex::new(None),
                     track,
                     sample_rate,
                     stopped: std::sync::atomic::AtomicBool::new(false),
@@ -493,6 +505,7 @@ impl AudioTrackSink {
         self.call_void(jni::jni_str!("play"));
     }
     pub fn flush(&self) {
+        *self.played_memo.lock().unwrap() = None;
         self.call_void(jni::jni_str!("flush"));
         self.last_played_ms.store(0, std::sync::atomic::Ordering::Release);
     }
@@ -503,7 +516,15 @@ impl crate::renderers::AudioPassthrough for AudioTrackSink {
         AudioTrackSink::write(self, au)
     }
     fn played_ms(&self) -> Option<u64> {
-        AudioTrackSink::played_ms(self)
+        let now = clock_monotonic_ns();
+        if let Some((at, value)) = *self.played_memo.lock().unwrap() {
+            if now - at < CLOCK_MEMO_NS {
+                return value;
+            }
+        }
+        let value = AudioTrackSink::played_ms(self);
+        *self.played_memo.lock().unwrap() = Some((now, value));
+        value
     }
     fn consumed_ms(&self) -> Option<u64> {
         AudioTrackSink::consumed_ms(self)
@@ -515,6 +536,7 @@ impl crate::renderers::AudioPassthrough for AudioTrackSink {
         self.paused.load(std::sync::atomic::Ordering::Acquire)
     }
     fn set_paused(&self, paused: bool) {
+        *self.played_memo.lock().unwrap() = None;
         // Always record the desired state — the lazy start in write() reads it,
         // so a pause/resume that arrives BEFORE the first AU (during a seek or
         // initial buffer) isn't lost.

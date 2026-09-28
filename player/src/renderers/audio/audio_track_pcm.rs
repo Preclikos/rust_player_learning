@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use jni::objects::JObject;
-use jni::refs::GlobalRef;
+use jni::refs::Global;
 use tokio::sync::mpsc::{self, Sender};
 
 use super::QUEUE_CHUNKS;
@@ -63,11 +63,26 @@ fn android_vm() -> jni::JavaVM {
 }
 
 /// A 16-bit PCM `AudioTrack`. The clock source for the non-passthrough Android path.
+/// How long a clock read is reused. The sync loop asks for the audio position
+/// three or four times per video frame within microseconds; every ask was a
+/// JNI round trip (attach, getPlaybackHeadPosition, a new AudioTimestamp,
+/// getTimestamp, two field reads) under the track mutex, about 240 per second
+/// at 60 fps. Within this window the previous answer is returned: the media
+/// clock interpolates between sink updates anyway, so the value it sees is
+/// the same.
+const CLOCK_MEMO_NS: i64 = 2_000_000;
+
 pub struct AudioTrackPcmSink {
+    /// Last `presented_frames` answer and when it was read (see CLOCK_MEMO_NS).
+    clock_memo: Mutex<Option<(i64, Option<i64>)>>,
+    /// Reused Java `short[]` for `AudioTrack.write`, and its length. A new
+    /// array per write attempt (retried every 10 ms while the track buffer is
+    /// full) was steady garbage for the app's GC, on 1-2 GB TVs.
+    write_array: Mutex<Option<(jni::refs::Global<jni::objects::JShortArray<'static>>, usize)>>,
     /// The live `AudioTrack`. Behind a mutex because the stall heal can swap in
     /// a freshly built track when the current one wedges beyond client-side
     /// repair (see `recreate_track`).
-    track: Mutex<GlobalRef<JObject<'static>>>,
+    track: Mutex<Global<JObject<'static>>>,
     sample_rate: u32,
     /// Final head positions of released (recreated-away) tracks — the new
     /// track's head restarts at 0, so `played_ms` adds this base to stay
@@ -127,7 +142,7 @@ struct StallState {
     strikes: u32,
 }
 
-// The GlobalRef + VM handle are safe to use from the audio writer thread.
+// The Global ref + VM handle are safe to use from the audio writer thread.
 unsafe impl Send for AudioTrackPcmSink {}
 unsafe impl Sync for AudioTrackPcmSink {}
 
@@ -139,6 +154,8 @@ impl AudioTrackPcmSink {
             Ok(track) => {
                 log::info!("[audio-pcm] AudioTrack PCM_16BIT configured (paused): {}Hz stereo", sample_rate);
                 Some(Self {
+                    clock_memo: Mutex::new(None),
+                    write_array: Mutex::new(None),
                     track: Mutex::new(track),
                     sample_rate,
                     flush_state,
@@ -166,7 +183,7 @@ impl AudioTrackPcmSink {
     /// stall heal's `recreate_track`).
     fn build_track(
         sample_rate: u32,
-    ) -> Result<GlobalRef<JObject<'static>>, jni::errors::Error> {
+    ) -> Result<Global<JObject<'static>>, jni::errors::Error> {
         let mask = CHANNEL_OUT_STEREO;
         let vm = android_vm();
         vm.attach_current_thread(|env| {
@@ -323,6 +340,7 @@ impl AudioTrackPcmSink {
     /// its final head rolls into `head_base`, so `played_ms` stays cumulative
     /// and the clock skips over the lost span (lip-sync preserved).
     fn recreate_track(&self) -> bool {
+        *self.clock_memo.lock().unwrap() = None;
         let old_head = self.head_frames().unwrap_or(0).max(0) as u64;
         // The replacement must prime again before it is played — starting it
         // with a near-empty buffer would repeat the exact wedge being healed.
@@ -439,7 +457,7 @@ impl AudioTrackPcmSink {
             let written = vm
                 .attach_current_thread(|env| -> Result<i32, jni::errors::Error> {
                     let arr = env.new_short_array(chunk.len())?;
-                    env.set_short_array_region(&arr, 0, chunk)?;
+                    arr.set_region(env, 0, chunk)?;
                     let n = env
                         .call_method(
                             track.as_obj(),
@@ -535,10 +553,18 @@ impl AudioTrackPcmSink {
             let chunk = &pcm[off..];
             let vm = android_vm();
             let track = self.track.lock().unwrap();
+            let mut write_array = self.write_array.lock().unwrap();
             let written = vm
                 .attach_current_thread(|env| -> Result<i32, jni::errors::Error> {
-                    let arr = env.new_short_array(chunk.len())?;
-                    env.set_short_array_region(&arr, 0, chunk)?;
+                    // Grow the reused array only when a batch needs more room.
+                    if write_array.as_ref().map_or(true, |(_, len)| *len < chunk.len()) {
+                        let len = chunk.len().max(8192);
+                        let arr = env.new_short_array(len)?;
+                        *write_array = Some((env.new_global_ref(&arr)?, len));
+                    }
+                    let (arr, _) = write_array.as_ref().expect("allocated above");
+                    arr.set_region(env, 0, chunk)?;
+                    let arr_obj: &jni::objects::JObject = arr.as_ref();
                     // write(short[], offsetInShorts, sizeInShorts, WRITE_NON_BLOCKING)
                     let n = env
                         .call_method(
@@ -546,7 +572,7 @@ impl AudioTrackPcmSink {
                             jni::jni_str!("write"),
                             jni::jni_sig!("([SIII)I"),
                             &[
-                                (&arr).into(),
+                                arr_obj.into(),
                                 0i32.into(),
                                 (chunk.len() as i32).into(),
                                 WRITE_NON_BLOCKING.into(),
@@ -556,6 +582,7 @@ impl AudioTrackPcmSink {
                     Ok(n)
                 })
                 .unwrap_or(-1);
+            drop(write_array);
             drop(track);
             if written < 0 {
                 // AudioTrack.ERROR_DEAD_OBJECT: the track died under us (audio
@@ -791,6 +818,29 @@ impl AudioTrackPcmSink {
     /// process-wide so later pipelines are corrected from their first frame
     /// (same handoff-continuity trick as audio_passthrough.rs).
     fn presented_frames(&self) -> Option<i64> {
+        static READS: AtomicU64 = AtomicU64::new(0);
+        static HITS: AtomicU64 = AtomicU64::new(0);
+        let now = clock_monotonic_ns();
+        if let Some((at, value)) = *self.clock_memo.lock().unwrap() {
+            if now - at < CLOCK_MEMO_NS {
+                HITS.fetch_add(1, Ordering::Relaxed);
+                return value;
+            }
+        }
+        let value = self.presented_frames_jni();
+        *self.clock_memo.lock().unwrap() = Some((now, value));
+        let reads = READS.fetch_add(1, Ordering::Relaxed) + 1;
+        if reads % 2000 == 0 {
+            log::debug!(
+                "[audio-pcm] clock reads: {} via JNI, {} reused",
+                reads,
+                HITS.load(Ordering::Relaxed)
+            );
+        }
+        value
+    }
+
+    fn presented_frames_jni(&self) -> Option<i64> {
         use std::sync::atomic::AtomicI64;
         // Learned CONSUMED − PRESENTED gap (output latency) in frames.
         // Process-wide: seeks/heals rebuild the sink, the device latency
@@ -1046,6 +1096,7 @@ impl AudioTrackPcmSink {
     }
 
     pub fn set_paused(&self, paused: bool) {
+        *self.clock_memo.lock().unwrap() = None;
         let prev = self.paused.swap(paused, Ordering::AcqRel);
         let primed = self.primed.load(Ordering::Acquire);
         if prev != paused {

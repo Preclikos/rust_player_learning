@@ -81,4 +81,19 @@ impl Segment {
             elapsed: started.elapsed(),
         })
     }
+
+    /// [`download`](Self::download) without the copy into a `Vec`: media
+    /// segments (MBs each, 10+ MB at 4K) go straight on to the decoder task,
+    /// which joins them with the init segment into one buffer anyway. The
+    /// `to_vec` was a full extra copy of every segment.
+    pub async fn download_bytes(
+        &self,
+        http: &HttpClient,
+        kind: RequestKind,
+    ) -> Result<(bytes::Bytes, Duration), Box<dyn Error + Send + Sync>> {
+        let url = format!("{}{}", self.base_url, self.file_url);
+        let started = crate::rt::Instant::now();
+        let bytes = http.get_range(url, kind, self.start, self.end).await?;
+        Ok((bytes, started.elapsed()))
+    }
 }

@@ -30,7 +30,7 @@ use ndk::media::media_codec::{
 use ndk::media::media_format::MediaFormat;
 
 use crate::parsers::hevc;
-use crate::parsers::mp4::parse_hevc_nalu;
+use crate::parsers::mp4::hevc_nalu_bodies;
 
 use super::{
     AndroidHardwareBufferFrame, DecodedVideoFrame, DecoderError, HdrFrameMeta, HwVideoDecoder,
@@ -393,7 +393,7 @@ impl MediaCodecDecoder {
                 return Ok(None);
             }
             let jstr = env.cast_local::<jni::objects::JString>(name)?;
-            let s: String = env.get_string(&jstr)?.into();
+            let s = jstr.try_to_string(env)?;
             Ok(Some(s))
         })
         .ok()
@@ -919,7 +919,9 @@ impl HwVideoDecoder for MediaCodecDecoder {
 
         // `sample` is length-prefixed NALU (raw mdat). Convert to Annex-B
         // (start-code prefixed) — MediaCodec expects this for HEVC/H.264.
-        let nalus = parse_hevc_nalu(sample)
+        // Slices into `sample`, joined straight into `annex_b`: no per-NALU
+        // allocation and copy on the way (this runs for every video sample).
+        let nalus = hevc_nalu_bodies(sample)
             .map_err(|e| -> DecoderError { format!("NALU parse: {}", e).into() })?;
         let mut annex_b = Vec::with_capacity(sample.len() + nalus.len() * 4);
         for n in nalus {
@@ -928,8 +930,7 @@ impl HwVideoDecoder for MediaCodecDecoder {
             // pair it with the frame by pts (one access unit per submit).
             // Only bother for HDR streams; the parse is cheap but pointless
             // on the SDR ladder.
-            // NALUs here carry the 4-byte start code prefix.
-            let body = n.strip_prefix(&[0, 0, 0, 1][..]).unwrap_or(&n);
+            let body = n;
             let nal_type = hevc::nal_unit_type(body);
             // Dolby Vision RPU / enhancement-layer NALs: the platform
             // video/dolby-vision decoder NEEDS them (keep_dv_nalus), but a
@@ -988,7 +989,8 @@ impl HwVideoDecoder for MediaCodecDecoder {
                     }
                 }
             }
-            annex_b.extend_from_slice(&n);
+            annex_b.extend_from_slice(&[0, 0, 0, 1]);
+            annex_b.extend_from_slice(n);
         }
 
         if self.direct.is_some() {

@@ -177,7 +177,7 @@ pub(super) async fn download_task(
 #[derive(Debug, Clone)]
 pub(super) struct DataSegment {
     pub(super) id: usize,
-    pub(super) data: Vec<u8>,
+    pub(super) data: bytes::Bytes,
 }
 
 pub(super) fn log_task_result<T, E: std::fmt::Display>(
@@ -654,24 +654,24 @@ pub(super) async fn download_and_queue(
     http: &HttpClient,
     stats: Option<&Arc<StatsState>>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let dl = segment
-        .download(http, RequestKind::Segment)
+    let (dl_data, dl_elapsed) = segment
+        .download_bytes(http, RequestKind::Segment)
         .await
         .map_err(|e| -> Box<dyn Error + Send + Sync> {
             format!("segment download: {}", e).into()
         })?;
     if let Some(s) = stats {
-        update_bandwidth_ewma(&s.bandwidth_bps_ewma, dl.data.len(), dl.elapsed);
+        update_bandwidth_ewma(&s.bandwidth_bps_ewma, dl_data.len(), dl_elapsed);
         s.bandwidth_bytes_total
-            .fetch_add(dl.data.len() as u64, Ordering::Relaxed);
+            .fetch_add(dl_data.len() as u64, Ordering::Relaxed);
         // net_stall = how much SLOWER than realtime this segment downloaded.
         // A large segment that arrives in ~its own media duration is keeping
         // pace (no stall); only download time BEYOND that means the link can't
         // sustain the bitrate and the buffer is draining toward a real rebuffer.
-        // Measured from the network time (`dl.elapsed`) only — NOT the wall span
+        // Measured from the network time (`dl_elapsed`) only — NOT the wall span
         // that includes `send()` blocking on a full channel (healthy buffer
         // backpressure), which is what made this spike during fine playback.
-        let dl_ms = dl.elapsed.as_millis() as u64;
+        let dl_ms = dl_elapsed.as_millis() as u64;
         let seg_ms = segment
             .end_time()
             .saturating_sub(segment.start_time())
@@ -682,7 +682,7 @@ pub(super) async fn download_and_queue(
     }
     let data_segment = DataSegment {
         id: index,
-        data: dl.data,
+        data: dl_data,
     };
     if let Err(e) = sender.send(data_segment).await {
         return Err(format!("downstream receiver dropped: {:?}", e).into());

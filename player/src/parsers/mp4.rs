@@ -151,6 +151,26 @@ pub fn append_hevc_header(mut nalu_data: Vec<u8>) -> Vec<u8> {
     nalu
 }
 
+/// The NALU bodies of a length-prefixed (4-byte, big-endian) HEVC sample, as
+/// slices into it (no copy, no start codes). Same validation as
+/// [`parse_hevc_nalu`]: a length past the end is an error, 1-3 trailing bytes
+/// are ignored.
+pub fn hevc_nalu_bodies(data: &[u8]) -> Result<Vec<&[u8]>, Box<dyn Error>> {
+    let mut bodies = Vec::new();
+    let mut rest = data;
+    while rest.len() >= 4 {
+        let (prefix, body) = rest.split_at(4);
+        let length = u32::from_be_bytes(prefix.try_into().expect("4-byte prefix")) as usize;
+        if length > body.len() {
+            return Err("Invalid length: Not enough bytes in the vector".into());
+        }
+        let (nal, after) = body.split_at(length);
+        bodies.push(nal);
+        rest = after;
+    }
+    Ok(bodies)
+}
+
 /// Split a length-prefixed (4-byte, big-endian) HEVC sample into Annex-B
 /// NALUs, each returned with its `00 00 00 01` start code.
 ///
@@ -210,6 +230,18 @@ mod tests {
         let sample = [0, 0, 0, 3, 0xAA, 0xBB, 0xCC, 0, 0, 0, 1, 0xDD, 0, 0];
         let nalus = parse_hevc_nalu(&sample).unwrap();
         assert_eq!(nalus, vec![vec![0, 0, 0, 1, 0xAA, 0xBB, 0xCC], vec![0, 0, 0, 1, 0xDD]]);
+    }
+
+    #[test]
+    fn nalu_bodies_match_the_start_code_split() {
+        let sample = [0, 0, 0, 3, 0xAA, 0xBB, 0xCC, 0, 0, 0, 1, 0xDD, 0, 0];
+        let bodies = hevc_nalu_bodies(&sample).unwrap();
+        let with_codes = parse_hevc_nalu(&sample).unwrap();
+        assert_eq!(bodies.len(), with_codes.len());
+        for (b, n) in bodies.iter().zip(&with_codes) {
+            assert_eq!(&n[4..], *b);
+        }
+        assert!(hevc_nalu_bodies(&[0, 0, 0, 9, 1, 2]).is_err());
     }
 
     #[test]

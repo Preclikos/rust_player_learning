@@ -1611,6 +1611,11 @@ impl VideoRenderer {
             | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
             other => {
                 log::warn!("[gles_oes] overlay surface not available: {:?}", other);
+                // Not presented: forget the generation, or this cue change
+                // would be skipped for good and a stale (or missing)
+                // subtitle would stay on screen until the next cue.
+                self.overlay_presented_gen
+                    .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
                 return;
             }
         };
@@ -1909,6 +1914,7 @@ impl VideoRenderer {
         }
         if let Some(oes) = &self.gles_oes_renderer {
             Self::install_gles_present_hook(&new_surface, oes, &self.gles_oes_pending);
+            oes.reset_surface_hdr_metadata();
         }
         // The old surface (and its EGL window surface) drops here.
         *surface = new_surface;

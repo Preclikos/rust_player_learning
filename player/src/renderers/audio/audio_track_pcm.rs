@@ -520,6 +520,7 @@ impl AudioTrackPcmSink {
             pcm.pop();
         }
         let mut zero_streak = 0u32;
+        let mut recreated_this_batch = false;
         while off < pcm.len() {
             if self.stopped.load(Ordering::Acquire) || abort() {
                 return;
@@ -557,7 +558,28 @@ impl AudioTrackPcmSink {
                 .unwrap_or(-1);
             drop(track);
             if written < 0 {
-                return; // JNI failure — drop the batch rather than spin
+                // AudioTrack.ERROR_DEAD_OBJECT: the track died under us (audio
+                // server restart, output route change). This used to drop
+                // every later batch the same way, without ever reaching the
+                // stall self-heal, so the sink stayed mute for good. Rebuild
+                // the track once per batch and retry the write.
+                const ERROR_DEAD_OBJECT: i32 = -6;
+                if written == ERROR_DEAD_OBJECT && !recreated_this_batch {
+                    recreated_this_batch = true;
+                    log::warn!("[audio-pcm] write -> ERROR_DEAD_OBJECT; recreating the track");
+                    if self.recreate_track() {
+                        *self.stall.lock().unwrap() = StallState::default();
+                        continue;
+                    }
+                    self.discard_paced(pcm.len() - off, abort);
+                    return;
+                }
+                static WRITE_ERRORS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let n = WRITE_ERRORS.fetch_add(1, Ordering::Relaxed) + 1;
+                if n <= 5 || n % 100 == 0 {
+                    log::warn!("[audio-pcm] write -> {} (JNI failure or track error, #{}); dropping the batch", written, n);
+                }
+                return;
             }
             if written > 0 {
                 off += written as usize;

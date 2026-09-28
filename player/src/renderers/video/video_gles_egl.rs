@@ -746,6 +746,15 @@ struct HdrProgram {
 }
 
 impl GlesOesRenderer {
+    /// A new EGL window surface starts without the static HDR metadata (it
+    /// is a per-surface attribute). Called when the renderer swaps to a new
+    /// host window (Home -> back): without it a PQ passthrough session came
+    /// back washed out, because the flag said "already attached".
+    pub(crate) fn reset_surface_hdr_metadata(&self) {
+        self.hdr_metadata_set
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Initialise the GL program, VAO/VBO, and OES texture.
     /// Must be called while the EGL context is current (`AdapterContext::lock()` guard held).
     pub unsafe fn new(gl: &glow::Context) -> Result<Self, String> {

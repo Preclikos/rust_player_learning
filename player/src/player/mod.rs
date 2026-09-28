@@ -1592,8 +1592,8 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
     /// Select a subtitle track. Spawns the text_play pipeline
     /// immediately — works regardless of whether `play()` is currently
     /// running, has finished, or hasn't been called yet. Single-file
-    /// VTT downloads once then exits; CMAF streaming runs until the
-    /// segment list is exhausted or `clear_subtitle_track` fires.
+    /// VTT downloads once then exits; CMAF streaming fetches a window around
+    /// the playhead until every segment is in or `clear_subtitle_track` fires.
     pub fn set_subtitle_track(&self, representation: &crate::tracks::text::TextRepresenation) {
         *self.subtitle_representation.lock().unwrap() = Some(representation.clone());
         let _ = self.events.send(PlayerEvent::TrackChanged {
@@ -1617,8 +1617,9 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         let sink = self.video_renderer.clone();
         let active = Arc::clone(&self.subtitle_representation);
         let target_id = representation.id;
+        let position_ms = Arc::clone(&self.position_ms);
         self.rt.spawn(async move {
-            let res = text_play(repr, stop_epoch, http, sink, active, target_id).await;
+            let res = text_play(repr, stop_epoch, http, sink, active, target_id, position_ms).await;
             if let Err(e) = res {
                 log::warn!("[subs] text_play exited: {}", e);
             }

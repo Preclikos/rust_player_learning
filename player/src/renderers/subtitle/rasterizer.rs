@@ -205,25 +205,42 @@ fn wrap_line(fonts: &FontSet, line: &str, px_size: f32, max_w: i32, out: &mut Ve
         out.push(line.to_string());
         return;
     }
-    let space_w = fonts.primary.metrics(' ', px_size).advance_width;
+    let advance = |ch: char| fonts.for_char(ch).metrics(ch, px_size).advance_width;
+    wrap_words(line, max_w, &advance, out);
+}
+
+/// The wrap itself, over glyph advances from `advance`. A word wider than
+/// `max_w` on its own (CJK text has no spaces, and URLs) is broken between
+/// characters; it used to become one line running off both sides.
+fn wrap_words(line: &str, max_w: f32, advance: &dyn Fn(char) -> f32, out: &mut Vec<String>) {
+    let space_w = advance(' ');
     let mut current = String::new();
     let mut current_w = 0.0f32;
     for word in line.split_whitespace() {
-        let word_w = measure_width(fonts, word, px_size);
-        if current.is_empty() {
+        let word_w: f32 = word.chars().map(advance).sum();
+        if !current.is_empty() && current_w + space_w + word_w <= max_w {
+            current.push(' ');
+            current.push_str(word);
+            current_w += space_w + word_w;
+            continue;
+        }
+        if !current.is_empty() {
+            out.push(std::mem::take(&mut current));
+            current_w = 0.0;
+        }
+        if word_w <= max_w {
             current.push_str(word);
             current_w = word_w;
             continue;
         }
-        let candidate_w = current_w + space_w + word_w;
-        if candidate_w <= max_w {
-            current.push(' ');
-            current.push_str(word);
-            current_w = candidate_w;
-        } else {
-            out.push(std::mem::take(&mut current));
-            current.push_str(word);
-            current_w = word_w;
+        for ch in word.chars() {
+            let w = advance(ch);
+            if !current.is_empty() && current_w + w > max_w {
+                out.push(std::mem::take(&mut current));
+                current_w = 0.0;
+            }
+            current.push(ch);
+            current_w += w;
         }
     }
     if !current.is_empty() {
@@ -438,5 +455,31 @@ mod tests {
         // And the whole bitmap still has ink within its padding.
         let (a, b) = ink_span(&left);
         assert!(a < left.width && b < left.width);
+    }
+}
+
+#[cfg(test)]
+mod wrap_tests {
+    use super::wrap_words;
+
+    fn wrap(line: &str, max_w: f32) -> Vec<String> {
+        let mut out = Vec::new();
+        // Every glyph (and the space) 10 px wide.
+        wrap_words(line, max_w, &|_| 10.0, &mut out);
+        out
+    }
+
+    #[test]
+    fn words_wrap_greedily() {
+        assert_eq!(wrap("aa bb cc", 50.0), vec!["aa bb", "cc"]);
+    }
+
+    #[test]
+    fn a_word_wider_than_the_line_breaks_between_characters() {
+        // A URL, then a CJK run with no spaces at all.
+        assert_eq!(wrap("see https://x.cz/abc", 60.0), vec!["see", "https:", "//x.cz", "/abc"]);
+        assert_eq!(wrap("字幕が長すぎる", 30.0), vec!["字幕が", "長すぎ", "る"]);
+        // The tail of a broken word keeps filling its line.
+        assert_eq!(wrap("abcdefg h", 50.0), vec!["abcde", "fg h"]);
     }
 }

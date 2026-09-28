@@ -424,7 +424,8 @@ struct Inner {
     /// next]`. Kept so `set_pts_ms`, which runs every frame, can tell a
     /// PTS update that changes nothing from one that crosses a cue
     /// boundary, and only wake the worker for the latter.
-    wanted: [Option<usize>; 2],
+    /// What the worker last woke up for (see `wanted_key`).
+    wanted: WantedKey,
     /// Set by `Drop` to retire the worker.
     shutdown: bool,
     /// Longest cue duration currently in `cues`, in ms. Bounds how far
@@ -480,6 +481,52 @@ impl Inner {
         [active, next]
     }
 
+    /// What is on screen at `pts_ms`: the active cue's text and layout, or,
+    /// when cues overlap (two speakers, a sign plus dialogue), every active
+    /// cue as one block in start order with the first one's layout. Every
+    /// renderer draws a single bitmap; this used to show the first active
+    /// cue only and drop the rest.
+    fn shown_at(&self, pts_ms: i64) -> Option<(std::borrow::Cow<'_, str>, CueLayout)> {
+        let first = self.active_index(pts_ms)?;
+        let hi = self.cues.partition_point(|c| c.start_ms <= pts_ms);
+        let cue = &self.cues[first];
+        let mut rest = self.cues[first + 1..hi].iter().filter(|c| c.is_active(pts_ms)).peekable();
+        if rest.peek().is_none() {
+            return Some((std::borrow::Cow::Borrowed(cue.text.as_str()), cue.layout));
+        }
+        let mut text = cue.text.clone();
+        for other in rest {
+            text.push('\n');
+            text.push_str(&other.text);
+        }
+        Some((std::borrow::Cow::Owned(text), cue.layout))
+    }
+
+    /// The texts the worker should keep rasterized: what is shown now, and
+    /// what will be shown when the next cue starts (prefetch).
+    fn wanted_shows(&self, pts_ms: i64) -> [Option<(std::borrow::Cow<'_, str>, CueLayout)>; 2] {
+        let [_, next] = self.wanted_indices(pts_ms);
+        [self.shown_at(pts_ms), next.and_then(|i| self.shown_at(self.cues[i].start_ms))]
+    }
+
+    /// Identifies what the worker has to produce for `pts_ms`, cheaply: the
+    /// active cues (first, last, how many) and the next one. A change means
+    /// the shown block or the prefetch changed.
+    fn wanted_key(&self, pts_ms: i64) -> WantedKey {
+        let [first, next] = self.wanted_indices(pts_ms);
+        let (mut last, mut active) = (first, 0);
+        if let Some(first) = first {
+            let hi = self.cues.partition_point(|c| c.start_ms <= pts_ms);
+            for (i, c) in self.cues[first..hi].iter().enumerate() {
+                if c.is_active(pts_ms) {
+                    active += 1;
+                    last = Some(first + i);
+                }
+            }
+        }
+        WantedKey { first, last, active, next }
+    }
+
     /// Finished bitmap for `text` at roughly `target_w`, if the worker has
     /// produced one. The 5% width tolerance matches the old cache rule:
     /// a window drag resizes continuously and re-rasterizing on every
@@ -517,6 +564,15 @@ impl Inner {
         self.ready.clear();
         self.epoch += 1;
     }
+}
+
+/// See [`Inner::wanted_key`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct WantedKey {
+    first: Option<usize>,
+    last: Option<usize>,
+    active: usize,
+    next: Option<usize>,
 }
 
 /// Rasterized-at width close enough to the drawn width to reuse. Mirrors
@@ -655,7 +711,7 @@ impl SubtitleOverlay {
                 target_h: 0,
                 type_h: 0,
                 epoch: 0,
-                wanted: [None, None],
+                wanted: WantedKey::default(),
                 shutdown: false,
                 max_cue_span_ms: 0,
             }),
@@ -755,7 +811,7 @@ impl SubtitleOverlay {
             }
             // Indices shifted; force the worker to recompute rather than
             // trust `wanted`.
-            inner.wanted = [None, None];
+            inner.wanted = WantedKey::default();
         });
     }
 
@@ -766,7 +822,7 @@ impl SubtitleOverlay {
             inner.cues.clear();
             inner.max_cue_span_ms = 0;
             inner.invalidate();
-            inner.wanted = [None, None];
+            inner.wanted = WantedKey::default();
         });
     }
 
@@ -785,15 +841,11 @@ impl SubtitleOverlay {
             let mut inner = self.shared.inner.lock().unwrap();
             let resized = inner.note_target(target_w, target_h, type_h);
             let pts = inner.current_pts_ms;
+            // Borrows the cue text for the lookup (a single active cue, the
+            // normal case, allocates nothing).
             let bitmap = inner
-                .active_index(pts)
-                .and_then(|idx| {
-                    // Borrow the text for the lookup; nothing is cloned
-                    // unless we actually have a bitmap to hand back.
-                    let cue = &inner.cues[idx];
-                    inner.ready_for(cue.text.as_str(), &cue.layout, target_w)
-                })
-                .cloned();
+                .shown_at(pts)
+                .and_then(|(text, layout)| inner.ready_for(&text, &layout, target_w).cloned());
             (bitmap, resized)
         };
         if resized {
@@ -822,7 +874,7 @@ impl SubtitleOverlay {
             // Called once per frame, so this must stay cheap: two binary
             // searches, and a notify only when the playhead actually moved
             // into a different cue (roughly once every few seconds).
-            let wanted = inner.wanted_indices(pts_ms);
+            let wanted = inner.wanted_key(pts_ms);
             if wanted == inner.wanted {
                 false
             } else {
@@ -863,12 +915,8 @@ impl SubtitleOverlay {
             let resized = inner.note_target(target_w, target_h, type_h);
             let pts = inner.current_pts_ms;
             let bitmap = inner
-                .active_index(pts)
-                .and_then(|idx| {
-                    let cue = &inner.cues[idx];
-                    inner.ready_for(cue.text.as_str(), &cue.layout, target_w)
-                })
-                .cloned();
+                .shown_at(pts)
+                .and_then(|(text, layout)| inner.ready_for(&text, &layout, target_w).cloned());
             (bitmap, resized)
         };
         if resized {
@@ -1119,16 +1167,15 @@ fn next_job(inner: &Inner) -> Option<RasterJob> {
     if inner.target_w == 0 || inner.target_h == 0 {
         return None;
     }
-    for idx in inner.wanted_indices(inner.current_pts_ms).into_iter().flatten() {
-        let cue = &inner.cues[idx];
-        if inner.ready_for(cue.text.as_str(), &cue.layout, inner.target_w).is_none() {
+    for (text, layout) in inner.wanted_shows(inner.current_pts_ms).into_iter().flatten() {
+        if inner.ready_for(&text, &layout, inner.target_w).is_none() {
             return Some(RasterJob {
                 fonts: rasterizer::FontSet {
                     primary: Arc::clone(font),
                     fallback: inner.fallback.clone(),
                 },
-                text: cue.text.clone(),
-                layout: cue.layout,
+                text: text.into_owned(),
+                layout,
                 style: inner.style,
                 target_w: inner.target_w,
                 target_h: inner.target_h,
@@ -1197,7 +1244,7 @@ mod tests {
             target_h: 1080,
             type_h: 1080,
             epoch: 0,
-            wanted: [None, None],
+            wanted: WantedKey::default(),
             shutdown: false,
             max_cue_span_ms,
         }
@@ -1261,6 +1308,22 @@ mod tests {
         assert_eq!(inner.active_index(1000), Some(0));
         assert_eq!(inner.active_index(5000), Some(2));
         assert_eq!(inner.active_index(3000), Some(1));
+    }
+
+    #[test]
+    fn overlapping_cues_are_shown_together_in_start_order() {
+        let inner = inner_with(vec![cue(1000, 5000, "Sign"), cue(2000, 3000, "Speaker"), cue(6000, 7000, "Later")]);
+        let shown = |inner: &Inner, pts| inner.shown_at(pts).map(|(t, _)| t.into_owned());
+        assert_eq!(shown(&inner, 1500).as_deref(), Some("Sign"));
+        assert_eq!(shown(&inner, 2500).as_deref(), Some("Sign\nSpeaker"));
+        assert_eq!(shown(&inner, 4000).as_deref(), Some("Sign"));
+        assert_eq!(shown(&inner, 5500), None);
+        // The worker wakes when the set of active cues changes, not only the first.
+        assert_ne!(inner.wanted_key(1500), inner.wanted_key(2500));
+        assert_ne!(inner.wanted_key(2500), inner.wanted_key(4000));
+        // At 1500 the prefetch is what shows when "Speaker" starts: both.
+        let [_, prefetch] = inner.wanted_shows(1500);
+        assert_eq!(prefetch.map(|(t, _)| t.into_owned()).as_deref(), Some("Sign\nSpeaker"));
     }
 
     #[test]

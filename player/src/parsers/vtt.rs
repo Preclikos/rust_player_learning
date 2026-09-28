@@ -194,20 +194,25 @@ fn parse_fraction(pct: &str) -> Option<f32> {
         .map(|f| f / 100.0)
 }
 
+/// Same values as ExoPlayer's `parseLineAnchor`, including the older
+/// draft's `middle`.
 fn parse_line_anchor(s: &str) -> Option<Anchor> {
     match s {
         "start" => Some(Anchor::Start),
-        "center" => Some(Anchor::Middle),
+        "center" | "middle" => Some(Anchor::Middle),
         "end" => Some(Anchor::End),
         _ => None,
     }
 }
 
+/// Same values as ExoPlayer's `parsePositionAnchor`: the current
+/// `line-left`/`center`/`line-right` and the older draft's
+/// `start`/`middle`/`end`.
 fn parse_position_anchor(s: &str) -> Option<Anchor> {
     match s {
-        "line-left" => Some(Anchor::Start),
-        "center" => Some(Anchor::Middle),
-        "line-right" => Some(Anchor::End),
+        "line-left" | "start" => Some(Anchor::Start),
+        "center" | "middle" => Some(Anchor::Middle),
+        "line-right" | "end" => Some(Anchor::End),
         _ => None,
     }
 }
@@ -377,7 +382,16 @@ fn parse_timestamp(s: &str) -> Option<i64> {
         [m, s] => (0, m.parse::<i64>().ok()?, s.parse::<i64>().ok()?),
         _ => return None,
     };
-    let ms: i64 = ms_part.parse().ok()?;
+    // The fraction is decimal: ".5" is 500 ms (it used to parse as 5 ms),
+    // ".25" 250 ms; digits past milliseconds are dropped.
+    if !ms_part.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let ms = ms_part
+        .bytes()
+        .chain(std::iter::repeat(b'0'))
+        .take(3)
+        .fold(0i64, |acc, d| acc * 10 + (d - b'0') as i64);
     Some(((h * 3600 + m * 60 + sec) * 1000) + ms)
 }
 
@@ -680,6 +694,17 @@ mod tests {
     fn parses_short_timestamp_form() {
         assert_eq!(parse_timestamp("01:02.345"), Some(62345));
         assert_eq!(parse_timestamp("00:01:02.345"), Some(62345));
+        // Short and long fractions are decimal, not a millisecond count.
+        assert_eq!(parse_timestamp("00:01.5"), Some(1500));
+        assert_eq!(parse_timestamp("00:01.25"), Some(1250));
+        assert_eq!(parse_timestamp("00:01.2345"), Some(1234));
+        assert_eq!(parse_timestamp("00:01,500"), Some(1500));
+        assert_eq!(parse_timestamp("00:01"), Some(1000));
+        assert_eq!(parse_timestamp("00:01.5x"), None);
+        // Older-draft anchor names.
+        assert_eq!(parse_line_anchor("middle"), Some(Anchor::Middle));
+        assert_eq!(parse_position_anchor("start"), Some(Anchor::Start));
+        assert_eq!(parse_position_anchor("end"), Some(Anchor::End));
     }
 
     #[test]

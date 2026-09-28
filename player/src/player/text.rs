@@ -80,6 +80,7 @@ pub(super) async fn text_play<V: VideoSink>(
     video_sink: Arc<V>,
     active: Arc<StdMutex<Option<crate::tracks::text::TextRepresenation>>>,
     target_id: u32,
+    position_ms: Arc<AtomicU64>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let epoch_at_start = stop_epoch.load(Ordering::SeqCst);
     let stopped = || stop_epoch.load(Ordering::SeqCst) != epoch_at_start;
@@ -197,12 +198,28 @@ pub(super) async fn text_play<V: VideoSink>(
     };
     let _ = init.download(&http, RequestKind::InitSegment).await;
 
-    for (i, seg) in text_representation.segments.iter().enumerate() {
+    // Segments are fetched in a window around the playhead: the one under it
+    // first, then up to CMAF_LOOKAHEAD ahead. The whole title used to be
+    // fetched back to back from the first segment at start (thousands of
+    // requests on a film, competing with the video download). A seek, either
+    // way, just moves the window; what was fetched stays queued.
+    let segments = &text_representation.segments;
+    let origin = segments.first().map(|s| s.start_time()).unwrap_or_default();
+    let mut fetched = vec![false; segments.len()];
+    let mut remaining = segments.len();
+    while remaining > 0 {
         if stopped() || !still_selected(&active) {
             break;
         }
-        let dl = seg.download(&http, RequestKind::Segment).await;
-        match dl {
+        let pos = Duration::from_millis(position_ms.load(Ordering::Relaxed));
+        let Some(i) = next_text_segment(segments, &fetched, origin, pos, CMAF_LOOKAHEAD) else {
+            crate::rt::sleep(Duration::from_millis(500)).await;
+            continue;
+        };
+        fetched[i] = true;
+        remaining -= 1;
+        let seg = &segments[i];
+        match seg.download(&http, RequestKind::Segment).await {
             Ok(d) => {
                 let pts_ms = seg.start_time().as_millis() as i64;
                 let cues = crate::parsers::vtt::parse_segment(&d.data, pts_ms);
@@ -220,6 +237,27 @@ pub(super) async fn text_play<V: VideoSink>(
 }
 
 
+
+/// How far past the playhead CMAF subtitle segments are fetched.
+const CMAF_LOOKAHEAD: Duration = Duration::from_secs(60);
+
+/// The text segment to fetch next: the unfetched one under the playhead,
+/// else the first unfetched one starting within `lookahead` of it. Times are
+/// relative to the first segment (the playhead is 0-based). `None` = nothing
+/// due yet.
+fn next_text_segment(
+    segments: &[crate::tracks::segment::Segment],
+    fetched: &[bool],
+    origin: Duration,
+    pos: Duration,
+    lookahead: Duration,
+) -> Option<usize> {
+    let rel = |t: Duration| t.saturating_sub(origin);
+    let horizon = pos + lookahead;
+    (0..segments.len()).find(|&i| {
+        !fetched[i] && rel(segments[i].end_time()) > pos && rel(segments[i].start_time()) <= horizon
+    })
+}
 
 /// One line on the cue settings a track carries — the placement input the
 /// renderer honours and the first thing to check when "our subtitles sit
@@ -240,4 +278,42 @@ fn settings_summary(cues: &[crate::parsers::vtt::VttCue]) -> String {
     top.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
     let shown: Vec<String> = top.iter().take(3).map(|(s, n)| format!("{:?}×{}", s, n)).collect();
     format!("{} with settings, most common {}", with, shown.join(", "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::next_text_segment;
+    use crate::tracks::segment::Segment;
+    use std::time::Duration;
+
+    fn segs(n: u64, secs: u64, origin_s: u64) -> Vec<Segment> {
+        (0..n)
+            .map(|i| {
+                let (a, b) = ((origin_s + i * secs) * 1000, (origin_s + (i + 1) * secs) * 1000);
+                Segment::new(&"http://x/".to_string(), &format!("{i}.m4s"), 0, 0, Some(a), Some(b), Some(1000)).unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn text_segments_follow_the_playhead_window() {
+        // 100 segments of 6 s, presentation times starting at 3600 s.
+        let s = segs(100, 6, 3600);
+        let origin = s[0].start_time();
+        let ahead = Duration::from_secs(60);
+        let mut fetched = vec![false; s.len()];
+        let next = |f: &[bool], pos_s: u64| next_text_segment(&s, f, origin, Duration::from_secs(pos_s), ahead);
+        // Start at 0: segment 0 first, then only up to 60 s ahead (0..=10).
+        for want in 0..=10 {
+            assert_eq!(next(&fetched, 0), Some(want));
+            fetched[want] = true;
+        }
+        assert_eq!(next(&fetched, 0), None);
+        // Seek to 300 s: the segment under the playhead comes first.
+        assert_eq!(next(&fetched, 300), Some(50));
+        fetched[50] = true;
+        assert_eq!(next(&fetched, 300), Some(51));
+        // Seek back to 30 s: already fetched there, so only the window's tail.
+        assert_eq!(next(&fetched, 30), Some(11));
+    }
 }

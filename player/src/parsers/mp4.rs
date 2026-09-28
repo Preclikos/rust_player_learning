@@ -155,6 +155,8 @@ pub fn append_hevc_header(mut nalu_data: Vec<u8>) -> Vec<u8> {
 /// slices into it (no copy, no start codes). Same validation as
 /// [`parse_hevc_nalu`]: a length past the end is an error, 1-3 trailing bytes
 /// are ignored.
+// Only the Android MediaCodec path splits this way; the tests cover it everywhere.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
 pub fn hevc_nalu_bodies(data: &[u8]) -> Result<Vec<&[u8]>, Box<dyn Error>> {
     let mut bodies = Vec::new();
     let mut rest = data;

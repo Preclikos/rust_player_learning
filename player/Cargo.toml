@@ -43,7 +43,7 @@ serde_json = "1"
 # timestamps, so the renderer's output-latency compensation is accurate
 # on desktop + Apple too.
 bytemuck ={ version =  "1.13.1" }
-pollster = "0.4.0"
+pollster = "1.0"
 wgpu = { git = "https://github.com/Preclikos/wgpu.git" }
 # Raw window/display handle types for building wgpu surfaces from a
 # host-provided window/layer. The player is winit-free — hosts pass handles in.
@@ -70,7 +70,7 @@ unicode-normalization = "0.1"
 # compare us against do, and `encoding_rs` does the actual transcode (it
 # is already in the tree via reqwest's `charset` feature).
 encoding_rs = "0.8"
-chardetng = "0.1"
+chardetng = "1.0"
 
 # Native (everything but the browser): the Tokio runtime the engine runs
 # on, HTTP/2 for the CDN fetches, cpal for PCM output, and the Vulkan
@@ -145,21 +145,14 @@ web-sys = { version = "0.3", features = [
 # iOS links a STATIC, audio-only FFmpeg built by player/scripts/build-ffmpeg.sh
 # (ios-arm64 / ios-sim-*); see app-ios/ios/build_sim.sh for the cross link wiring.
 #
-# Pinned to 8.1 series because ffmpeg-sys-next 7.1.x ships a bindgen that
-# breaks against LLVM 22+ libclang (emits opaque struct shells with broken
-# layout asserts — fails to compile under rustc 1.95+, which bundles LLVM 22).
-# 8.1's bindgen handles LLVM 22 cleanly.
-#
-# ffmpeg-next 8.1.0 itself is patched via the workspace [patch.crates-io] to
-# add `_ =>` wildcard arms to three match statements (AVCodecID,
-# AVFrameSideDataType, AVPacketSideDataType) so it builds against FFmpeg 8.1.1+
-# headers that have new enum variants (IAMF_*, DYNAMIC_HDR_SMPTE_2094_APP5, …).
-# All target platforms ship FFmpeg 7.x system libs but the 8.x crate's
-# bindings are generated against the system headers and have stayed ABI
-# compatible.
+# Not below 8.1: ffmpeg-sys-next 7.1.x ships a bindgen that breaks against
+# LLVM 22+ libclang (opaque struct shells with broken layout asserts under
+# rustc 1.95+). 9.0 matches the newer FFmpeg enum variants with wildcard arms,
+# which the vendored 8.1.0 patch used to add. The bindings are generated
+# against the system headers, so the FFmpeg 7.x libs the platforms ship work.
 [target.'cfg(any(target_os = "windows", target_os = "linux", target_os = "macos", target_os = "ios"))'.dependencies]
-ffmpeg-next = { version = "8.1" }
-ffmpeg-sys-next = { version = "8.1" }
+ffmpeg-next = { version = "9.0" }
+ffmpeg-sys-next = { version = "9.0" }
 
 # Win/Linux: native-tls (system OpenSSL/Schannel). macOS prefers rustls
 # so we don't drag native-tls + OpenSSL into the build.

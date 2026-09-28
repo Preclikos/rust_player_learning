@@ -153,10 +153,11 @@ fn decode(bytes: &[u8], forced: Option<&str>) -> Result<(String, &'static str), 
         return Ok((text.to_string(), encoding_rs::UTF_8.name()));
     }
 
-    let mut detector = chardetng::EncodingDetector::new();
+    // ISO-2022-JP stays off, as `new()` had it before chardetng 1.0.
+    let mut detector = chardetng::EncodingDetector::new(chardetng::Iso2022JpDetection::Deny);
     detector.feed(bytes, true);
-    // `false`: we have no top-level domain to bias the guess with.
-    let enc = detector.guess(None, false);
+    // No top-level domain to bias the guess with; valid UTF-8 returned above.
+    let enc = detector.guess(None, chardetng::Utf8Detection::Deny);
     let (text, _, had_errors) = enc.decode(bytes);
     if had_errors {
         log::warn!(

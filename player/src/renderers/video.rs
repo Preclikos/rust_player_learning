@@ -2400,6 +2400,14 @@ impl VideoRenderer {
                 }
             }
         }
+
+        // The submitted draw still samples the imported image. Freeing its
+        // VkDeviceMemory (VideoFrame's Drop) or handing the decoder surface
+        // back to FFmpeg's pool (the last Arc<Video>) must wait until the GPU
+        // is done, or the memory is freed in use and the decoder can write
+        // the next picture into a surface that is still being drawn.
+        self.queue
+            .on_submitted_work_done(move || drop((video_frame, frame)));
     }
 
     /// Shared Apple Metal render path: draws an NV12 frame from two

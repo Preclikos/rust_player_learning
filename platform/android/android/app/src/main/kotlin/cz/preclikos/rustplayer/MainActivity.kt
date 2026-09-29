@@ -118,6 +118,9 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         // --ez verbose true: engine debug lines (audio clock internals etc.).
         if (intent.getBooleanExtra("verbose", false)) player.setVerboseLogging(true)
         keepAlive = intent.getBooleanExtra("keep_alive", false)
+        // Test hook: start without the video plane, so frames go through
+        // ImageReader + GLES into the overlay (the path direct mode replaced).
+        noVideoPlane = intent.getBooleanExtra("no_video_plane", false)
         // --ez overlay_on_change true: BlackZone mobile behaviour — hand the
         // overlay Surface to the player on EVERY surfaceChanged, including a
         // 180-degree rotation that changes nothing but the transform.
@@ -506,6 +509,10 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         override fun surfaceCreated(holder: SurfaceHolder) {}
         override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
             videoSurface = holder.surface
+            if (noVideoPlane) {
+                maybeStart()
+                return
+            }
             if (keepAlive && player.isStarted) {
                 player.setVideoSurface(holder.surface)
                 reattached()
@@ -515,6 +522,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         }
         override fun surfaceDestroyed(holder: SurfaceHolder) {
             videoSurface = null
+            if (noVideoPlane) return
             if (keepAlive && player.isStarted) {
                 // The player pauses itself while a surface is gone.
                 player.setVideoSurface(null)
@@ -558,6 +566,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     }
 
     private var overlayDetached = false
+    private var noVideoPlane = false
 
     /** Both planes back after a keep-alive background (the player resumes itself). */
     private fun reattached() {
@@ -568,7 +577,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
     private fun maybeStart() {
         val overlay = overlaySurface ?: return
-        val video = videoSurface ?: return
+        val video = if (noVideoPlane) null else (videoSurface ?: return)
         if (!player.isStarted) {
             traceMark("start", "url" to manifestUrl, "storm" to stormMode)
             if (stormMode) {

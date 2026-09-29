@@ -96,7 +96,7 @@ class RustPlayer(private val context: Context) {
      */
     fun start(
         overlay: Surface,
-        video: Surface,
+        video: Surface?,
         width: Int,
         height: Int,
         displayHdrTypes: Int,

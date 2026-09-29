@@ -19,7 +19,7 @@ object NativeBridge {
         context: Context,
         bridge: PlayerBridge,
         overlaySurface: Surface,
-        videoSurface: Surface,
+        videoSurface: Surface?,     // null = no video plane (frames drawn via GLES into the overlay)
         width: Int,
         height: Int,
         displayHdrTypes: Int,

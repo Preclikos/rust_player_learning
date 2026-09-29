@@ -335,14 +335,22 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeStart<'lo
             log::error!("nativeStart: ANativeWindow_fromSurface returned null");
             return 0;
         }
-        let video_window = unsafe {
-            ndk_sys::ANativeWindow_fromSurface(env.get_raw() as *mut _, video_surface.as_raw() as *mut _)
+        // A null video Surface = no video plane: frames go through ImageReader
+        // and are drawn with GLES into the overlay (the path direct mode
+        // replaced; kept reachable for diagnostics and single-surface hosts).
+        let video_window = if video_surface.is_null() {
+            std::ptr::null_mut()
+        } else {
+            let w = unsafe {
+                ndk_sys::ANativeWindow_fromSurface(env.get_raw() as *mut _, video_surface.as_raw() as *mut _)
+            };
+            if w.is_null() {
+                log::error!("nativeStart: video ANativeWindow_fromSurface returned null");
+                unsafe { ndk_sys::ANativeWindow_release(native_window) };
+                return 0;
+            }
+            w
         };
-        if video_window.is_null() {
-            log::error!("nativeStart: video ANativeWindow_fromSurface returned null");
-            unsafe { ndk_sys::ANativeWindow_release(native_window) };
-            return 0;
-        }
 
         let w = width.max(1) as u32;
         let h = height.max(1) as u32;
@@ -354,7 +362,9 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeStart<'lo
                 log::error!("nativeStart: get_java_vm: {}", e);
                 unsafe {
                     ndk_sys::ANativeWindow_release(native_window);
-                    ndk_sys::ANativeWindow_release(video_window);
+                    if !video_window.is_null() {
+                        ndk_sys::ANativeWindow_release(video_window);
+                    }
                 }
                 return 0;
             }
@@ -365,7 +375,9 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeStart<'lo
                 log::error!("nativeStart: new_global_ref(provider): {}", e);
                 unsafe {
                     ndk_sys::ANativeWindow_release(native_window);
-                    ndk_sys::ANativeWindow_release(video_window);
+                    if !video_window.is_null() {
+                        ndk_sys::ANativeWindow_release(video_window);
+                    }
                 }
                 return 0;
             }
@@ -379,8 +391,13 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeStart<'lo
             player.set_display_hdr_types(display_hdr_types as u32);
         }
         // Direct MediaCodec→Surface mode is the production path (HW video plane →
-        // native HDR/DV). Always on; the host detaches via setVideoSurface(null).
-        player.set_video_output_window(video_window as *mut c_void);
+        // native HDR/DV); the host detaches via setVideoSurface(null). Without a
+        // video Surface at start the player renders through the overlay.
+        if video_window.is_null() {
+            log::info!("nativeStart: no video Surface, frames are drawn into the overlay (GLES)");
+        } else {
+            player.set_video_output_window(video_window as *mut c_void);
+        }
 
         let config = StartConfig {
             start_position: None,

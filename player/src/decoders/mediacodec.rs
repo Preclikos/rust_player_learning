@@ -113,6 +113,14 @@ pub struct SharedDirectCodec {
     /// Surface is gone (see [`park_direct_output`]); dropped on the next
     /// real window.
     placeholder: std::sync::Mutex<Option<ImageReader>>,
+    /// Output buffers released while the output surface was being switched
+    /// (index, present time; `None` = drop), and whether a switch is running.
+    /// `setOutputSurface` holds `call_lock` for milliseconds (up to ~9 ms on
+    /// the Streamer at Home); the render thread used to block on it for each
+    /// frame it released meanwhile. It now hands the release over and the
+    /// switching thread performs it right after the switch. Both sides go
+    /// through this mutex, so a release can never be left behind.
+    deferred: std::sync::Mutex<(bool, Vec<(usize, Option<i64>)>)>,
 }
 
 /// The direct codec currently bound to the video plane ([C2]: at most one at
@@ -154,17 +162,77 @@ impl SharedDirectCodec {
     /// Point the codec at `w` (caller holds `call_lock`); the codec takes
     /// its own reference and gives up the previous window's.
     unsafe fn switch_output(&self, w: *mut ndk_sys::ANativeWindow) -> ndk_sys::media_status_t {
+        self.deferred.lock().unwrap_or_else(|e| e.into_inner()).0 = true;
+        let t0 = std::time::Instant::now();
         ndk_sys::ANativeWindow_acquire(w);
         let st = ndk_sys::AMediaCodec_setOutputSurface(self.raw, w);
+        let switch_us = t0.elapsed().as_micros();
         if st != ndk_sys::media_status_t::AMEDIA_OK {
             ndk_sys::ANativeWindow_release(w);
-            return st;
+        } else {
+            let old = self.window.swap(w, std::sync::atomic::Ordering::AcqRel);
+            if !old.is_null() {
+                ndk_sys::ANativeWindow_release(old);
+            }
         }
-        let old = self.window.swap(w, std::sync::atomic::Ordering::AcqRel);
-        if !old.is_null() {
-            ndk_sys::ANativeWindow_release(old);
+        // Still under call_lock: release what the render thread handed over,
+        // onto whichever surface the codec now has.
+        let released = {
+            let mut d = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
+            d.0 = false;
+            std::mem::take(&mut d.1)
+        };
+        // Every ABR swap switches too (~0.2-0.5 ms); Home takes 2-9 ms.
+        let level = if switch_us > 2_000 || !released.is_empty() { log::Level::Info } else { log::Level::Debug };
+        log::log!(
+            level,
+            "[mc-direct] setOutputSurface took {} us; {} frame release(s) handed over meanwhile",
+            switch_us,
+            released.len()
+        );
+        if !self.stopped.load(std::sync::atomic::Ordering::Acquire) {
+            for (index, present_ns) in released {
+                match present_ns {
+                    Some(ns) => {
+                        ndk_sys::AMediaCodec_releaseOutputBufferAtTime(self.raw, index, ns);
+                    }
+                    None => {
+                        ndk_sys::AMediaCodec_releaseOutputBuffer(self.raw, index, false);
+                    }
+                }
+            }
         }
         st
+    }
+
+    /// `call_lock` for a release, or `None` once teardown has begun. At an ABR
+    /// swap the old codec's `AMediaCodec_stop` holds the lock for ~5 ms while
+    /// the render thread releases that codec's last frames; their buffers die
+    /// with the stop, so waiting for it only held the new rung's first frame.
+    /// Every other holder keeps the lock for microseconds.
+    fn lock_unless_stopping(&self) -> Option<std::sync::MutexGuard<'_, ()>> {
+        loop {
+            match self.call_lock.try_lock() {
+                Ok(guard) => return Some(guard),
+                Err(std::sync::TryLockError::Poisoned(p)) => return Some(p.into_inner()),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    if self.stopped.load(std::sync::atomic::Ordering::Acquire) {
+                        return None;
+                    }
+                    std::thread::yield_now();
+                }
+            }
+        }
+    }
+
+    /// Hand a release to the running surface switch, if there is one.
+    /// Returns false when no switch runs (the caller releases itself).
+    fn defer_if_switching(&self, index: usize, present_ns: Option<i64>) -> bool {
+        let mut d = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
+        if d.0 {
+            d.1.push((index, present_ns));
+        }
+        d.0
     }
 }
 
@@ -244,7 +312,10 @@ impl SharedDirectCodec {
         if self.stopped.load(std::sync::atomic::Ordering::Acquire) {
             return;
         }
-        let _l = self.call_lock.lock().unwrap();
+        if self.defer_if_switching(index, Some(present_ns)) {
+            return;
+        }
+        let Some(_l) = self.lock_unless_stopping() else { return };
         let st = unsafe {
             ndk_sys::AMediaCodec_releaseOutputBufferAtTime(self.raw, index, present_ns)
         };
@@ -258,7 +329,10 @@ impl SharedDirectCodec {
         if self.stopped.load(std::sync::atomic::Ordering::Acquire) {
             return;
         }
-        let _l = self.call_lock.lock().unwrap();
+        if self.defer_if_switching(index, None) {
+            return;
+        }
+        let Some(_l) = self.lock_unless_stopping() else { return };
         let _ = unsafe { ndk_sys::AMediaCodec_releaseOutputBuffer(self.raw, index, false) };
     }
 
@@ -543,6 +617,7 @@ impl MediaCodecDecoder {
                 window: std::sync::atomic::AtomicPtr::new(window),
                 size: (params.width as i32, params.height as i32),
                 placeholder: std::sync::Mutex::new(None),
+                deferred: std::sync::Mutex::new((false, Vec::new())),
             }));
             if let Some(d) = &self.direct {
                 *LIVE_DIRECT.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::downgrade(d));

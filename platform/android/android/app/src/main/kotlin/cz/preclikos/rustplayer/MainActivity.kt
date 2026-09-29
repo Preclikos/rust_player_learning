@@ -4,6 +4,7 @@ import android.app.Activity
 import android.app.AlertDialog
 import android.graphics.Color
 import android.graphics.PixelFormat
+import android.graphics.Typeface
 import android.graphics.drawable.ColorDrawable
 import android.os.Build
 import android.os.Bundle
@@ -121,6 +122,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         // Test hook: start without the video plane, so frames go through
         // ImageReader + GLES into the overlay (the path direct mode replaced).
         noVideoPlane = intent.getBooleanExtra("no_video_plane", false)
+        hudRequested = intent.getBooleanExtra("hud", false)
         // --ez overlay_on_change true: BlackZone mobile behaviour — hand the
         // overlay Surface to the player on EVERY surfaceChanged, including a
         // 180-degree rotation that changes nothing but the transform.
@@ -186,7 +188,22 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             Gravity.BOTTOM,
         ))
 
+        hudView = TextView(this).apply {
+            typeface = Typeface.MONOSPACE
+            textSize = 10f
+            setTextColor(Color.rgb(150, 230, 150))
+            setBackgroundColor(Color.argb(190, 0, 0, 0))
+            setPadding(16, 12, 16, 12)
+            visibility = View.GONE
+        }
+        root.addView(hudView, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT,
+            FrameLayout.LayoutParams.WRAP_CONTENT,
+            Gravity.TOP or Gravity.START,
+        ))
+
         setContentView(root)
+        setHud(hudRequested)
 
         player.listener = PlayerListener()
     }
@@ -229,6 +246,10 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         bar.addView(seekBar, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         bar.addView(timeLabel)
         bar.addView(tracksButton)
+        bar.addView(Button(this).apply {
+            text = "HUD"
+            setOnClickListener { setHud(hudView.visibility != View.VISIBLE) }
+        })
         return bar
     }
 
@@ -567,6 +588,25 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
     private var overlayDetached = false
     private var noVideoPlane = false
+
+    // Debug HUD: the engine's own text (RustPlayer.debugText), refreshed once
+    // a second only while it is shown.
+    private var hudRequested = false
+    private lateinit var hudView: TextView
+    private val hudHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val hudTick = object : Runnable {
+        override fun run() {
+            if (hudView.visibility != View.VISIBLE) return
+            if (player.isStarted) hudView.text = player.debugText(10)
+            hudHandler.postDelayed(this, 1000)
+        }
+    }
+
+    private fun setHud(visible: Boolean) {
+        hudView.visibility = if (visible) View.VISIBLE else View.GONE
+        hudHandler.removeCallbacks(hudTick)
+        if (visible) hudHandler.post(hudTick)
+    }
 
     /** Both planes back after a keep-alive background (the player resumes itself). */
     private fun reattached() {

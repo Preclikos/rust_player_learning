@@ -80,6 +80,7 @@ JSON.parse(player.tracksJson()); player.setVideoTrack(adapt, repr); player.setVi
 // is the ABR-style seamless swap (next segment boundary) — a test hook, not a UI control.
 player.setAudioTrack(adapt, repr); player.setSubtitleTrack(adapt, repr); player.clearSubtitles();
 player.resize(w, h);   // drawing-buffer size in device pixels
+player.debugText(8);   // debug HUD text (debugJson() for the fields), see docs/DEBUG_HUD.md
 player.shutdown(); player.free();
 </script>
 ```

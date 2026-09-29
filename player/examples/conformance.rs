@@ -73,6 +73,7 @@ struct Args {
     max_lipsync_median_ms: i64,
     max_late_pct: f64,
     allowed_stalls: Option<u64>,
+    hud: bool,
 }
 
 fn parse_args() -> Args {
@@ -91,6 +92,7 @@ fn parse_args() -> Args {
         max_lipsync_median_ms: 40,
         max_late_pct: 2.0,
         allowed_stalls: None,
+        hud: false,
     };
     while let Some(arg) = it.next() {
         let mut val = |name: &str| it.next().unwrap_or_else(|| panic!("{name} needs a value"));
@@ -101,6 +103,7 @@ fn parse_args() -> Args {
                 a.keys.insert(kid.to_string(), key.to_string());
             }
             "--secs" => a.secs = val("--secs").parse().expect("--secs"),
+            "--hud" => a.hud = true,
             "--switches" => a.switches = val("--switches").parse().expect("--switches"),
             "--seeks" => a.seeks = val("--seeks").parse().expect("--seeks"),
             "--max-gap-ms" => a.max_gap_ms = val("--max-gap-ms").parse().expect("--max-gap-ms"),
@@ -620,7 +623,17 @@ async fn main() {
     let mut next_action = 0usize;
     let mut on_high = false;
     let mut last_lip_report = Instant::now();
+    let mut last_hud = Instant::now();
     while start.elapsed() < total {
+        // --hud: the debug HUD every 5 s (the same text every platform shows).
+        if args.hud && last_hud.elapsed() >= Duration::from_secs(5) {
+            last_hud = Instant::now();
+            let t = std::time::Instant::now();
+            let text = player.debug_snapshot().lines(6).join("
+");
+            eprintln!("[conformance] HUD (built in {} us)
+{}", t.elapsed().as_micros(), text);
+        }
         tokio::time::sleep(Duration::from_millis(250)).await;
         while next_action < actions.len() && start.elapsed() >= actions[next_action].0 {
             let (_, what) = &actions[next_action];

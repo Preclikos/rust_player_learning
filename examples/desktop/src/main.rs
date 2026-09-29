@@ -17,6 +17,9 @@ struct App {
     last_frame_time: Instant,
     frame_count: u32,
     player: Option<Player>,
+    /// H toggles a 1 Hz debug HUD dump to the terminal.
+    hud: bool,
+    last_hud: Instant,
 }
 
 impl ApplicationHandler for App {
@@ -86,6 +89,13 @@ impl ApplicationHandler for App {
                 }
                 self.last_frame_time = Instant::now();
 
+                if self.hud && self.last_hud.elapsed() >= Duration::from_secs(1) {
+                    self.last_hud = Instant::now();
+                    println!("
+{}", player.debug_snapshot().lines(8).join("
+"));
+                }
+
                 window.request_redraw();
             }
             WindowEvent::Resized(size) => {
@@ -111,6 +121,10 @@ impl ApplicationHandler for App {
                         player.pause();
                     }
                     log::info!("space: paused={}", player.is_paused());
+                }
+                (PhysicalKey::Code(KeyCode::KeyH), ElementState::Pressed) => {
+                    self.hud = !self.hud;
+                    log::info!("debug HUD {}", if self.hud { "on" } else { "off" });
                 }
                 (PhysicalKey::Code(KeyCode::KeyF), ElementState::Pressed) => {
                     window.set_fullscreen(Some(Fullscreen::Borderless(None)));
@@ -157,6 +171,8 @@ async fn main() {
         last_frame_time: Instant::now(),
         frame_count: 0,
         player: None,
+        hud: false,
+        last_hud: Instant::now(),
     };
     _ = event_loop.run_app(&mut app);
 

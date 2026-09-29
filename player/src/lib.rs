@@ -14,6 +14,7 @@ mod crypto;
 mod crypto_web;
 mod decoders;
 mod events;
+mod debug;
 mod ffmpeg_log;
 mod hdr_tonemap;
 mod manifest;
@@ -39,6 +40,9 @@ pub use capabilities::{capabilities, probe_capabilities, PlayerCapabilities};
 /// types stay reachable through its public `video`/`audio`/`text` fields — a
 /// consumer reads them via inference (no need to name the inner types).
 pub use tracks::Tracks;
+pub use debug::{
+    DebugAbr, DebugAudio, DebugLogEntry, DebugNetwork, DebugPipeline, DebugSession, DebugSnapshot, DebugSync, DebugVideo,
+};
 pub use events::{
     BufferingReason, Fps, PlayerErrorKind, PlayerEvent, TrackInfo, TrackKind,
 };

@@ -23,6 +23,8 @@ pub(super) async fn download_task(
     stop_flag: Arc<AtomicBool>,
     http: Arc<HttpClient>,
     stats: Option<Arc<StatsState>>,
+    // Which debug-HUD counters this pipeline feeds.
+    track: crate::debug::Track,
     on_segment_done: Option<SegmentDoneCallback>,
     // Upper-exclusive segment index. Default `usize::MAX` means "no soft
     // limit, run to natural EOF". The supervisor lowers this on ABR
@@ -115,7 +117,7 @@ pub(super) async fn download_task(
             }
             let sender = segment_sender.clone();
             let outcome = tokio::select! {
-                res = download_and_queue(i, seg, sender, &http, stats.as_ref()) => Some(res),
+                res = download_and_queue(i, seg, sender, &http, stats.as_ref(), track) => Some(res),
                 _ = stop.notified() => None,
             };
             match outcome {
@@ -138,6 +140,10 @@ pub(super) async fn download_task(
                         "[dl] segment {} failed, retrying in {:?}: {}",
                         i, backoff, e
                     );
+                    if let Some(s) = &stats {
+                        s.debug.track(track).retries.fetch_add(1, Ordering::Relaxed);
+                        s.debug.log("net", format!("{track:?} segment {i} failed, retry in {backoff:?}: {e}"));
+                    }
                     last_err = Some(e);
                     tokio::select! {
                         _ = crate::rt::sleep(backoff) => {}
@@ -653,6 +659,7 @@ pub(super) async fn download_and_queue(
     sender: Sender<DataSegment>,
     http: &HttpClient,
     stats: Option<&Arc<StatsState>>,
+    track: crate::debug::Track,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let (dl_data, dl_elapsed) = segment
         .download_bytes(http, RequestKind::Segment)
@@ -684,8 +691,24 @@ pub(super) async fn download_and_queue(
         id: index,
         data: dl_data,
     };
+    let (bytes, media_ms) = (
+        data_segment.data.len() as u64,
+        segment.end_time().saturating_sub(segment.start_time()).as_millis() as u64,
+    );
     if let Err(e) = sender.send(data_segment).await {
         return Err(format!("downstream receiver dropped: {:?}", e).into());
+    }
+    // Debug HUD, once per segment: what arrived and how full the queue to the
+    // decoder is right after it went in.
+    if let Some(s) = stats {
+        let t = s.debug.track(track);
+        t.segments.fetch_add(1, Ordering::Relaxed);
+        t.last_index.store(index as u64, Ordering::Relaxed);
+        t.last_kib.store(bytes / 1024, Ordering::Relaxed);
+        t.last_download_ms.store(dl_elapsed.as_millis() as u64, Ordering::Relaxed);
+        t.last_media_ms.store(media_ms, Ordering::Relaxed);
+        t.capacity.store(sender.max_capacity() as u64, Ordering::Relaxed);
+        t.queued.store((sender.max_capacity() - sender.capacity()) as u64, Ordering::Relaxed);
     }
     Ok(())
 }

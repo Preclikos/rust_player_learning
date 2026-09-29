@@ -3332,6 +3332,15 @@ impl VideoRenderer {
 }
 
 impl super::VideoSink for VideoRenderer {
+    fn debug_output(&self) -> String {
+        let (format, mode) = match self.surface_config.as_ref().and_then(|c| c.try_read().ok()) {
+            Some(c) => (format!("{:?}", c.format), format!("{:?}", c.present_mode)),
+            None => ("-".into(), "-".into()),
+        };
+        let size = self.inner_size();
+        format!("wgpu {:?}  surface {}x{} {format} {mode}", self.backend, size.width, size.height)
+    }
+
     #[cfg(target_os = "android")]
     fn set_android_surface(&self, window: usize) -> impl std::future::Future<Output = ()> + Send + '_ {
         VideoRenderer::set_android_surface(self, window)

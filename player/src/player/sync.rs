@@ -125,7 +125,7 @@ pub(super) async fn video_sync_loop<V: VideoSink, A: AudioSink>(
     position_ms: Arc<AtomicU64>,
     stop: Arc<Notify>,
     stop_flag: Arc<AtomicBool>,
-    events: Arc<broadcast::Sender<PlayerEvent>>,
+    events: Arc<crate::debug::EventBus>,
     media_duration: Duration,
     paused: Arc<AtomicBool>,
     pause_notify: Arc<Notify>,
@@ -748,6 +748,9 @@ pub(super) async fn video_sync_loop<V: VideoSink, A: AudioSink>(
                 stats.last_decoded_pts_ms.load(Ordering::Relaxed) - raw_pts_ms as i64;
             let a_ahead =
                 stats.audio_last_decoded_pts_ms.load(Ordering::Relaxed) - raw_pts_ms as i64;
+            stats.debug.video_ahead_ms.store(v_ahead, Ordering::Relaxed);
+            stats.debug.audio_ahead_ms.store(a_ahead, Ordering::Relaxed);
+            stats.debug.net_stall_last_ms.store(net_stall, Ordering::Relaxed);
             let _ = events.send(PlayerEvent::Stats {
                 position_ms: position_ms.load(Ordering::Relaxed),
                 video_frames_decoded: decoded_total,
@@ -815,7 +818,7 @@ pub(super) async fn audio_sync_loop<A: AudioSink>(
     stop: Arc<Notify>,
     stop_flag: Arc<AtomicBool>,
     stats: Arc<StatsState>,
-    events: Arc<broadcast::Sender<PlayerEvent>>,
+    events: Arc<crate::debug::EventBus>,
     paused: Arc<AtomicBool>,
     at_target: Arc<VideoAtTarget>,
 ) {
@@ -994,7 +997,7 @@ pub(super) async fn av_sync_handler<V: VideoSink, A: AudioSink>(
     audio_sink: Arc<A>,
     stop: Arc<Notify>,
     stop_flag: Arc<AtomicBool>,
-    events: Arc<broadcast::Sender<PlayerEvent>>,
+    events: Arc<crate::debug::EventBus>,
     media_duration: Duration,
     paused: Arc<AtomicBool>,
     pause_notify: Arc<Notify>,

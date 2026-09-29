@@ -158,6 +158,21 @@ class RustPlayer(private val context: Context) {
 
     fun tracksJson(): String = if (handle != 0L) NativeBridge.nativeGetTracksJson(handle) else "{}"
 
+    /**
+     * Debug HUD snapshot JSON: pipelines (segments, queue, buffer, last
+     * download), decoder and output paths (incl. passthrough), sync, network,
+     * ABR and the recent event log. Built on call — poll at 1-2 Hz only while
+     * a HUD is visible.
+     */
+    fun debugJson(): String = if (handle != 0L) NativeBridge.nativeDebugJson(handle) else "{}"
+
+    /**
+     * The same snapshot as ready-made HUD text (one line per '\n'), ending with
+     * the [events] newest event-log lines. Identical on every platform.
+     */
+    fun debugText(events: Int = 8): String =
+        if (handle != 0L) NativeBridge.nativeDebugText(handle, events) else ""
+
     fun selectVideo(adapt: Int, repr: Int) {
         if (handle != 0L) NativeBridge.nativeSetVideoTrack(handle, adapt, repr)
     }

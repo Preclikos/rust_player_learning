@@ -13,6 +13,8 @@ pub(super) struct PreparedSegment {
     id: usize,
     data_vec: Vec<u8>,
     sample_info: Vec<(usize, usize, i64, u64)>,
+    /// Join + decrypt + parse time on the prepare thread (debug HUD).
+    prepare_ms: u64,
 }
 
 pub(super) type PrepareHandle =
@@ -97,6 +99,7 @@ pub(super) fn prepare_segment(
                 id: segment.id,
                 data_vec,
                 sample_info,
+                prepare_ms: (copy_ms + dec_ms + parse_ms) as u64,
             })
         })
     }
@@ -148,6 +151,7 @@ fn prepare_blocking(
         id: segment.id,
         data_vec,
         sample_info,
+        prepare_ms: (copy_ms + dec_ms + parse_ms) as u64,
     })
 }
 
@@ -314,11 +318,28 @@ pub(super) async fn video_decoder_task(
             pending_prepare = Some(prepare(next));
         }
         let boundary_ms = boundary_t0.elapsed().as_millis();
+        stats
+            .debug
+            .track(crate::debug::Track::Video)
+            .last_prepare_ms
+            .store(prepared.prepare_ms, Ordering::Relaxed);
         if boundary_ms > 50 {
             log::info!(
                 "[dec] segment {} boundary stall {}ms ({} samples, {} KiB)",
                 prepared.id, boundary_ms,
                 prepared.sample_info.len(), prepared.data_vec.len() / 1024
+            );
+            stats.debug.boundary_stalls.fetch_add(1, Ordering::Relaxed);
+            stats.debug.boundary_stall_last_ms.store(boundary_ms as u64, Ordering::Relaxed);
+            stats.debug.log(
+                "decode",
+                format!(
+                    "segment {} boundary stall {} ms (prepare {} ms, {} KiB)",
+                    prepared.id,
+                    boundary_ms,
+                    prepared.prepare_ms,
+                    prepared.data_vec.len() / 1024
+                ),
             );
         }
         log::debug!("[dec] consuming video segment: {}", prepared.id);
@@ -528,6 +549,10 @@ pub(super) async fn drain_video_decoder(
                                 "[abr] NEW first frame {}ms after OLD teardown (pts={}ms)",
                                 sp.started.elapsed().as_millis(),
                                 to_send.pts_us / 1000
+                            );
+                            stats.debug.log(
+                                "abr",
+                                format!("new rung's first frame {} ms after the old one ended", sp.started.elapsed().as_millis()),
                             );
                         }
                     }

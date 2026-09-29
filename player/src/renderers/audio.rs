@@ -454,6 +454,40 @@ impl super::AudioSink for AudioRenderer {
         self.passthrough.lock().unwrap().is_some()
     }
 
+    fn debug_output(&self) -> String {
+        if let Some(pt) = self.passthrough.lock().unwrap().as_ref() {
+            return format!("passthrough {}", pt.debug_output());
+        }
+        #[cfg(target_os = "android")]
+        {
+            return match self.pcm_sink.as_ref() {
+                Some(s) => s.debug_output(),
+                None => "no AudioTrack (video on the wall clock)".to_string(),
+            };
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            let played = super::AudioSink::played_ms(self)
+                .map(|ms| format!("{:.1}s", ms as f64 / 1000.0))
+                .unwrap_or_else(|| "-".into());
+            #[cfg(target_arch = "wasm32")]
+            let backend = if self.output_running.load(Ordering::Relaxed) {
+                "Web Audio (running)"
+            } else {
+                "Web Audio (suspended: no user gesture yet?)"
+            };
+            #[cfg(not(target_arch = "wasm32"))]
+            let backend = "cpal";
+            format!(
+                "{backend} {} Hz {} ch  played {played}  device latency {} ms{}",
+                self.sample_rate,
+                self.channels,
+                AudioRenderer::output_latency_ms(self),
+                if self.paused_flag.load(Ordering::Relaxed) { "  paused" } else { "" }
+            )
+        }
+    }
+
     fn set_passthrough(&self, pt: Option<Arc<dyn super::AudioPassthrough>>) {
         // Engaging passthrough silences the cpal PCM path so it doesn't fight
         // the compressed AudioTrack for the HDMI output (concurrent PCM

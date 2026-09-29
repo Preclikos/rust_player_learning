@@ -76,7 +76,7 @@ pub(crate) async fn audio_output_watchdog<A: AudioSink>(
     gen: u64,
     audio_sink: Arc<A>,
     stats: Arc<StatsState>,
-    events: Arc<broadcast::Sender<PlayerEvent>>,
+    events: Arc<crate::debug::EventBus>,
     paused: Arc<AtomicBool>,
     stop: Arc<Notify>,
     stop_flag: Arc<AtomicBool>,
@@ -202,6 +202,10 @@ pub(crate) async fn audio_output_watchdog<A: AudioSink>(
                      {stood_ms}ms while playing — rebuilding the pipeline to get sound back"
                 );
                 stats.audio_output_rebuilds.fetch_add(1, Ordering::Relaxed);
+                stats.debug.log(
+                    "audio",
+                    format!("output stopped at {played} ms for {stood_ms} ms, rebuilding the pipeline"),
+                );
 
                 // Park the picture behind a spinner first: the user should see
                 // that something is being fixed, not a movie that went mute.
@@ -248,7 +252,7 @@ mod tests {
     struct WatchdogRig {
         sink: Arc<TestSink>,
         stats: Arc<StatsState>,
-        events: Arc<broadcast::Sender<PlayerEvent>>,
+        events: Arc<crate::debug::EventBus>,
         rx: broadcast::Receiver<PlayerEvent>,
         paused: Arc<AtomicBool>,
         stop: Arc<Notify>,
@@ -258,11 +262,13 @@ mod tests {
     }
 
     fn rig() -> WatchdogRig {
-        let (tx, rx) = broadcast::channel(64);
+        let stats = Arc::new(StatsState::default());
+        let events = Arc::new(crate::debug::EventBus::new(64, Arc::clone(&stats)));
+        let rx = events.subscribe();
         WatchdogRig {
             sink: Arc::new(TestSink::new(1_000)),
-            stats: Arc::new(StatsState::default()),
-            events: Arc::new(tx),
+            stats,
+            events,
             rx,
             paused: Arc::new(AtomicBool::new(false)),
             stop: Arc::new(Notify::new()),

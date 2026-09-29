@@ -17,6 +17,12 @@ use crate::PhysicalSize;
 /// Implementations swap per platform (wgpu NV12 on desktop, GLES OES on Android).
 pub trait VideoSink: Send + Sync + 'static {
     fn render_frame(&self, frame: DecodedVideoFrame) -> impl Future<Output = ()> + Send + '_;
+
+    /// One line for the debug HUD: how frames reach the screen. Called at
+    /// HUD refresh rate only; empty = unknown.
+    fn debug_output(&self) -> String {
+        String::new()
+    }
     fn resize(&self, size: PhysicalSize<u32>) -> impl Future<Output = ()> + Send + '_;
     fn change_frame_size(&self, size: PhysicalSize<u32>) -> impl Future<Output = ()> + Send + '_;
 
@@ -125,6 +131,11 @@ pub trait AudioPassthrough: Send + Sync {
     fn head_debug(&self) -> (bool, i64) {
         (false, 0)
     }
+    /// One line for the debug HUD: format, what was written, what played,
+    /// what is still queued in the device. Called at HUD refresh rate only.
+    fn debug_output(&self) -> String {
+        String::new()
+    }
 }
 
 /// Receives decoded PCM audio and feeds it to the output device.
@@ -218,5 +229,11 @@ pub trait AudioSink: Send + Sync + 'static {
     /// so the TUI can draw a tiny VU meter.
     fn last_peak_db(&self) -> Option<[f32; 2]> {
         None
+    }
+
+    /// One line for the debug HUD describing the output (backend, format,
+    /// played / queued). Called at HUD refresh rate only; empty = unknown.
+    fn debug_output(&self) -> String {
+        String::new()
     }
 }

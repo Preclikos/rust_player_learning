@@ -285,6 +285,20 @@ impl BridgeHandle {
         self.tracks_json.lock().unwrap().clone()
     }
 
+    /// Debug HUD snapshot as JSON (`player::DebugSnapshot`): pipelines,
+    /// segments, buffers, decoder / output paths, sync, network, ABR and the
+    /// recent event log. Built on call from counters the player keeps
+    /// anyway; poll it at 1-2 Hz while a HUD is visible, not otherwise.
+    pub fn debug_json(&self) -> String {
+        self.player.debug_snapshot().to_json()
+    }
+
+    /// The same snapshot as ready-made HUD text, one line per `\n`, ending
+    /// with the `events` newest event-log lines. Identical on every platform.
+    pub fn debug_text(&self, events: usize) -> String {
+        self.player.debug_snapshot().lines(events).join("\n")
+    }
+
     /// Manual quality switch — the one a UI wires to its quality menu. Hard
     /// and immediate: the pipeline restarts on the chosen representation at
     /// the current position and ABR drops to Manual, so the user sees what

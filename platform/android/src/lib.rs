@@ -560,6 +560,43 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeGetTracks
     })
 }
 
+/// Debug HUD snapshot JSON (see `BridgeHandle::debug_json`), or `"{}"`.
+#[no_mangle]
+pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeDebugJson<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) -> jstring {
+    with_env_or("nativeDebugJson", &mut env, std::ptr::null_mut(), move |env| {
+        let json = unsafe { handle_ref(handle) }
+            .map(|h| h.bridge.debug_json())
+            .unwrap_or_else(|| "{}".to_string());
+        match env.new_string(json) {
+            Ok(s) => s.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        }
+    })
+}
+
+/// Debug HUD text with the `events` newest event-log lines, or "".
+#[no_mangle]
+pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeDebugText<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    events: jint,
+) -> jstring {
+    with_env_or("nativeDebugText", &mut env, std::ptr::null_mut(), move |env| {
+        let text = unsafe { handle_ref(handle) }
+            .map(|h| h.bridge.debug_text(events.max(0) as usize))
+            .unwrap_or_default();
+        match env.new_string(text) {
+            Ok(s) => s.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        }
+    })
+}
+
 #[no_mangle]
 pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetVideoTrack(
     _env: EnvUnowned,

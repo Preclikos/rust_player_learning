@@ -54,6 +54,11 @@ void rustplayer_player_set_wrapped_licence(void *handle, const char *url, const 
 
 // Tracks. Returns a heap C string the caller MUST free with rustplayer_string_free.
 char *rustplayer_player_tracks_json(void *handle);
+// Debug HUD snapshot (JSON) and the same as text lines ending with `events`
+// event-log lines. Built on call: poll at 1-2 Hz while a HUD is shown.
+// Free both with rustplayer_string_free.
+char *rustplayer_player_debug_json(void *handle);
+char *rustplayer_player_debug_text(void *handle, uint32_t events);
 void rustplayer_string_free(char *s);
 void rustplayer_player_select_video(void *handle, uint32_t adapt, uint32_t repr, bool soft);
 void rustplayer_player_select_video_auto(void *handle);

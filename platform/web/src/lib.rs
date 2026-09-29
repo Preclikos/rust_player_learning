@@ -379,6 +379,19 @@ impl RustPlayer {
     pub fn tracks_json(&self) -> String {
         self.handle.tracks_json()
     }
+    /// Debug HUD snapshot JSON (pipelines, segments, buffers, decoder and
+    /// output paths, sync, network, ABR, recent event log). Built on call:
+    /// poll at 1-2 Hz while a HUD is shown.
+    #[wasm_bindgen(js_name = debugJson)]
+    pub fn debug_json(&self) -> String {
+        self.handle.debug_json()
+    }
+    /// The same as ready-made HUD text lines ending with the `events` newest
+    /// event-log lines. Identical on every platform.
+    #[wasm_bindgen(js_name = debugText)]
+    pub fn debug_text(&self, events: u32) -> String {
+        self.handle.debug_text(events as usize)
+    }
     /// Manual quality switch: immediate (pipeline restart at the current
     /// position) and locks ABR to manual. Wire the quality menu to this.
     #[wasm_bindgen(js_name = setVideoTrack)]

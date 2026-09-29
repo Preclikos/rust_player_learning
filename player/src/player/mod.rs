@@ -178,6 +178,8 @@ enum StallSide {
 /// accumulating across seek / track-switch boundaries.
 #[derive(Default)]
 pub(crate) struct StatsState {
+    /// Debug HUD counters and event log (see `crate::debug`).
+    pub(crate) debug: crate::debug::DebugCounters,
     video_frames_decoded: AtomicU64,
     video_frames_dropped: AtomicU64,
     /// Frames presented >45 ms after their master-clock time (shown, not
@@ -394,7 +396,7 @@ pub struct Player<V: VideoSink = VideoRenderer, A: AudioSink = AudioRenderer> {
     /// Broadcast(64) sender for `PlayerEvent`s. Cloning a `Player` shares
     /// the same channel, so every subscriber sees every event regardless
     /// of which Player handle emitted it.
-    events: Arc<broadcast::Sender<PlayerEvent>>,
+    events: Arc<crate::debug::EventBus>,
 
     /// Pause flag — checked in both video_sync_loop and audio_sync_loop
     /// inner ticks. Toggled by `pause()` / `resume()`. While set, both
@@ -731,8 +733,10 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         let audio_ready = Arc::new(Notify::new());
         let stop = Arc::new(Notify::new());
 
-        let (events_tx, _) = broadcast::channel::<PlayerEvent>(64);
-        let events = Arc::new(events_tx);
+        let stats = Arc::new(StatsState::default());
+        let position_ms = Arc::new(AtomicU64::new(0));
+        stats.debug.attach_position(Arc::clone(&position_ms));
+        let events = Arc::new(crate::debug::EventBus::new(64, Arc::clone(&stats)));
         // Emit the initial Idle state so freshly-constructed subscribers
         // see something on their first recv() if they happen to subscribe
         // before any state transition.
@@ -763,11 +767,11 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             seek_target: Arc::new(RwLock::new(None)),
             stop_epoch: Arc::new(AtomicU64::new(0)),
             rebuild_reason: Arc::new(StdMutex::new(BufferingReason::Initial)),
-            position_ms: Arc::new(AtomicU64::new(0)),
+            position_ms,
 
             decryptor: Arc::new(StdMutex::new(None)),
 
-            stats: Arc::new(StatsState::default()),
+            stats,
             abr_strategy: Arc::new(ArcSwap::from_pointee(AbrStrategy::default())),
             abr_video_profile: Arc::new(ArcSwap::from_pointee(AbrVideoProfile::default())),
             abr_switch_at: Arc::new(StdMutex::new(None)),
@@ -1377,9 +1381,12 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
     /// nothing plays unseen in the background.
     fn surface_gone(&self, plane: SurfacePlane) {
         let h = &self.surface_hold;
-        match plane {
-            SurfacePlane::Video => h.video_gone.store(true, Ordering::SeqCst),
-            SurfacePlane::Overlay => h.overlay_gone.store(true, Ordering::SeqCst),
+        let was_gone = match plane {
+            SurfacePlane::Video => h.video_gone.swap(true, Ordering::SeqCst),
+            SurfacePlane::Overlay => h.overlay_gone.swap(true, Ordering::SeqCst),
+        };
+        if !was_gone {
+            self.stats.debug.log("surface", format!("{plane:?} surface gone"));
         }
         if !self.paused.load(Ordering::SeqCst) && !h.held.swap(true, Ordering::SeqCst) {
             log::info!("[player] {:?} surface gone — pausing until it is back on screen", plane);
@@ -1391,9 +1398,13 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
     /// attached again, and only if the pause was ours (a user pause stays).
     fn surface_back(&self, plane: SurfacePlane) {
         let h = &self.surface_hold;
-        match plane {
-            SurfacePlane::Video => h.video_gone.store(false, Ordering::SeqCst),
-            SurfacePlane::Overlay => h.overlay_gone.store(false, Ordering::SeqCst),
+        let was_gone = match plane {
+            SurfacePlane::Video => h.video_gone.swap(false, Ordering::SeqCst),
+            SurfacePlane::Overlay => h.overlay_gone.swap(false, Ordering::SeqCst),
+        };
+        // A window handed over again at a pipeline spawn is not news.
+        if was_gone {
+            self.stats.debug.log("surface", format!("{plane:?} surface back"));
         }
         if h.video_gone.load(Ordering::SeqCst) || h.overlay_gone.load(Ordering::SeqCst) {
             return;
@@ -2294,6 +2305,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                     audio = if let Some(sink) = pt_sink {
                         drop(sample_sender);
                         log::info!("[audio] passthrough engaged ({})", audio_representation.codecs);
+                        stats.debug.log("audio", format!("passthrough engaged ({})", audio_representation.codecs));
                         crate::rt::spawn(audio_passthrough_play(
                             audio_representation,
                             audio_start_index,
@@ -2414,6 +2426,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
     }
 
     pub fn seek(&self, target: Duration) {
+        self.stats.debug.log("seek", format!("seek to {:.1} s", target.as_secs_f64()));
         *self.rebuild_reason.lock().unwrap() = BufferingReason::Seek;
         self.seek_internal(target)
     }
@@ -2456,6 +2469,144 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
 
     pub fn position(&self) -> Duration {
         Duration::from_millis(self.position_ms.load(Ordering::Relaxed))
+    }
+
+    /// Everything a debug HUD shows (see [`crate::DebugSnapshot`]): state,
+    /// both pipelines (segments, queue, buffer, last download), decoder and
+    /// output paths, sync, network, ABR and the recent event log.
+    ///
+    /// Built from counters the player keeps anyway; nothing extra runs while
+    /// no one asks. Call it at HUD refresh rate (1-2 Hz) while a HUD is shown.
+    /// `DebugSnapshot::lines` renders the same content as text for hosts that
+    /// just want to draw it.
+    pub fn debug_snapshot(&self) -> crate::DebugSnapshot {
+        use crate::debug::{
+            DebugAbr, DebugAudio, DebugNetwork, DebugPipeline, DebugSession, DebugSync, DebugVideo, Track,
+        };
+        let st = &self.stats;
+        let d = &st.debug;
+        let load = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        let pipeline = |track: Track, ahead: i64| {
+            let c = d.track(track);
+            DebugPipeline {
+                buffer_ahead_ms: ahead,
+                segment: load(&c.last_index),
+                segments_downloaded: load(&c.segments),
+                queued: load(&c.queued),
+                capacity: load(&c.capacity),
+                last_segment_kib: load(&c.last_kib),
+                last_segment_download_ms: load(&c.last_download_ms),
+                last_segment_media_ms: load(&c.last_media_ms),
+                retries: load(&c.retries),
+            }
+        };
+        let state = if self.surface_hold.held.load(Ordering::Relaxed) {
+            "held (surface gone)"
+        } else if self.paused.load(Ordering::Relaxed) {
+            "paused"
+        } else if st.video_starving.load(Ordering::Relaxed) || st.audio_starving.load(Ordering::Relaxed) {
+            "buffering"
+        } else {
+            "playing"
+        };
+
+        let renderer_output = self.video_renderer.debug_output();
+        #[cfg(target_os = "android")]
+        let video_output = if self.video_output_window.is_set() {
+            format!("MediaCodec direct -> video plane; overlay (subtitles): {renderer_output}")
+        } else {
+            format!("ImageReader + GLES into the overlay; {renderer_output}")
+        };
+        #[cfg(not(target_os = "android"))]
+        let video_output = renderer_output;
+        let mut video = DebugVideo {
+            decoder: st.decoder_name.lock().unwrap().clone(),
+            output: video_output,
+            frames_decoded: load(&st.video_frames_decoded),
+            frames_dropped: load(&st.video_frames_dropped),
+            frames_late: load(&st.video_late_frames),
+            last_prepare_ms: load(&d.track(Track::Video).last_prepare_ms),
+            boundary_stalls: load(&d.boundary_stalls),
+            boundary_stall_last_ms: load(&d.boundary_stall_last_ms),
+            render_gap_max_ms: load(&st.render_gap_max_ms),
+            judder_frames: load(&st.judder_frames),
+            interval_hist: [load(&st.int_lt25), load(&st.int_25_41), load(&st.int_42_58), load(&st.int_gt58)],
+            pipeline: pipeline(Track::Video, d.video_ahead_ms.load(Ordering::Relaxed)),
+            ..Default::default()
+        };
+        // Read the fields in place: cloning the representation would copy its
+        // whole segment list.
+        if let Some(r) = self.video_representation.lock().unwrap().as_ref() {
+            video.representation = Some(r.id);
+            video.codec = r.codecs.clone();
+            video.width = r.width;
+            video.height = r.height;
+            video.bandwidth_bps = r.bandwidth;
+        }
+        let mut audio = DebugAudio {
+            passthrough: self.audio_renderer.is_passthrough(),
+            output: self.audio_renderer.debug_output(),
+            underruns: load(&st.audio_underruns),
+            peak_db: self.audio_renderer.last_peak_db(),
+            pipeline: pipeline(Track::Audio, d.audio_ahead_ms.load(Ordering::Relaxed)),
+            ..Default::default()
+        };
+        if let Some(r) = self.audio_representation.lock().unwrap().as_ref() {
+            audio.representation = Some(r.id);
+            audio.codec = r.codecs.clone();
+            audio.channels = r.channels;
+            audio.sample_rate = r.audio_sampling_rate;
+        }
+        let measured = self.video_frames_measured();
+        let sync = DebugSync {
+            av_drift_ms: measured.then(|| st.av_drift_ms.load(Ordering::Relaxed)),
+            av_drift_max_ms: st.av_drift_max_ms.load(Ordering::Relaxed),
+            clock: if self.audio_renderer.played_ms().is_some() { "audio" } else { "wall" }.to_string(),
+            clock_wall_fallbacks: load(&st.clock_wall_fallbacks),
+            output_latency_ms: self.audio_renderer.output_latency_ms(),
+        };
+        crate::DebugSnapshot {
+            state: state.to_string(),
+            position_ms: self.position_ms.load(Ordering::Relaxed),
+            duration_ms: self
+                .tracks
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|t| t.duration.as_millis() as u64)
+                .unwrap_or(0),
+            uptime_s: (d.uptime_s() * 10.0).round() / 10.0,
+            video,
+            audio,
+            sync,
+            network: DebugNetwork {
+                bandwidth_bps: load(&st.bandwidth_bps_ewma),
+                bytes_total: load(&st.bandwidth_bytes_total),
+                net_stall_ms: load(&d.net_stall_last_ms),
+            },
+            abr: DebugAbr {
+                strategy: format!("{:?}", **self.abr_strategy.load()),
+                profile: format!("{:?}", **self.abr_video_profile.load()),
+                last_switch_s_ago: self
+                    .abr_switch_at
+                    .lock()
+                    .unwrap()
+                    .map(|at| (at.elapsed().as_secs_f64() * 10.0).round() / 10.0),
+                buffer_target_s: self.buffer_target_secs.load(Ordering::Relaxed),
+            },
+            session: DebugSession {
+                stall_events: load(&st.stall_events),
+                stall_ms_total: load(&st.stall_ms_total),
+                pipeline_retries: load(&st.pipeline_retries),
+                audio_output_rebuilds: st.audio_output_rebuilds.load(Ordering::Relaxed),
+            },
+            events: d.recent(30),
+        }
+    }
+
+    /// A drift sample exists once frames have been decoded this session.
+    fn video_frames_measured(&self) -> bool {
+        self.stats.video_frames_decoded.load(Ordering::Relaxed) > 0
     }
 
     /// Stop the current `play()` pipeline. Re-callable: the Player can

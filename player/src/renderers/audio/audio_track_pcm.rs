@@ -1049,6 +1049,26 @@ impl AudioTrackPcmSink {
     /// pipeline's video then holds its first frame until audio really starts
     /// instead of running ahead on the wall clock and lurching when the
     /// audio clock takes over.
+    /// Debug HUD line: written vs presented, what the track still holds.
+    pub fn debug_output(&self) -> String {
+        let rate = self.sample_rate.max(1) as u64;
+        let written = self.written_frames.load(Ordering::Acquire);
+        let presented = self.presented_total_frames();
+        let in_track = presented
+            .map(|p| format!("{} ms", written.saturating_sub(p) * 1000 / rate))
+            .unwrap_or_else(|| "-".into());
+        format!(
+            "AudioTrack PCM16 {} Hz  written {:.1}s  presented {}  in track {}  dropped {}{}{}",
+            self.sample_rate,
+            written as f64 / rate as f64,
+            presented.map(|p| format!("{:.1}s", p as f64 / rate as f64)).unwrap_or_else(|| "-".into()),
+            in_track,
+            self.dropped_frames.load(Ordering::Acquire),
+            if self.paused.load(Ordering::Acquire) { "  paused" } else { "" },
+            if self.primed.load(Ordering::Acquire) { "" } else { "  unprimed" },
+        )
+    }
+
     pub fn played_since_flush_ms(&self) -> Option<u64> {
         if self.sample_rate == 0 || self.stopped.load(Ordering::Acquire) {
             return None;

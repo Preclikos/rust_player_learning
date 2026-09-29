@@ -228,6 +228,7 @@ pub(super) async fn video_prefetch(
         stop_flag,
         http,
         Some(Arc::clone(&stats)),
+        crate::debug::Track::Video,
         Some(on_video_dl),
         soft_end_exclusive,
     ));
@@ -369,6 +370,11 @@ impl DirectWindow {
 
     /// A counted reference to the current window (raw 0 = none / classic
     /// renderer path), valid for as long as the returned value lives.
+    /// A video window is installed (direct mode).
+    pub(super) fn is_set(&self) -> bool {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) != 0
+    }
+
     pub(super) fn lease(&self) -> WindowRef {
         let w = self.0.lock().unwrap_or_else(|e| e.into_inner());
         WindowRef::acquire(*w)
@@ -645,15 +651,7 @@ pub(super) async fn audio_play(
     })?;
 
     let segments = audio_representation.segments.clone();
-    let dl_stats = Arc::clone(&stats);
-    let on_audio_dl: SegmentDoneCallback = Arc::new(move |pts_ms| {
-        let prev = dl_stats.audio_last_decoded_pts_ms.load(Ordering::Relaxed);
-        if pts_ms > prev {
-            dl_stats
-                .audio_last_decoded_pts_ms
-                .store(pts_ms, Ordering::Relaxed);
-        }
-    });
+    let on_audio_dl = audio_buffer_gauge(&stats);
     let download_task = crate::rt::spawn(download_task(
         segments,
         start_index,
@@ -662,6 +660,7 @@ pub(super) async fn audio_play(
         stop_flag,
         http,
         Some(Arc::clone(&stats)),
+        crate::debug::Track::Audio,
         Some(on_audio_dl),
         // Audio doesn't ABR-switch in this player (single audio rep per
         // session), so the soft-end mechanism is unused — usize::MAX
@@ -685,6 +684,15 @@ pub(super) async fn audio_play(
         Some(e) => Err(e),
         None => Ok(()),
     }
+}
+
+/// Advances the audio buffer gauge (`audio_last_decoded_pts_ms`) as audio
+/// segments finish downloading; downloaded counts as buffered, as on video.
+fn audio_buffer_gauge(stats: &Arc<StatsState>) -> SegmentDoneCallback {
+    let stats = Arc::clone(stats);
+    Arc::new(move |pts_ms| {
+        stats.audio_last_decoded_pts_ms.fetch_max(pts_ms, Ordering::Relaxed);
+    })
 }
 
 /// Audio passthrough feed: download + decrypt the audio segments, slice the
@@ -729,7 +737,10 @@ pub(super) async fn audio_passthrough_play(
         stop_flag.clone(),
         http,
         Some(Arc::clone(&stats)),
-        None,
+        crate::debug::Track::Audio,
+        // The audio buffer gauge: without it a passthrough session showed no
+        // audio buffer at all (nothing is decoded on this path).
+        Some(audio_buffer_gauge(&stats)),
         Arc::new(AtomicUsize::new(usize::MAX)),
     ));
     let feed = crate::rt::spawn(audio_passthrough_task(

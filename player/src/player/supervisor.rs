@@ -62,7 +62,7 @@ pub(super) async fn video_supervisor(
     stats: Arc<StatsState>,
     mut switch_rx: tokio::sync::watch::Receiver<Option<VideoRepresenation>>,
     position_ms: Arc<AtomicU64>,
-    events: Arc<broadcast::Sender<PlayerEvent>>,
+    events: Arc<crate::debug::EventBus>,
     segments_in_flight: usize,
     // Content origin (first segment's absolute presentation time). position_ms
     // is 0-based, so we add this back to locate segments on a soft swap.
@@ -198,6 +198,7 @@ const PREPARE_READY_BUDGET: Duration = Duration::from_millis(5_000);
                         return Ok(());
                     }
                     log::error!("[video] supervisor: pipeline failed: {}", detail);
+                    stats.debug.log("pipeline", format!("video pipeline failed: {detail}"));
 
                     // Bounded retry-with-resume. Progress since the last
                     // failure resets the budget.
@@ -232,6 +233,10 @@ const PREPARE_READY_BUDGET: Duration = Duration::from_millis(5_000);
                         retry_attempt,
                         MAX_PIPELINE_RETRIES,
                         pos_now
+                    );
+                    stats.debug.log(
+                        "pipeline",
+                        format!("retry {retry_attempt}/{MAX_PIPELINE_RETRIES} from {} s", pos_now / 1000),
                     );
                     // Backoff, abortable by stop. av_sync's starvation
                     // detection keeps the consumer in Buffering meanwhile.
@@ -389,6 +394,18 @@ const PREPARE_READY_BUDGET: Duration = Duration::from_millis(5_000);
             "[abr] soft switch: repr {} -> {} from seg {} (pos {}ms)",
             current_repr.id, new_repr.id, new_start, pos.as_millis()
         );
+        stats.debug.log(
+            "abr",
+            format!(
+                "switch repr {} ({}p) -> {} ({}p) from segment {}, measured {:.1} Mb/s",
+                current_repr.id,
+                current_repr.height,
+                new_repr.id,
+                new_repr.height,
+                new_start,
+                measured_download_bps(&stats) * 8.0 / 1_000_000.0
+            ),
+        );
         let swap_t0 = Instant::now();
 
         // --- Make-before-break, step 1: prefetch NEW while OLD keeps playing.
@@ -447,6 +464,7 @@ const PREPARE_READY_BUDGET: Duration = Duration::from_millis(5_000);
                     "[video] supervisor: pipeline failed during an ABR prefetch at {}ms: {}",
                     pos_now, detail
                 );
+                stats.debug.log("pipeline", format!("failed during an ABR prefetch: {detail}"));
                 *pending_resume.lock().unwrap() = Some(Duration::from_millis(pos_now));
                 let _ = events.send(PlayerEvent::Error {
                     kind: PlayerErrorKind::Decoder,

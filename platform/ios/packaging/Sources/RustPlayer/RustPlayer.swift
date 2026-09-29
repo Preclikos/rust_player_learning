@@ -165,6 +165,23 @@ public final class RustPlayer {
         return String(cString: c)
     }
 
+    /// Debug HUD snapshot JSON: pipelines, segments, buffers, decoder and
+    /// output paths, sync, network, ABR, recent event log. Built on call —
+    /// poll at 1-2 Hz only while a HUD is visible.
+    public func debugJSON() -> String {
+        guard let handle, let c = rustplayer_player_debug_json(handle) else { return "{}" }
+        defer { rustplayer_string_free(c) }
+        return String(cString: c)
+    }
+
+    /// The same snapshot as ready-made HUD text lines, ending with the
+    /// `events` newest event-log lines. Identical on every platform.
+    public func debugText(events: UInt32 = 8) -> String {
+        guard let handle, let c = rustplayer_player_debug_text(handle, events) else { return "" }
+        defer { rustplayer_string_free(c) }
+        return String(cString: c)
+    }
+
     public func selectVideo(adapt: UInt32, repr: UInt32, soft: Bool = false) {
         handle.map { rustplayer_player_select_video($0, adapt, repr, soft) }
     }

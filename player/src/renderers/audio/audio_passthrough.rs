@@ -62,6 +62,12 @@ pub struct AudioTrackSink {
     played_memo: std::sync::Mutex<Option<(i64, Option<u64>)>>,
     track: Global<JObject<'static>>,
     sample_rate: u32,
+    /// `AudioFormat.ENCODING_*` and channel count, for the debug HUD.
+    encoding: i32,
+    channels: u16,
+    /// Access units / bytes accepted by `write` (debug HUD).
+    aus_written: std::sync::atomic::AtomicU64,
+    bytes_written: std::sync::atomic::AtomicU64,
     /// Set in Drop before stop/release; write/played_ms/lifecycle become no-ops
     /// so a feed or the clock touching the track mid-teardown can't hit a
     /// stopped/released native object (the seek-time crash).
@@ -243,6 +249,10 @@ impl AudioTrackSink {
                     played_memo: std::sync::Mutex::new(None),
                     track,
                     sample_rate,
+                    encoding,
+                    channels,
+                    aus_written: std::sync::atomic::AtomicU64::new(0),
+                    bytes_written: std::sync::atomic::AtomicU64::new(0),
                     stopped: std::sync::atomic::AtomicBool::new(false),
                     started: std::sync::atomic::AtomicBool::new(false),
                     last_played_ms: std::sync::atomic::AtomicU64::new(0),
@@ -300,6 +310,9 @@ impl AudioTrackSink {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
         }
+        self.aus_written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.bytes_written
+            .fetch_add(au.len() as u64, std::sync::atomic::Ordering::Relaxed);
         // Lazily start playback on the first AU: the track now has real data, so
         // play() begins output with actual audio (no silent pre-roll counted by
         // the clock, no "dead IAudioTrack" from getTimestamp on an idle track).
@@ -514,6 +527,37 @@ impl AudioTrackSink {
 impl crate::renderers::AudioPassthrough for AudioTrackSink {
     fn write(&self, au: &[u8]) {
         AudioTrackSink::write(self, au)
+    }
+    fn debug_output(&self) -> String {
+        use std::sync::atomic::Ordering::Relaxed;
+        let codec = match self.encoding {
+            5 => "AC-3",
+            6 => "E-AC-3",
+            18 => "E-AC-3 JOC",
+            _ => "bitstream",
+        };
+        let aus = self.aus_written.load(Relaxed);
+        // AC-3 and E-AC-3 carry 1536 samples per access unit.
+        let written_ms = aus * 1536 * 1000 / self.sample_rate.max(1) as u64;
+        let played = crate::renderers::AudioPassthrough::played_ms(self);
+        let consumed = AudioTrackSink::consumed_ms(self);
+        let ms = |v: Option<u64>| v.map(|m| format!("{:.1}s", m as f64 / 1000.0)).unwrap_or_else(|| "-".into());
+        format!(
+            "{codec} {} Hz {} ch (enc {})  written {} AUs = {} ({:.1} MiB)  consumed {}  played {}  in device {}{}{}",
+            self.sample_rate,
+            self.channels,
+            self.encoding,
+            aus,
+            ms(Some(written_ms)),
+            self.bytes_written.load(Relaxed) as f64 / 1_048_576.0,
+            ms(consumed),
+            ms(played),
+            consumed
+                .map(|c| format!("{} ms", written_ms.saturating_sub(c)))
+                .unwrap_or_else(|| "-".into()),
+            if self.paused.load(Relaxed) { "  paused" } else { "" },
+            if self.started.load(Relaxed) { "" } else { "  not started" },
+        )
     }
     fn played_ms(&self) -> Option<u64> {
         let now = clock_monotonic_ns();

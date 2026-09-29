@@ -439,6 +439,30 @@ pub extern "C" fn rustplayer_player_tracks_json(handle: *mut c_void) -> *mut c_c
     })
 }
 
+/// Debug HUD snapshot JSON (see `BridgeHandle::debug_json`). Returns a heap
+/// C string the caller MUST free with [`rustplayer_string_free`].
+#[no_mangle]
+pub extern "C" fn rustplayer_player_debug_json(handle: *mut c_void) -> *mut c_char {
+    ffi_guard("rustplayer_player_debug_json", std::ptr::null_mut(), move || {
+        let json = unsafe { handle_ref(handle) }
+            .map(|h| h.bridge.debug_json())
+            .unwrap_or_else(|| "{}".to_string());
+        CString::new(json).map(CString::into_raw).unwrap_or(std::ptr::null_mut())
+    })
+}
+
+/// Debug HUD text with the `events` newest event-log lines. Free with
+/// [`rustplayer_string_free`].
+#[no_mangle]
+pub extern "C" fn rustplayer_player_debug_text(handle: *mut c_void, events: u32) -> *mut c_char {
+    ffi_guard("rustplayer_player_debug_text", std::ptr::null_mut(), move || {
+        let text = unsafe { handle_ref(handle) }
+            .map(|h| h.bridge.debug_text(events as usize))
+            .unwrap_or_default();
+        CString::new(text).map(CString::into_raw).unwrap_or(std::ptr::null_mut())
+    })
+}
+
 #[no_mangle]
 pub extern "C" fn rustplayer_string_free(s: *mut c_char) {
     ffi_guard("rustplayer_string_free", (), move || {

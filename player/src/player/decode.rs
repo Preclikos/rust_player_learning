@@ -258,9 +258,13 @@ pub(super) async fn video_decoder_task(
     // We always emit the lowest-PTS frame from the buffer. video_ready fires
     // on the first send so start_time is calibrated to when frames are
     // actually available (avoids a timing hole at startup).
-    // Direct mode holds codec output buffers captive in this window — keep
-    // it shallow there (see the frame-channel capacity comment in play()).
-    let reorder_depth: usize = if decoder.is_direct() { 2 } else { 4 };
+    // Direct mode: none. MediaCodec hands out buffers in presentation order
+    // (it reorders B-frames itself), and every frame held here is a codec
+    // output buffer the decoder cannot reuse. On Amlogic (Mi TV Stick) the
+    // codec has 13 output buffers and needs 8 for decoding; with this window
+    // at 2 plus the frame channel and the frames queued in SurfaceFlinger we
+    // held 9-10 and decoding fell to 5-8 fps (VDA "CLIENT[10]").
+    let reorder_depth: usize = if decoder.is_direct() { 0 } else { 4 };
     let mut reorder_buf: Vec<DecodedVideoFrame> = Vec::with_capacity(reorder_depth + 1);
 
     // Segment preparation (init concat + CENC decrypt + mp4 parse) runs on

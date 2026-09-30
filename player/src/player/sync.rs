@@ -146,6 +146,10 @@ pub(super) async fn video_sync_loop<V: VideoSink, A: AudioSink>(
     // to finish before the VSync deadline. The compositor (via
     // eglPresentationTimeANDROID) then holds the frame until the exact VSync.
     const RENDER_BUDGET_MS: u64 = 20;
+    // Direct mode: how far ahead of its display time a frame is released to
+    // the Surface (see the pacing sleep).
+    #[cfg(target_os = "android")]
+    const DIRECT_RELEASE_LEAD_MS: u64 = 100; // TEMP-AB variant A
 
     let mut last_pts_ms = 0u64;
     let mut frame_idx: u64 = 0;
@@ -447,17 +451,17 @@ pub(super) async fn video_sync_loop<V: VideoSink, A: AudioSink>(
             // Sleep until shortly before the target PTS. GL path: the GPU
             // draws the frame early and eglPresentationTimeANDROID holds it
             // until exactly pts_ms. Direct mode: the release timestamp does
-            // the same, and a LARGER lead is the point — every released
-            // frame returns its output buffer to MediaCodec (the channel +
-            // reorder window only hold ~4), so queueing 2-3 frames ahead in
-            // SurfaceFlinger is what bridges the segment-boundary decoder
-            // warmup that the GL path bridged with its 32-image pool.
+            // the same. The lead is how long a released frame waits in
+            // SurfaceFlinger, and every waiting frame is a codec output buffer
+            // the decoder cannot reuse: 100 ms kept 2-3 there on top of the
+            // frame channel, which starved the Amlogic decoder (13 buffers,
+            // 8 needed for decoding). 50 ms is ExoPlayer's release window.
             #[cfg(target_os = "android")]
             let render_budget_ms = if matches!(
                 frame.native,
                 crate::decoders::PlatformFrame::MediaCodecDirect(_)
             ) {
-                100
+                DIRECT_RELEASE_LEAD_MS
             } else {
                 RENDER_BUDGET_MS
             };

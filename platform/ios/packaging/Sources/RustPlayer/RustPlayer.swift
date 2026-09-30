@@ -165,6 +165,13 @@ public final class RustPlayer {
         return String(cString: c)
     }
 
+    /// Buffer size and network-outage tolerance; 0 keeps a field's default
+    /// (30 s, fill continuously, 96 MiB, 180 s). Call right after create;
+    /// later calls apply from the next seek or track change.
+    public func setBufferConfig(maxSecs: UInt32 = 0, minSecs: UInt32 = 0, maxMb: UInt32 = 0, outageSecs: UInt32 = 0) {
+        handle.map { rustplayer_player_set_buffer_config($0, maxSecs, minSecs, maxMb, outageSecs) }
+    }
+
     /// Debug HUD snapshot JSON: pipelines, segments, buffers, decoder and
     /// output paths, sync, network, ABR, recent event log. Built on call —
     /// poll at 1-2 Hz only while a HUD is visible.

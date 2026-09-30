@@ -80,11 +80,73 @@ use crate::rt::JoinHandle;
 
 use crate::manifest::Manifest;
 
-/// Default target buffer in seconds — how far ahead the download path is
-/// allowed to run from the renderer. Higher = more resilience against
-/// network jitter, lower = less RAM (each queued segment holds ~1-4 MB).
-/// Configurable per Player via `set_buffer_target_secs`.
-const DEFAULT_BUFFER_TARGET_SECS: u32 = 8;
+/// How far ahead the player downloads and how it rides out a lost network.
+/// Set with [`Player::set_buffer_config`]; applies from the next pipeline
+/// start (the first `play()`, a seek, a track change).
+///
+/// Defaults follow ExoPlayer's video defaults (fill continuously, 50 s there)
+/// scaled for TVs: 30 s, capped at 96 MiB of downloaded media per pipeline,
+/// and a network outage of up to 3 minutes (a tunnel, a Wi-Fi drop) rides
+/// through: playback shows Buffering once the buffer runs dry and continues
+/// where it stopped when the network is back.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BufferConfig {
+    /// Media the player downloads ahead of the picture, seconds (filled up to
+    /// this). At least 2.
+    pub max_secs: u32,
+    /// Once full, downloading resumes when the buffer falls below this.
+    /// `>= max_secs` fills continuously (ExoPlayer's video default); lower
+    /// downloads in bursts, which lets a mobile radio idle in between.
+    pub min_secs: u32,
+    /// Cap on downloaded, not yet played media per pipeline, bytes, estimated
+    /// from the representation bitrate. Keeps a 4K title within a TV's RAM:
+    /// the buffer is the smaller of `max_secs` and this.
+    pub max_bytes: u64,
+    /// How long one segment keeps being retried through a network outage
+    /// before playback fails with an error, seconds.
+    pub network_outage_secs: u32,
+}
+
+impl Default for BufferConfig {
+    fn default() -> Self {
+        Self {
+            max_secs: 30,
+            min_secs: 30,
+            max_bytes: 96 * 1024 * 1024,
+            network_outage_secs: 180,
+        }
+    }
+}
+
+/// The buffer a pipeline runs with, derived from [`BufferConfig`] and the
+/// selected representation.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct BufferPlan {
+    /// Segments the download -> decode channel holds.
+    pub capacity: usize,
+    /// Refill once the queue is at or below this many segments;
+    /// `usize::MAX` = continuous.
+    pub refill_below: usize,
+}
+
+/// The plan for `cfg` given the representation's typical segment duration
+/// and bitrate (0 = unknown).
+fn plan_buffer(cfg: &BufferConfig, segment_secs: f64, bandwidth_bps: u64) -> BufferPlan {
+    let by_time = segments_for_target(cfg.max_secs, segment_secs);
+    let segment_bytes = (bandwidth_bps as f64 * segment_secs / 8.0) as u64;
+    let by_bytes = if segment_bytes > 0 {
+        (cfg.max_bytes / segment_bytes) as usize
+    } else {
+        usize::MAX
+    };
+    let capacity = by_time.min(by_bytes).max(2);
+    let refill_below = if cfg.min_secs >= cfg.max_secs {
+        usize::MAX
+    } else {
+        ((cfg.min_secs as f64 / segment_secs.max(0.5)).floor() as usize).min(capacity - 1)
+    };
+    BufferPlan { capacity, refill_below }
+}
 
 /// Segment duration assumed when the selected representation has no timed
 /// segments yet (converting buffer-target-seconds into segments in flight).
@@ -180,6 +242,13 @@ enum StallSide {
 pub(crate) struct StatsState {
     /// Debug HUD counters and event log (see `crate::debug`).
     pub(crate) debug: crate::debug::DebugCounters,
+    /// Buffer policy of the running play(), read by the download tasks:
+    /// 0 = fill continuously, n = once the queue is full, wait until it holds
+    /// fewer than n segments (hysteresis, `BufferConfig::min_secs`).
+    pub(crate) buffer_refill_at: AtomicUsize,
+    /// How long one segment is retried through a network outage, ms
+    /// (`BufferConfig::network_outage_secs`); 0 = the built-in 30 s.
+    pub(crate) network_outage_ms: AtomicU64,
     video_frames_decoded: AtomicU64,
     video_frames_dropped: AtomicU64,
     /// Frames presented >45 ms after their master-clock time (shown, not
@@ -475,7 +544,7 @@ pub struct Player<V: VideoSink = VideoRenderer, A: AudioSink = AudioRenderer> {
     /// of the renderer. Affects the segments-in-flight capacity of the
     /// download → decode channel. Takes effect at the next `play()` call
     /// — the running pipeline holds whatever it was given at spawn time.
-    buffer_target_secs: Arc<AtomicU32>,
+    buffer_config: Arc<StdMutex<BufferConfig>>,
 
     /// Currently-selected subtitle representation. `None` means
     /// subtitles disabled — text_play won't spawn. Consumer toggles via
@@ -578,7 +647,7 @@ impl<V: VideoSink, A: AudioSink> Clone for Player<V, A> {
             abr_video_profile: Arc::clone(&self.abr_video_profile),
             abr_switch_at: Arc::clone(&self.abr_switch_at),
             video_switch_tx: Arc::clone(&self.video_switch_tx),
-            buffer_target_secs: Arc::clone(&self.buffer_target_secs),
+            buffer_config: Arc::clone(&self.buffer_config),
             subtitle_representation: Arc::clone(&self.subtitle_representation),
             external_text: Arc::clone(&self.external_text),
             next_external_id: Arc::clone(&self.next_external_id),
@@ -776,7 +845,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             abr_video_profile: Arc::new(ArcSwap::from_pointee(AbrVideoProfile::default())),
             abr_switch_at: Arc::new(StdMutex::new(None)),
             video_switch_tx: Arc::new(StdMutex::new(None)),
-            buffer_target_secs: Arc::new(AtomicU32::new(DEFAULT_BUFFER_TARGET_SECS)),
+            buffer_config: Arc::new(StdMutex::new(BufferConfig::default())),
             subtitle_representation: Arc::new(StdMutex::new(None)),
             external_text: Arc::new(StdMutex::new(Vec::new())),
             next_external_id: Arc::new(AtomicU32::new(EXTERNAL_TEXT_ID_BASE)),
@@ -1481,13 +1550,37 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
     /// keeps its current capacity until it restarts.
     ///
     /// Clamped to at least 2s so the channel always has room for one
-    /// segment ahead of the decoder.
+    /// segment ahead of the decoder. Shorthand for [`Self::set_buffer_config`]
+    /// with `max_secs` (and `min_secs` lowered to it if it was above).
     pub fn set_buffer_target_secs(&self, secs: u32) {
-        self.buffer_target_secs.store(secs.max(2), Ordering::Relaxed);
+        let mut cfg = self.buffer_config();
+        cfg.max_secs = secs.max(2);
+        cfg.min_secs = cfg.min_secs.min(cfg.max_secs);
+        self.set_buffer_config(cfg);
     }
 
     pub fn buffer_target_secs(&self) -> u32 {
-        self.buffer_target_secs.load(Ordering::Relaxed)
+        self.buffer_config().max_secs
+    }
+
+    /// Buffer size, refill policy and network-outage tolerance (see
+    /// [`BufferConfig`]). Applies from the next pipeline start: set it before
+    /// or right after the host starts playback (the first `play()` runs only
+    /// after the manifest and init segments are in), or it takes effect at the
+    /// next seek / track change.
+    pub fn set_buffer_config(&self, cfg: BufferConfig) {
+        let cfg = BufferConfig {
+            max_secs: cfg.max_secs.max(2),
+            min_secs: cfg.min_secs,
+            max_bytes: cfg.max_bytes.max(1024 * 1024),
+            network_outage_secs: cfg.network_outage_secs.max(5),
+        };
+        log::info!("[buffer] config {:?}", cfg);
+        *self.buffer_config.lock().unwrap() = cfg;
+    }
+
+    pub fn buffer_config(&self) -> BufferConfig {
+        *self.buffer_config.lock().unwrap()
     }
 
     /// Provide a TTF/OTF font for subtitle rendering. Until this is
@@ -1672,21 +1765,21 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         self.subtitle_representation.lock().unwrap().clone()
     }
 
-    /// Convert the configured `buffer_target_secs` into a channel capacity
-    /// (segments in flight) from the selected video representation's real
-    /// segment duration. With the old fixed 2 s estimate, 6 s segments made
-    /// the 8 s target 4 segments (~24-30 s, ~40 MB at 14 Mbps, twice that
-    /// during an ABR swap); it is now 2 (~12-18 s).
-    fn segments_in_flight(&self) -> usize {
-        let target = self.buffer_target_secs.load(Ordering::Relaxed);
-        let segment_secs = self
+    /// The buffer the next pipeline runs with (see [`BufferConfig`]): channel
+    /// capacity from the target and the selected video representation's real
+    /// segment duration, capped by the byte limit, plus the refill threshold.
+    /// With the old fixed 2 s estimate, 6 s segments made an 8 s target 4
+    /// segments (~24-30 s).
+    fn buffer_plan(&self) -> BufferPlan {
+        let cfg = self.buffer_config();
+        let (segment_secs, bandwidth) = self
             .video_representation
             .lock()
             .unwrap()
             .as_ref()
-            .and_then(|r| typical_segment_secs(&r.segments))
-            .unwrap_or(ASSUMED_SEGMENT_SECS);
-        segments_for_target(target, segment_secs)
+            .map(|r| (typical_segment_secs(&r.segments).unwrap_or(ASSUMED_SEGMENT_SECS), r.bandwidth))
+            .unwrap_or((ASSUMED_SEGMENT_SECS, 0));
+        plan_buffer(&cfg, segment_secs, bandwidth)
     }
 
     /// One ABR reconsideration. Called from the per-second tick spawned in
@@ -1989,10 +2082,29 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         // Capture the configured buffer target at play() time so the
         // spawned pipeline stays consistent across its lifetime even if
         // the consumer flips set_buffer_target_secs mid-play.
-        let seg_in_flight = self.segments_in_flight();
+        let plan = self.buffer_plan();
+        let buffer_cfg = self.buffer_config();
+        let seg_in_flight = plan.capacity;
+        // The download tasks read these (see net_io::download_task).
+        self.stats.buffer_refill_at.store(
+            if plan.refill_below == usize::MAX { 0 } else { plan.refill_below + 1 },
+            Ordering::Relaxed,
+        );
+        self.stats
+            .network_outage_ms
+            .store(buffer_cfg.network_outage_secs as u64 * 1000, Ordering::Relaxed);
         log::info!(
-            "play(): buffer target {}s -> {} segments in flight (from the video segment duration)",
-            self.buffer_target_secs.load(Ordering::Relaxed), seg_in_flight
+            "play(): buffer {}s (refill below {}s, cap {} MiB) -> {} segments in flight, {}; network outage tolerance {}s",
+            buffer_cfg.max_secs,
+            buffer_cfg.min_secs.min(buffer_cfg.max_secs),
+            buffer_cfg.max_bytes / (1024 * 1024),
+            seg_in_flight,
+            if plan.refill_below == usize::MAX {
+                "filled continuously".to_string()
+            } else {
+                format!("refilled at {} queued", plan.refill_below)
+            },
+            buffer_cfg.network_outage_secs
         );
         // Oneshot used to kill the abr_tick task when this play() invocation
         // ends FOR REAL (outer loop break — either no track selected or a
@@ -2592,7 +2704,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                     .lock()
                     .unwrap()
                     .map(|at| (at.elapsed().as_secs_f64() * 10.0).round() / 10.0),
-                buffer_target_s: self.buffer_target_secs.load(Ordering::Relaxed),
+                buffer_target_s: self.buffer_config().max_secs,
             },
             session: DebugSession {
                 stall_events: load(&st.stall_events),
@@ -2727,7 +2839,23 @@ use net_io::*;
 
 #[cfg(test)]
 mod tests {
-    use super::{segments_for_target, typical_segment_secs};
+    use super::{plan_buffer, segments_for_target, typical_segment_secs, BufferConfig};
+
+    #[test]
+    fn buffer_plan_follows_time_bytes_and_refill() {
+        let cfg = BufferConfig::default(); // 30 s, continuous, 96 MiB
+        // 6 s segments at 3 Mb/s: time-bound (5 segments), continuous.
+        let p = plan_buffer(&cfg, 6.0, 3_000_000);
+        assert_eq!((p.capacity, p.refill_below), (5, usize::MAX));
+        // 4K at 40 Mb/s: 30 MB per segment, so the 96 MiB cap wins (3).
+        assert_eq!(plan_buffer(&cfg, 6.0, 40_000_000).capacity, 3);
+        // Hysteresis: refill below 12 s = 2 segments.
+        let burst = BufferConfig { min_secs: 12, ..cfg };
+        assert_eq!(plan_buffer(&burst, 6.0, 3_000_000).refill_below, 2);
+        // Never below 2 segments, even with a tiny byte cap.
+        let tiny = BufferConfig { max_bytes: 1, ..cfg };
+        assert_eq!(plan_buffer(&tiny, 6.0, 40_000_000).capacity, 2);
+    }
 
     fn seg(start_s: u64, end_s: u64) -> Segment {
         Segment::new(&"http://x/".to_string(), &"s.m4s".to_string(), 0, 0, Some(start_s * 1000), Some(end_s * 1000), Some(1000)).unwrap()

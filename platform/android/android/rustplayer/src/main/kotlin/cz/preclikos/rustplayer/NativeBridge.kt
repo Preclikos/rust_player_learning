@@ -41,6 +41,7 @@ object NativeBridge {
     external fun nativeSetVolume(handle: Long, volume: Float)
     external fun nativeGetTracksJson(handle: Long): String
     external fun nativeDebugJson(handle: Long): String
+    external fun nativeSetBufferConfig(handle: Long, maxSecs: Int, minSecs: Int, maxMb: Int, outageSecs: Int)
     external fun nativeDebugText(handle: Long, events: Int): String
     external fun nativeSetVideoTrack(handle: Long, adapt: Int, repr: Int)
     external fun nativeSetVideoTrackSoft(handle: Long, adapt: Int, repr: Int)

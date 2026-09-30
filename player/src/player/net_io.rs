@@ -34,17 +34,25 @@ pub(super) async fn download_task(
     // ranges are disjoint, and av_sync sees a continuous frame stream.
     soft_end_exclusive: Arc<AtomicUsize>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    /// How long `download_task` keeps retrying a single failing
-    /// segment before giving up and ending the pipeline. The inner
-    /// `HttpClient::get` already does ~3 short retries (~2 s); this
-    /// outer cap covers extended outages, e.g. a Wi-Fi drop while a
-    /// movie is playing. Long enough for a typical reconnect, short
-    /// enough that the player doesn't sit silently forever when the
-    /// network is genuinely gone.
-    const SEGMENT_RETRY_TOTAL: Duration = Duration::from_secs(30);
+    // How long `download_task` keeps retrying a single failing
+    // segment before giving up and ending the pipeline. The inner
+    // `HttpClient::get` already does ~3 short retries (~2 s); this
+    // outer cap covers extended outages: a Wi-Fi drop, a train tunnel.
+    // `BufferConfig::network_outage_secs` (default 3 min) sets it; 30 s
+    // when the pipeline runs without the player's stats (tests).
+    let segment_retry_total = stats
+        .as_ref()
+        .map(|s| s.network_outage_ms.load(Ordering::Relaxed))
+        .filter(|&ms| ms > 0)
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::from_secs(30));
+    let refill_at = stats
+        .as_ref()
+        .map(|s| s.buffer_refill_at.load(Ordering::Relaxed))
+        .unwrap_or(0);
 
     let segment_slice = &segments[..];
-    // Set when a segment was abandoned after SEGMENT_RETRY_TOTAL — turned
+    // Set when a segment was abandoned after segment_retry_total — turned
     // into this task's Err below (natural completion / stop / soft-end /
     // receiver-drop all stay Ok).
     let mut gave_up: Option<Box<dyn Error + Send + Sync>> = None;
@@ -70,11 +78,28 @@ pub(super) async fn download_task(
             );
             break;
         }
+        // Refill hysteresis (BufferConfig::min_secs): once the queue to the
+        // decoder is full, wait until it drains below the refill mark before
+        // downloading again, instead of topping it up segment by segment.
+        // Continuous filling (the default) skips this: the full channel's
+        // send already paces the download.
+        if refill_at > 0 && segment_sender.capacity() == 0 {
+            log::debug!("[dl] buffer full at segment {}, waiting to refill", i);
+            while segment_sender.max_capacity() - segment_sender.capacity() >= refill_at {
+                tokio::select! {
+                    _ = crate::rt::sleep(Duration::from_millis(250)) => {}
+                    _ = stop.notified() => break,
+                }
+                if stop_flag.load(Ordering::Relaxed) || segment_sender.is_closed() {
+                    break;
+                }
+            }
+        }
         let seg = &segment_slice[i];
         let mut backoff = Duration::from_millis(500);
         // Outer retry loop: keep trying the same segment until it
         // succeeds, the user stops playback, the seek target changes,
-        // or `SEGMENT_RETRY_TOTAL` elapses. Previously download_task
+        // or `segment_retry_total` elapses. Previously download_task
         // broke out on the first error — so a brief network blip tore
         // the whole pipeline down. Now a Wi-Fi blip rides through
         // transparently, and only a genuine extended outage ends the
@@ -89,11 +114,11 @@ pub(super) async fn download_task(
                 should_break = true;
                 break;
             }
-            if retry_started.elapsed() > SEGMENT_RETRY_TOTAL {
+            if retry_started.elapsed() > segment_retry_total {
                 log::error!(
                     "[dl] segment {} gave up after {:?} of retries: {}",
                     i,
-                    SEGMENT_RETRY_TOTAL,
+                    segment_retry_total,
                     last_err
                         .as_ref()
                         .map(|e| e.to_string())
@@ -152,7 +177,9 @@ pub(super) async fn download_task(
                             break;
                         }
                     }
-                    backoff = (backoff * 2).min(Duration::from_secs(8));
+                    // Capped at 5 s (ExoPlayer's retry cap): once the network is
+                    // back, the next attempt is never more than 5 s away.
+                    backoff = (backoff * 2).min(Duration::from_secs(5));
                 }
                 None => {
                     should_break = true;
@@ -173,7 +200,7 @@ pub(super) async fn download_task(
     if let Some(e) = gave_up {
         return Err(format!(
             "segment download gave up after {:?}: {}",
-            SEGMENT_RETRY_TOTAL, e
+            segment_retry_total, e
         )
         .into());
     }

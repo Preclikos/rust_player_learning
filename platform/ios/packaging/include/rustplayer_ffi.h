@@ -58,6 +58,9 @@ char *rustplayer_player_tracks_json(void *handle);
 // event-log lines. Built on call: poll at 1-2 Hz while a HUD is shown.
 // Free both with rustplayer_string_free.
 char *rustplayer_player_debug_json(void *handle);
+// Buffer size, refill policy and network-outage tolerance; 0 keeps a field's
+// default (30 s, continuous, 96 MiB, 180 s). Call right after create.
+void rustplayer_player_set_buffer_config(void *handle, uint32_t max_secs, uint32_t min_secs, uint32_t max_mb, uint32_t outage_secs);
 char *rustplayer_player_debug_text(void *handle, uint32_t events);
 void rustplayer_string_free(char *s);
 void rustplayer_player_select_video(void *handle, uint32_t adapt, uint32_t repr, bool soft);

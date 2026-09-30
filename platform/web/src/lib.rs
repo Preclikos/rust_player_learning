@@ -235,6 +235,21 @@ enum WebHdrPolicy {
     Browser,
 }
 
+/// `options.buffer`: `{ maxSecs, minSecs, maxMb, outageSecs }`, each optional
+/// (missing = `player::BufferConfig` default). `None` without the object.
+fn read_buffer_option(options: &JsValue) -> Option<player::BufferConfig> {
+    let b = get(options, "buffer")?;
+    let d = player::BufferConfig::default();
+    let num = |k: &str| get(&b, k).and_then(|v| v.as_f64()).filter(|v| *v >= 0.0);
+    let max_secs = num("maxSecs").map(|v| v as u32).unwrap_or(d.max_secs);
+    Some(player::BufferConfig {
+        max_secs,
+        min_secs: num("minSecs").map(|v| v as u32).unwrap_or(max_secs),
+        max_bytes: num("maxMb").map(|v| (v * 1_048_576.0) as u64).unwrap_or(d.max_bytes),
+        network_outage_secs: num("outageSecs").map(|v| v as u32).unwrap_or(d.network_outage_secs),
+    })
+}
+
 fn read_options(options: &JsValue) -> Result<(StartConfig, HashMap<[u8; 16], [u8; 16]>, WebHdrPolicy), String> {
     let mut config = StartConfig::default();
     let mut keys = HashMap::new();
@@ -324,6 +339,7 @@ impl RustPlayer {
         options: JsValue,
     ) -> Result<RustPlayer, JsValue> {
         let (config, keys, hdr) = read_options(&options).map_err(|e| JsValue::from_str(&e))?;
+        let buffer = read_buffer_option(&options);
         let (w, h) = (canvas.width().max(1), canvas.height().max(1));
         log::info!("[web] creating player on {}x{} canvas for {} (hdr policy {:?})", w, h, manifest_url, hdr);
         let player = Player::new_from_canvas(canvas, w, h).await;
@@ -341,6 +357,9 @@ impl RustPlayer {
                 log::info!("[web] HDR representations with the browser's own conversion (hdr: \"browser\")");
                 player.set_web_hdr_passthrough(true);
             }
+        }
+        if let Some(cfg) = buffer {
+            player.set_buffer_config(cfg);
         }
         let host: Arc<dyn BridgeHost> = Arc::new(WebHost { host, keys });
         let handle = bridge::start(player, manifest_url, host, config);

@@ -439,6 +439,31 @@ pub extern "C" fn rustplayer_player_tracks_json(handle: *mut c_void) -> *mut c_c
     })
 }
 
+/// Buffer size, refill policy and network-outage tolerance
+/// (`player::BufferConfig`); 0 keeps a field's default, `min_secs` 0 = fill
+/// continuously. Call right after create (the first pipeline starts once the
+/// manifest is in); later calls apply from the next seek or track change.
+#[no_mangle]
+pub extern "C" fn rustplayer_player_set_buffer_config(
+    handle: *mut c_void,
+    max_secs: u32,
+    min_secs: u32,
+    max_mb: u32,
+    outage_secs: u32,
+) {
+    ffi_guard("rustplayer_player_set_buffer_config", (), move || {
+        let Some(h) = (unsafe { handle_ref(handle) }) else { return };
+        let d = player::BufferConfig::default();
+        let max_secs = if max_secs > 0 { max_secs } else { d.max_secs };
+        h.bridge.player().set_buffer_config(player::BufferConfig {
+            max_secs,
+            min_secs: if min_secs > 0 { min_secs } else { max_secs },
+            max_bytes: if max_mb > 0 { max_mb as u64 * 1_048_576 } else { d.max_bytes },
+            network_outage_secs: if outage_secs > 0 { outage_secs } else { d.network_outage_secs },
+        });
+    })
+}
+
 /// Debug HUD snapshot JSON (see `BridgeHandle::debug_json`). Returns a heap
 /// C string the caller MUST free with [`rustplayer_string_free`].
 #[no_mangle]

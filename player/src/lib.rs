@@ -76,5 +76,5 @@ pub use parsers::vtt::VttCue;
 /// Types defined by the player module itself, re-exported so the public
 /// surface is unchanged by where they live.
 pub use player::{
-    ConformanceSummary, ExternalSubtitleOptions, OffscreenPlayer, PhysicalSize, Player,
+    BufferConfig, ConformanceSummary, ExternalSubtitleOptions, OffscreenPlayer, PhysicalSize, Player,
 };

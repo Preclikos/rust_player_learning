@@ -560,6 +560,33 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeGetTracks
     })
 }
 
+/// Buffer size, refill policy and network-outage tolerance
+/// (`player::BufferConfig`). Call right after `nativeStart`: the first pipeline
+/// starts only once the manifest and init segments are in. A value <= 0 keeps
+/// that field's default; `minSecs` <= 0 means "fill continuously".
+#[no_mangle]
+pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetBufferConfig(
+    _env: EnvUnowned,
+    _class: JClass,
+    handle: jlong,
+    max_secs: jint,
+    min_secs: jint,
+    max_mb: jint,
+    outage_secs: jint,
+) {
+    ffi_guard("nativeSetBufferConfig", (), move || {
+        let Some(h) = (unsafe { handle_ref(handle) }) else { return };
+        let d = player::BufferConfig::default();
+        let max_secs = if max_secs > 0 { max_secs as u32 } else { d.max_secs };
+        h.bridge.player().set_buffer_config(player::BufferConfig {
+            max_secs,
+            min_secs: if min_secs > 0 { min_secs as u32 } else { max_secs },
+            max_bytes: if max_mb > 0 { max_mb as u64 * 1_048_576 } else { d.max_bytes },
+            network_outage_secs: if outage_secs > 0 { outage_secs as u32 } else { d.network_outage_secs },
+        });
+    })
+}
+
 /// Debug HUD snapshot JSON (see `BridgeHandle::debug_json`), or `"{}"`.
 #[no_mangle]
 pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeDebugJson<'local>(

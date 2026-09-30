@@ -167,6 +167,22 @@ class RustPlayer(private val context: Context) {
     fun debugJson(): String = if (handle != 0L) NativeBridge.nativeDebugJson(handle) else "{}"
 
     /**
+     * Buffer size and network-outage tolerance. Call right after [start] (the
+     * first pipeline starts once the manifest is in); later calls apply from
+     * the next seek or track change. 0 keeps a field's default.
+     *
+     * @param maxSecs media downloaded ahead of the picture (default 30).
+     * @param minSecs once full, downloading resumes below this; 0 = fill
+     *   continuously (default, like ExoPlayer), lower = bursts (saves radio).
+     * @param maxMb memory cap for downloaded media per pipeline (default 96).
+     * @param outageSecs how long a lost network is ridden out before an error
+     *   (default 180); playback shows buffering and continues when it is back.
+     */
+    fun setBufferConfig(maxSecs: Int = 0, minSecs: Int = 0, maxMb: Int = 0, outageSecs: Int = 0) {
+        if (handle != 0L) NativeBridge.nativeSetBufferConfig(handle, maxSecs, minSecs, maxMb, outageSecs)
+    }
+
+    /**
      * The same snapshot as ready-made HUD text (one line per '\n'), ending with
      * the [events] newest event-log lines. Identical on every platform.
      */

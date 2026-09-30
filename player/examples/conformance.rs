@@ -74,6 +74,7 @@ struct Args {
     max_late_pct: f64,
     allowed_stalls: Option<u64>,
     hud: bool,
+    buffer_secs: Option<u32>,
 }
 
 fn parse_args() -> Args {
@@ -93,6 +94,7 @@ fn parse_args() -> Args {
         max_late_pct: 2.0,
         allowed_stalls: None,
         hud: false,
+        buffer_secs: None,
     };
     while let Some(arg) = it.next() {
         let mut val = |name: &str| it.next().unwrap_or_else(|| panic!("{name} needs a value"));
@@ -104,6 +106,7 @@ fn parse_args() -> Args {
             }
             "--secs" => a.secs = val("--secs").parse().expect("--secs"),
             "--hud" => a.hud = true,
+            "--buffer-secs" => a.buffer_secs = Some(val("--buffer-secs").parse().expect("--buffer-secs")),
             "--switches" => a.switches = val("--switches").parse().expect("--switches"),
             "--seeks" => a.seeks = val("--seeks").parse().expect("--seeks"),
             "--max-gap-ms" => a.max_gap_ms = val("--max-gap-ms").parse().expect("--max-gap-ms"),
@@ -536,6 +539,9 @@ async fn main() {
     }
 
     let t0 = Instant::now();
+    if let Some(secs) = args.buffer_secs {
+        player.set_buffer_config(player::BufferConfig { max_secs: secs, min_secs: secs, ..Default::default() });
+    }
     player.open_url(&args.mpd).await.expect("open_url");
     player.prepare().await.expect("prepare");
     let tracks = player.get_tracks().expect("get_tracks");

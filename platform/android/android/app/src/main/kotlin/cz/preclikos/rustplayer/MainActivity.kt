@@ -118,11 +118,18 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         readScenarioExtras()
         // --ez verbose true: engine debug lines (audio clock internals etc.).
         if (intent.getBooleanExtra("verbose", false)) player.setVerboseLogging(true)
+        // Make sure the app's external files dir exists, so the adb-written
+        // overrides the bridge reads (audio_passthrough.txt, video_pref.txt, …)
+        // can be created on a fresh install (shell cannot mkdir it on Android 11+).
+        getExternalFilesDir(null)
         keepAlive = intent.getBooleanExtra("keep_alive", false)
         // Test hook: start without the video plane, so frames go through
         // ImageReader + GLES into the overlay (the path direct mode replaced).
         noVideoPlane = intent.getBooleanExtra("no_video_plane", false)
         hudRequested = intent.getBooleanExtra("hud", false)
+        // --ez passthrough true|false overrides the audio_passthrough.txt
+        // default (the shell cannot write that file on Android 11+).
+        passthroughExtra = if (intent.hasExtra("passthrough")) intent.getBooleanExtra("passthrough", false) else null
         // --ez overlay_on_change true: BlackZone mobile behaviour — hand the
         // overlay Surface to the player on EVERY surfaceChanged, including a
         // 180-degree rotation that changes nothing but the transform.
@@ -592,6 +599,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     // Debug HUD: the engine's own text (RustPlayer.debugText), refreshed once
     // a second only while it is shown.
     private var hudRequested = false
+    private var passthroughExtra: Boolean? = null
     private lateinit var hudView: TextView
     private val hudHandler = android.os.Handler(android.os.Looper.getMainLooper())
     private val hudTick = object : Runnable {
@@ -656,7 +664,17 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                     manifestUrl = manifestUrl,
                     provider = TestProvider,
                     startFraction = startFraction,
+                    audioPassthrough = passthroughExtra,
                 )
+                // --ei buffer_max / buffer_min / buffer_mb / outage (docs/BUFFERING.md).
+                if (listOf("buffer_max", "buffer_min", "buffer_mb", "outage").any { intent.hasExtra(it) }) {
+                    player.setBufferConfig(
+                        maxSecs = intent.getIntExtra("buffer_max", 0),
+                        minSecs = intent.getIntExtra("buffer_min", 0),
+                        maxMb = intent.getIntExtra("buffer_mb", 0),
+                        outageSecs = intent.getIntExtra("outage", 0),
+                    )
+                }
             }
         }
     }

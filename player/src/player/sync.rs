@@ -569,6 +569,9 @@ pub(super) async fn video_sync_loop<V: VideoSink, A: AudioSink>(
         // frame N"). Clamping keeps the buffer flowing through SF regardless of
         // any clock discontinuity; pacing still comes from the sleep above.
         let present_ns = present_ns.min(clock_monotonic_ns() + MAX_PRESENT_LEAD_NS);
+        // Interval between this frame's and the previous frame's present
+        // stamps, ms (the judder gauge below; None on the first frame).
+        let present_interval_ms = last_present.map(|(last_ns, _)| (present_ns - last_ns) / 1_000_000);
         last_present = Some((present_ns, pts_us_rel));
         frame.desired_present_ns = present_ns;
 
@@ -620,11 +623,26 @@ pub(super) async fn video_sync_loop<V: VideoSink, A: AudioSink>(
             if interval_ms < 5 {
                 stats.render_burst_frames.fetch_add(1, Ordering::Relaxed);
             }
-            // Judder: the wall interval should track the media delta. Guard to
+            // Judder: the frame interval should track the media delta. Guard to
             // steady-state (sane consecutive deltas) so seeks, splices and
             // segment boundaries don't count as stutter.
+            //
+            // Android measures the PRESENT stamps: SurfaceFlinger shows the
+            // frame at that time (direct releaseOutputBuffer timestamp or
+            // eglPresentationTimeANDROID), so they are what the viewer sees.
+            // The wake-up interval wobbles with the audio clock (32 ms E-AC-3
+            // steps in passthrough) without any visible effect, and counted
+            // that as judder. Elsewhere the frame shows at the next VSync after
+            // submit, so the render interval is the visible one.
             if delta_pts > 0 && delta_pts < 100 {
-                let jitter = interval_ms as i64 - delta_pts as i64;
+                #[cfg(target_os = "android")]
+                let shown_ms = present_interval_ms.unwrap_or(interval_ms as i64);
+                #[cfg(not(target_os = "android"))]
+                let shown_ms = {
+                    let _ = present_interval_ms;
+                    interval_ms as i64
+                };
+                let jitter = shown_ms - delta_pts as i64;
                 if jitter.abs() > 10 {
                     stats.judder_frames.fetch_add(1, Ordering::Relaxed);
                 }

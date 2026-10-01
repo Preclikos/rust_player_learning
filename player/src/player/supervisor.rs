@@ -23,6 +23,32 @@ fn signal_stop(flag: &AtomicBool, stop: &Notify) {
     stop.notify_waiters();
 }
 
+/// Direct mode: hold off configuring a codec while the host has no video
+/// window (Home, another app on top: the host cleared it in
+/// `surfaceDestroyed`). An ABR swap or retry that landed there configured
+/// MediaCodec on the vanished Surface, failed with
+/// `AMediaCodec_configure(direct): -10000` and cost a pipeline rebuild after
+/// returning. Playback is held paused meanwhile (`SurfaceHold`), so waiting
+/// loses nothing. Returns false when the pipeline is stopped while waiting.
+async fn wait_for_video_window(window: &DirectWindow, direct: bool, stop_flag: &AtomicBool) -> bool {
+    if !direct || window.is_set() {
+        return true;
+    }
+    log::info!("[video] supervisor: no video surface, codec configure deferred until it is back");
+    let t0 = Instant::now();
+    while !window.is_set() {
+        if stop_flag.load(Ordering::Relaxed) {
+            return false;
+        }
+        crate::rt::sleep(Duration::from_millis(50)).await;
+    }
+    log::info!(
+        "[video] supervisor: video surface back after {}ms, configuring the codec",
+        t0.elapsed().as_millis()
+    );
+    true
+}
+
 /// Long-lived task that owns the video pipeline for a single `play()` call.
 /// It runs one representation's decode at a time and switches on ABR request.
 ///
@@ -88,6 +114,8 @@ pub(super) async fn video_supervisor(
     // surfaces as PlayerEvent::Error instead of a fake EndOfStream.
     const MAX_PIPELINE_RETRIES: u32 = 3;
     const PROGRESS_RESET_MS: u64 = 10_000;
+    // Direct mode is decided by the window the play() started with.
+    let direct = video_window.is_set();
     let mut retry_attempt: u32 = 0;
     let mut last_fail_pos_ms: u64 = 0;
     let spawn_pipeline = |repr: VideoRepresenation,
@@ -207,7 +235,16 @@ const PREPARE_READY_BUDGET: Duration = Duration::from_millis(5_000);
                         retry_attempt = 0;
                     }
                     last_fail_pos_ms = pos_now;
-                    retry_attempt += 1;
+                    // A codec configured just as the host's Surface went away
+                    // (Home during a swap) fails on the abandoned window. Not
+                    // a broken stream: the retry below waits for the surface,
+                    // so it does not spend the retry budget.
+                    let surface_lost = direct && !video_window.is_set();
+                    if surface_lost {
+                        log::info!("[video] supervisor: failure while the video surface is gone, not counted as a retry");
+                    } else {
+                        retry_attempt += 1;
+                    }
                     stats.pipeline_retries.fetch_add(1, Ordering::Relaxed);
                     let licence_refused = detail.starts_with(net_io::LICENSE_ERROR_PREFIX);
                     if licence_refused || retry_attempt > MAX_PIPELINE_RETRIES {
@@ -259,6 +296,9 @@ const PREPARE_READY_BUDGET: Duration = Duration::from_millis(5_000);
                     // (no rewind). The retry task includes the prefetch, so
                     // a network failure during recovery lands back in this
                     // arm and consumes another attempt.
+                    if !wait_for_video_window(&video_window, direct, &stop_flag).await {
+                        return Ok(());
+                    }
                     let pos_abs = Duration::from_millis(pos_now) + origin;
                     let resume_idx = find_segment_index(&current_repr.segments, pos_abs);
                     cur_stop = Arc::new(Notify::new());
@@ -484,6 +524,8 @@ const PREPARE_READY_BUDGET: Duration = Duration::from_millis(5_000);
         // network wait. OLD keeps feeding av_sync throughout.
         let primed = Arc::clone(&new_pf.primed);
         let mut old_done = false;
+        // Why OLD ended early, if it failed (see the check after step 2.5).
+        let mut old_error: Option<String> = None;
         tokio::select! {
             _ = primed.notified() => {
                 log::info!("[abr] NEW primed {}ms after switch", swap_t0.elapsed().as_millis());
@@ -509,6 +551,7 @@ const PREPARE_READY_BUDGET: Duration = Duration::from_millis(5_000);
                 // OLD reached EOF while NEW was priming — bring NEW up anyway.
                 if let Ok(Err(e)) = res {
                     log::error!("[video] supervisor: pipeline failed during prime: {}", e);
+                    old_error = Some(e.to_string());
                 }
                 old_done = true;
             }
@@ -646,6 +689,7 @@ const PREPARE_READY_BUDGET: Duration = Duration::from_millis(5_000);
                 res = &mut cur_handle => {
                     if let Ok(Err(e)) = res {
                         log::error!("[video] supervisor: pipeline failed during boundary wait: {}", e);
+                        old_error = Some(e.to_string());
                     }
                     old_done = true;
                 }
@@ -657,6 +701,34 @@ const PREPARE_READY_BUDGET: Duration = Duration::from_millis(5_000);
             position_ms.load(Ordering::Relaxed) + origin.as_millis() as u64,
             boundary_ms
         );
+
+        // OLD FAILED before the picture reached the boundary (e.g. Home during
+        // the swap: its codec configure hit the vanished Surface). NEW starts
+        // AT the boundary, so carrying on would leave nothing to show between
+        // here and there: the picture waits for a frame in the future while
+        // audio waits for the picture, black and frozen until the next switch.
+        // Keep the switch but rebuild it from the current position, through
+        // the retry path (which also waits for the surface to come back).
+        if let Some(e) = old_error.take() {
+            let rendered_abs = position_ms.load(Ordering::Relaxed) + origin.as_millis() as u64;
+            if boundary_ms != 0 && rendered_abs + BOUNDARY_LEAD_MS < boundary_ms {
+                log::warn!(
+                    "[abr] OLD failed at {}ms, before the boundary at {}ms: rebuilding repr {} from the current position",
+                    rendered_abs, boundary_ms, new_repr.id
+                );
+                signal_stop(&new_flag, &new_stop);
+                if let Some((_, release)) = warm.as_ref() {
+                    release.notify_one();
+                }
+                let _ = events.send(PlayerEvent::TrackChanged {
+                    kind: TrackKind::Video,
+                    info: video_track_info(&new_repr),
+                });
+                current_repr = new_repr;
+                cur_handle = crate::rt::spawn(async move { Err(e.into()) });
+                continue;
+            }
+        }
 
         // Reaching the boundary is not the same as being READY at it. The
         // decrypt of NEW's first segment was started back when the prefetch
@@ -764,6 +836,10 @@ const PREPARE_READY_BUDGET: Duration = Duration::from_millis(5_000);
             // wait above uses) is where OLD's picture actually is, so NEW
             // splices there cleanly.
             None => {
+                if !wait_for_video_window(&video_window, direct, &stop_flag).await {
+                    signal_stop(&new_flag, &new_stop);
+                    return Ok(());
+                }
                 let rendered_abs_ms =
                     position_ms.load(Ordering::Relaxed) + origin.as_millis() as u64;
                 let splice_pts_us = rendered_abs_ms as i64 * 1000;

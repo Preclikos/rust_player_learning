@@ -51,7 +51,8 @@ reuse happens within a group.
 | Mi TV Stick (Amlogic) | OMX.amlogic.hevc.decoder.awesome2, adaptive | LATE 0, codec holds ≤ 9 buffers, 5/5 clean starts with max 4K | LATE 5 | 2× clean; 1× the known Amlogic post-Home `input-buffer stall`, recovered (pre-existing) |
 | Samsung S21 (Exynos) | c2.exynos.hevc.decoder, adaptive | first frame 4-7 ms, LATE 0 | LATE 0 | LATE 0 |
 | Windows (D3D11VA, warm handoff) | unchanged path | - | LATE 7 = master | - |
-| Chrome (WebCodecs, warm) | functional only | 5 switches incl. SDR↔HDR, gate opened, no errors | - | - |
+| Chrome (WebCodecs, warm) | visible tab, 5 switches incl. SDR↔HDR | render gap max 57-66 ms, 0-1 late/drop per switch, full frame count (≈175 per 7.5 s) | - | - |
+| Chrome, cold path (A/B, warm off) | same | render gap **466-483 ms** per switch, ≈160 frames per 7.5 s (~15-20 frames frozen) | - | - |
 
 How to read a run (Android logcat, test app PID only):
 - `[abr] decoder kept: reconfigured in place for repr N (WxH)`: reuse happened.
@@ -90,9 +91,11 @@ How to read a run (Android logcat, test app PID only):
   `send_packet: Not enough space` → pipeline retry. Seen 1 in 3 runs on master
   too, so not caused by this change. The gate holds 2 frames, but the D3D11VA
   pool still runs out sometimes.
-- **Web pacing during warm switches:** not measured, because the Chrome tab was
-  hidden (throttled). Repeat with the demo in a visible window: `?hud=1`,
-  `window.__player.setVideoTrackSoft(0, i)`.
+- **Web, fixed on the way:** `Instant::now() - Duration` panicked right after a
+  page reload ("overflow when subtracting duration from instant"):
+  `performance.now()` starts at page load. Now `rt::instant_ago`.
+  Measure web switches in a VISIBLE tab and start with a real click (Web Audio
+  needs a user gesture). Use `?hud=1` and `window.__player.setVideoTrackSoft(0, i)`.
 - **Amlogic:** the codec sometimes dies across Home (`dequeueInputBuffer -10000`
   or `input-buffer stall` after return). The supervisor recovers since 0.1.54;
   root cause not investigated.

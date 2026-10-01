@@ -354,7 +354,7 @@ mod tests {
     /// `stood_ms`, without the test having to sleep for it.
     fn stand_still_for(fx: &ClockFixture, played_ms: u64, stood_ms: u64, ever_advanced: bool) {
         let mut st = fx.clock.state.lock().unwrap();
-        st.seen = Some((played_ms, Instant::now() - Duration::from_millis(stood_ms), Duration::ZERO));
+        st.seen = Some((played_ms, crate::rt::instant_ago(Duration::from_millis(stood_ms)), Duration::ZERO));
         st.ever_advanced = ever_advanced;
     }
 
@@ -440,7 +440,7 @@ mod tests {
             let mut st = fx.clock.state.lock().unwrap();
             st.seen = Some((1_000, Instant::now(), Duration::ZERO));
             st.ever_advanced = true;
-            st.wall_from = Some((1_000, Instant::now() - Duration::from_millis(1_000), Duration::ZERO));
+            st.wall_from = Some((1_000, crate::rt::instant_ago(Duration::from_millis(1_000)), Duration::ZERO));
         }
         // Output comes back roughly where we are -> re-adopt.
         fx.sink.played_ms.store(2_050, Ordering::Relaxed);
@@ -459,7 +459,7 @@ mod tests {
             let mut st = fx.clock.state.lock().unwrap();
             st.seen = Some((1_000, Instant::now(), Duration::ZERO));
             st.ever_advanced = true;
-            st.wall_from = Some((1_000, Instant::now() - Duration::from_millis(1_000), Duration::ZERO));
+            st.wall_from = Some((1_000, crate::rt::instant_ago(Duration::from_millis(1_000)), Duration::ZERO));
         }
         fx.sink.played_ms.store(1_200, Ordering::Relaxed);
         let now = fx.clock.audio_now_us(Duration::ZERO).unwrap();

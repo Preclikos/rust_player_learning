@@ -157,9 +157,9 @@ pub(super) async fn video_sync_loop<V: VideoSink, A: AudioSink>(
     let mut frame_idx: u64 = 0;
     let mut last_render_elapsed: u64 = 0;
     // Position event rate-limit: ≤ 4 Hz per PLAYER_INTEGRATION.md §4.2.
-    let mut last_position_emit = Instant::now() - Duration::from_secs(1);
+    let mut last_position_emit = crate::rt::instant_ago(Duration::from_secs(1));
     // Stats event rate-limit: ≤ 1 Hz per PLAYER_INTEGRATION.md §4.1.
-    let mut last_stats_emit = Instant::now() - Duration::from_secs(1);
+    let mut last_stats_emit = crate::rt::instant_ago(Duration::from_secs(1));
     // A/V drift measurement: (video elapsed_ms, audio played_ms) at the
     // first stats tick — subsequent ticks compare ADVANCES from here.
     let mut drift_baseline: Option<(u64, u64)> = None;

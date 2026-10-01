@@ -25,3 +25,12 @@ pub use native::*;
 mod web;
 #[cfg(target_arch = "wasm32")]
 pub use web::*;
+
+/// The instant `d` before now, or now when the clock does not reach back that
+/// far. On the web `Instant` starts at page load (`performance.now()`), so
+/// `Instant::now() - d` right after a reload panics ("overflow when
+/// subtracting duration from instant") and took the whole player down.
+pub fn instant_ago(d: std::time::Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_sub(d).unwrap_or(now)
+}

@@ -87,10 +87,30 @@ How to read a run (Android logcat, test app PID only):
 
 ## Other open points found on the way
 
-- **Windows warm handoff, rare:** `Static surface pool size exceeded` →
-  `send_packet: Not enough space` → pipeline retry. Seen 1 in 3 runs on master
-  too, so not caused by this change. The gate holds 2 frames, but the D3D11VA
-  pool still runs out sometimes.
+- **Windows D3D11VA pool exhaustion: FIXED.**
+  - **Cause:** D3D11VA's frame pool is one fixed `Texture2DArray`, auto-sized to
+    20 for HEVC. Outside the decoder the pipeline holds the frame channel (8),
+    the reorder buffer (4), the renderer (1-2), and during a warm switch the
+    gate (2) and the pump (1).
+  - **Before:** 3 of 4 switch runs ran the pool dry → `Static surface pool size
+    exceeded` → `send_packet ENOMEM` → pipeline retry.
+  - **Fix:** `extra_hw_frames = 10` (pool 30): 6/6 runs clean.
+  - **Linux/VAAPI is unaffected:** VA-API ≥ 1.0 pools are dynamic and FFmpeg
+    ignores `extra_hw_frames` there.
+
+### TODO: Windows GPU matrix (hand to testers with other GPUs)
+The log line `[ffmpeg_hw] hw frame pool: N surfaces (WxH)` shows the pool per
+decoder (expected 30).
+1. **Integrated GPU (Intel UHD/Iris, AMD APU) with 4K HDR**:
+   - 30 × 4K P010 surfaces ≈ 750 MB of shared RAM.
+   - Check that the decoder opens and that ABR switches stay clean (no
+     `surface pool size exceeded`, no decoder-open failure).
+   - If memory fails, scale `EXTRA_HW_FRAMES` with resolution instead of a
+     flat 10.
+2. **NVIDIA and AMD discrete**: the same switch test. The pool must stay ≤ 64
+   (D3D11 array limit, FFmpeg clamps). Compare LATE per switch with the Intel
+   result.
+
 - **Web, fixed on the way:** `Instant::now() - Duration` panicked right after a
   page reload ("overflow when subtracting duration from instant"):
   `performance.now()` starts at page load. Now `rt::instant_ago`.

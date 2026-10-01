@@ -12,6 +12,10 @@ use crate::parsers::mp4::{append_hevc_header, hevc_nalu_bodies};
 
 use super::{DecodedVideoFrame, DecoderError, HwVideoDecoder, PlatformFrame, VideoCodec, VideoDecoderParams};
 
+/// See `configure`: frames the pipeline keeps out of the decoder's own pool.
+/// Each costs one decoder surface (4K P010 ~25 MB, 1080p NV12 ~3 MB).
+const EXTRA_HW_FRAMES: i32 = 10;
+
 pub struct FfmpegHwDecoder {
     decoder: Option<ffmpeg_next::decoder::Video>,
     /// Owned hw-device — only created+held when this decoder was NOT handed a
@@ -26,6 +30,8 @@ pub struct FfmpegHwDecoder {
     /// Frames taken out of the decoder inside `submit` (to make room when
     /// `send_packet` said EAGAIN), handed out by `try_recv` first.
     pending: VecDeque<ffmpeg_next::util::frame::Video>,
+    /// The hw frame pool size was logged (once per decoder).
+    pool_logged: bool,
 }
 
 unsafe impl Send for FfmpegHwDecoder {}
@@ -108,6 +114,7 @@ impl FfmpegHwDecoder {
             shared_device: None,
             color: Default::default(),
             pending: VecDeque::new(),
+            pool_logged: false,
         }
     }
 
@@ -120,6 +127,7 @@ impl FfmpegHwDecoder {
             shared_device: Some(device),
             color: Default::default(),
             pending: VecDeque::new(),
+            pool_logged: false,
         }
     }
 
@@ -218,6 +226,14 @@ impl HwVideoDecoder for FfmpegHwDecoder {
         unsafe {
             (*ctx.as_mut_ptr()).hw_device_ctx = device_ref;
             (*ctx.as_mut_ptr()).get_format = Some(select_hw_format);
+            // Surfaces the pipeline holds OUTSIDE the decoder. The auto-sized
+            // pool (20 for HEVC: DPB + threading) only covers the decoder
+            // itself, while we keep up to 8 frames in the frame channel, 4 in
+            // the reorder buffer and 1-2 at the renderer, plus 2 in the gate
+            // and 1 in the pump while a warm ABR handoff waits. That ran the
+            // pool dry ("Static surface pool size exceeded" -> send_packet
+            // ENOMEM -> pipeline retry, a frozen second) on 3 of 4 switch runs.
+            (*ctx.as_mut_ptr()).extra_hw_frames = EXTRA_HW_FRAMES;
         }
 
         // No pre-allocated hw_frames_ctx: let hevc_d3d11va2 auto-create it
@@ -335,6 +351,19 @@ impl HwVideoDecoder for FfmpegHwDecoder {
                 let pts_us = frame.pts().unwrap_or(0) * 1000;
                 let width = frame.width();
                 let height = frame.height();
+                if !self.pool_logged {
+                    self.pool_logged = true;
+                    unsafe {
+                        let hwf = (*frame.as_ptr()).hw_frames_ctx;
+                        if !hwf.is_null() {
+                            let fc = (*hwf).data as *const ffmpeg_sys_next::AVHWFramesContext;
+                            log::info!(
+                                "[ffmpeg_hw] hw frame pool: {} surfaces ({}x{})",
+                                (*fc).initial_pool_size, (*fc).width, (*fc).height
+                            );
+                        }
+                    }
+                }
 
                 // macOS: keep the AVFrame as AV_PIX_FMT_VIDEOTOOLBOX — the CVPixelBufferRef
                 // lives in frame.data[3] and the video renderer wraps it as two MTLTextures

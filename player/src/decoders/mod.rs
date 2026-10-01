@@ -92,6 +92,14 @@ pub struct VideoDecoderParams {
     /// reconstruction in the OS pipeline — and falls back to the HEVC
     /// base layer for profiles 7/8 when no DV decoder exists.
     pub dovi_profile: Option<u8>,
+    /// Largest picture of the video ladder (0 = unknown). A decoder that can
+    /// switch resolution in place (Android adaptive playback) is configured
+    /// for this size, so an ABR switch reuses it instead of building a new
+    /// one (see [`HwVideoDecoder::try_reconfigure`]).
+    #[allow(dead_code)]
+    pub max_width: u32,
+    #[allow(dead_code)]
+    pub max_height: u32,
 }
 
 /// Transfer function of the video signal, from the SPS VUI
@@ -398,6 +406,17 @@ pub trait HwVideoDecoder: Send {
 
     /// Install codec parameters. Called once before the first `submit`.
     fn configure(&mut self, params: VideoDecoderParams) -> Result<(), DecoderError>;
+
+    /// ABR switch: carry on with `params` (a new representation) in THIS
+    /// decoder instead of a new one. `true` = reconfigured in place, keep
+    /// feeding (the next sample is the new representation's first IDR);
+    /// `false` = not possible here (different codec, bit depth or transfer,
+    /// larger than configured, no in-place switch support) and the caller
+    /// drops this decoder and builds a new one. Removes the
+    /// teardown -> first-frame hole where decoders cannot run side by side.
+    fn try_reconfigure(&mut self, _params: &VideoDecoderParams) -> bool {
+        false
+    }
 
     /// Queue a compressed sample for decoding. `sample` is the raw mdat bytes
     /// (length-prefixed NALU format, CENC-decrypted). Each decoder impl handles

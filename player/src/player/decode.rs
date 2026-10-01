@@ -7,6 +7,100 @@ use super::*;
 // Decoder tasks (platform-generic, communicate via channels)
 // ---------------------------------------------------------------------------
 
+/// Hand-over slot for an ABR switch that keeps the hardware decoder.
+///
+/// Where two decoders cannot run side by side (Android direct mode, Apple),
+/// a switch used to drop OLD's decoder and build NEW's: a 300-400 ms hole
+/// with nothing to show. The supervisor now [`request`](Self::request)s the
+/// running pipeline's decoder; when that pipeline's decode task ends, the
+/// decoder is parked here instead of dropped, and NEW tries
+/// [`HwVideoDecoder::try_reconfigure`] on it before building a new one.
+pub(super) struct DecoderHandoff {
+    wanted: AtomicBool,
+    /// Switch boundary (pts, us): while the decoder is wanted, the running
+    /// pipeline feeds nothing at or after it. With a fresh decoder per
+    /// switch, samples OLD fed past the boundary died with its codec; a kept
+    /// codec would emit them ahead of NEW's first frame (same pts range
+    /// twice, late frames at every switch).
+    cutoff_us: std::sync::atomic::AtomicI64,
+    slot: StdMutex<Option<Box<dyn HwVideoDecoder>>>,
+}
+
+impl DecoderHandoff {
+    pub(super) fn new() -> Self {
+        Self {
+            wanted: AtomicBool::new(false),
+            cutoff_us: std::sync::atomic::AtomicI64::new(i64::MAX),
+            slot: StdMutex::new(None),
+        }
+    }
+
+    /// The switch lands at `pts_us`: the running pipeline stops feeding there.
+    pub(super) fn set_cutoff(&self, pts_us: i64) {
+        self.cutoff_us.store(pts_us, Ordering::SeqCst);
+    }
+
+    /// True when a sample at `pts_us` belongs to the representation being
+    /// switched to and must not reach the kept decoder.
+    fn past_cutoff(&self, pts_us: i64) -> bool {
+        self.wanted.load(Ordering::SeqCst) && pts_us >= self.cutoff_us.load(Ordering::SeqCst)
+    }
+
+    /// Keep the running pipeline's decoder when its decode task ends.
+    pub(super) fn request(&self) {
+        self.wanted.store(true, Ordering::SeqCst);
+    }
+
+    /// Stop asking and take whatever was parked. Call before building any
+    /// new decoder: a parked one still holds the hardware slot.
+    pub(super) fn take(&self) -> Option<Box<dyn HwVideoDecoder>> {
+        self.wanted.store(false, Ordering::SeqCst);
+        self.cutoff_us.store(i64::MAX, Ordering::SeqCst);
+        self.slot.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+
+    fn offer(&self, decoder: Box<dyn HwVideoDecoder>) -> Option<Box<dyn HwVideoDecoder>> {
+        if !self.wanted.load(Ordering::SeqCst) {
+            return Some(decoder);
+        }
+        let mut slot = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+        let old = slot.replace(decoder);
+        old
+    }
+}
+
+/// The decode task's decoder: parked in the [`DecoderHandoff`] when the task
+/// ends while a switch asked for it, dropped otherwise. A guard, because the
+/// task has many exits (stop, end of input, errors).
+struct DecoderGuard {
+    decoder: Option<Box<dyn HwVideoDecoder>>,
+    handoff: Option<Arc<DecoderHandoff>>,
+}
+
+impl std::ops::Deref for DecoderGuard {
+    type Target = Box<dyn HwVideoDecoder>;
+    fn deref(&self) -> &Self::Target {
+        self.decoder.as_ref().expect("decoder present until drop")
+    }
+}
+
+impl std::ops::DerefMut for DecoderGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.decoder.as_mut().expect("decoder present until drop")
+    }
+}
+
+impl Drop for DecoderGuard {
+    fn drop(&mut self) {
+        if let (Some(decoder), Some(handoff)) = (self.decoder.take(), self.handoff.as_ref()) {
+            match handoff.offer(decoder) {
+                None => log::info!("[dec] decoder kept for the next representation"),
+                Some(unwanted) => drop(unwanted),
+            }
+        }
+    }
+}
+
 /// A segment with its init header prepended, CENC-decrypted and mp4-parsed —
 /// everything that has to happen before bytes can be fed to a decoder.
 pub(super) struct PreparedSegment {
@@ -225,7 +319,10 @@ macro_rules! breathe {
 pub(super) async fn video_decoder_task(
     mut receiver: Receiver<DataSegment>,
     sender: Sender<DecodedVideoFrame>,
-    mut decoder: Box<dyn HwVideoDecoder>,
+    decoder: Box<dyn HwVideoDecoder>,
+    // Where the decoder goes when the task ends during an ABR switch that
+    // keeps it (see [`DecoderHandoff`]).
+    handoff: Option<Arc<DecoderHandoff>>,
     init_data: Vec<u8>,
     video_ready: Arc<Notify>,
     track_crypto: Option<TrackCrypto>,
@@ -247,6 +344,10 @@ pub(super) async fn video_decoder_task(
     // `prepare_segment`). `None` outside an ABR swap.
     first_prepared: Option<PrepareHandle>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let mut decoder = DecoderGuard {
+        decoder: Some(decoder),
+        handoff,
+    };
     let mut first_frame_signaled = false;
 
     // Reorder buffer to fix two sources of non-monotonic PTS:
@@ -351,6 +452,23 @@ pub(super) async fn video_decoder_task(
         stats.video_segment_id.store(prepared.id as u64, Ordering::Relaxed);
         let data_vec = prepared.data_vec;
         let sample_info = prepared.sample_info;
+
+        // An ABR switch that keeps this decoder lands at this segment: it is
+        // the next representation's to feed. Checked per SEGMENT, by its
+        // first (IDR) sample: in decode order a segment's last P-frame can
+        // carry a pts past the boundary while the B-frames after it are
+        // still before it, and a per-sample cut lost those frames.
+        if let Some((_, _, ts, ts_scale)) = sample_info.first() {
+            let first_pts_us = if *ts_scale > 0 { ts * 1_000_000 / *ts_scale as i64 } else { 0 };
+            if decoder.handoff.as_ref().is_some_and(|h| h.past_cutoff(first_pts_us)) {
+                log::debug!(
+                    "[dec] segment {} starts at the switch boundary ({}ms); handing the decoder over",
+                    prepared.id,
+                    first_pts_us / 1000
+                );
+                return Ok(());
+            }
+        }
 
         let mut first_pts_us: Option<i64> = None;
         let mut last_pts_us: i64 = 0;
@@ -674,4 +792,59 @@ pub(super) async fn audio_decoder_task(
         stats.diag_audio_dec.fetch_add(1, Ordering::Relaxed);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct NullDecoder;
+    impl HwVideoDecoder for NullDecoder {
+        fn configure(&mut self, _params: VideoDecoderParams) -> Result<(), crate::decoders::DecoderError> {
+            Ok(())
+        }
+        fn submit(&mut self, _sample: &[u8], _pts_us: i64) -> Result<(), crate::decoders::DecoderError> {
+            Ok(())
+        }
+        fn try_recv(&mut self) -> Result<Option<DecodedVideoFrame>, crate::decoders::DecoderError> {
+            Ok(None)
+        }
+    }
+
+    fn guard(handoff: &Arc<DecoderHandoff>) -> DecoderGuard {
+        DecoderGuard {
+            decoder: Some(Box::new(NullDecoder)),
+            handoff: Some(Arc::clone(handoff)),
+        }
+    }
+
+    #[test]
+    fn decoder_is_parked_only_when_a_switch_asked_for_it() {
+        let handoff = Arc::new(DecoderHandoff::new());
+        drop(guard(&handoff));
+        assert!(handoff.take().is_none(), "not requested: dropped");
+
+        handoff.request();
+        drop(guard(&handoff));
+        assert!(handoff.take().is_some(), "requested: parked");
+        assert!(handoff.take().is_none(), "take empties the slot");
+
+        // take() also withdraws the request.
+        drop(guard(&handoff));
+        assert!(handoff.take().is_none());
+    }
+
+    #[test]
+    fn cutoff_applies_only_while_requested_and_resets_on_take() {
+        let handoff = DecoderHandoff::new();
+        handoff.set_cutoff(42_042_000);
+        assert!(!handoff.past_cutoff(50_000_000), "no request: no cutoff");
+        handoff.request();
+        assert!(!handoff.past_cutoff(36_119_000));
+        assert!(handoff.past_cutoff(42_042_000));
+        assert!(handoff.past_cutoff(42_125_000));
+        let _ = handoff.take();
+        handoff.request();
+        assert!(!handoff.past_cutoff(42_125_000), "take resets the cutoff");
+    }
 }

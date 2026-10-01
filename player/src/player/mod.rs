@@ -2116,6 +2116,19 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         // afterwards would silently never fire any ticks again.
         let (abr_kill_tx, mut abr_kill_rx) = tokio::sync::oneshot::channel::<()>();
         let video_output_window = Arc::clone(&self.video_output_window);
+        // Largest picture of the selected ladder, for decoders that switch
+        // resolution in place (VideoDecoderParams::max_width).
+        let ladder_max = self
+            .video_adaptation
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|a| {
+                a.representations
+                    .iter()
+                    .fold((0u32, 0u32), |m, r| (m.0.max(r.width), m.1.max(r.height)))
+            })
+            .unwrap_or((0, 0));
         // Adaptive-frame-rate inputs (Android direct mode only): the toggle and
         // the content fps (MPD @frameRate on the selected adaptation, captured
         // once per play() — ABR swaps keep the same content fps).
@@ -2371,6 +2384,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                     origin,
                     Arc::clone(&video_output_window),
                     Arc::clone(&hdr_decode_8bit),
+                    ladder_max,
                     Arc::clone(&pending_resume),
                 ));
 

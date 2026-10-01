@@ -212,6 +212,16 @@ class RustPlayer(private val context: Context) {
     }
 
     /**
+     * Which representations auto quality (ABR) may pick: `"sdr"` (SDR only,
+     * by the manifest's HDR signalling, e.g. HDR turned off in settings),
+     * `"8bit"` / `"10bit"` (by codec profile), `"hdr"` (HDR preferred), or
+     * `"adaptive"` (default: all). Applies from the next ABR decision.
+     */
+    fun setAbrVideoProfile(profile: String) {
+        if (handle != 0L) NativeBridge.nativeSetAbrVideoProfile(handle, profile)
+    }
+
+    /**
      * Fetch ClearKey content keys WRAPPED from [url] instead of through the
      * host's resolveKey (see docs/CLEARKEY_WRAPPED_LICENCE.md): per KID an
      * ephemeral ECDH P-256 exchange, HKDF-SHA256 and AES-256-GCM, so no key

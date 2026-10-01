@@ -411,7 +411,12 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             if (arr.length() == 0) return null
             // Alternate between the two ends so consecutive steps always mean a
             // real change; with a single entry there is nothing to alternate.
-            val idx = if (arr.length() < 2) 0 else if (step % 2 == 0) arr.length() - 1 else 0
+            // --ei alt_lo / --ei alt_hi narrow the ends to a range of the list
+            // (e.g. only the SDR rungs, to exercise in-place codec reuse).
+            val last = arr.length() - 1
+            val lo = intent.getIntExtra("alt_lo", 0).coerceIn(0, last)
+            val hi = intent.getIntExtra("alt_hi", last).coerceIn(lo, last)
+            val idx = if (hi == lo) lo else if (step % 2 == 0) hi else lo
             return arr.getJSONObject(idx)
         }
 
@@ -667,6 +672,9 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                     audioPassthrough = passthroughExtra,
                 )
                 // --ei buffer_max / buffer_min / buffer_mb / outage (docs/BUFFERING.md).
+                // --es abr_profile sdr|8bit|10bit|hdr: limit auto quality (e.g. keep
+                // ABR within the 8-bit rungs while exercising in-place codec reuse).
+                intent.getStringExtra("abr_profile")?.let { player.setAbrVideoProfile(it) }
                 if (listOf("buffer_max", "buffer_min", "buffer_mb", "outage").any { intent.hasExtra(it) }) {
                     player.setBufferConfig(
                         maxSecs = intent.getIntExtra("buffer_max", 0),

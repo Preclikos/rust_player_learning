@@ -706,6 +706,32 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetVideoA
     })
 }
 
+/// Which video representations ABR may pick: "sdr" (8-bit SDR only, by the
+/// MPD's HDR signalling), "8bit" / "10bit" (by codec profile), "hdr" (HDR
+/// preferred) or anything else for the default (all). Takes effect from the
+/// next ABR decision.
+#[no_mangle]
+pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetAbrVideoProfile<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    profile: JString<'local>,
+) {
+    with_env_or("nativeSetAbrVideoProfile", &mut env, (), move |env| {
+        let Some(h) = (unsafe { handle_ref(handle) }) else { return };
+        let profile = profile.try_to_string(env).unwrap_or_default();
+        let p = match profile.as_str() {
+            "sdr" => player::AbrVideoProfile::SdrOnly,
+            "hdr" => player::AbrVideoProfile::HdrPreferred,
+            "8bit" => player::AbrVideoProfile::LockedDepth(8),
+            "10bit" => player::AbrVideoProfile::LockedDepth(10),
+            _ => player::AbrVideoProfile::Adaptive,
+        };
+        log::info!("ABR video profile: {:?}", p);
+        h.bridge.player().set_abr_video_profile(p);
+    })
+}
+
 #[no_mangle]
 pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetAudioTrack(
     _env: EnvUnowned,

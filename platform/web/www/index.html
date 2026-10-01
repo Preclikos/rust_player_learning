@@ -206,6 +206,7 @@ async function startItem(url) {
   }
   try {
     player = await RustPlayer.create(canvas, url, host, options);
+    window.__player = player; // dev hook: drive switches from the console / automation
     player.setVolume($('vol').value / 100);
     $('stop').disabled = false;
   } catch (e) {

@@ -101,6 +101,9 @@ pub(super) async fn video_supervisor(
     // "BufferQueue has been abandoned", then retries exhausted).
     video_window: Arc<DirectWindow>,
     hdr_decode_8bit: Arc<AtomicBool>,
+    // Largest picture of the video ladder: decoders that can switch
+    // resolution in place are configured for it (see `try_reconfigure`).
+    ladder_max: (u32, u32),
     // Resume slot written when retries are exhausted: the NEXT play() call
     // starts from this position instead of zero ("continue where we
     // stopped" semantics for the consumer's manual retry).
@@ -116,6 +119,8 @@ pub(super) async fn video_supervisor(
     const PROGRESS_RESET_MS: u64 = 10_000;
     // Direct mode is decided by the window the play() started with.
     let direct = video_window.is_set();
+    // ABR switches that keep the decoder park it here (see DecoderHandoff).
+    let handoff = Arc::new(DecoderHandoff::new());
     let mut retry_attempt: u32 = 0;
     let mut last_fail_pos_ms: u64 = 0;
     let spawn_pipeline = |repr: VideoRepresenation,
@@ -142,6 +147,8 @@ pub(super) async fn video_supervisor(
             soft_end.clone(),
             video_window.lease(),
             Arc::clone(&hdr_decode_8bit),
+            ladder_max,
+            Some(Arc::clone(&handoff)),
         ));
         (handle, soft_end)
     };
@@ -318,6 +325,10 @@ const PREPARE_READY_BUDGET: Duration = Duration::from_millis(5_000);
                         let hdr_decode_8bit = Arc::clone(&hdr_decode_8bit);
                         let direct_window = video_window.lease();
                         let splice_pts_us = pos_abs.as_micros() as i64;
+                        // A decoder parked by an interrupted switch still
+                        // holds the HW slot: free it before building anew.
+                        drop(handoff.take());
+                        let handoff = Arc::clone(&handoff);
                         async move {
                             let pf = video_prefetch(
                                 &repr,
@@ -336,7 +347,7 @@ const PREPARE_READY_BUDGET: Duration = Duration::from_millis(5_000);
                                 pf,
                                 sender,
                                 video_ready,
-                                decoder_factory(),
+                                DecoderSource::New(decoder_factory()),
                                 stats,
                                 flag,
                                 Some(SwapSplice {
@@ -345,6 +356,8 @@ const PREPARE_READY_BUDGET: Duration = Duration::from_millis(5_000);
                                 }),
                                 direct_window,
                                 hdr_decode_8bit,
+                                ladder_max,
+                                Some(handoff),
                             )
                             .await
                         }
@@ -452,6 +465,11 @@ const PREPARE_READY_BUDGET: Duration = Duration::from_millis(5_000);
             ),
         );
         let swap_t0 = Instant::now();
+        // Keep OLD's decoder when its decode task ends (it may end at the
+        // soft-capped boundary before step 3): NEW reconfigures it in place
+        // where the decoder can, instead of a teardown and a new instance.
+        // The warm-handoff platforms cancel this below.
+        handoff.request();
 
         // --- Make-before-break, step 1: prefetch NEW while OLD keeps playing.
         // `video_prefetch` only downloads — it never allocates the HW decoder,
@@ -568,6 +586,9 @@ const PREPARE_READY_BUDGET: Duration = Duration::from_millis(5_000);
             .get(new_start)
             .map(|s| s.start_time().as_millis() as u64)
             .unwrap_or(0);
+        if boundary_ms != 0 {
+            handoff.set_cutoff(boundary_ms as i64 * 1000);
+        }
 
         // --- step 2.6, renderer-path platforms only: warm handoff. Desktop
         // hw decoders (D3D11VA/VAAPI/VideoToolbox) can coexist, unlike
@@ -595,8 +616,13 @@ const PREPARE_READY_BUDGET: Duration = Duration::from_millis(5_000);
         // Android GL path, where each decoder owns its own ImageReader — and
         // that needs a device on that path to verify before it is turned on,
         // so it stays off rather than assumed.
-        let warm_capable =
-            cfg!(any(target_os = "windows", target_os = "linux")) && video_window.lease().raw() == 0;
+        //
+        // The browser (WebCodecs) joins them: VideoDecoder instances are
+        // independent objects with nothing shared, and two side by side is the
+        // ordinary MSE-player case in Chrome/Edge/Safari; the 2-frame gate
+        // keeps NEW from pinning more than two VideoFrames while it waits.
+        let warm_capable = cfg!(any(target_os = "windows", target_os = "linux", target_arch = "wasm32"))
+            && video_window.lease().raw() == 0;
         let warm = if warm_capable && boundary_ms != 0 {
             // Tiny gate on purpose: each held frame pins a surface from the
             // decoder's fixed hw frame pool (D3D11VA/VAAPI), and holding a
@@ -637,11 +663,13 @@ const PREPARE_READY_BUDGET: Duration = Duration::from_millis(5_000);
             // this segment index, so everything below the boundary is OLD's
             // and NEW keeps the boundary frame up (the trim is `<=`, hence -1).
             let splice_pts_us = boundary_ms as i64 * 1000 - 1;
+            // Two decoders run side by side here: OLD keeps its own.
+            drop(handoff.take());
             let handle = crate::rt::spawn(run_decode(
                 new_pf.take().unwrap(),
                 gate_tx,
                 video_ready.clone(),
-                decoder_factory(),
+                DecoderSource::New(decoder_factory()),
                 Arc::clone(&stats),
                 new_flag.clone(),
                 Some(SwapSplice {
@@ -650,6 +678,8 @@ const PREPARE_READY_BUDGET: Duration = Duration::from_millis(5_000);
                 }),
                 video_window.lease(),
                 Arc::clone(&hdr_decode_8bit),
+                ladder_max,
+                Some(Arc::clone(&handoff)),
             ));
             Some((handle, release))
         } else {
@@ -720,6 +750,7 @@ const PREPARE_READY_BUDGET: Duration = Duration::from_millis(5_000);
                 if let Some((_, release)) = warm.as_ref() {
                     release.notify_one();
                 }
+                drop(handoff.take());
                 let _ = events.send(PlayerEvent::TrackChanged {
                     kind: TrackKind::Video,
                     info: video_track_info(&new_repr),
@@ -849,20 +880,46 @@ const PREPARE_READY_BUDGET: Duration = Duration::from_millis(5_000);
                     splice_pts_us / 1000
                 );
                 let decode_t0 = Instant::now();
-                let decoder = decoder_factory();
+                let pf = new_pf.take().expect("new_pf unconsumed on non-warm path");
+                let window = video_window.lease();
+                let params = video_decoder_params(&pf, &window, &hdr_decode_8bit, ladder_max);
+                // OLD's decoder, parked when its decode task ended. Reuse it
+                // where it can switch in place; otherwise drop it FIRST (it
+                // holds the HW slot), then build NEW's.
+                let source = match handoff.take() {
+                    Some(mut kept) => {
+                        if kept.try_reconfigure(&params) {
+                            log::info!(
+                                "[abr] decoder kept: reconfigured in place for repr {} ({}x{})",
+                                new_repr.id, pf.width, pf.height
+                            );
+                            stats.debug.log(
+                                "abr",
+                                format!("decoder kept across the switch ({}x{})", pf.width, pf.height),
+                            );
+                            DecoderSource::Reconfigured(kept)
+                        } else {
+                            drop(kept);
+                            DecoderSource::New(decoder_factory())
+                        }
+                    }
+                    None => DecoderSource::New(decoder_factory()),
+                };
                 crate::rt::spawn(run_decode(
-                    new_pf.take().expect("new_pf unconsumed on non-warm path"),
+                    pf,
                     frame_sender.clone(),
                     video_ready.clone(),
-                    decoder,
+                    source,
                     Arc::clone(&stats),
                     new_flag.clone(),
                     Some(SwapSplice {
                         started: decode_t0,
                         skip_below_pts_us: splice_pts_us,
                     }),
-                    video_window.lease(),
+                    window,
                     Arc::clone(&hdr_decode_8bit),
+                    ladder_max,
+                    Some(Arc::clone(&handoff)),
                 ))
             }
         };

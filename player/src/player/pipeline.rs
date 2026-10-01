@@ -443,15 +443,48 @@ pub(super) struct SwapSplice {
     pub(super) skip_below_pts_us: i64,
 }
 
+/// What a decoder for `pf` is configured with. Shared by [`run_decode`] and
+/// the supervisor, which offers the same parameters to a kept decoder first
+/// ([`HwVideoDecoder::try_reconfigure`]).
+pub(super) fn video_decoder_params(
+    pf: &VideoPrefetch,
+    direct_window: &WindowRef,
+    hdr_decode_8bit: &AtomicBool,
+    ladder_max: (u32, u32),
+) -> VideoDecoderParams {
+    VideoDecoderParams {
+        codec: VideoCodec::Hevc,
+        width: pf.width,
+        height: pf.height,
+        hvcc_nalus: pf.hvcc_nalus.clone(),
+        decoder_config_record: pf.decoder_config_record.clone(),
+        color: pf.color,
+        direct_window: direct_window.raw(),
+        dovi_profile: pf.dovi_profile,
+        force_8bit_hdr: hdr_decode_8bit.load(Ordering::Relaxed),
+        max_width: ladder_max.0.max(pf.width),
+        max_height: ladder_max.1.max(pf.height),
+    }
+}
+
+/// How [`run_decode`] gets its decoder.
+pub(super) enum DecoderSource {
+    /// Fresh: configure it for the prefetched representation. The caller
+    /// creates it only *after* any previous representation's decoder has
+    /// been dropped (the scarce HW slot).
+    New(Box<dyn HwVideoDecoder>),
+    /// Kept across an ABR switch and already reconfigured in place.
+    Reconfigured(Box<dyn HwVideoDecoder>),
+}
+
 /// Decode half: configure the HW decoder and run [`video_decoder_task`] against
 /// the segments [`video_prefetch`] is already streaming, joining both halves to
-/// completion. `decoder` (the scarce HW slot) must be created by the caller
-/// only *after* any previous representation's decoder has been dropped.
+/// completion.
 pub(super) async fn run_decode(
     pf: VideoPrefetch,
     sender: Sender<DecodedVideoFrame>,
     video_ready: Arc<Notify>,
-    mut decoder: Box<dyn HwVideoDecoder>,
+    decoder: DecoderSource,
     stats: Arc<StatsState>,
     decoder_stop_flag: Arc<AtomicBool>,
     // `Some(..)` on an ABR swap (splice trim + timing), `None` initially.
@@ -462,18 +495,18 @@ pub(super) async fn run_decode(
     // Player-level HDR-to-8-bit decode switch, sampled here at configure
     // time so ABR swaps / retries pick up a changed value.
     hdr_decode_8bit: Arc<AtomicBool>,
+    // Largest picture of the ladder (see `VideoDecoderParams::max_width`).
+    ladder_max: (u32, u32),
+    // Where this pipeline's decoder goes if an ABR switch keeps it.
+    handoff: Option<Arc<DecoderHandoff>>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    decoder.configure(VideoDecoderParams {
-        codec: VideoCodec::Hevc,
-        width: pf.width,
-        height: pf.height,
-        hvcc_nalus: pf.hvcc_nalus,
-        decoder_config_record: pf.decoder_config_record,
-        color: pf.color,
-        direct_window: direct_window.raw(),
-        dovi_profile: pf.dovi_profile,
-        force_8bit_hdr: hdr_decode_8bit.load(Ordering::Relaxed),
-    })?;
+    let mut decoder = match decoder {
+        DecoderSource::New(mut decoder) => {
+            decoder.configure(video_decoder_params(&pf, &direct_window, &hdr_decode_8bit, ladder_max))?;
+            decoder
+        }
+        DecoderSource::Reconfigured(decoder) => decoder,
+    };
     // Let the decoder's input-buffer and image waits observe teardown so a
     // seek / track-switch can't strand the decode task in them (see [B] in
     // mediacodec submit_direct).
@@ -483,6 +516,7 @@ pub(super) async fn run_decode(
         pf.download_rx,
         sender,
         decoder,
+        handoff,
         pf.init_data,
         video_ready,
         pf.track_crypto,
@@ -544,6 +578,8 @@ pub(super) async fn video_play(
     // as long as this pipeline may configure a codec on it.
     direct_window: WindowRef,
     hdr_decode_8bit: Arc<AtomicBool>,
+    ladder_max: (u32, u32),
+    handoff: Option<Arc<DecoderHandoff>>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     // Initial pipeline: nothing to overlap with, so download and decode run
     // back to back. `prime_target = MAX` → the readiness signal never fires
@@ -565,12 +601,14 @@ pub(super) async fn video_play(
         pf,
         sender,
         video_ready,
-        decoder,
+        DecoderSource::New(decoder),
         stats,
         stop_flag,
         None,
         direct_window,
         hdr_decode_8bit,
+        ladder_max,
+        handoff,
     )
     .await
 }

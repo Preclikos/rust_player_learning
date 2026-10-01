@@ -187,6 +187,14 @@ extern "C" {
     ) -> OSStatus;
 
     fn VTDecompressionSessionInvalidate(session: VTDecompressionSessionRef);
+
+    /// True (non-zero) when the session can decode samples of `new_format`
+    /// without being recreated (same codec; the decoder handles the new
+    /// parameter sets / dimensions itself).
+    fn VTDecompressionSessionCanAcceptFormatDescription(
+        session: VTDecompressionSessionRef,
+        new_format: CMVideoFormatDescriptionRef,
+    ) -> u8;
 }
 
 // -------------------------------------------------------------------------
@@ -209,6 +217,9 @@ pub struct VideoToolboxDecoder {
     session: VTDecompressionSessionRef,
     /// Stamped onto every decoded frame (from configure params).
     color: crate::decoders::VideoColorInfo,
+    /// The 8-bit-destination knob the session was created with (part of
+    /// what decides its output pixel format; see `try_reconfigure`).
+    force_8bit_hdr: bool,
 }
 
 unsafe impl Send for VideoToolboxDecoder {}
@@ -222,7 +233,30 @@ impl VideoToolboxDecoder {
             format_desc: ptr::null_mut(),
             session: ptr::null_mut(),
             color: Default::default(),
+            force_8bit_hdr: false,
         })
+    }
+
+    /// Format description for `nalus` (VPS/SPS/PPS, 4-byte NAL lengths).
+    fn format_description(nalus: &[Vec<u8>]) -> Result<CMVideoFormatDescriptionRef, DecoderError> {
+        let ptrs: Vec<*const u8> = nalus.iter().map(|n| n.as_ptr()).collect();
+        let sizes: Vec<usize> = nalus.iter().map(|n| n.len()).collect();
+        let mut format_desc: CMVideoFormatDescriptionRef = ptr::null_mut();
+        let st = unsafe {
+            CMVideoFormatDescriptionCreateFromHEVCParameterSets(
+                ptr::null(),
+                ptrs.len(),
+                ptrs.as_ptr(),
+                sizes.as_ptr(),
+                4, // 4-byte length prefix (AVCC)
+                ptr::null(),
+                &mut format_desc,
+            )
+        };
+        if st != 0 || format_desc.is_null() {
+            return Err(format!("CMVideoFormatDescriptionCreateFromHEVCParameterSets: {}", st).into());
+        }
+        Ok(format_desc)
     }
 }
 
@@ -297,28 +331,7 @@ impl HwVideoDecoder for VideoToolboxDecoder {
         // session kept decoding threads and IOSurfaces alive until drop.
         self.release_session();
 
-        // CMVideoFormatDescription wants C arrays of (ptr, size). Build
-        // them from the Vec<Vec<u8>> input; the NALUs themselves are kept
-        // alive by params for the duration of this call.
-        let ptrs: Vec<*const u8> = params.hvcc_nalus.iter().map(|n| n.as_ptr()).collect();
-        let sizes: Vec<usize> = params.hvcc_nalus.iter().map(|n| n.len()).collect();
-
-        let mut format_desc: CMVideoFormatDescriptionRef = ptr::null_mut();
-        let st = unsafe {
-            CMVideoFormatDescriptionCreateFromHEVCParameterSets(
-                ptr::null(),
-                ptrs.len(),
-                ptrs.as_ptr(),
-                sizes.as_ptr(),
-                4, // 4-byte length prefix (AVCC)
-                ptr::null(),
-                &mut format_desc,
-            )
-        };
-        if st != 0 || format_desc.is_null() {
-            return Err(format!("CMVideoFormatDescriptionCreateFromHEVCParameterSets: {}", st).into());
-        }
-        self.format_desc = format_desc;
+        self.format_desc = Self::format_description(&params.hvcc_nalus)?;
 
         // Destination image buffer attributes:
         //   PixelFormatType = NV12 (420v) for SDR, or the P010-layout
@@ -448,7 +461,50 @@ impl HwVideoDecoder for VideoToolboxDecoder {
         }
         self.session = session;
         self.color = params.color;
+        self.force_8bit_hdr = force_8bit;
         Ok(())
+    }
+
+    /// Keep the session across an ABR switch when VideoToolbox accepts the
+    /// new representation's format description as is. The destination pixel
+    /// format (8-bit NV12 vs 10-bit for HDR) is fixed at session creation,
+    /// so a change of bit depth / transfer, or of the 8-bit knob, needs a
+    /// new session. Decoding is synchronous (each frame comes out of
+    /// DecodeFrame), so nothing of the old representation is left inside.
+    fn try_reconfigure(&mut self, params: &VideoDecoderParams) -> bool {
+        if self.session.is_null() || params.hvcc_nalus.is_empty() {
+            return false;
+        }
+        if params.color.bit_depth != self.color.bit_depth
+            || params.color.transfer != self.color.transfer
+            || params.color.bt2020 != self.color.bt2020
+            || params.force_8bit_hdr != self.force_8bit_hdr
+        {
+            log::info!("VideoToolbox: new session for {}x{} (output format differs)", params.width, params.height);
+            return false;
+        }
+        let new_desc = match Self::format_description(&params.hvcc_nalus) {
+            Ok(d) => d,
+            Err(e) => {
+                log::warn!("VideoToolbox: {}", e);
+                return false;
+            }
+        };
+        let accepted = unsafe { VTDecompressionSessionCanAcceptFormatDescription(self.session, new_desc) } != 0;
+        if !accepted {
+            log::info!("VideoToolbox: session does not accept {}x{}, new session", params.width, params.height);
+            unsafe { CFRelease(new_desc as CFTypeRef) };
+            return false;
+        }
+        unsafe {
+            if !self.format_desc.is_null() {
+                CFRelease(self.format_desc as CFTypeRef);
+            }
+        }
+        self.format_desc = new_desc;
+        self.color = params.color;
+        log::info!("VideoToolbox: session kept for {}x{}", params.width, params.height);
+        true
     }
 
     fn submit(&mut self, sample: &[u8], pts_us: i64) -> Result<(), DecoderError> {

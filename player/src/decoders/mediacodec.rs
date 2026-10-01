@@ -76,6 +76,17 @@ pub struct MediaCodecDecoder {
     /// teardown (seek/track-switch) doesn't leave the decode task wedged in
     /// them while the codec is being torn down.
     stop_signal: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Direct mode, in-place ABR switches (ExoPlayer's codec reuse): the
+    /// mime the codec was created for, whether it supports
+    /// `adaptive-playback`, the picture size it was configured to accept and
+    /// the Dolby Vision profile. See `try_reconfigure`.
+    direct_mime: &'static str,
+    adaptive: bool,
+    max_size: (u32, u32),
+    dovi_profile: Option<u8>,
+    /// VPS/SPS/PPS (Annex-B) of the representation switched to in place,
+    /// sent in front of its first sample.
+    pending_csd: Option<Vec<u8>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -394,6 +405,13 @@ impl Drop for DirectVideoFrame {
 unsafe impl Send for MediaCodecDecoder {}
 
 impl MediaCodecDecoder {
+    /// The shared direct codec was stopped (teardown in progress).
+    fn stop_requested_codec(&self) -> bool {
+        self.direct
+            .as_ref()
+            .is_some_and(|d| d.stopped.load(std::sync::atomic::Ordering::Acquire))
+    }
+
     /// The pipeline asked this decoder's task to stop (seek, switch, teardown).
     fn stop_requested(&self) -> bool {
         self.stop_signal
@@ -417,7 +435,113 @@ impl MediaCodecDecoder {
             seen_max_cll_nits: None,
             keep_dv_nalus: false,
             stop_signal: None,
+            direct_mime: "",
+            adaptive: false,
+            max_size: (0, 0),
+            dovi_profile: None,
+            pending_csd: None,
         }
+    }
+
+    /// Name of a created codec (`AMediaCodec_getName`, API 28; looked up at
+    /// runtime because the app supports API 26). None below 28 or on error.
+    fn codec_name(codec: *mut ndk_sys::AMediaCodec) -> Option<String> {
+        type GetName = unsafe extern "C" fn(*mut ndk_sys::AMediaCodec, *mut *mut std::ffi::c_char) -> i32;
+        type ReleaseName = unsafe extern "C" fn(*mut ndk_sys::AMediaCodec, *mut std::ffi::c_char);
+        unsafe {
+            let lib = libc::dlopen(c"libmediandk.so".as_ptr(), libc::RTLD_NOW | libc::RTLD_NOLOAD);
+            let lib = if lib.is_null() { libc::dlopen(c"libmediandk.so".as_ptr(), libc::RTLD_NOW) } else { lib };
+            if lib.is_null() {
+                return None;
+            }
+            let get = libc::dlsym(lib, c"AMediaCodec_getName".as_ptr());
+            let release = libc::dlsym(lib, c"AMediaCodec_releaseName".as_ptr());
+            if get.is_null() || release.is_null() {
+                return None;
+            }
+            let get: GetName = std::mem::transmute(get);
+            let release: ReleaseName = std::mem::transmute(release);
+            let mut out: *mut std::ffi::c_char = std::ptr::null_mut();
+            if get(codec, &mut out) != 0 || out.is_null() {
+                return None;
+            }
+            let name = std::ffi::CStr::from_ptr(out).to_string_lossy().into_owned();
+            release(codec, out);
+            Some(name)
+        }
+    }
+
+    /// Whether codec `name` supports `adaptive-playback` for `mime`, and
+    /// whether it accepts pictures of `max` (MediaCodecInfo, via JNI).
+    /// `(false, false)` on any JNI trouble.
+    fn adaptive_support(name: &str, mime: &str, max: (u32, u32)) -> (bool, bool) {
+        let ctx = ndk_context::android_context();
+        let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) };
+        vm.attach_current_thread(|env| -> Result<(bool, bool), jni::errors::Error> {
+            let list = env.new_object(
+                jni::jni_str!("android/media/MediaCodecList"),
+                jni::jni_sig!("(I)V"),
+                &[1i32.into()],
+            )?;
+            let infos = env
+                .call_method(
+                    &list,
+                    jni::jni_str!("getCodecInfos"),
+                    jni::jni_sig!("()[Landroid/media/MediaCodecInfo;"),
+                    &[],
+                )?
+                .l()?;
+            let infos = env.cast_local::<jni::objects::JObjectArray>(infos)?;
+            let n = infos.len(env)?;
+            for i in 0..n {
+                let info = infos.get_element(env, i)?;
+                let jname = env
+                    .call_method(&info, jni::jni_str!("getName"), jni::jni_sig!("()Ljava/lang/String;"), &[])?
+                    .l()?;
+                let jname = env.cast_local::<jni::objects::JString>(jname)?;
+                if jname.try_to_string(env)? != name {
+                    continue;
+                }
+                let jmime = env.new_string(mime)?;
+                let caps = env
+                    .call_method(
+                        &info,
+                        jni::jni_str!("getCapabilitiesForType"),
+                        jni::jni_sig!("(Ljava/lang/String;)Landroid/media/MediaCodecInfo$CodecCapabilities;"),
+                        &[(&jmime).into()],
+                    )?
+                    .l()?;
+                let feature = env.new_string("adaptive-playback")?;
+                let adaptive = env
+                    .call_method(
+                        &caps,
+                        jni::jni_str!("isFeatureSupported"),
+                        jni::jni_sig!("(Ljava/lang/String;)Z"),
+                        &[(&feature).into()],
+                    )?
+                    .z()?;
+                let vcaps = env
+                    .call_method(
+                        &caps,
+                        jni::jni_str!("getVideoCapabilities"),
+                        jni::jni_sig!("()Landroid/media/MediaCodecInfo$VideoCapabilities;"),
+                        &[],
+                    )?
+                    .l()?;
+                let size_ok = !vcaps.is_null()
+                    && env
+                        .call_method(
+                            &vcaps,
+                            jni::jni_str!("isSizeSupported"),
+                            jni::jni_sig!("(II)Z"),
+                            &[(max.0 as i32).into(), (max.1 as i32).into()],
+                        )?
+                        .z()?;
+                return Ok((adaptive, size_ok));
+            }
+            Ok((false, false))
+        })
+        .unwrap_or((false, false))
     }
 
     /// Resolve the platform decoder NAME for (mime, profile) via the Java
@@ -525,6 +649,28 @@ impl MediaCodecDecoder {
                 .into());
             }
 
+            // In-place ABR switches: configure for the ladder's largest
+            // picture where the codec can change resolution in place
+            // (adaptive playback), so a switch keeps this codec.
+            let want_max = (params.max_width.max(params.width), params.max_height.max(params.height));
+            let (adaptive, max_ok) = match Self::codec_name(codec) {
+                Some(name) => {
+                    let (a, ok) = Self::adaptive_support(&name, mime, want_max);
+                    log::info!(
+                        "MediaCodecDecoder: {} adaptive-playback={} {}x{} supported={}",
+                        name, a, want_max.0, want_max.1, ok
+                    );
+                    (a, ok)
+                }
+                None => (false, false),
+            };
+            self.adaptive = adaptive;
+            self.max_size = if adaptive && max_ok {
+                want_max
+            } else {
+                (params.width, params.height)
+            };
+
             let format = ndk_sys::AMediaFormat_new();
             let key_mime = CString::new("mime").unwrap();
             ndk_sys::AMediaFormat_setString(format, key_mime.as_ptr(), mime_c.as_ptr());
@@ -532,6 +678,10 @@ impl MediaCodecDecoder {
             let key_h = CString::new("height").unwrap();
             ndk_sys::AMediaFormat_setInt32(format, key_w.as_ptr(), params.width as i32);
             ndk_sys::AMediaFormat_setInt32(format, key_h.as_ptr(), params.height as i32);
+            if self.adaptive && self.max_size != (params.width, params.height) {
+                ndk_sys::AMediaFormat_setInt32(format, c"max-width".as_ptr(), self.max_size.0 as i32);
+                ndk_sys::AMediaFormat_setInt32(format, c"max-height".as_ptr(), self.max_size.1 as i32);
+            }
             if mime == "video/dolby-vision" {
                 // MediaCodecInfo.CodecProfileLevel DolbyVisionProfile*
                 // constants — DV decoders key their mode off this.
@@ -623,17 +773,32 @@ impl MediaCodecDecoder {
                 *LIVE_DIRECT.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::downgrade(d));
             }
         }
+        self.direct_mime = if mime == "video/dolby-vision" { "video/dolby-vision" } else { "video/hevc" };
+        self.dovi_profile = params.dovi_profile;
         log::info!(
-            "MediaCodecDecoder: configured {} DIRECT to video surface, {}x{}",
+            "MediaCodecDecoder: configured {} DIRECT to video surface, {}x{} (max {}x{})",
             mime,
             params.width,
-            params.height
+            params.height,
+            self.max_size.0,
+            self.max_size.1
         );
         Ok(())
     }
 
     /// Direct-mode submit: same Annex-B conversion, raw FFI input queue.
     fn submit_direct(&mut self, annex_b: &[u8], pts_us: i64) -> Result<(), DecoderError> {
+        // After an in-place switch the new representation's parameter sets go
+        // in-band in front of its first (IDR) sample.
+        let joined;
+        let annex_b: &[u8] = match self.pending_csd.take() {
+            Some(mut csd) => {
+                csd.extend_from_slice(annex_b);
+                joined = csd;
+                &joined
+            }
+            None => annex_b,
+        };
         // Frames the codec has emitted so far this session. Frozen during the
         // dequeue_input spin (try_recv runs on the same task), so logging it at
         // a stall tells us whether the codec ever produced output: 0 after a
@@ -836,6 +1001,58 @@ impl MediaCodecDecoder {
 impl HwVideoDecoder for MediaCodecDecoder {
     fn name(&self) -> &'static str {
         "MediaCodec"
+    }
+
+    /// Keep the codec across an ABR switch (direct mode, adaptive playback):
+    /// same mime and Dolby Vision profile, same bit depth, transfer and
+    /// gamut (a different output format needs a new codec), a picture
+    /// within the configured maximum, and the same video window.
+    fn try_reconfigure(&mut self, params: &VideoDecoderParams) -> bool {
+        let Some(direct) = self.direct.as_ref() else {
+            return false;
+        };
+        let mime = if params.dovi_profile.is_some() && self.keep_dv_nalus {
+            "video/dolby-vision"
+        } else {
+            "video/hevc"
+        };
+        let window = direct.window.load(std::sync::atomic::Ordering::Acquire) as usize;
+        let reason = if !self.adaptive {
+            Some("no adaptive playback")
+        } else if mime != self.direct_mime || params.dovi_profile != self.dovi_profile {
+            Some("codec or Dolby Vision profile differs")
+        } else if params.color.bit_depth != self.color.bit_depth
+            || params.color.transfer != self.color.transfer
+            || params.color.bt2020 != self.color.bt2020
+        {
+            Some("bit depth / transfer / gamut differs")
+        } else if params.width > self.max_size.0 || params.height > self.max_size.1 {
+            Some("larger than the configured maximum")
+        } else if params.direct_window == 0 || params.direct_window != window {
+            Some("video window changed")
+        } else if self.stop_requested_codec() {
+            Some("codec is stopping")
+        } else {
+            None
+        };
+        if let Some(why) = reason {
+            log::info!(
+                "MediaCodecDecoder: new codec for {}x{} ({})",
+                params.width, params.height, why
+            );
+            return false;
+        }
+        let mut csd = Vec::new();
+        for n in &params.hvcc_nalus {
+            csd.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+            csd.extend_from_slice(n);
+        }
+        self.pending_csd = Some(csd);
+        self.width = params.width;
+        self.height = params.height;
+        self.color = params.color;
+        self.static_hdr_meta = None;
+        true
     }
 
     fn configure(&mut self, params: VideoDecoderParams) -> Result<(), DecoderError> {

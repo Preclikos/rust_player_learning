@@ -196,12 +196,13 @@ async function startItem(url) {
   const params = new URLSearchParams(location.search);
   const hdr = params.get('hdr');
   if (hdr) options.hdr = hdr;
-  // ?licence=URL — wrapped ClearKey licence endpoint (docs/CLEARKEY_WRAPPED_LICENCE.md);
-  // the fixture's clearKeys are then NOT passed, every key comes wrapped.
+  // ?licence=URL&secret=B64URL[&sid=ID]: wrapped ClearKey licence endpoint and this
+  // client's secret (docs/CLEARKEY_WRAPPED_LICENCE.md); sid = scenario A, none = B.
+  // The fixture's clearKeys are then NOT passed, every key comes wrapped.
   const licence = params.get('licence');
   if (licence) {
     delete options.clearKeys;
-    options.wrappedLicence = { url: licence };
+    options.wrappedLicence = { url: licence, secret: params.get('secret') || '', secretId: params.get('sid') || undefined };
   }
   try {
     player = await RustPlayer.create(canvas, url, host, options);

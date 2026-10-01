@@ -675,6 +675,16 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                         outageSecs = intent.getIntExtra("outage", 0),
                     )
                 }
+                // --es licence_url <endpoint> --es licence_secret <b64url> [--es licence_sid <id>]:
+                // wrapped ClearKey licence v2 (docs/CLEARKEY_WRAPPED_LICENCE.md); no sid = scenario B.
+                intent.getStringExtra("licence_url")?.takeIf { it.isNotBlank() }?.let { url ->
+                    val ok = player.setWrappedLicence(
+                        url,
+                        clientSecret = intent.getStringExtra("licence_secret") ?: "",
+                        secretId = intent.getStringExtra("licence_sid"),
+                    )
+                    android.util.Log.i(TRACE_TAG, "wrapped licence $url (sid=${intent.getStringExtra("licence_sid")}) accepted=$ok")
+                }
             }
         }
     }

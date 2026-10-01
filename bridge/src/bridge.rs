@@ -87,6 +87,38 @@ impl LicenseResolver for HostResolver {
     }
 }
 
+/// Stands in for the wrapped-licence resolver when its configuration is
+/// unusable (missing or malformed client secret): every key request fails
+/// with the reason, so the host sees `Error { LicenseResolver }` instead of
+/// the player silently falling back to `resolve_key`.
+struct MisconfiguredResolver(String);
+
+#[async_trait]
+impl LicenseResolver for MisconfiguredResolver {
+    async fn resolve(&self, _kid: [u8; 16]) -> Result<[u8; 16], BoxError> {
+        Err(self.0.clone().into())
+    }
+}
+
+/// Install the wrapped-licence resolver for `url`, or a
+/// [`MisconfiguredResolver`] when the secret is unusable.
+fn install_wrapped_licence(player: &Player, url: String, secret: Option<&str>, secret_id: Option<String>) -> Result<(), String> {
+    let client = secret
+        .ok_or_else(|| "wrapped licence: no client secret configured".to_string())
+        .and_then(|s| player::wrapped_licence::LicenceClient::new(s, secret_id));
+    match client {
+        Ok(client) => {
+            player.set_wrapped_licence(url, client);
+            Ok(())
+        }
+        Err(e) => {
+            log::error!("{e}");
+            player.set_license_resolver(Arc::new(MisconfiguredResolver(e.clone())));
+            Err(e)
+        }
+    }
+}
+
 // --- commands that need the (private) Tracks type for an index→repr lookup ---
 
 enum Cmd {
@@ -152,8 +184,13 @@ pub struct StartConfig {
     /// host's `intercept` for `RequestKind::License`. `None` keeps the
     /// `clearKeys` / `resolve_key` behaviour.
     pub wrapped_licence_url: Option<String>,
-    /// HKDF `info` the licence server uses; `None` = the documented default.
-    pub wrapped_licence_hkdf_info: Option<String>,
+    /// This app version's client secret (base64url, >= 16 bytes), the one
+    /// the licence server holds for it. Required with `wrapped_licence_url`.
+    /// Inject it at build time; never commit it.
+    pub wrapped_licence_secret: Option<String>,
+    /// The secret's non-secret id (scenario A). `None` = the server finds
+    /// the secret from the request proof (scenario B).
+    pub wrapped_licence_secret_id: Option<String>,
 }
 
 impl Default for StartConfig {
@@ -166,7 +203,8 @@ impl Default for StartConfig {
             preferred_audio_language: None,
             preferred_subtitle_language: None,
             wrapped_licence_url: None,
-            wrapped_licence_hkdf_info: None,
+            wrapped_licence_secret: None,
+            wrapped_licence_secret_id: None,
         }
     }
 }
@@ -200,7 +238,14 @@ pub fn start(
 ) -> BridgeHandle {
     player.set_request_interceptor(Arc::new(HostInterceptor(host.clone())));
     match &config.wrapped_licence_url {
-        Some(url) => player.set_wrapped_licence(url.clone(), config.wrapped_licence_hkdf_info.clone()),
+        Some(url) => {
+            let _ = install_wrapped_licence(
+                &player,
+                url.clone(),
+                config.wrapped_licence_secret.as_deref(),
+                config.wrapped_licence_secret_id.clone(),
+            );
+        }
         None => player.set_license_resolver(Arc::new(HostResolver(host.clone()))),
     }
 
@@ -340,10 +385,12 @@ impl BridgeHandle {
     /// instead of through the host's `resolve_key`. Same as
     /// `StartConfig::wrapped_licence_url`, for shells whose create signature is
     /// fixed: call it right after `start()` — keys are only resolved once the
-    /// init segments are parsed, well after that. `hkdf_info` `None` = the
-    /// documented default.
-    pub fn set_wrapped_licence(&self, url: String, hkdf_info: Option<String>) {
-        self.player.set_wrapped_licence(url, hkdf_info);
+    /// init segments are parsed, well after that. `secret`: this app
+    /// version's client secret (base64url); `secret_id`: its id for scenario
+    /// A, `None` for scenario B. A malformed secret is returned as the error
+    /// and also fails every key request with it.
+    pub fn set_wrapped_licence(&self, url: String, secret: &str, secret_id: Option<String>) -> Result<(), String> {
+        install_wrapped_licence(&self.player, url, Some(secret), secret_id)
     }
 
     /// The underlying player, for platform-specific wiring the unified surface

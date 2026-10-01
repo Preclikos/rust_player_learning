@@ -46,7 +46,7 @@ object NativeBridge {
     external fun nativeSetVideoTrack(handle: Long, adapt: Int, repr: Int)
     external fun nativeSetVideoTrackSoft(handle: Long, adapt: Int, repr: Int)
     external fun nativeSetVideoAuto(handle: Long)
-    external fun nativeSetWrappedLicence(handle: Long, url: String, info: String?)
+    external fun nativeSetWrappedLicence(handle: Long, url: String, secret: String, secretId: String?): Boolean
     external fun nativeSetAudioTrack(handle: Long, adapt: Int, repr: Int)
     external fun nativeSetSubtitleTrack(handle: Long, adapt: Int, repr: Int)
     external fun nativeClearSubtitles(handle: Long)

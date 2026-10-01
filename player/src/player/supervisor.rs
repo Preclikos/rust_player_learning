@@ -209,12 +209,17 @@ const PREPARE_READY_BUDGET: Duration = Duration::from_millis(5_000);
                     last_fail_pos_ms = pos_now;
                     retry_attempt += 1;
                     stats.pipeline_retries.fetch_add(1, Ordering::Relaxed);
-                    if retry_attempt > MAX_PIPELINE_RETRIES {
-                        log::error!(
-                            "[video] supervisor: {} consecutive pipeline failures — giving up at {}ms",
-                            retry_attempt - 1,
-                            pos_now
-                        );
+                    let licence_refused = detail.starts_with(net_io::LICENSE_ERROR_PREFIX);
+                    if licence_refused || retry_attempt > MAX_PIPELINE_RETRIES {
+                        if licence_refused {
+                            log::error!("[video] supervisor: licence refused — giving up at {}ms (no retry)", pos_now);
+                        } else {
+                            log::error!(
+                                "[video] supervisor: {} consecutive pipeline failures — giving up at {}ms",
+                                retry_attempt - 1,
+                                pos_now
+                            );
+                        }
                         // Park the position for the consumer's next play()
                         // ("continue where we stopped"), surface the error,
                         // and stop WITHOUT the fake EndOfStream (av_sync
@@ -222,7 +227,7 @@ const PREPARE_READY_BUDGET: Duration = Duration::from_millis(5_000);
                         *pending_resume.lock().unwrap() =
                             Some(Duration::from_millis(pos_now));
                         let _ = events.send(PlayerEvent::Error {
-                            kind: PlayerErrorKind::Decoder,
+                            kind: net_io::pipeline_error_kind(&detail),
                             detail,
                         });
                         signal_stop(&stop_flag, &stop);
@@ -467,7 +472,7 @@ const PREPARE_READY_BUDGET: Duration = Duration::from_millis(5_000);
                 stats.debug.log("pipeline", format!("failed during an ABR prefetch: {detail}"));
                 *pending_resume.lock().unwrap() = Some(Duration::from_millis(pos_now));
                 let _ = events.send(PlayerEvent::Error {
-                    kind: PlayerErrorKind::Decoder,
+                    kind: net_io::pipeline_error_kind(&detail),
                     detail,
                 });
                 signal_stop(&stop_flag, &stop);

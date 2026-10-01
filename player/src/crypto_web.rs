@@ -127,16 +127,36 @@ impl KeyAgreement {
     }
 }
 
-/// Derive the wrapping key from the server's `epk` and `salt`, unwrap
-/// `entry` into a non-extractable AES-CTR key and register it for its KID.
-/// Byte-for-byte the server's recipe: ECDH x-coordinate → HKDF-SHA256(salt,
-/// info) → AES-256-GCM with the KID as additional data.
+/// `HMAC-SHA256(key, message)`: the wrapped-licence request proof.
+pub async fn hmac_sha256(key: &[u8], message: &[u8]) -> Result<Vec<u8>, BoxError> {
+    let subtle = subtle().ok_or("WebCrypto unavailable (not a secure context?)")?;
+    let alg = js_obj(&[("name", "HMAC".into()), ("hash", "SHA-256".into())]);
+    let hmac_key = await_key(
+        subtle.import_key_with_object("raw", &Uint8Array::from(key), &alg, false, &str_array(&["sign"])),
+        "importKey(HMAC)",
+    )
+    .await?;
+    let promise = subtle
+        .sign_with_str_and_u8_array("HMAC", &hmac_key, message)
+        .map_err(|e| -> BoxError { format!("sign(HMAC): {}", describe(&e)).into() })?;
+    let sig: js_sys::ArrayBuffer = JsFuture::from(promise)
+        .await
+        .map_err(|e| -> BoxError { format!("sign(HMAC): {}", describe(&e)).into() })?
+        .unchecked_into();
+    Ok(Uint8Array::new(&sig).to_vec())
+}
+
+/// Derive the wrapping key from the server's `epk`, the client secret and
+/// `salt`, unwrap `entry` into a non-extractable AES-CTR key and register it
+/// for its KID. Byte-for-byte the server's recipe: ECDH x-coordinate ‖
+/// client secret → HKDF-SHA256(salt, KDF_INFO) → AES-256-GCM with the KID as
+/// additional data.
 pub async fn unwrap_and_install(
     agreement: &KeyAgreement,
     server_x: &[u8],
     server_y: &[u8],
     salt: &[u8],
-    info: &[u8],
+    client_secret: &[u8],
     entry: &crate::wrapped_licence::WrappedKey,
 ) -> Result<(), BoxError> {
     use crate::wrapped_licence::base64url_encode;
@@ -162,16 +182,19 @@ pub async fn unwrap_and_install(
         .await
         .map_err(|e| -> BoxError { format!("deriveBits(ECDH): {}", describe(&e)).into() })?
         .unchecked_into();
+    let mut ikm = crate::wrapped_licence::kdf_ikm(&Uint8Array::new(&secret).to_vec(), client_secret);
     let hkdf_key = await_key(
-        subtle.import_key_with_str("raw", &Uint8Array::new(&secret), "HKDF", false, &str_array(&["deriveKey"])),
+        subtle.import_key_with_str("raw", &Uint8Array::from(&ikm[..]), "HKDF", false, &str_array(&["deriveKey"])),
         "importKey(HKDF)",
     )
-    .await?;
+    .await;
+    ikm.fill(0);
+    let hkdf_key = hkdf_key?;
     let hkdf_alg = js_obj(&[
         ("name", "HKDF".into()),
         ("hash", "SHA-256".into()),
         ("salt", Uint8Array::from(salt).into()),
-        ("info", Uint8Array::from(info).into()),
+        ("info", Uint8Array::from(crate::wrapped_licence::KDF_INFO).into()),
     ]);
     let gcm_type = js_obj(&[("name", "AES-GCM".into()), ("length", JsValue::from_f64(256.0))]);
     let wrap_key = await_key(

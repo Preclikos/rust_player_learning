@@ -389,29 +389,33 @@ pub extern "C" fn rustplayer_player_duration_ms(handle: *mut c_void) -> i64 {
     })
 }
 
-/// Wrapped ClearKey licence endpoint (docs/CLEARKEY_WRAPPED_LICENCE.md);
-/// `hkdf_info` may be NULL for the default. Call right after create.
+/// Wrapped ClearKey licence endpoint (docs/CLEARKEY_WRAPPED_LICENCE.md) with
+/// this app version's client secret (base64url) and, for scenario A, its id
+/// (NULL/empty = scenario B). Call right after create. Returns false when the
+/// url is empty or the secret malformed (key requests then fail with that
+/// reason).
 #[no_mangle]
 pub extern "C" fn rustplayer_player_set_wrapped_licence(
     handle: *mut c_void,
     url: *const c_char,
-    hkdf_info: *const c_char,
-) {
-    ffi_guard("rustplayer_player_set_wrapped_licence", (), move || {
-        if let Some(h) = unsafe { handle_ref(handle) } {
-            let url = unsafe { cstr(url) };
-            if url.is_empty() {
-                log::error!("rustplayer_player_set_wrapped_licence: empty url");
-                return;
-            }
-            let info = if hkdf_info.is_null() {
-                None
-            } else {
-                Some(unsafe { cstr(hkdf_info) }).filter(|s| !s.is_empty())
-            };
-            let _guard = runtime().enter();
-            h.bridge.set_wrapped_licence(url, info);
+    secret: *const c_char,
+    secret_id: *const c_char,
+) -> bool {
+    ffi_guard("rustplayer_player_set_wrapped_licence", false, move || {
+        let Some(h) = (unsafe { handle_ref(handle) }) else { return false };
+        let url = unsafe { cstr(url) };
+        if url.is_empty() || secret.is_null() {
+            log::error!("rustplayer_player_set_wrapped_licence: url and secret are required");
+            return false;
         }
+        let secret = unsafe { cstr(secret) };
+        let secret_id = if secret_id.is_null() {
+            None
+        } else {
+            Some(unsafe { cstr(secret_id) })
+        };
+        let _guard = runtime().enter();
+        h.bridge.set_wrapped_licence(url, &secret, secret_id).is_ok()
     })
 }
 

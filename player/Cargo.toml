@@ -79,9 +79,11 @@ chardetng = "1.0"
 tokio = { version = "1.52", features = ["full"] }
 reqwest = { version = "0.13", default-features = false, features = ["http2"] }
 # Wrapped ClearKey licences, native unwrap: ECDH P-256 + HKDF-SHA256 +
-# AES-256-GCM (the browser uses WebCrypto for the same protocol).
+# HMAC-SHA256 proof + AES-256-GCM (the browser uses WebCrypto for the same
+# protocol).
 p256 = { version = "0.14", default-features = false, features = ["ecdh", "std"] }
 hkdf = "0.13"
+hmac = "0.13"
 sha2 = "0.11"
 aes-gcm = "0.11"
 # 0.18 AAudio: requests PERFORMANCE_MODE_LOW_LATENCY under the `realtime`

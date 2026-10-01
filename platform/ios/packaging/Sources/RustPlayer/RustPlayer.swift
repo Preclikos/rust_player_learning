@@ -147,14 +147,19 @@ public final class RustPlayer {
     /// ephemeral ECDH P-256 exchange, HKDF-SHA256 and AES-256-GCM, so no key
     /// crosses the wire in the clear. Authorization headers come from the
     /// provider's intercept for kind "license". Call right after `start`.
-    /// `hkdfInfo` must match the server's; nil = the documented default.
-    public func setWrappedLicence(url: String, hkdfInfo: String? = nil) {
-        guard let handle else { return }
-        url.withCString { u in
-            if let info = hkdfInfo {
-                info.withCString { i in rustplayer_player_set_wrapped_licence(handle, u, i) }
-            } else {
-                rustplayer_player_set_wrapped_licence(handle, u, nil)
+    /// `clientSecret`: this app version's secret (base64url, >= 16 bytes), the
+    /// one the licence server holds for it; inject it at build time, never
+    /// commit it. `secretId`: its id (scenario A); nil = the server finds the
+    /// secret from the request proof (scenario B). False = malformed secret.
+    @discardableResult
+    public func setWrappedLicence(url: String, clientSecret: String, secretId: String? = nil) -> Bool {
+        guard let handle else { return false }
+        return url.withCString { u in
+            clientSecret.withCString { s in
+                if let id = secretId {
+                    return id.withCString { i in rustplayer_player_set_wrapped_licence(handle, u, s, i) }
+                }
+                return rustplayer_player_set_wrapped_licence(handle, u, s, nil)
             }
         }
     }

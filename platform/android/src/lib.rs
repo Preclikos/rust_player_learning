@@ -416,7 +416,8 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeStart<'lo
             preferred_subtitle_language,
             // Set after create via nativeSetWrappedLicence (fixed create signature).
             wrapped_licence_url: None,
-            wrapped_licence_hkdf_info: None,
+            wrapped_licence_secret: None,
+            wrapped_licence_secret_id: None,
         };
 
         let bridge = bridge::start(player, manifest, host.clone(), config);
@@ -660,32 +661,35 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetVideoT
     })
 }
 
-/// Wrapped ClearKey licence endpoint (docs/CLEARKEY_WRAPPED_LICENCE.md).
-/// `info` may be null for the default HKDF info. Call right after nativeStart.
+/// Wrapped ClearKey licence endpoint (docs/CLEARKEY_WRAPPED_LICENCE.md) with
+/// this app version's client secret (base64url) and, for scenario A, its id
+/// (null/empty = scenario B). Call right after nativeStart. Returns false when
+/// the secret is malformed (key requests then fail with that reason).
 #[no_mangle]
 pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetWrappedLicence<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
     handle: jlong,
     url: JString<'local>,
-    info: JString<'local>,
-) {
-    with_env_or("nativeSetWrappedLicence", &mut env, (), move |env| {
-        let Some(h) = (unsafe { handle_ref(handle) }) else { return };
-        let url: String = match url.try_to_string(env) {
-            Ok(s) => s,
-            Err(e) => {
-                log::error!("nativeSetWrappedLicence: url: {}", e);
-                return;
+    secret: JString<'local>,
+    secret_id: JString<'local>,
+) -> jboolean {
+    with_env_or("nativeSetWrappedLicence", &mut env, false, move |env| {
+        let Some(h) = (unsafe { handle_ref(handle) }) else { return false };
+        let (url, secret) = match (url.try_to_string(env), secret.try_to_string(env)) {
+            (Ok(u), Ok(s)) => (u, s),
+            (Err(e), _) | (_, Err(e)) => {
+                log::error!("nativeSetWrappedLicence: {}", e);
+                return false;
             }
         };
-        let info: Option<String> = if info.is_null() {
+        let secret_id: Option<String> = if secret_id.is_null() {
             None
         } else {
-            info.try_to_string(env).ok().filter(|s| !s.is_empty())
+            secret_id.try_to_string(env).ok()
         };
         let _guard = runtime().enter();
-        h.bridge.set_wrapped_licence(url, info);
+        h.bridge.set_wrapped_licence(url, &secret, secret_id).is_ok()
     })
 }
 

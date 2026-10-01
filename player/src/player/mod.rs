@@ -953,11 +953,12 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
     /// (`RequestKind::License`) for the host's authorisation headers.
     /// Natively the unwrapped key lands in the ClearKey cache; in the browser
     /// it is unwrapped into a non-extractable WebCrypto key and every
-    /// decrypt for that KID runs through WebCrypto. `hkdf_info` must match
-    /// the server's (`None` = the documented default). Replaces any
-    /// previously installed `LicenseResolver`.
-    pub fn set_wrapped_licence(&self, url: String, hkdf_info: Option<String>) {
-        let resolver = crate::wrapped_licence::WrappedLicenceResolver::new(url, hkdf_info, Arc::clone(&self.http));
+    /// decrypt for that KID runs through WebCrypto. `client` is this app
+    /// version's secret (and its id for scenario A), the same the server
+    /// holds. Replaces any previously installed `LicenseResolver`.
+    pub fn set_wrapped_licence(&self, url: String, client: crate::wrapped_licence::LicenceClient) {
+        log::info!("[licence] wrapped licence endpoint set ({:?})", client);
+        let resolver = crate::wrapped_licence::WrappedLicenceResolver::new(url, client, Arc::clone(&self.http));
         self.set_license_resolver(Arc::new(resolver));
     }
 

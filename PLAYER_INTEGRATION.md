@@ -229,12 +229,15 @@ Implemented exactly as originally specced — summary:
 - `LicenseResolver::resolve(kid: [u8;16]) -> [u8;16]` is consulted on
   cache miss; `set_clearkey(HashMap)` pre-populates the cache so the
   resolver is never called for known keys.
-- `set_wrapped_licence(url, hkdf_info)` installs the built-in resolver for
-  the wrapped-licence endpoint (`docs/CLEARKEY_WRAPPED_LICENCE.md`: ECDH
-  P-256 + HKDF-SHA256 + AES-256-GCM, so no content key crosses the wire in
-  the clear). The POST goes through the interceptor as `RequestKind::License`
-  (put the auth header there). Bridge: `StartConfig::wrapped_licence_url` /
-  `BridgeHandle::set_wrapped_licence`; shells: `setWrappedLicence(url, info)`
+- `set_wrapped_licence(url, LicenceClient)` installs the built-in resolver
+  for the wrapped-licence endpoint (`docs/CLEARKEY_WRAPPED_LICENCE.md`,
+  protocol v2: ECDH P-256 + HKDF-SHA256 over ECDH ‖ the app version's client
+  secret + AES-256-GCM, with an HMAC proof so the server can identify and
+  revoke app versions). The POST goes through the interceptor as
+  `RequestKind::License` (put the auth header there). Bridge:
+  `StartConfig::wrapped_licence_url` / `_secret` / `_secret_id` or
+  `BridgeHandle::set_wrapped_licence`; shells:
+  `setWrappedLicence(url, clientSecret, secretId)`
   on Android/iOS, `options.wrappedLicence` on the web (where the key becomes
   a non-extractable WebCrypto key and all CENC decryption of that track runs
   through `crypto.subtle`).

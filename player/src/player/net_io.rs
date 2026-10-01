@@ -229,6 +229,21 @@ pub(super) fn log_task_result<T, E: std::fmt::Display>(
 /// `LicenseResolver`) so the per-sample `decrypt_sample` stays sync on the hot
 /// path. Returns `None` for a clear track. `label` ("video"/"audio") only
 /// flavours the log lines and the error text.
+/// Prefix of a pipeline error caused by the `LicenseResolver`; the supervisor
+/// keys on it to report `PlayerErrorKind::LicenseResolver` instead of
+/// `Decoder`, and to give up at once (a refused licence does not heal on a
+/// pipeline rebuild).
+pub(super) const LICENSE_ERROR_PREFIX: &str = "license resolve (";
+
+/// The error kind a failed pipeline reports for `detail`.
+pub(super) fn pipeline_error_kind(detail: &str) -> PlayerErrorKind {
+    if detail.starts_with(LICENSE_ERROR_PREFIX) {
+        PlayerErrorKind::LicenseResolver
+    } else {
+        PlayerErrorKind::Decoder
+    }
+}
+
 pub(super) async fn setup_track_crypto(
     init_data: &[u8],
     decryptor: Option<Arc<dyn Decryptor>>,
@@ -259,7 +274,7 @@ pub(super) async fn setup_track_crypto(
     dec.ensure_key_for(tenc.default_kid)
         .await
         .map_err(|e| -> Box<dyn Error + Send + Sync> {
-            format!("license resolve ({} kid={}): {}", label, kid_short(&tenc.default_kid), e).into()
+            format!("{LICENSE_ERROR_PREFIX}{} kid={}): {}", label, kid_short(&tenc.default_kid), e).into()
         })?;
     Ok(Some(TrackCrypto {
         decryptor: dec,

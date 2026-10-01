@@ -217,12 +217,17 @@ class RustPlayer(private val context: Context) {
      * ephemeral ECDH P-256 exchange, HKDF-SHA256 and AES-256-GCM, so no key
      * crosses the wire in the clear. Authorization headers come from the
      * host's `intercept` for kind "license". Call right after start(); keys
-     * are resolved when the init segments are parsed. [hkdfInfo] must match
-     * the server's; null = the documented default.
+     * are resolved when the init segments are parsed.
+     *
+     * @param clientSecret this app version's secret (base64url, >= 16 bytes),
+     *   the one the licence server holds for it. Inject it at build time
+     *   (e.g. a BuildConfig field from CI); never commit it.
+     * @param secretId the secret's id (scenario A); null = the server finds
+     *   the secret from the request proof (scenario B).
+     * @return false when [clientSecret] is malformed.
      */
-    fun setWrappedLicence(url: String, hkdfInfo: String? = null) {
-        if (handle != 0L) NativeBridge.nativeSetWrappedLicence(handle, url, hkdfInfo)
-    }
+    fun setWrappedLicence(url: String, clientSecret: String, secretId: String? = null): Boolean =
+        handle != 0L && NativeBridge.nativeSetWrappedLicence(handle, url, clientSecret, secretId)
 
     fun selectAudio(adapt: Int, repr: Int) {
         if (handle != 0L) NativeBridge.nativeSetAudioTrack(handle, adapt, repr)

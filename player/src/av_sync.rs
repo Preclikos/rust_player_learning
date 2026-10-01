@@ -141,6 +141,7 @@ impl PrerollGate {
         }
     }
 
+    #[cfg(test)]
     pub fn is_open(&self) -> bool {
         self.open
     }
@@ -212,6 +213,7 @@ impl VsyncCadence {
         self.last_tick_ms = Some(ts_ms);
     }
 
+    #[cfg(test)]
     pub fn period_ms(&self) -> f64 {
         self.period_ms
     }

@@ -432,7 +432,7 @@ impl HdrDetectGl {
         };
         let (grid_fbo, grid_tex) = make_target(DETECT_W, DETECT_H, "detect grid")?;
 
-        let mut make_pbo = || -> Result<glow::Buffer, String> {
+        let make_pbo = || -> Result<glow::Buffer, String> {
             let b = gl.create_buffer().map_err(|e| e.to_string())?;
             gl.bind_buffer(glow::PIXEL_PACK_BUFFER, Some(b));
             gl.buffer_data_size(glow::PIXEL_PACK_BUFFER, GRID_BYTES, glow::STREAM_READ);

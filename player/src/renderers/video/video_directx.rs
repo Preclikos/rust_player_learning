@@ -574,79 +574,6 @@ pub fn create_vk_image_from_d3d11_texture(
     }
 }
 
-pub fn create_dx12_resource_from_d3d11_texture(
-    device: &wgpu::Device,
-    d3d11_device: &ID3D11Device,
-    d3d11_device_context: &ID3D11DeviceContext,
-    texture: &ID3D11Texture2D,
-    width: u32,
-    height: u32,
-    region: Option<u32>,
-) -> Result<Direct3D12::ID3D12Resource, Box<dyn std::error::Error>> {
-    unsafe {
-        log::trace!(
-            "[dx12_import] begin: {}x{} region={:?}",
-            width,
-            height,
-            region
-        );
-
-        let (handle, shared_texture) =
-            get_shared_texture_d3d11(d3d11_device, texture, width, height)?;
-        log::trace!("[dx12_import] got shared NT handle, doing synchronized copy");
-
-        if let Err(e) = shared_texture.synchronized_copy_from(
-            d3d11_device_context,
-            texture,
-            width,
-            height,
-            region,
-        ) {
-            log::error!(
-                "[dx12_import] synchronized_copy_from failed: hr=0x{:08x} ({})",
-                e.code().0 as u32,
-                e.message(),
-            );
-            log_d3d11_device_removed_reason(d3d11_device);
-            log_dx12_device_removed_reason(device);
-            let _ = CloseHandle(handle);
-            return Err(Box::new(e));
-        }
-
-        let raw_image = {
-            let hdevice = device
-                .as_hal::<Dx12>()
-                .ok_or("wgpu backend is not DX12")?;
-            let raw_device = hdevice.raw_device();
-            let mut resource = None::<Direct3D12::ID3D12Resource>;
-            if let Err(e) = raw_device.OpenSharedHandle(handle, &mut resource) {
-                log::error!(
-                    "[dx12_import] OpenSharedHandle failed: hr=0x{:08x} ({})",
-                    e.code().0 as u32,
-                    e.message(),
-                );
-                log_d3d11_device_removed_reason(d3d11_device);
-                log_dx12_device_removed_reason(device);
-                let _ = CloseHandle(handle);
-                return Err(Box::new(e));
-            }
-            let _ = CloseHandle(handle);
-            let resource = resource.ok_or("OpenSharedHandle returned no resource")?;
-            let imported_desc = resource.GetDesc();
-            log::trace!(
-                "[dx12_import] OpenSharedHandle OK: format={:?} {}x{} flags=0x{:x}",
-                imported_desc.Format,
-                imported_desc.Width,
-                imported_desc.Height,
-                imported_desc.Flags.0,
-            );
-            resource
-        };
-
-        Ok(raw_image)
-    }
-}
-
 /// Intermediate shared textures for the D3D11 -> D3D12 import, reused frame
 /// after frame.
 ///
@@ -676,8 +603,9 @@ const DX12_IMPORT_SLOTS: usize = 4;
 
 static DX12_IMPORT_POOL: std::sync::Mutex<Option<Dx12ImportPool>> = std::sync::Mutex::new(None);
 
-/// [`create_dx12_resource_from_d3d11_texture`] with the intermediate texture
-/// taken from [`Dx12ImportPool`]. Same result, same synchronisation.
+/// Import a D3D11 decoder texture into DX12: the visible region is copied into
+/// an intermediate shared texture taken from [`Dx12ImportPool`] and opened on
+/// the wgpu DX12 device.
 pub fn import_d3d11_texture_pooled(
     device: &wgpu::Device,
     d3d11_device: &ID3D11Device,

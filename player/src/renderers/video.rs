@@ -532,7 +532,7 @@ impl VideoRenderer {
             std::ptr::NonNull::new(native_window).expect("null ANativeWindow"),
         ));
         let display = RawDisplayHandle::Android(AndroidDisplayHandle::new());
-        let mut renderer = Self::new_with_surface(
+        let renderer = Self::new_with_surface(
             size,
             SurfaceSource::RawHandle {
                 window,

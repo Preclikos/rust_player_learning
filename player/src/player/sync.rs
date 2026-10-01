@@ -147,9 +147,11 @@ pub(super) async fn video_sync_loop<V: VideoSink, A: AudioSink>(
     // eglPresentationTimeANDROID) then holds the frame until the exact VSync.
     const RENDER_BUDGET_MS: u64 = 20;
     // Direct mode: how far ahead of its display time a frame is released to
-    // the Surface (see the pacing sleep).
+    // the Surface (see the pacing sleep). ExoPlayer's window: every frame
+    // queued in SurfaceFlinger holds a codec output buffer, and on Amlogic
+    // (13 buffers, 8 needed for decoding) 100 ms starved the decoder.
     #[cfg(target_os = "android")]
-    const DIRECT_RELEASE_LEAD_MS: u64 = 100; // TEMP-AB variant A
+    const DIRECT_RELEASE_LEAD_MS: u64 = 50;
 
     let mut last_pts_ms = 0u64;
     let mut frame_idx: u64 = 0;

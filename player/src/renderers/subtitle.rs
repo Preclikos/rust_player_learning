@@ -1150,7 +1150,6 @@ struct RasterJob {
     layout: CueLayout,
     style: SubtitleStyle,
     target_w: u32,
-    target_h: u32,
     /// See `CueParent::picture_h` — what the glyph size scales with.
     type_h: u32,
     /// `Inner::epoch` when the job was cut.
@@ -1178,7 +1177,6 @@ fn next_job(inner: &Inner) -> Option<RasterJob> {
                 layout,
                 style: inner.style,
                 target_w: inner.target_w,
-                target_h: inner.target_h,
                 type_h: inner.type_h,
                 epoch: inner.epoch,
             });

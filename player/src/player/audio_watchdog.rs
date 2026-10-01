@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{broadcast, Notify, RwLock};
+use tokio::sync::{Notify, RwLock};
 
 use crate::events::{BufferingReason, PlayerErrorKind, PlayerEvent};
 use crate::renderers::AudioSink;
@@ -242,6 +242,7 @@ pub(crate) async fn audio_output_watchdog<A: AudioSink>(
 mod tests {
     use super::*;
     use crate::test_support::TestSink;
+    use tokio::sync::broadcast;
 
     // ---- audio-output watchdog ----------------------------------------------
     //

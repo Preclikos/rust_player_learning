@@ -145,7 +145,7 @@ impl VideoFrame {
             // FFmpeg's decoder texture is a DPB array (e.g. 2560×1536 for 2560×1440
             // visible) with the source format set by the codec profile — NV12 for
             // Main 8-bit, P010 for Main 10. The imported intermediate DX12 resource
-            // (built in create_dx12_resource_from_d3d11_texture) uses the visible
+            // (built in import_d3d11_texture_pooled) uses the visible
             // dimensions `frame.width() × frame.height()`, so the wgpu descriptor
             // must match those — not the decoder's padded dx_desc.Width/Height.
             // Mismatch (wrong format OR wrong size) makes wgpu emit DX12 plane

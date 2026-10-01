@@ -1136,23 +1136,6 @@ impl AudioTrackPcmSink {
             self.call_void(jni::jni_str!("play"));
         }
     }
-
-    pub fn set_volume(&self, volume: f32) {
-        if self.stopped.load(Ordering::Acquire) {
-            return;
-        }
-        let vm = android_vm();
-        let track = self.track.lock().unwrap();
-        let _ = vm.attach_current_thread(|env| -> Result<(), jni::errors::Error> {
-            env.call_method(
-                track.as_obj(),
-                jni::jni_str!("setVolume"),
-                jni::jni_sig!("(F)I"),
-                &[volume.into()],
-            )?;
-            Ok(())
-        });
-    }
 }
 
 impl Drop for AudioTrackPcmSink {

@@ -105,6 +105,10 @@ How to read a run (Android logcat, test app PID only):
   - **Fix:** the renderer records its adapter LUID; the decoder opens D3D11VA
     on the DXGI adapter with that LUID. Log:
     `[ffmpeg_hw] D3D11VA on adapter N (<name>), the renderer's GPU`.
+  - Both renderer constructors record it: the windowed one and, since the
+    desktop app (BlackZoneDesktop) turned out to miss the fix, also
+    `new_offscreen`, where the host creates the device (the desktop asks
+    for `HighPerformance`, i.e. typically the discrete GPU).
   - Verified on a single-GPU PC only (Intel UHD); dual GPU is for the testers.
 
 ### TODO: Windows GPU matrix (hand to testers with other GPUs)

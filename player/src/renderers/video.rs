@@ -1417,6 +1417,13 @@ impl VideoRenderer {
                  (see Player::new_offscreen docs)"
             );
         }
+        // The host picked the GPU here (e.g. a high-performance adapter on a
+        // laptop with an integrated and a discrete one); the D3D11VA decoder
+        // must open on that same GPU — see new_with_surface.
+        #[cfg(target_os = "windows")]
+        if let Some(luid) = video_directx::dx12_adapter_luid(&device) {
+            crate::decoders::ffmpeg_hw::set_render_adapter_luid(luid);
+        }
 
         let size = PhysicalSize::new(width.max(1), height.max(1));
         // Pipelines must target the format the host samples.

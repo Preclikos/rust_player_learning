@@ -196,8 +196,11 @@ public final class RustPlayer {
         case forced
     }
 
-    /// Default `.auto`. Takes effect from the next frame.
-    public var hdrOutput: HdrOutput = .auto {
+    /// Default `.off`: the picture pipeline is exactly the pre-0.1.56 one
+    /// (VideoToolbox + the player's tonemap on every screen). Opt in with
+    /// `.auto` once HDR output / direct mode has been seen on an HDR device.
+    /// Takes effect from the next frame.
+    public var hdrOutput: HdrOutput = .off {
         didSet { applyHdrOutput() }
     }
 

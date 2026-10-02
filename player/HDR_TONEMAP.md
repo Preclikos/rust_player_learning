@@ -181,7 +181,8 @@ signal to the OS:
 
 - **Trigger:** `Player::set_display_hdr_types(mask)` with bit 1 (HDR10)
   set, plus an HDR (PQ/HLG) frame. The iOS Swift wrapper sets the mask
-  itself (`RustPlayer.hdrOutput = .auto`: `AVPlayer.eligibleForHDRPlayback`
+  itself (`RustPlayer.hdrOutput = .auto`, opt-in — the default `.off` keeps
+  the tonemap everywhere: `AVPlayer.eligibleForHDRPlayback`
   and `UIScreen.potentialEDRHeadroom > 1`, iOS 16+). On macOS use
   `player::macos_display_hdr_types(ns_view)` (screen EDR headroom > 1)
   and re-check when the window changes screen; `examples/desktop` does

@@ -194,7 +194,8 @@ player.set_video_output_layer(av_layer);  // before playback starts
 
 (iOS FFI: `rustplayer_player_create_ex(metal_layer, video_layer, mask, …)`;
 the Swift `RustPlayer` does all of it itself — `directMode` (default on) +
-`hdrOutput`; macOS hosts can use `player::macos_install_direct_video_layer`
+`hdrOutput` (default `.off` = the pre-0.1.56 picture pipeline; `.auto`
+opts in to direct mode / EDR output on HDR screens); macOS hosts can use `player::macos_install_direct_video_layer`
 and `player::macos_display_hdr_types`, as `examples/desktop` does.)
 
 While the mask reports HDR10 or DV, compressed samples go straight into

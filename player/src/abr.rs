@@ -177,9 +177,125 @@ pub fn pick_representation(
     Some(pick)
 }
 
+/// Decoder-overload detector behind the ABR pixel cap.
+///
+/// A bandwidth-only ABR climbs to whatever the link carries. On a device
+/// whose decoder cannot keep up with that rung (an iPhone SE at 2160p
+/// decodes ~13 fps and drops 10+ frames a second for the rest of playback)
+/// nothing ever brought it back down: the bandwidth estimate says the rung
+/// fits. hls.js answers this with `capLevelOnFPSDrop`; this is the same idea
+/// on the per-second counters the sync loop already keeps: for `STRIKES`
+/// consecutive ticks the frames dropped as late must be at least
+/// `DROP_RATIO` of the frames presented, while at least `MIN_DECODED`
+/// frames a second still get presented. Whether the decoder or the render
+/// path is what cannot keep up does not matter: the rung is too heavy for
+/// this device, and the bandwidth estimate will never say so. A tick with
+/// almost nothing presented (a hidden browser tab on its 250 ms fallback, a
+/// stall) is not a measurement and never counts as a strike.
+#[derive(Debug, Default)]
+pub(crate) struct DecodeOverloadDetector {
+    rung: Option<u32>,
+    decoded: u64,
+    dropped: u64,
+    strikes: u8,
+}
+
+impl DecodeOverloadDetector {
+    pub(crate) const STRIKES: u8 = 3;
+    /// Dropped ≥ this share of the decoded frames in a tick.
+    pub(crate) const DROP_RATIO: f64 = 0.25;
+    /// Fewer presented frames than this in a tick is a stall or a hidden
+    /// tab, not a measurement.
+    const MIN_DECODED: u64 = 8;
+
+    /// One ABR tick (~1 s): the pipeline's cumulative frame counters and the
+    /// representation they belong to. `true` once the device has been shown
+    /// unable to keep up with `rung`.
+    pub(crate) fn observe(&mut self, rung: u32, decoded_total: u64, dropped_total: u64) -> bool {
+        if self.rung != Some(rung) || decoded_total < self.decoded {
+            // New rung, or a rebuilt pipeline with fresh counters: take the
+            // baseline. The tick that contains the switch itself drops the
+            // frames OLD left behind and must not count against NEW.
+            self.rung = Some(rung);
+            self.decoded = decoded_total;
+            self.dropped = dropped_total;
+            self.strikes = 0;
+            return false;
+        }
+        let decoded = decoded_total - self.decoded;
+        let dropped = dropped_total.saturating_sub(self.dropped);
+        self.decoded = decoded_total;
+        self.dropped = dropped_total;
+        let overloaded =
+            decoded >= Self::MIN_DECODED && dropped as f64 >= Self::DROP_RATIO * decoded as f64;
+        self.strikes = if overloaded { self.strikes + 1 } else { 0 };
+        if self.strikes >= Self::STRIKES {
+            self.strikes = 0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// iPhone SE at 2160p: ~13 presented, ~11 dropped per second.
+    #[test]
+    fn overload_trips_after_three_bad_ticks() {
+        let mut d = DecodeOverloadDetector::default();
+        assert!(!d.observe(0, 100, 0)); // baseline on the new rung
+        assert!(!d.observe(0, 113, 11));
+        assert!(!d.observe(0, 127, 22));
+        assert!(d.observe(0, 140, 35));
+        // Re-armed afterwards: no immediate second verdict.
+        assert!(!d.observe(0, 153, 46));
+    }
+
+    #[test]
+    fn a_hidden_tab_or_a_stall_is_not_a_measurement() {
+        // Hidden browser tab: ~4 frames a second reach the screen on the
+        // 250 ms fallback, everything else is dropped as late.
+        let mut d = DecodeOverloadDetector::default();
+        d.observe(0, 0, 0);
+        for i in 1..=6 {
+            assert!(!d.observe(0, 4 * i, 20 * i));
+        }
+        // A stall: next to nothing presented, next to nothing dropped.
+        for i in 1..=5 {
+            assert!(!d.observe(0, 24 + 2 * i, 120 + 2 * i));
+        }
+    }
+
+    #[test]
+    fn a_clean_tick_resets_the_strikes_and_a_switch_takes_a_baseline() {
+        let mut d = DecodeOverloadDetector::default();
+        d.observe(0, 0, 0);
+        assert!(!d.observe(0, 13, 11));
+        assert!(!d.observe(0, 26, 22));
+        assert!(!d.observe(0, 50, 22)); // clean second: strikes back to 0
+        assert!(!d.observe(0, 63, 33));
+        assert!(!d.observe(0, 76, 44));
+        // The switch to rung 1 (same counters, OLD's leftovers dropped) is a
+        // baseline, never a strike.
+        assert!(!d.observe(1, 80, 60));
+        assert!(!d.observe(1, 93, 71));
+        assert!(!d.observe(1, 106, 82));
+        assert!(d.observe(1, 119, 93));
+    }
+
+    #[test]
+    fn a_rebuilt_pipeline_with_fresh_counters_takes_a_baseline() {
+        let mut d = DecodeOverloadDetector::default();
+        d.observe(0, 500, 10);
+        assert!(!d.observe(0, 513, 21));
+        assert!(!d.observe(0, 3, 2)); // counters restarted: baseline, no strike
+        assert!(!d.observe(0, 16, 13));
+        assert!(!d.observe(0, 29, 24));
+        assert!(d.observe(0, 42, 35));
+    }
 
     #[test]
     fn picks_highest_within_budget() {

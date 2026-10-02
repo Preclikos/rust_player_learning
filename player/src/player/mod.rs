@@ -531,6 +531,15 @@ pub struct Player<V: VideoSink = VideoRenderer, A: AudioSink = AudioRenderer> {
     /// us from changing too often and annoying the user", and it covers the
     /// start-up window where the first bandwidth samples are still noisy.
     abr_switch_at: Arc<StdMutex<Option<Instant>>>,
+    /// Per-tick frame-drop watch behind `abr_pixel_cap`
+    /// (`abr::DecodeOverloadDetector`).
+    abr_decode_watch: Arc<StdMutex<crate::abr::DecodeOverloadDetector>>,
+    /// Representations with at least this many pixels are out of ABR's
+    /// reach for the rest of this stream: the decoder was measured unable
+    /// to keep up with one of them. `u64::MAX` = no cap. Reset by
+    /// `prepare()` (a new stream), never by a re-arm — the decoder has not
+    /// changed.
+    abr_pixel_cap: Arc<AtomicU64>,
 
     /// Watch channel the running `play()` supervisor listens on for
     /// mid-flight representation swaps. Each `play()` call installs a
@@ -646,6 +655,8 @@ impl<V: VideoSink, A: AudioSink> Clone for Player<V, A> {
             abr_strategy: Arc::clone(&self.abr_strategy),
             abr_video_profile: Arc::clone(&self.abr_video_profile),
             abr_switch_at: Arc::clone(&self.abr_switch_at),
+            abr_decode_watch: Arc::clone(&self.abr_decode_watch),
+            abr_pixel_cap: Arc::clone(&self.abr_pixel_cap),
             video_switch_tx: Arc::clone(&self.video_switch_tx),
             buffer_config: Arc::clone(&self.buffer_config),
             subtitle_representation: Arc::clone(&self.subtitle_representation),
@@ -844,6 +855,8 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             abr_strategy: Arc::new(ArcSwap::from_pointee(AbrStrategy::default())),
             abr_video_profile: Arc::new(ArcSwap::from_pointee(AbrVideoProfile::default())),
             abr_switch_at: Arc::new(StdMutex::new(None)),
+            abr_decode_watch: Arc::new(StdMutex::new(Default::default())),
+            abr_pixel_cap: Arc::new(AtomicU64::new(u64::MAX)),
             video_switch_tx: Arc::new(StdMutex::new(None)),
             buffer_config: Arc::new(StdMutex::new(BufferConfig::default())),
             subtitle_representation: Arc::new(StdMutex::new(None)),
@@ -1050,6 +1063,10 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
     pub async fn prepare(&mut self) -> Result<(), Box<dyn Error>> {
         #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
         ffmpeg_next::init()?;
+        // A new stream: whatever rung overloaded the decoder in the last one
+        // says nothing about this ladder.
+        self.abr_pixel_cap.store(u64::MAX, Ordering::Relaxed);
+        *self.abr_decode_watch.lock().unwrap() = Default::default();
 
         let manifest = match &self.manifest {
             Some(m) => m,
@@ -1819,6 +1836,41 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             .as_ref()
             .map(|r| r.id);
 
+        // Device overload → pixel cap (`DecodeOverloadDetector`). Evaluated
+        // every tick the pipeline is live, before any of the gates below: a
+        // rung the device cannot keep up with is the one case a switch must
+        // not wait for the switch interval.
+        let cap_now = current_id.is_some_and(|cid| {
+            let decoded = self.stats.video_frames_decoded.load(Ordering::Relaxed);
+            let dropped = self.stats.video_frames_dropped.load(Ordering::Relaxed);
+            let overloaded = self.abr_decode_watch.lock().unwrap().observe(cid, decoded, dropped);
+            if !overloaded {
+                return false;
+            }
+            let (cur_px, cur_w, cur_h) = self
+                .video_representation
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|r| (r.width as u64 * r.height as u64, r.width, r.height))
+                .unwrap_or((0, 0, 0));
+            if cur_px == 0 || cur_px >= self.abr_pixel_cap.load(Ordering::Relaxed) {
+                return false;
+            }
+            self.abr_pixel_cap.store(cur_px, Ordering::Relaxed);
+            log::warn!(
+                "[abr] this device cannot keep up with repr {} ({}x{}): ≥{}% of its frames dropped as late for {} s — representations of {}x{} or more are out for this stream",
+                cid,
+                cur_w,
+                cur_h,
+                (crate::abr::DecodeOverloadDetector::DROP_RATIO * 100.0) as u32,
+                crate::abr::DecodeOverloadDetector::STRIKES,
+                cur_w,
+                cur_h
+            );
+            true
+        });
+
         let ewma_bps = self.stats.bandwidth_bps_ewma.load(Ordering::Relaxed);
         // Warmup: don't switch until we have *some* sample. Otherwise the
         // very first tick would always pick the lowest rung.
@@ -1834,7 +1886,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         // the pipeline (re)start included, so the first seconds after a
         // start, seek or switch never see another switch on top.
         if let Some(at) = *self.abr_switch_at.lock().unwrap() {
-            if at.elapsed() < ABR_SWITCH_INTERVAL {
+            if !cap_now && at.elapsed() < ABR_SWITCH_INTERVAL {
                 return;
             }
         }
@@ -1852,7 +1904,24 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
 
         // Stage 1: filter by HDR / bit-depth policy.
         let profile = **self.abr_video_profile.load();
-        let candidate_indices = profile.filter_indices(&adaptation.representations);
+        let mut candidate_indices = profile.filter_indices(&adaptation.representations);
+        // Stage 1b: the decoder's own limit. Rungs at or above the measured
+        // overload are out; if nothing lighter exists the cap cannot help
+        // and the set stays as it is.
+        let pixel_cap = self.abr_pixel_cap.load(Ordering::Relaxed);
+        if pixel_cap < u64::MAX {
+            let lighter: Vec<usize> = candidate_indices
+                .iter()
+                .copied()
+                .filter(|&i| {
+                    let r = &adaptation.representations[i];
+                    (r.width as u64) * (r.height as u64) < pixel_cap
+                })
+                .collect();
+            if !lighter.is_empty() {
+                candidate_indices = lighter;
+            }
+        }
         if candidate_indices.is_empty() {
             // Profile filtered everything out (e.g. SdrOnly on an HDR-only
             // adaptation). Keep the currently-playing rep rather than

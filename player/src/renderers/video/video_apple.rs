@@ -303,8 +303,17 @@ impl VideoRenderer {
         if let Some((surface, mut cfg)) = self.lock_surface().await {
             cfg.alpha_mode =
                 if on { wgpu::CompositeAlphaMode::PostMultiplied } else { wgpu::CompositeAlphaMode::Auto };
+            // Non-opaque alone is not enough: Core Animation composites a
+            // 10-bit CAMetalLayer (the preferred rgb10a2Unorm, 2-bit alpha) as
+            // opaque — the overlay showed black over the video layer on an
+            // iPhone SE. While transparent, the layer carries an 8-bit-alpha
+            // format; the renderer's own format comes back with the video.
+            let format = if on { crate::renderers::subtitle::DIRECT_OVERLAY_FORMAT } else { self.surface_format };
+            cfg.format = format;
+            cfg.view_formats = vec![format];
             surface.configure(&self.device, &cfg);
         }
+        self.ensure_subtitle_overlay().set_direct_output(on);
         direct.active.store(on, Ordering::Relaxed);
         direct.invalidate();
         log::info!(

@@ -333,6 +333,14 @@ struct GpuCue {
     transform: [f32; 4],
 }
 
+/// The render layer's format while it is the direct-mode subtitle overlay.
+/// Core Animation composites a 10-bit `CAMetalLayer` (`rgb10a2Unorm`, 2-bit
+/// alpha) as OPAQUE whatever `opaque` and the drawable say — measured on an
+/// iPhone SE (iOS 15.8): a drawable cleared to (0, 0, 0, 0) in that format
+/// showed black over the video layer, the same drawable as `bgra8Unorm`
+/// showed through. 8-bit alpha is all subtitles need.
+pub const DIRECT_OVERLAY_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8Unorm;
+
 pub struct SubtitleOverlay {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
@@ -344,6 +352,11 @@ pub struct SubtitleOverlay {
     /// Draw through `pipeline_pq` — the video renderer flips it on HDR
     /// output session entry/exit.
     pq_output: std::sync::atomic::AtomicBool,
+    /// `fs_main` into a [`DIRECT_OVERLAY_FORMAT`] target — the Apple direct
+    /// mode keeps the render layer in that 8-bit-alpha format while it is a
+    /// transparent subtitle overlay (see [`Self::set_direct_output`]).
+    pipeline_direct: std::sync::OnceLock<wgpu::RenderPipeline>,
+    direct_output: std::sync::atomic::AtomicBool,
     shader: wgpu::ShaderModule,
     pipeline_layout: wgpu::PipelineLayout,
     bind_group_layout: wgpu::BindGroupLayout,
@@ -710,6 +723,8 @@ impl SubtitleOverlay {
             pipeline,
             pipeline_pq: std::sync::OnceLock::new(),
             pq_output: std::sync::atomic::AtomicBool::new(false),
+            pipeline_direct: std::sync::OnceLock::new(),
+            direct_output: std::sync::atomic::AtomicBool::new(false),
             shader,
             pipeline_layout,
             bind_group_layout,
@@ -951,7 +966,17 @@ impl SubtitleOverlay {
             g.transform = transform;
         }
 
-        let pipeline = if self.pq_output.load(std::sync::atomic::Ordering::Relaxed) {
+        let pipeline = if self.direct_output.load(std::sync::atomic::Ordering::Relaxed) {
+            self.pipeline_direct.get_or_init(|| {
+                build_pipeline(
+                    &self.device,
+                    &self.shader,
+                    &self.pipeline_layout,
+                    DIRECT_OVERLAY_FORMAT,
+                    "fs_main",
+                )
+            })
+        } else if self.pq_output.load(std::sync::atomic::Ordering::Relaxed) {
             self.pipeline_pq.get_or_init(|| {
                 build_pipeline(
                     &self.device,
@@ -975,6 +1000,13 @@ impl SubtitleOverlay {
     /// rgba16float target (SDR white → 203 nits). Takes effect next frame.
     pub fn set_pq_output(&self, on: bool) {
         self.pq_output.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Apple direct mode on/off: the render layer is then a transparent
+    /// overlay in [`DIRECT_OVERLAY_FORMAT`] and cues draw into that format.
+    /// Takes effect next frame.
+    pub fn set_direct_output(&self, on: bool) {
+        self.direct_output.store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Allocate the texture/view/bind-group triple for a cue bitmap of the

@@ -36,6 +36,45 @@ pub struct FfmpegHwDecoder {
 
 unsafe impl Send for FfmpegHwDecoder {}
 
+/// LUID of the GPU the video renderer runs on (0 = not known yet). Set by the
+/// renderer when it creates its device; one renderer per process in practice.
+#[cfg(target_os = "windows")]
+static RENDER_ADAPTER_LUID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Record the renderer's GPU, so decoders open their D3D11VA device on it.
+#[cfg(target_os = "windows")]
+pub fn set_render_adapter_luid(luid: u64) {
+    RENDER_ADAPTER_LUID.store(luid, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// DXGI adapter index of the renderer's GPU, the form FFmpeg's D3D11VA
+/// device takes ("0", "1", ... in `EnumAdapters` order). `None` when the
+/// renderer's GPU is not known or not found: FFmpeg then uses the default
+/// adapter, as before.
+#[cfg(target_os = "windows")]
+fn render_adapter_index() -> Option<(u32, String)> {
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
+    let luid = RENDER_ADAPTER_LUID.load(std::sync::atomic::Ordering::Relaxed);
+    if luid == 0 {
+        return None;
+    }
+    unsafe {
+        let factory: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
+        let mut i = 0u32;
+        while let Ok(adapter) = factory.EnumAdapters1(i) {
+            if let Ok(desc) = adapter.GetDesc1() {
+                let l = desc.AdapterLuid;
+                if ((l.HighPart as u32 as u64) << 32) | l.LowPart as u64 == luid {
+                    let name_len = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
+                    return Some((i, String::from_utf16_lossy(&desc.Description[..name_len])));
+                }
+            }
+            i += 1;
+        }
+    }
+    None
+}
+
 /// Create a fresh platform hw-device context (D3D11VA on Windows, VAAPI on
 /// Linux). The caller owns the returned ref and must `av_buffer_unref` it.
 fn create_hwdevice_ctx() -> Result<*mut AVBufferRef, DecoderError> {
@@ -51,9 +90,30 @@ fn create_hwdevice_ctx() -> Result<*mut AVBufferRef, DecoderError> {
     // with no driver detail.
     crate::ffmpeg_log::set_log_level(crate::ffmpeg_log::LogLevel::Verbose);
 
+    // Windows: decode on the renderer's GPU (see render_adapter_index).
+    #[cfg(target_os = "windows")]
+    let device_name: Option<std::ffi::CString> = match render_adapter_index() {
+        Some((index, name)) => {
+            log::info!("[ffmpeg_hw] D3D11VA on adapter {} ({}), the renderer's GPU", index, name);
+            std::ffi::CString::new(index.to_string()).ok()
+        }
+        None => {
+            log::info!("[ffmpeg_hw] D3D11VA on the default adapter (renderer GPU unknown)");
+            None
+        }
+    };
+    #[cfg(not(target_os = "windows"))]
+    let device_name: Option<std::ffi::CString> = None;
+
     let mut ctx: *mut AVBufferRef = std::ptr::null_mut();
     let ret = unsafe {
-        av_hwdevice_ctx_create(&mut ctx, device_type, std::ptr::null(), std::ptr::null_mut(), 0)
+        av_hwdevice_ctx_create(
+            &mut ctx,
+            device_type,
+            device_name.as_ref().map_or(std::ptr::null(), |n| n.as_ptr()),
+            std::ptr::null_mut(),
+            0,
+        )
     };
     if ret < 0 {
         return Err(format!("av_hwdevice_ctx_create failed: {}", ret).into());

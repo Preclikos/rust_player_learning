@@ -98,7 +98,21 @@ How to read a run (Android logcat, test app PID only):
   - **Linux/VAAPI is unaffected:** VA-API ≥ 1.0 pools are dynamic and FFmpeg
     ignores `extra_hw_frames` there.
 
+- **Laptops with two GPUs (Windows):**
+  - **Problem:** the D3D11VA decode device used FFmpeg's default adapter while
+    wgpu picked its own, and the frame import (`OpenSharedHandle`) cannot cross
+    GPUs.
+  - **Fix:** the renderer records its adapter LUID; the decoder opens D3D11VA
+    on the DXGI adapter with that LUID. Log:
+    `[ffmpeg_hw] D3D11VA on adapter N (<name>), the renderer's GPU`.
+  - Verified on a single-GPU PC only (Intel UHD); dual GPU is for the testers.
+
 ### TODO: Windows GPU matrix (hand to testers with other GPUs)
+0. **Laptop with integrated + discrete GPU**:
+   - check that the `D3D11VA on adapter` name matches `[renderer] … adapter=`;
+   - check that the picture plays, with no `OpenSharedHandle failed`;
+   - then repeat with Windows Settings → Graphics forcing the app to the
+     discrete GPU.
 The log line `[ffmpeg_hw] hw frame pool: N surfaces (WxH)` shows the pool per
 decoder (expected 30).
 1. **Integrated GPU (Intel UHD/Iris, AMD APU) with 4K HDR**:

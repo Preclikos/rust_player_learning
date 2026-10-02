@@ -769,6 +769,13 @@ impl VideoRenderer {
         device.on_uncaptured_error(std::sync::Arc::new(|e: wgpu::Error| {
             log::error!("[renderer] wgpu error (continuing): {e}");
         }));
+        // The decoder must create its D3D11VA device on this same GPU: its
+        // frames are imported here through a shared handle, which cannot
+        // cross adapters (a laptop with an integrated and a discrete GPU).
+        #[cfg(target_os = "windows")]
+        if let Some(luid) = video_directx::dx12_adapter_luid(&device) {
+            crate::decoders::ffmpeg_hw::set_render_adapter_luid(luid);
+        }
 
         let preferred_formats = vec![
             TextureFormat::Rgb10a2Unorm,

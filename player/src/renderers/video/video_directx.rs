@@ -386,6 +386,16 @@ fn log_d3d11_device_removed_reason(device: &ID3D11Device) -> bool {
     }
 }
 
+/// LUID of the GPU wgpu renders on (DX12 backend), packed as
+/// `(HighPart << 32) | LowPart`; `None` on another backend.
+pub fn dx12_adapter_luid(device: &wgpu::Device) -> Option<u64> {
+    unsafe {
+        let hdevice = device.as_hal::<Dx12>()?;
+        let luid = hdevice.raw_device().GetAdapterLuid();
+        Some(((luid.HighPart as u32 as u64) << 32) | luid.LowPart as u64)
+    }
+}
+
 /// Same as above but for the DX12 device wgpu is holding.
 pub fn log_dx12_device_removed_reason(device: &wgpu::Device) {
     unsafe {

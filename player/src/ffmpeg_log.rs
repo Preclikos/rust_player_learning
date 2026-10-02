@@ -83,7 +83,9 @@ fn is_dxva_guid_dump(msg: &str) -> bool {
 ///
 /// Both forwarders mapped this by hand; they have to agree, or the same
 /// ffmpeg message lands at a different level depending on which one saw it.
-#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+// Only the Windows / Linux log callbacks below map levels; macOS installs
+// no FFmpeg log callback (FFmpeg is audio-only there).
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 fn rust_level_for(level: std::ffi::c_int) -> log::Level {
     use ffmpeg_next::ffi as sys;
     if level <= sys::AV_LOG_ERROR {

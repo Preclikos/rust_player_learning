@@ -44,7 +44,7 @@ type MTLPixelFormat = u64;
 // Subset of MTLPixelFormat values we use.
 const MTL_PIXEL_FORMAT_R8_UNORM: MTLPixelFormat = 10;
 const MTL_PIXEL_FORMAT_RG8_UNORM: MTLPixelFormat = 30;
-const MTL_PIXEL_FORMAT_R16_UNORM: MTLPixelFormat = 23;
+const MTL_PIXEL_FORMAT_R16_UNORM: MTLPixelFormat = 20;
 const MTL_PIXEL_FORMAT_RG16_UNORM: MTLPixelFormat = 60;
 
 // CVPixelBuffer 10-bit biplanar formats (P010 layout: 10-bit codes in the

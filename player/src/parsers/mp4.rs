@@ -145,6 +145,7 @@ pub fn parse_sidx(data: &mut &[u8]) -> Result<SidxBox, Box<dyn Error>> {
 }
 
 /// Prefix a raw NALU body with the 4-byte Annex-B start code (`00 00 00 01`).
+#[cfg_attr(not(any(target_os = "windows", target_os = "linux")), allow(dead_code))]
 pub fn append_hevc_header(mut nalu_data: Vec<u8>) -> Vec<u8> {
     let mut nalu = vec![0x00, 0x00, 0x00, 0x01];
     nalu.append(&mut nalu_data);

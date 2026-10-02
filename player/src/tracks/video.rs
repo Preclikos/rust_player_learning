@@ -293,7 +293,7 @@ mod tests {
     }
 
     #[test]
-    fn label_emits_2K_4K_buckets_by_height() {
+    fn label_emits_2k_4k_buckets_by_height() {
         let mut r4k = rep("hvc1.2.4.L150.90", 3840, 2160, false, false);
         r4k.bandwidth = 14_000_000;
         assert!(r4k.label().starts_with("4K "));

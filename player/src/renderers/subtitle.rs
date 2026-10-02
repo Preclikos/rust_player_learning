@@ -144,6 +144,7 @@ impl CueParent {
     }
 
     /// From the content (frame) size; 0×0 = unknown → the whole target.
+    #[cfg_attr(target_os = "android", allow(dead_code))]
     pub fn fit(
         target_w: u32,
         target_h: u32,
@@ -315,6 +316,7 @@ struct QuadUniform {
 /// the bind group) and costs one `write_texture`. Previously every frame
 /// allocated a fresh bind group and re-wrote the uniform even when nothing
 /// had moved.
+#[cfg_attr(target_os = "android", allow(dead_code))]
 struct GpuCue {
     /// `SubtitleBitmap::generation` of the content currently uploaded.
     generation: u64,
@@ -339,8 +341,10 @@ struct GpuCue {
 /// iPhone SE (iOS 15.8): a drawable cleared to (0, 0, 0, 0) in that format
 /// showed black over the video layer, the same drawable as `bgra8Unorm`
 /// showed through. 8-bit alpha is all subtitles need.
+#[cfg_attr(target_os = "android", allow(dead_code))]
 pub const DIRECT_OVERLAY_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8Unorm;
 
+#[cfg_attr(target_os = "android", allow(dead_code))]
 pub struct SubtitleOverlay {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
@@ -820,6 +824,7 @@ impl SubtitleOverlay {
     ///
     /// Pure lookup — no rasterization, no allocation. Runs on the render
     /// thread for every frame.
+    #[cfg_attr(not(any(target_os = "android", target_os = "ios", target_os = "macos")), allow(dead_code))]
     pub fn active_bitmap(&self, parent: &CueParent) -> Option<std::sync::Arc<SubtitleBitmap>> {
         let (target_w, target_h) = (parent.width(), parent.height());
         let type_h = parent.type_height();
@@ -883,6 +888,7 @@ impl SubtitleOverlay {
     /// Draws whatever the worker has ready for the active cue. Nothing
     /// ready (no cue, or a seek the worker hasn't caught up with) simply
     /// draws nothing this frame.
+    #[cfg_attr(target_os = "android", allow(dead_code))]
     pub fn draw_into(&self, render_pass: &mut wgpu::RenderPass<'_>, parent: &CueParent) {
         if parent.target_w == 0 || parent.target_h == 0 {
             return;
@@ -998,6 +1004,7 @@ impl SubtitleOverlay {
 
     /// HDR output session on/off: cues are then drawn PQ-encoded into an
     /// rgba16float target (SDR white → 203 nits). Takes effect next frame.
+    #[cfg_attr(not(any(target_os = "ios", target_os = "macos")), allow(dead_code))]
     pub fn set_pq_output(&self, on: bool) {
         self.pq_output.store(on, std::sync::atomic::Ordering::Relaxed);
     }
@@ -1005,12 +1012,14 @@ impl SubtitleOverlay {
     /// Apple direct mode on/off: the render layer is then a transparent
     /// overlay in [`DIRECT_OVERLAY_FORMAT`] and cues draw into that format.
     /// Takes effect next frame.
+    #[cfg_attr(not(any(target_os = "ios", target_os = "macos")), allow(dead_code))]
     pub fn set_direct_output(&self, on: bool) {
         self.direct_output.store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Allocate the texture/view/bind-group triple for a cue bitmap of the
     /// given size. Only called when the size changes.
+    #[cfg_attr(target_os = "android", allow(dead_code))]
     fn create_gpu_cue(&self, bitmap_w: u32, bitmap_h: u32) -> GpuCue {
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("subtitle_cue_texture"),
@@ -1063,6 +1072,7 @@ impl SubtitleOverlay {
     /// One `raster_worker` iteration, run synchronously by the render path
     /// when there is no worker thread. Bakes at most one cue per call — the
     /// active one first, the prefetch on the next frame.
+    #[cfg_attr(target_os = "android", allow(dead_code))]
     fn rasterize_inline(&self, target_w: u32, target_h: u32, type_h: u32) {
         let job = {
             let mut inner = self.shared.inner.lock().unwrap();

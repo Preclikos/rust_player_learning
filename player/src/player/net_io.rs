@@ -284,6 +284,7 @@ pub(super) async fn setup_track_crypto(
 }
 
 /// Below this, the thread hand-off costs more than the decryption saves.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub(super) const PARALLEL_DECRYPT_MIN_BYTES: usize = 2 * 1024 * 1024;
 
 /// Decrypt one sample, honouring the "clear sample inside an encrypted senc"
@@ -313,6 +314,7 @@ pub(super) fn decrypt_one_sample(
 /// The split is by BYTES, not by sample count: sample sizes within a GOP vary
 /// by an order of magnitude (an IDR against a B-frame), so an even count would
 /// leave one worker holding most of the work.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub(super) fn decrypt_samples_parallel(
     data_vec: &mut [u8],
     tc: &TrackCrypto,
@@ -398,6 +400,7 @@ pub(super) fn decrypt_samples_parallel(
     })
 }
 
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub(super) fn decrypt_segment_in_place(
     data_vec: &mut [u8],
     track_crypto: Option<&TrackCrypto>,

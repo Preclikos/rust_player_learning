@@ -77,6 +77,7 @@ pub fn create_texture_from_vk_image(
     }
 }
 
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub fn format_wgpu_to_vulkan(format: wgpu::TextureFormat) -> vk::Format {
     use ash::vk::Format as F;
     use wgpu::TextureFormat as Tf;

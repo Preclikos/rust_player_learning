@@ -179,6 +179,7 @@ impl PrerollGate {
 /// time. Presenting on the nearest vsync turns 24 fps on a 60 Hz display into
 /// the regular 3:2 pull-down instead of landing frames on a random side of a
 /// vsync (±16 ms of judder that render-interval numbers never show).
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 pub struct VsyncCadence {
     period_ms: f64,
     last_tick_ms: Option<f64>,
@@ -190,6 +191,7 @@ impl Default for VsyncCadence {
     }
 }
 
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 impl VsyncCadence {
     /// Start from a 60 Hz assumption; `observe_tick` converges on the real
     /// display within a few frames.
@@ -229,12 +231,14 @@ impl VsyncCadence {
 }
 
 /// Result of pulling the next chunk off a sink's queue.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub enum Pulled {
     /// A live chunk of the current generation. `starts_gen` is true for the
     /// first chunk of a generation — the consumer must mark the boundary
     /// with its own device position BEFORE handing any of it to the device.
     Chunk { samples: Vec<f32>, gen: u64, starts_gen: bool },
     /// Queue empty right now.
+    #[cfg_attr(target_os = "android", allow(dead_code))]
     Empty,
     /// Producer gone (sink torn down).
     Closed,
@@ -247,12 +251,15 @@ pub enum Pulled {
 pub struct ChunkCursor {
     rx: tokio::sync::mpsc::Receiver<AudioChunk>,
     /// Current chunk + read offset (sample-level API only).
+    #[cfg_attr(any(target_os = "android", target_arch = "wasm32"), allow(dead_code))]
     cur: Option<(Vec<f32>, usize)>,
     cur_gen: u64,
     state: std::sync::Arc<FlushState>,
     /// Samples handed to the device by the sample-level API (this cursor is
     /// the sole writer; `commit` publishes it).
+    #[cfg_attr(any(target_os = "android", target_arch = "wasm32"), allow(dead_code))]
     consumed: u64,
+    #[cfg_attr(any(target_os = "android", target_arch = "wasm32"), allow(dead_code))]
     consumed_shared: std::sync::Arc<AtomicU64>,
     closed: bool,
     /// A live chunk `drop_stale` pulled while paused; `next_chunk` returns
@@ -260,6 +267,7 @@ pub struct ChunkCursor {
     pending: Option<AudioChunk>,
 }
 
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 impl ChunkCursor {
     pub fn new(
         rx: tokio::sync::mpsc::Receiver<AudioChunk>,
@@ -288,6 +296,7 @@ impl ChunkCursor {
     /// sound (desktop, every seek after the first). The first live chunk
     /// met here is parked in `pending`, not consumed, so the resume still
     /// starts exactly at the generation boundary.
+    #[cfg_attr(target_os = "android", allow(dead_code))]
     pub fn drop_stale(&mut self) {
         if self.pending.is_some() {
             return;
@@ -324,6 +333,7 @@ impl ChunkCursor {
     }
 
     /// Non-blocking pull (realtime callbacks).
+    #[cfg_attr(target_os = "android", allow(dead_code))]
     pub fn next_chunk(&mut self) -> Pulled {
         if let Some(chunk) = self.pending.take() {
             if let Some(p) = self.classify(chunk) {
@@ -373,6 +383,7 @@ impl ChunkCursor {
     /// (emit silence). Marks the boundary itself with the consumed-sample
     /// position, and drops the rest of the current chunk the moment a flush
     /// supersedes its generation.
+    #[cfg_attr(target_os = "android", allow(dead_code))]
     pub fn next_sample(&mut self) -> Option<f32> {
         loop {
             if let Some((buf, off)) = self.cur.as_mut() {
@@ -398,10 +409,12 @@ impl ChunkCursor {
     }
 
     /// Publish the consumed-sample count (call once per callback).
+    #[cfg_attr(target_os = "android", allow(dead_code))]
     pub fn commit(&self) {
         self.consumed_shared.store(self.consumed, Ordering::Release);
     }
 
+    #[cfg_attr(target_os = "android", allow(dead_code))]
     pub fn is_closed(&self) -> bool {
         self.closed
     }
@@ -409,6 +422,7 @@ impl ChunkCursor {
     /// The producer is gone (every sender dropped), even if chunks are still
     /// queued. Lets a consumer that is waiting without pulling, like the PCM
     /// writer holding a chunk through a pause, notice the shutdown.
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
     pub fn sender_gone(&self) -> bool {
         self.closed || self.rx.is_closed()
     }

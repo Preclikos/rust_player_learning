@@ -54,6 +54,7 @@ pub enum VideoCodec {
 }
 
 pub struct VideoDecoderParams {
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub codec: VideoCodec,
     // Width/height are consumed by MediaCodec on Android; the FFmpeg desktop
     // path reads them from the bitstream/init segment so they're unused there.
@@ -63,6 +64,7 @@ pub struct VideoDecoderParams {
     pub height: u32,
     /// Raw NALU bytes (no length prefix, no start code) — VPS/SPS/PPS for HEVC,
     /// extracted from the hvcC box in the init segment.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub hvcc_nalus: Vec<Vec<u8>>,
     /// The whole decoder configuration record (`hvcC` payload) the NALUs above
     /// were taken from. WebCodecs wants the record itself (it derives the
@@ -82,18 +84,21 @@ pub struct VideoDecoderParams {
     /// come back as [`PlatformFrame::MediaCodecDirect`] release handles
     /// instead of AHardwareBuffers. 0 = classic ImageReader/GL path.
     /// Ignored by the desktop / Apple decoders.
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
     pub direct_window: usize,
     /// Force an 8-bit decode destination even for HDR (PQ/HLG) content —
     /// the in-player tonemap still runs, at 8-bit quantization of the PQ
     /// signal. Debug/compat knob, set via [`Player::set_hdr_decode_8bit`]
     /// (crate::Player) and seeded from `RUST_PLAYER_VT_FORCE_8BIT`.
     /// Honoured by the VideoToolbox decoder (macOS/iOS); ignored elsewhere.
+    #[cfg_attr(not(any(target_os = "ios", target_os = "macos")), allow(dead_code))]
     pub force_8bit_hdr: bool,
     /// Dolby Vision profile (5/7/8) when the representation is DV. In
     /// direct mode the Android decoder then prefers the platform
     /// `video/dolby-vision` codec with the RPU NALs KEPT — full DV
     /// reconstruction in the OS pipeline — and falls back to the HEVC
     /// base layer for profiles 7/8 when no DV decoder exists.
+    #[cfg_attr(not(any(target_os = "android", target_os = "ios", target_os = "macos")), allow(dead_code))]
     pub dovi_profile: Option<u8>,
     /// The raw DV configuration box (`dvvC`/`dvcC`) and its type, for
     /// decoders that hand DV to the OS whole (Apple direct mode).

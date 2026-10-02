@@ -67,6 +67,7 @@ pub struct AudioRenderer {
     /// listener has heard. Drives the A/V drift measurement in the video
     /// sync loop (the device crystal and CLOCK_MONOTONIC disagree by
     /// 10-100 ppm — minutes-long playback drifts audibly without it).
+    #[cfg_attr(target_os = "android", allow(dead_code))]
     samples_consumed: Arc<AtomicU64>,
     /// Output-path latency in ms (device buffer + DAC), from the cpal
     /// callback timestamp. 0 until the first callback / when the backend

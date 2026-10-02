@@ -111,10 +111,13 @@ pub fn nal_unit_type(nalu: &[u8]) -> Option<u8> {
 }
 
 pub const NAL_SPS: u8 = 33;
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
 pub const NAL_SEI_PREFIX: u8 = 39;
 /// Unspecified NAL types carrying Dolby Vision data in single-track
 /// streams: 62 = RPU (reshaping/DM metadata), 63 = enhancement layer.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
 pub const NAL_DV_RPU: u8 = 62;
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
 pub const NAL_DV_EL: u8 = 63;
 
 /// Parse colour info from the first SPS found in `nalus` (raw NALU bytes,
@@ -356,6 +359,7 @@ fn skip_st_ref_pic_set(r: &mut BitReader, idx: u32, num_delta_pocs: &[u32]) -> O
 /// Dynamic (per-access-unit) HDR10+ metadata from the ST 2094-40 SEI.
 /// Converted to nits; only the fields the mobius tonemap consumes.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
 pub struct Hdr10PlusInfo {
     /// max(maxscl[0..3]) of window 0 — the scene peak.
     pub max_scl_nits: f32,
@@ -366,6 +370,7 @@ pub struct Hdr10PlusInfo {
 /// Static HDR10 metadata from the mastering-display / content-light-level
 /// SEI messages (typically present on every IDR).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
 pub struct HdrStaticInfo {
     /// max_display_mastering_luminance (SEI 137), nits.
     pub mastering_peak_nits: Option<f32>,
@@ -375,18 +380,23 @@ pub struct HdrStaticInfo {
 
 /// All HDR-relevant payloads found in one SEI prefix NAL unit.
 #[derive(Clone, Copy, Debug, Default)]
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
 pub struct SeiHdrMetadata {
     pub hdr10plus: Option<Hdr10PlusInfo>,
     pub static_info: HdrStaticInfo,
 }
 
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
 const SEI_MASTERING_DISPLAY: u32 = 137;
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
 const SEI_CONTENT_LIGHT_LEVEL: u32 = 144;
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
 const SEI_USER_DATA_REGISTERED_T35: u32 = 4;
 
 /// Parse the HDR-relevant SEI payloads out of one SEI prefix NAL unit
 /// (raw NALU bytes including the 2-byte header). Unknown payloads are
 /// skipped; malformed ones abort the scan and return what was found.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
 pub fn parse_sei_hdr_metadata(nalu: &[u8]) -> SeiHdrMetadata {
     let mut out = SeiHdrMetadata::default();
     let Some(payload) = nalu.get(2..) else {
@@ -467,6 +477,7 @@ pub fn parse_sei_hdr_metadata(nalu: &[u8]) -> SeiHdrMetadata {
 
 /// ST 2094-40 (HDR10+) dynamic metadata inside the ITU-T T.35 SEI.
 /// Returns window-0 maxscl/average in nits.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
 fn parse_t35_hdr10plus(body: &[u8]) -> Option<Hdr10PlusInfo> {
     // itu_t_t35_country_code 0xB5 (USA), terminal_provider_code 0x003C
     // (Samsung), terminal_provider_oriented_code 0x0001,

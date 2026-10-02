@@ -157,8 +157,10 @@ pub struct HttpClient {
 
 /// A connection idle (no bytes) longer than this is treated as a stalled
 /// request: it fails so the RetryPolicy restarts it instead of hanging forever.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 const STALL_READ_TIMEOUT: Duration = Duration::from_secs(8);
 /// Cap establishing a connection so a dead/blackholed host doesn't hang.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 const STALL_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Build the reqwest client. On native-tls targets (Win/Linux) this is the

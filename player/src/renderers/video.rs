@@ -300,6 +300,7 @@ pub struct VideoRenderer {
     // plus a group-1 storage binding for the frame peak/average detection
     // result. None on devices where NV12 is unavailable (no 10-bit there
     // either).
+    #[cfg_attr(target_os = "android", allow(dead_code))]
     render_pipeline_hdr: Option<RenderPipeline>,
     /// Uniform buffer carrying the HDR→SDR tonemap parameters (the FFmpeg
     /// tonemap_opencl-style tone_param / desat / peak / scene_threshold,
@@ -317,6 +318,7 @@ pub struct VideoRenderer {
     /// buffer that never leaves the GPU; the HDR fragment shader reads the
     /// published result straight from that buffer. `None` on devices
     /// without NV12.
+    #[cfg_attr(target_os = "android", allow(dead_code))]
     hdr_detect: Option<HdrDetect>,
     /// Latest tonemap params pushed by `Player::set_hdr_tonemap`. Read on
     /// each P010 frame before draw and uploaded into `hdr_tonemap_uniform`.
@@ -449,6 +451,7 @@ fn wgsl_module(label: &'static str, src: String) -> wgpu::ShaderModuleDescriptor
     }
 }
 
+#[cfg_attr(target_os = "android", allow(dead_code))]
 struct HdrDetect {
     /// Rolling detection state + published result (HDR_DETECT_BUFFER_SIZE).
     buffer: wgpu::Buffer,
@@ -1523,6 +1526,7 @@ impl VideoRenderer {
     /// destination `target_view` (swapchain texture view or offscreen ring
     /// view) and its dimensions. Does NOT present/publish; the caller does that
     /// after this returns (surface: `queue.present`, offscreen: `publish`).
+    #[cfg_attr(target_os = "android", allow(dead_code))]
     #[allow(clippy::too_many_arguments)]
     async fn encode_and_submit(
         &self,
@@ -1983,6 +1987,7 @@ impl VideoRenderer {
 
     /// Aspect-FIT scale of a `frame`-sized picture into `window` — the
     /// letterbox/pillarbox factors ∈ (0, 1]. Unknown frame size → (1, 1).
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
     fn aspect_fit_scale(window: PhysicalSize<u32>, frame: PhysicalSize<u32>) -> (f32, f32) {
         if frame.width > 0 && frame.height > 0 && window.width > 0 && window.height > 0 {
             let wa = window.width as f32 / window.height as f32;

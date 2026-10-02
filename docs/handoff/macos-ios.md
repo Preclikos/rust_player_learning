@@ -209,8 +209,9 @@ which 4 are not built on macOS was not checked).
   runs next: the rustls config build (134 ms in create vs 23 ms on an idle
   thread), or with prewarm `spawn_event_pump` (102 ms for a spawn). The
   "several seconds" seen earlier came from the ASan + debug harness.
-  `RustPlayer.prewarm()` (ab9088f) moves the one-time
-  setup off the main thread: 198-206 ms -> 179-195 ms. Open: start the
+  A `RustPlayer.prewarm()` that moved the one-time setup off the main
+  thread (0fc2dc4) saved only ~10-20 ms (198-206 -> 179-195 ms) and was
+  removed again as not worth the API. Open: start the
   background threads at a lower QoS, or build the player off the main
   thread; neither done.
 - **Slow start to first frame is the first segment.** The player waits

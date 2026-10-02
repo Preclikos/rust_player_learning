@@ -621,34 +621,6 @@ pub extern "C" fn rustplayer_player_set_verbose_logging(enabled: bool) {
     })
 }
 
-/// Warm up the one-time process setup off the calling thread, so the first
-/// `rustplayer_player_create` does not pay for it on the main thread: the
-/// logger, the tokio runtime and the TLS stack (rustls / aws-lc, 155 ms of
-/// the first create's 220 ms on an iPhone SE). Returns immediately; safe to
-/// call more than once and at any time, a create that overlaps it just waits
-/// for the part still running.
-#[no_mangle]
-pub extern "C" fn rustplayer_prewarm() {
-    ffi_guard("rustplayer_prewarm", (), || {
-        static STARTED: OnceLock<()> = OnceLock::new();
-        if STARTED.set(()).is_err() {
-            return;
-        }
-        let spawned = std::thread::Builder::new()
-            .name("bz-prewarm".into())
-            .spawn(|| {
-                let t = std::time::Instant::now();
-                init_once();
-                let _ = runtime();
-                drop(player::tls_client());
-                log::info!("rustplayer_prewarm: done in {} ms", t.elapsed().as_millis());
-            });
-        if let Err(e) = spawned {
-            log::warn!("rustplayer_prewarm: could not spawn: {}", e);
-        }
-    })
-}
-
 #[no_mangle]
 pub extern "C" fn rustplayer_player_destroy(handle: *mut c_void) {
     ffi_guard("rustplayer_player_destroy", (), move || {

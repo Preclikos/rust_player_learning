@@ -89,12 +89,6 @@ public final class RustPlayer {
 
     public init() {}
 
-    /// Optional: call once early (e.g. at app launch) to run the library's
-    /// one-time setup (runtime, TLS) on a background thread, so the first
-    /// `start` does not block the main thread for it (~150 ms on older
-    /// devices). Returns immediately; calling it again does nothing.
-    public static func prewarm() { rustplayer_prewarm() }
-
     deinit { destroy() }
 
     public var isStarted: Bool { handle != nil }

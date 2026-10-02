@@ -158,6 +158,19 @@ public final class RustPlayer {
         rustplayer_player_set_video_output_layer(handle, Unmanaged.passUnretained(v).toOpaque())
     }
 
+    /// Keep the direct-mode video layer under the render layer's frame. The
+    /// macOS host gets this from `autoresizingMask`; iOS layers have none, so
+    /// a host that re-lays out the render layer (rotation, split view, a
+    /// resize it does NOT forward to `setSize`) calls this from its
+    /// `layoutSubviews`. No-op without direct mode.
+    public func syncVideoLayerFrame() {
+        guard let v = videoLayer, let m = metalLayer, v.frame != m.frame else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        v.frame = m.frame
+        CATransaction.commit()
+    }
+
     private func installVideoLayer(under layer: CAMetalLayer) {
         metalLayer = layer
         guard directMode, let parent = layer.superlayer else { return }

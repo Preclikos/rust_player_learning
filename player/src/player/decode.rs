@@ -343,6 +343,8 @@ pub(super) async fn video_decoder_task(
     // First segment whose decrypt+parse was started ahead of time (see
     // `prepare_segment`). `None` outside an ABR swap.
     first_prepared: Option<PrepareHandle>,
+    // See [`VideoPrefetch::feed_end`](super::pipeline::VideoPrefetch).
+    feed_end: Arc<AtomicUsize>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut decoder = DecoderGuard {
         decoder: Some(decoder),
@@ -446,6 +448,13 @@ pub(super) async fn video_decoder_task(
                     prepared.data_vec.len() / 1024
                 ),
             );
+        }
+        // A warm ABR handoff lands here: NEW feeds this segment. Unlike the
+        // kept-decoder cut below, OLD ends like at end of input, so the frames
+        // it still holds (all before the boundary) reach the screen.
+        if prepared.id >= feed_end.load(Ordering::Relaxed) {
+            log::debug!("[dec] segment {} is the next representation's; ending the feed", prepared.id);
+            break;
         }
         log::debug!("[dec] consuming video segment: {}", prepared.id);
         stats.diag_video_seg.fetch_add(1, Ordering::Relaxed);

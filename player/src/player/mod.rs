@@ -3163,6 +3163,7 @@ hi
             dl_pts_ms: Arc::new(std::sync::atomic::AtomicI64::new(dl_pts_ms)),
             // A swap prefetch starts out NOT publishing the shared gauge.
             track_dl: Arc::new(AtomicBool::new(false)),
+            feed_end: Arc::new(AtomicUsize::new(usize::MAX)),
         }
     }
 

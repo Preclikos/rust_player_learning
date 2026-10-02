@@ -153,6 +153,12 @@ pub(super) async fn video_sync_loop<V: VideoSink, A: AudioSink>(
     #[cfg(target_os = "android")]
     const DIRECT_RELEASE_LEAD_MS: u64 = 50;
 
+    // Frames behind the last presented one are dropped up to this far back
+    // (see the BACKWARD check); a retry from the current position lands at
+    // most a segment back.
+    const BACKWARD_DROP_MAX_MS: u64 = 10_000;
+    let mut backward_dropped = 0u32;
+
     let mut last_pts_ms = 0u64;
     let mut frame_idx: u64 = 0;
     let mut last_render_elapsed: u64 = 0;
@@ -402,9 +408,31 @@ pub(super) async fn video_sync_loop<V: VideoSink, A: AudioSink>(
             );
         }
 
+        // A frame behind the one on screen is content already shown: an ABR
+        // warm handoff splices NEW in at the segment boundary, and OLD may have
+        // presented past it (the switch came less than OLD's decode lead
+        // before the boundary). Presenting it stepped the picture back and then
+        // ran a LATE drain. Drop it so NEW joins where OLD left off. Bounded,
+        // so a timeline that really restarts further back still plays. A frame
+        // AT the on-screen pts is the same moment again (NEW's copy of OLD's
+        // last frame) and goes too.
+        if frame_idx > 0 && pts_ms <= last_pts_ms && last_pts_ms - pts_ms <= BACKWARD_DROP_MAX_MS {
+            if backward_dropped == 0 {
+                log::info!("[vsync] BACKWARD #{} pts={}ms last={}ms: dropping frames already shown",
+                    frame_idx, pts_ms, last_pts_ms);
+            }
+            backward_dropped += 1;
+            stats.video_frames_dropped.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
         if pts_ms < last_pts_ms {
             log::warn!("[vsync] BACKWARD #{} pts={}ms last={}ms Δ=-{}ms elapsed={}ms",
                 frame_idx, pts_ms, last_pts_ms, last_pts_ms - pts_ms, elapsed);
+        }
+        if backward_dropped > 0 {
+            log::info!("[vsync] dropped {} frames already shown; resuming at pts={}ms",
+                backward_dropped, pts_ms);
+            backward_dropped = 0;
         }
 
         if elapsed > pts_ms {

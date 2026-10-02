@@ -130,8 +130,10 @@ pub(super) async fn video_supervisor(
      -> (
         crate::rt::JoinHandle<Result<(), Box<dyn Error + Send + Sync>>>,
         Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
     ) {
         let soft_end = Arc::new(AtomicUsize::new(usize::MAX));
+        let feed_end = Arc::new(AtomicUsize::new(usize::MAX));
         let handle = crate::rt::spawn(video_play(
             repr,
             start_index,
@@ -145,12 +147,13 @@ pub(super) async fn video_supervisor(
             Arc::clone(&stats),
             segments_in_flight,
             soft_end.clone(),
+            feed_end.clone(),
             video_window.lease(),
             Arc::clone(&hdr_decode_8bit),
             ladder_max,
             Some(Arc::clone(&handoff)),
         ));
-        (handle, soft_end)
+        (handle, soft_end, feed_end)
     };
 
     // The pipeline currently feeding av_sync. `cur_*` are reassigned on each
@@ -164,12 +167,17 @@ pub(super) async fn video_supervisor(
     let mut cur_stop = Arc::new(Notify::new());
     let mut cur_flag = Arc::new(AtomicBool::new(false));
     log::info!("[video gen {}] supervisor start (repr={} idx={})", gen, current_repr.id, initial_start_index);
-    let (mut cur_handle, mut cur_soft_end) = spawn_pipeline(
+    let (mut cur_handle, mut cur_soft_end, mut cur_feed_end) = spawn_pipeline(
         current_repr.clone(),
         initial_start_index,
         cur_stop.clone(),
         cur_flag.clone(),
     );
+    // A warm-handoff pipeline's frames reach the main channel through its
+    // gate pump, which can still be forwarding OLD's tail after OLD's decode
+    // has ended. The next switch waits for it, or NEW's first frames
+    // interleave with that tail.
+    let mut cur_pump: Option<crate::rt::JoinHandle<()>> = None;
 
     // Segments to buffer in NEW before tearing OLD down. One segment is
     // seconds of frames, which a HW decoder chews through far faster than
@@ -311,11 +319,14 @@ const PREPARE_READY_BUDGET: Duration = Duration::from_millis(5_000);
                     cur_stop = Arc::new(Notify::new());
                     cur_flag = Arc::new(AtomicBool::new(false));
                     cur_soft_end = Arc::new(AtomicUsize::new(usize::MAX));
+                    cur_feed_end = Arc::new(AtomicUsize::new(usize::MAX));
+                    cur_pump = None;
                     cur_handle = crate::rt::spawn({
                         let repr = current_repr.clone();
                         let stop = cur_stop.clone();
                         let flag = cur_flag.clone();
                         let soft_end = cur_soft_end.clone();
+                        let feed_end = cur_feed_end.clone();
                         let decryptor = decryptor.clone();
                         let http = Arc::clone(&http);
                         let stats = Arc::clone(&stats);
@@ -340,6 +351,7 @@ const PREPARE_READY_BUDGET: Duration = Duration::from_millis(5_000);
                                 Arc::clone(&stats),
                                 segments_in_flight,
                                 soft_end,
+                                feed_end,
                                 usize::MAX,
                             )
                             .await?;
@@ -477,6 +489,7 @@ const PREPARE_READY_BUDGET: Duration = Duration::from_millis(5_000);
         let new_stop = Arc::new(Notify::new());
         let new_flag = Arc::new(AtomicBool::new(false));
         let new_soft_end = Arc::new(AtomicUsize::new(usize::MAX));
+        let new_feed_end = Arc::new(AtomicUsize::new(usize::MAX));
         let mut new_pf = tokio::select! {
             r = video_prefetch(
                 &new_repr,
@@ -488,6 +501,7 @@ const PREPARE_READY_BUDGET: Duration = Duration::from_millis(5_000);
                 Arc::clone(&stats),
                 segments_in_flight,
                 new_soft_end.clone(),
+                new_feed_end.clone(),
                 PRIME_TARGET,
             ) => match r {
                 Ok(pf) => pf,
@@ -639,7 +653,7 @@ const PREPARE_READY_BUDGET: Duration = Duration::from_millis(5_000);
             // forwarder into the main frame channel. If NEW's decode dies
             // before release (stop/error), the gate closes and the pump just
             // flushes and exits — the supervisor's retry handles the rest.
-            crate::rt::spawn({
+            let pump = crate::rt::spawn({
                 let sender = frame_sender.clone();
                 let release = Arc::clone(&release);
                 async move {
@@ -663,6 +677,11 @@ const PREPARE_READY_BUDGET: Duration = Duration::from_millis(5_000);
             // this segment index, so everything below the boundary is OLD's
             // and NEW keeps the boundary frame up (the trim is `<=`, hence -1).
             let splice_pts_us = boundary_ms as i64 * 1000 - 1;
+            // ...and OLD feeds nothing from that segment on. It may have
+            // downloaded it already (the buffer runs well ahead); decoding it
+            // put up to a few hundred ms of OLD past the boundary on screen,
+            // and NEW's boundary frame then stepped the picture back.
+            cur_feed_end.store(new_start, Ordering::Relaxed);
             // Two decoders run side by side here: OLD keeps its own.
             drop(handoff.take());
             let handle = crate::rt::spawn(run_decode(
@@ -681,7 +700,7 @@ const PREPARE_READY_BUDGET: Duration = Duration::from_millis(5_000);
                 ladder_max,
                 Some(Arc::clone(&handoff)),
             ));
-            Some((handle, release))
+            Some((handle, release, pump))
         } else {
             None
         };
@@ -709,7 +728,7 @@ const PREPARE_READY_BUDGET: Duration = Duration::from_millis(5_000);
                     // Unblock a warm NEW decode parked on its full gate so it
                     // can observe the flag and drop the HW decoder — otherwise
                     // it (and the decoder slot) would leak past this stop.
-                    if let Some((_, release)) = warm.as_ref() {
+                    if let Some((_, release, _)) = warm.as_ref() {
                         release.notify_one();
                     }
                     signal_stop(&cur_flag, &cur_stop);
@@ -747,7 +766,7 @@ const PREPARE_READY_BUDGET: Duration = Duration::from_millis(5_000);
                     rendered_abs, boundary_ms, new_repr.id
                 );
                 signal_stop(&new_flag, &new_stop);
-                if let Some((_, release)) = warm.as_ref() {
+                if let Some((_, release, _)) = warm.as_ref() {
                     release.notify_one();
                 }
                 drop(handoff.take());
@@ -834,11 +853,24 @@ const PREPARE_READY_BUDGET: Duration = Duration::from_millis(5_000);
             pf.take_over_buffer_gauge(&stats);
         }
 
+        // OLD's decode has ended; when it came in through a warm handoff, its
+        // pump may still hold a frame or two of its tail. Let that reach the
+        // main channel first. Bounded: the channel may be full while paused.
+        if let Some(mut pump) = cur_pump.take() {
+            tokio::select! {
+                _ = &mut pump => {}
+                _ = crate::rt::sleep(Duration::from_secs(1)) => {
+                    log::warn!("[abr] OLD's frame pump still busy after 1 s; starting NEW anyway");
+                }
+            }
+        }
+
         cur_handle = match warm {
             // Warm handoff: NEW is already configured with its first GOP
             // decoded and parked — just open the gate. Its frames land in the
             // main channel right behind OLD's tail.
-            Some((handle, release)) => {
+            Some((handle, release, pump)) => {
+                cur_pump = Some(pump);
                 release.notify_one();
                 log::info!(
                     "[abr] OLD torn down {}ms after switch; warm handoff gate opened",
@@ -926,6 +958,7 @@ const PREPARE_READY_BUDGET: Duration = Duration::from_millis(5_000);
         cur_stop = new_stop;
         cur_flag = new_flag;
         cur_soft_end = new_soft_end;
+        cur_feed_end = new_feed_end;
         current_repr = new_repr;
     }
 }

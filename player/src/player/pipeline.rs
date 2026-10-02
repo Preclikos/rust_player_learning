@@ -43,6 +43,11 @@ pub(super) struct VideoPrefetch {
     /// (`stats.last_decoded_pts_ms`). False for a swap prefetch until it
     /// takes over as the live pipeline — see [`VideoPrefetch::take_over_buffer_gauge`].
     pub(super) track_dl: Arc<AtomicBool>,
+    /// Segment index the decode stops feeding at (exclusive; `usize::MAX` =
+    /// never). Set by an ABR warm handoff to the switch segment, which OLD
+    /// may already have downloaded: NEW splices in there, and OLD decoding it
+    /// too put a few hundred ms of OLD past the boundary on screen.
+    pub(super) feed_end: Arc<AtomicUsize>,
 }
 
 impl VideoPrefetch {
@@ -115,6 +120,8 @@ pub(super) async fn video_prefetch(
     stats: Arc<StatsState>,
     segments_in_flight: usize,
     soft_end_exclusive: Arc<AtomicUsize>,
+    // See [`VideoPrefetch::feed_end`].
+    feed_end: Arc<AtomicUsize>,
     // Notify `primed` once this many segments are buffered. `usize::MAX` means
     // "never signal" — used for the initial pipeline, which has no OLD to
     // overlap and so decodes immediately.
@@ -248,6 +255,7 @@ pub(super) async fn video_prefetch(
         first_prepared: None,
         dl_pts_ms,
         track_dl,
+        feed_end,
     })
 }
 
@@ -524,6 +532,7 @@ pub(super) async fn run_decode(
         decoder_stop_flag,
         splice,
         pf.first_prepared,
+        pf.feed_end,
     ));
 
     let (dl_res, dec_res) = join!(pf.download_handle, decoder_task);
@@ -574,6 +583,8 @@ pub(super) async fn video_play(
     // supervisor can softly cap an old pipeline mid-flight without
     // discarding its already-decoded tail.
     soft_end_exclusive: Arc<AtomicUsize>,
+    // See [`VideoPrefetch::feed_end`].
+    feed_end: Arc<AtomicUsize>,
     // Android direct mode video window (raw 0 = renderer path), held for
     // as long as this pipeline may configure a codec on it.
     direct_window: WindowRef,
@@ -594,6 +605,7 @@ pub(super) async fn video_play(
         Arc::clone(&stats),
         segments_in_flight,
         soft_end_exclusive,
+        feed_end,
         usize::MAX,
     )
     .await?;

@@ -419,6 +419,12 @@ pub(super) fn layer_flush(layer: &AnyObject) {
     unsafe { let _: () = msg_send![layer, flush]; }
 }
 
+/// `flush` that also drops the image on screen (a stopped title must not
+/// linger under the next one).
+pub(super) fn layer_flush_and_remove_image(layer: &AnyObject) {
+    unsafe { let _: () = msg_send![layer, flushAndRemoveImage]; }
+}
+
 pub(super) fn layer_enqueue(layer: &AnyObject, sample: &SampleBuffer) {
     unsafe { let _: () = msg_send![layer, enqueueSampleBuffer: sample.as_ptr()]; }
 }

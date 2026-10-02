@@ -262,6 +262,16 @@ impl AppleDirectOutput {
         self.inner.lock().unwrap().flush_pending = true;
     }
 
+    /// Stop: drop everything enqueued and the picture on screen now, so
+    /// the layer shows nothing until the next title's first frame.
+    pub fn clear(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(layer) = &inner.layer {
+            ffi::layer_flush_and_remove_image(&layer.0);
+        }
+        inner.flush();
+    }
+
     /// Should the next decoder use direct mode?
     pub fn eligible(&self) -> bool {
         let has_layer = self.inner.lock().unwrap().layer.is_some();

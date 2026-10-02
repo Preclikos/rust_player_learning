@@ -20,12 +20,13 @@
 #![cfg(any(target_os = "macos", target_os = "ios"))]
 
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use wgpu::TextureFormat;
 
 use super::apple_hdr_output::{self, EdrSession, HdrOutputPipelines, SessionStep};
-use crate::renderers::subtitle::CueParent;
+use crate::renderers::subtitle::{CueParent, SubtitleOverlay};
+use crate::renderers::video_offscreen::OffscreenTarget;
 use super::video_metal::MetalNV12Frame;
 use super::{PlaneDraw, Vertex, VideoRenderer};
 use crate::decoders::{CvPixelBufferOwned, TransferFunction, VideoColorInfo};
@@ -290,14 +291,23 @@ impl VideoRenderer {
             // An EDR session belongs to the renderer-drawn video only.
             self.leave_edr_session().await;
         }
-        let Some((surface, mut cfg)) = self.lock_surface().await else { return };
-        cfg.alpha_mode = if on { wgpu::CompositeAlphaMode::PostMultiplied } else { wgpu::CompositeAlphaMode::Auto };
-        surface.configure(&self.device, &cfg);
+        // Offscreen there is no surface of ours to reconfigure: the host
+        // composites the published texture above its video layer, and
+        // `present_direct_overlay` publishes a transparent one.
+        if let Some((surface, mut cfg)) = self.lock_surface().await {
+            cfg.alpha_mode =
+                if on { wgpu::CompositeAlphaMode::PostMultiplied } else { wgpu::CompositeAlphaMode::Auto };
+            surface.configure(&self.device, &cfg);
+        }
         direct.active.store(on, Ordering::Relaxed);
         direct.invalidate();
         log::info!(
             "[direct] render layer → {}",
-            if on { "transparent subtitle overlay above the video layer" } else { "opaque video surface" }
+            match (on, self.offscreen.is_some()) {
+                (true, false) => "transparent subtitle overlay above the video layer",
+                (true, true) => "transparent offscreen texture (subtitles only) above the host's video layer",
+                (false, _) => "opaque video surface",
+            }
         );
     }
 
@@ -306,6 +316,10 @@ impl VideoRenderer {
     /// clearing, or a resize. Cue-less playback leaves it idle.
     pub(super) async fn present_direct_overlay(&self) {
         self.set_direct_overlay(true).await;
+        if let Some(off) = self.offscreen.clone() {
+            self.publish_direct_offscreen(&off).await;
+            return;
+        }
         let (Some(surface), Some(config)) = (self.surface.as_ref(), self.surface_config.as_ref()) else {
             return;
         };
@@ -313,6 +327,48 @@ impl VideoRenderer {
             let cfg = config.read().await;
             ((cfg.width, cfg.height), cfg.format)
         };
+        let Some((cue_parent, generation, overlay)) = self.direct_overlay_cue(size).await else { return };
+
+        let surface = surface.lock().await;
+        let texture = match surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
+            other => {
+                // Occluded window etc. — retried on the next frame.
+                log::debug!("[direct] overlay texture not available: {:?}", other);
+                self.apple_output.direct.invalidate();
+                return;
+            }
+        };
+        let view = texture
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor { format: Some(format), ..Default::default() });
+        self.draw_direct_overlay(&view, generation, overlay.as_ref(), &cue_parent);
+        self.pre_present_notify();
+        texture.present();
+    }
+
+    /// Offscreen direct mode: publish a transparent texture carrying only
+    /// the active cue, so the host's picture of us stops covering its video
+    /// layer — instead of the last renderer-drawn frame staying in the ring.
+    /// Same change-only rule as the windowed overlay.
+    async fn publish_direct_offscreen(&self, off: &OffscreenTarget) {
+        // Acquiring applies a pending resize, so the cue is laid out for the
+        // size actually drawn; an unchanged overlay leaves the slot unused.
+        let (idx, view, sz) = off.acquire();
+        let Some((cue_parent, generation, overlay)) = self.direct_overlay_cue((sz.width, sz.height)).await
+        else {
+            return;
+        };
+        self.draw_direct_overlay(&view, generation, overlay.as_ref(), &cue_parent);
+        off.publish(idx);
+    }
+
+    /// The cue layout for a `size` overlay and the cue's generation (0 =
+    /// none) — or `None` when exactly this was already presented.
+    async fn direct_overlay_cue(
+        &self,
+        size: (u32, u32),
+    ) -> Option<(CueParent, u64, Option<Arc<SubtitleOverlay>>)> {
         let frame = *self.frame_size.read().await;
         let overlay = self.subtitle_overlay.lock().unwrap().clone();
         let cue_parent = CueParent::fit(
@@ -329,28 +385,25 @@ impl VideoRenderer {
             .and_then(|o| o.active_bitmap(&cue_parent))
             .map_or(0, |bitmap| bitmap.generation.max(1));
         if !self.apple_output.direct.take_present(generation, size) {
-            return;
+            return None;
         }
+        Some((cue_parent, generation, overlay))
+    }
 
-        let surface = surface.lock().await;
-        let texture = match surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
-            other => {
-                // Occluded window etc. — retried on the next frame.
-                log::debug!("[direct] overlay texture not available: {:?}", other);
-                self.apple_output.direct.invalidate();
-                return;
-            }
-        };
-        let view = texture
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor { format: Some(format), ..Default::default() });
+    /// Clear `view` to transparent and draw the cue (if any) into it.
+    fn draw_direct_overlay(
+        &self,
+        view: &wgpu::TextureView,
+        generation: u64,
+        overlay: Option<&Arc<SubtitleOverlay>>,
+        cue_parent: &CueParent,
+    ) {
         let mut encoder = self.device.create_command_encoder(&Default::default());
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("direct subtitle overlay"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
+                    view,
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
@@ -363,13 +416,11 @@ impl VideoRenderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            if let (true, Some(overlay)) = (generation != 0, overlay.as_ref()) {
-                overlay.draw_into(&mut pass, &cue_parent);
+            if let (true, Some(overlay)) = (generation != 0, overlay) {
+                overlay.draw_into(&mut pass, cue_parent);
             }
         }
         self.queue.submit([encoder.finish()]);
-        self.pre_present_notify();
-        texture.present();
     }
 }
 

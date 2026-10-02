@@ -1461,6 +1461,15 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         }
     }
 
+    /// macOS / iOS: a decoder is feeding the host's video layer right now
+    /// (direct mode), so the rendered picture — the surface, or offscreen
+    /// the published texture — is transparent apart from subtitles. Cheap;
+    /// poll it per UI frame.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    pub fn is_direct_output_active(&self) -> bool {
+        self.apple_direct.is_feeding()
+    }
+
     /// Android direct playback mode: hand the decoder a dedicated video
     /// `ANativeWindow*` to render into. Decoded frames then ride a HW
     /// video plane — HDR10/HDR10+/Dolby Vision signals (incl. dynamic
@@ -2916,6 +2925,8 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         // clock). set_passthrough(None) un-pauses cpal, so re-park it after.
         self.audio_renderer.set_passthrough(None);
         self.audio_renderer.set_paused(true);
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        self.apple_direct.clear();
     }
 
     /// Relative volume nudge — adds `volume_diff` to the current value and

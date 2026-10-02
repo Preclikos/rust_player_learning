@@ -10,6 +10,9 @@ in the tonemap_opencl rework.
 > where the decoder renders to a hardware video plane and the OS/display
 > pipeline owns HDR10/HDR10+/Dolby Vision end-to-end — no tonemap, and
 > none of the knobs below apply. See `PLAYER_INTEGRATION.md` §3.2/§8.
+> On macOS / iOS an EDR-capable display gets the same treatment through
+> an **HDR output session** — see [Apple HDR output](#apple-hdr-output-edr)
+> below; the tonemap is then the fallback for SDR screens.
 
 ## ⚠ Breaking change for host UIs (tonemap_opencl rework)
 
@@ -86,6 +89,7 @@ paths. It now does an exact limited-range BT.709 decode.
 |-----------------|----------|--------------------------------------------------------|
 | Windows         | ✅       | wgpu shader (DX12, P010 import) + compute detection    |
 | Linux           | ✅       | Same (Vulkan, VAAPI P010 import)                       |
+| macOS / iOS (EDR display) | n/a | HDR output session — no tonemap, the OS maps PQ onto the display. |
 | macOS / iOS     | ✅       | Same shader — VideoToolbox decodes to a 10-bit `x420` destination imported as R16/RG16 Metal planes. If the 10-bit destination is refused, the 8-bit NV12 fallback is still PQ/BT.2020 (VT never converts colour) and goes through the same tonemap, at 8-bit quantization cost. |
 | Android (GL path) | ✅     | GLSL ES port of the same math in the OES present hook; scene detection via a GL reduction pass + PBO readback (no compute in ES 3.0) |
 | Android (direct mode) | n/a | No tonemap — the display pipeline owns HDR. |
@@ -169,6 +173,44 @@ if caps.hdr_tonemap_tunable {
     });
 }
 ```
+
+## Apple HDR output (EDR)
+
+When the display can show HDR, macOS / iOS skip the tonemap and hand the
+signal to the OS:
+
+- **Trigger:** `Player::set_display_hdr_types(mask)` with bit 1 (HDR10)
+  set, plus an HDR (PQ/HLG) frame. The iOS Swift wrapper sets the mask
+  itself (`RustPlayer.hdrOutput = .auto`: `AVPlayer.eligibleForHDRPlayback`
+  and `UIScreen.potentialEDRHeadroom > 1`, iOS 16+). On macOS use
+  `player::macos_display_hdr_types(ns_view)` (screen EDR headroom > 1)
+  and re-check when the window changes screen; `examples/desktop` does
+  this on `Moved`.
+- **Session:** the `CAMetalLayer` switches to `rgba16float` +
+  `kCGColorSpaceITUR_2100_PQ` + `wantsExtendedDynamicRangeContent` +
+  HDR10 `EDRMetadata` (1000-nit mastering peak). `shader_hdr_output.wgsl`
+  then hands PQ through unchanged, converts HLG to PQ (BT.2100 OOTF,
+  Lw = 1000) and up-converts SDR frames (ABR drop) to PQ with white at
+  203 nits (BT.2408). Subtitles use the same 203-nit mapping. The OS maps
+  the result onto the display's current headroom.
+- **Fallback:** a mask without bit 1, the offscreen (in-app) target, a layer
+  without EDR (iOS < 16) or no PQ colour space all keep or restore the
+  tonemap above. Clearing the mask mid-play leaves the session on the
+  next frame. `set_hdr_tonemap` has no effect while a session runs.
+- **Dolby Vision:** in this renderer-drawn path, profile 8.x plays its
+  HDR10 base layer (static HDR10, RPU ignored). Full DV is **direct mode**
+  (`Player::set_video_output_layer`, `PLAYER_INTEGRATION.md` §3.3): the OS
+  pipeline decodes and presents into an `AVSampleBufferDisplayLayer`, RPUs
+  intact. When the host provides that layer, direct mode takes precedence
+  over this EDR output; EDR output is what HDR screens get without one.
+- **Testing without an HDR screen:** `RUST_PLAYER_HDR_OUTPUT=1` (or
+  `RustPlayer.hdrOutput = .forced`) forces a session on any display; macOS
+  then maps the PQ layer down to SDR itself, so the whole path runs and can
+  be looked at. `=0` forces the tonemap. Logs:
+  `[hdr-output] HDR output ON …` and
+  `Metal NV12 path: … → HDR output (PQ passthrough) pipeline`.
+  `cargo test -p player --test hdr_output_gpu` renders the output shader
+  on the local GPU and checks the reference-white anchors.
 
 ## Debug/compat: 8-bit HDR decode (VideoToolbox)
 

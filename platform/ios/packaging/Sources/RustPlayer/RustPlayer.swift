@@ -1,6 +1,8 @@
 import Foundation
 import CoreGraphics
 import QuartzCore
+import AVFoundation
+import UIKit
 import RustPlayerFFI
 
 /// Provider policy supplied by the host: URL/auth rewriting and DRM key
@@ -113,20 +115,137 @@ public final class RustPlayer {
         let box = Unmanaged.passRetained(CallbackBox(self))
         let user = box.toOpaque()
         let ap: Int32 = audioPassthrough == nil ? -1 : (audioPassthrough! ? 1 : 0)
+        installVideoLayer(under: layer)
+        let videoPtr = videoLayer.map { Unmanaged.passUnretained($0).toOpaque() }
         handle = manifestURL.withCString { urlPtr in
-            rustplayer_player_create(
+            rustplayer_player_create_ex(
                 Unmanaged.passUnretained(layer).toOpaque(),
+                videoPtr,
+                hdrMask(),
                 max(w, 1), max(h, 1),
                 urlPtr, startFraction ?? -1, ap, autoSelectSubtitle,
                 interceptCallback, resolveKeyCallback, eventCallback,
                 user
             )
         }
-        if handle != nil { callbackBox = box } else { box.release() }
+        if handle != nil { callbackBox = box } else { box.release(); removeVideoLayer() }
+        // iOS fails the video layer in the background (-11847); the player
+        // falls back to its own renderer. Re-installing the layer on return
+        // re-arms direct mode and rebuilds the pipeline onto it.
+        foregroundObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.willEnterForegroundNotification, object: nil, queue: .main
+        ) { [weak self] _ in self?.rearmVideoLayer() }
+    }
+
+    // --- direct mode ---
+
+    /// Direct mode (default on, set before `start`): an
+    /// `AVSampleBufferDisplayLayer` is placed under the render layer and,
+    /// while HDR output applies (`hdrOutput`), HDR10 / HLG / Dolby Vision go
+    /// through the system video pipeline straight to the display — dynamic
+    /// metadata included — with the render layer carrying subtitles only.
+    /// SDR screens, `.off`, or a layer failure fall back to the player's
+    /// own rendering (tonemap). Needs the render layer to have a superlayer
+    /// (be on screen) at `start`.
+    public var directMode: Bool = true
+
+    private var videoLayer: AVSampleBufferDisplayLayer?
+    private weak var metalLayer: CAMetalLayer?
+    private var foregroundObserver: NSObjectProtocol?
+
+    private func rearmVideoLayer() {
+        guard let handle, let v = videoLayer else { return }
+        rustplayer_player_set_video_output_layer(handle, Unmanaged.passUnretained(v).toOpaque())
+    }
+
+    private func installVideoLayer(under layer: CAMetalLayer) {
+        metalLayer = layer
+        guard directMode, let parent = layer.superlayer else { return }
+        let v = AVSampleBufferDisplayLayer()
+        v.videoGravity = .resizeAspect
+        v.backgroundColor = UIColor.black.cgColor
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        v.frame = layer.frame
+        parent.insertSublayer(v, below: layer)
+        // Transparent where there are no subtitles (the player configures
+        // its surface non-opaque in direct mode too).
+        layer.isOpaque = false
+        CATransaction.commit()
+        videoLayer = v
+    }
+
+    private func removeVideoLayer() {
+        videoLayer?.removeFromSuperlayer()
+        videoLayer = nil
+    }
+
+    // --- HDR output ---
+
+    /// How HDR (PQ / HLG) video reaches the screen.
+    public enum HdrOutput {
+        /// Hand HDR to the display when it has EDR headroom
+        /// (`displaySupportsHdr`), otherwise tonemap to SDR in the player.
+        case auto
+        /// Always tonemap to SDR in the player.
+        case off
+        /// Always hand HDR to the display — testing only. With
+        /// `directMode` the system video pipeline plays HDR / Dolby Vision
+        /// even on an SDR screen and tonemaps it itself; without, iOS 16+
+        /// maps the PQ layer down (older systems stay on the tonemap).
+        case forced
+    }
+
+    /// Default `.auto`. Takes effect from the next frame.
+    public var hdrOutput: HdrOutput = .auto {
+        didSet { applyHdrOutput() }
+    }
+
+    /// Can this device's screen show HDR video right now: the OS
+    /// considers it HDR-eligible and the panel has EDR headroom
+    /// (iOS 16+). False on SDR panels, e.g. iPhone SE / 8 class devices.
+    public static var displaySupportsHdr: Bool {
+        guard AVPlayer.eligibleForHDRPlayback else { return false }
+        if #available(iOS 16.0, *) {
+            return UIScreen.main.potentialEDRHeadroom > 1.0
+        }
+        return false
+    }
+
+    /// The display also takes Dolby Vision (`AVPlayer.availableHDRModes`).
+    public static var displaySupportsDolbyVision: Bool {
+        displaySupportsHdr && AVPlayer.availableHDRModes.contains(.dolbyVision)
+    }
+
+    /// Re-evaluate the screen (call after e.g. an external display was
+    /// connected). `start()` and `hdrOutput` changes already do this.
+    public func refreshHdrOutput() { applyHdrOutput() }
+
+    private func applyHdrOutput() {
+        guard let handle else { return }
+        rustplayer_player_set_display_hdr_types(handle, hdrMask())
+    }
+
+    /// Display.HdrCapabilities-order mask: bit 0 = DV, 1 = HDR10, 2 = HLG.
+    private func hdrMask() -> UInt32 {
+        let hdr10Hlg: UInt32 = (1 << 1) | (1 << 2)
+        switch hdrOutput {
+        case .auto:
+            guard Self.displaySupportsHdr else { return 0 }
+            return hdr10Hlg | (Self.displaySupportsDolbyVision ? 1 : 0)
+        case .off: return 0
+        case .forced: return hdr10Hlg
+        }
     }
 
     public func setSize(_ size: CGSize, scale: CGFloat) {
         guard let handle else { return }
+        if let v = videoLayer, let m = metalLayer {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            v.frame = m.frame
+            CATransaction.commit()
+        }
         rustplayer_player_set_size(handle, UInt32(size.width * scale), UInt32(size.height * scale), Float(scale))
     }
 
@@ -222,7 +341,9 @@ public final class RustPlayer {
     }
 
     public func destroy() {
+        if let o = foregroundObserver { NotificationCenter.default.removeObserver(o); foregroundObserver = nil }
         if let handle { rustplayer_player_destroy(handle); self.handle = nil }
+        removeVideoLayer()
         callbackBox?.release()
         callbackBox = nil
     }

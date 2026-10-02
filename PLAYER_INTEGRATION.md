@@ -184,9 +184,47 @@ detection as desktop, falling back to VideoToolbox's internal 8-bit
 conversion when the 10-bit destination is refused. Audio decodes via
 FFmpeg (AudioToolbox's AAC decoder mishandles packetised access units).
 
-Full Dolby Vision / HDR10+ passthrough on tvOS will use
-`AVSampleBufferDisplayLayer` (the direct-mode analog); not implemented
-yet.
+**Direct mode** (the Android direct-mode analog): the host places an
+`AVSampleBufferDisplayLayer` **under** the render layer and hands it over —
+
+```rust
+player.set_display_hdr_types(mask);       // bit 0 = DV, 1 = HDR10, 2 = HLG
+player.set_video_output_layer(av_layer);  // before playback starts
+```
+
+(iOS FFI: `rustplayer_player_create_ex(metal_layer, video_layer, mask, …)`;
+the Swift `RustPlayer` does all of it itself — `directMode` (default on) +
+`hdrOutput`; macOS hosts can use `player::macos_install_direct_video_layer`
+and `player::macos_display_hdr_types`, as `examples/desktop` does.)
+
+While the mask reports HDR10 or DV, compressed samples go straight into
+the layer and the OS video pipeline decodes and presents them: **HDR10,
+HLG and Dolby Vision — RPU dynamic metadata, profile 5 included — reach
+the display as AVFoundation delivers them** (DV streams are handed over as
+`dvh1` with their `dvcC`/`dvvC` when the display takes DV). The A/V sync
+loop is unchanged; each frame it would show re-anchors the layer's
+`controlTimebase` to its present time, so audio stays the master clock.
+The render layer turns non-opaque and only carries subtitles. Seeks flush
+the layer; ABR switches (also HDR↔SDR, DV↔HEVC) continue in place.
+Rotation / resize only needs the host to keep the video layer's frame in
+step with the render layer (the Swift wrapper does it in `setSize`).
+
+**Home → back:** iOS fails the layer when the app goes to the background
+(`-11847 Operation Interrupted`); the player falls back to its own
+renderer and plays on after the audio-session interruption ends. The host
+must call `set_video_output_layer` again on `willEnterForeground` — that
+re-arms direct mode and rebuilds the live pipeline onto the layer at the
+current position (the Swift wrapper and the iOS shell do this).
+
+Fallback: on an SDR display (mask 0), without a layer, or when the layer
+reports `failed`, the pipeline uses VideoToolbox + the player's renderer
+(EDR output on HDR screens, otherwise the tonemap); a failed layer is
+retired for the player's lifetime and the supervisor rebuilds at the
+current position. Testing without HDR hardware: `RUST_PLAYER_DIRECT=1`
+(or Swift `hdrOutput = .forced`, the iOS shell's `-RustPlayerHdrForced YES`)
+uses direct mode on any display — the OS then tonemaps HDR / DV to SDR
+itself; `RUST_PLAYER_DIRECT_FAIL_AFTER=N` simulates a layer failure after
+N samples to exercise the failover.
 
 ### 3.4 Reference bridge core (`app-shared`)
 
@@ -329,14 +367,17 @@ Per-platform behaviour (details in `player/HDR_TONEMAP.md`):
 | Platform | HDR10 | HDR10+ dynamic | Dolby Vision | Output |
 |---|---|---|---|---|
 | Windows / Linux | ✅ tonemap (wgpu mobius + scene detection) | metadata parsed, detection preferred | profile 7/8 base layer | SDR |
-| macOS / iOS | ✅ tonemap (same shader, 10-bit VT dest) | as above | profile 7/8 base layer | SDR |
+| macOS / iOS | ✅ tonemap (same shader, 10-bit VT dest), or EDR output on HDR screens | as above | profile 7/8 base layer | SDR / EDR |
+| **macOS / iOS, direct mode** | ✅ **native** | in-bitstream metadata passed to the OS | ✅ **native (`dvh1` into AVSampleBufferDisplayLayer, RPUs intact; profile 5 included)** | display-negotiated |
 | Android, GL path | ✅ tonemap (GLES port + GL scene detection) or GL passthrough on capable panels | SEI parsed → tonemap peak | profile 7/8 base layer | SDR / panel HDR |
 | **Android, direct mode** | ✅ **native** | ✅ **native (ST 2094-40 reaches the display)** | ✅ **native (platform `video/dolby-vision` decoder, RPUs intact; profile 5 included)** | display-negotiated |
 
 Host controls:
 
 - `capabilities()` / `probe_capabilities()` — what this build can play.
-- `set_display_hdr_types(mask)` — display capability hint (Android).
+- `set_display_hdr_types(mask)` — display capability hint (Android, macOS, iOS).
+- `set_video_output_layer(ptr)` — enable direct mode (macOS / iOS; an
+  `AVSampleBufferDisplayLayer*` under the render layer, see §3.3).
 - `set_video_output_window(ptr)` — enable direct mode (Android); null on
   `surfaceDestroyed`, the new window on return (see §3.2).
 - `set_android_overlay_window(ptr)` — re-target the overlay surface

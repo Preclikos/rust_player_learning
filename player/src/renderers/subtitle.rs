@@ -263,56 +263,44 @@ pub fn cue_quad(bitmap: &SubtitleBitmap, parent: &CueParent) -> [f32; 4] {
     ]
 }
 
-const SHADER_WGSL: &str = r#"
-struct VertexOut {
-    @builtin(position) position: vec4<f32>,
-    @location(0) tex_coords: vec2<f32>,
-};
-
-struct Quad {
-    /// xy = NDC center, zw = NDC half-extent.
-    transform: vec4<f32>,
-};
-
-@group(0) @binding(0) var t_tex: texture_2d<f32>;
-@group(0) @binding(1) var s_tex: sampler;
-@group(0) @binding(2) var<uniform> quad: Quad;
-
-@vertex
-fn vs_main(@builtin(vertex_index) vi: u32) -> VertexOut {
-    // Unit quad in [-1, 1] × [-1, 1], two triangles.
-    var pos = array<vec2<f32>, 6>(
-        vec2<f32>(-1.0, -1.0),
-        vec2<f32>( 1.0, -1.0),
-        vec2<f32>(-1.0,  1.0),
-        vec2<f32>(-1.0,  1.0),
-        vec2<f32>( 1.0, -1.0),
-        vec2<f32>( 1.0,  1.0),
-    );
-    var uv = array<vec2<f32>, 6>(
-        vec2<f32>(0.0, 1.0),
-        vec2<f32>(1.0, 1.0),
-        vec2<f32>(0.0, 0.0),
-        vec2<f32>(0.0, 0.0),
-        vec2<f32>(1.0, 1.0),
-        vec2<f32>(1.0, 0.0),
-    );
-    let p = pos[vi];
-    var out: VertexOut;
-    out.position = vec4<f32>(
-        quad.transform.x + p.x * quad.transform.z,
-        quad.transform.y + p.y * quad.transform.w,
-        0.0, 1.0,
-    );
-    out.tex_coords = uv[vi];
-    return out;
+fn build_pipeline(
+    device: &wgpu::Device,
+    shader: &wgpu::ShaderModule,
+    layout: &wgpu::PipelineLayout,
+    format: wgpu::TextureFormat,
+    fs_entry: &'static str,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("subtitle_pipeline"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            buffers: &[],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some(fs_entry),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                // Premultiplied alpha so the cue blends naturally
+                // over arbitrary video content.
+                blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            ..Default::default()
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    })
 }
-
-@fragment
-fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
-    return textureSample(t_tex, s_tex, in.tex_coords);
-}
-"#;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -350,6 +338,14 @@ pub struct SubtitleOverlay {
     queue: Arc<wgpu::Queue>,
     surface_format: wgpu::TextureFormat,
     pipeline: wgpu::RenderPipeline,
+    /// `fs_main_pq` into an rgba16float target, built on the first frame of
+    /// an HDR output session (see [`Self::set_pq_output`]).
+    pipeline_pq: std::sync::OnceLock<wgpu::RenderPipeline>,
+    /// Draw through `pipeline_pq` — the video renderer flips it on HDR
+    /// output session entry/exit.
+    pq_output: std::sync::atomic::AtomicBool,
+    shader: wgpu::ShaderModule,
+    pipeline_layout: wgpu::PipelineLayout,
     bind_group_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     uniform_buffer: wgpu::Buffer,
@@ -645,43 +641,14 @@ impl SubtitleOverlay {
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("subtitle_shader"),
-            source: wgpu::ShaderSource::Wgsl(SHADER_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(crate::shader_src::subtitle().into()),
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("subtitle_pipeline_layout"),
             bind_group_layouts: &[Some(&bind_group_layout)],
             immediate_size: 0,
         });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("subtitle_pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                buffers: &[],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: surface_format,
-                    // Premultiplied alpha so the cue blends naturally
-                    // over arbitrary video content.
-                    blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                ..Default::default()
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
+        let pipeline = build_pipeline(&device, &shader, &pipeline_layout, surface_format, "fs_main");
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("subtitle_sampler"),
@@ -741,6 +708,10 @@ impl SubtitleOverlay {
             queue,
             surface_format,
             pipeline,
+            pipeline_pq: std::sync::OnceLock::new(),
+            pq_output: std::sync::atomic::AtomicBool::new(false),
+            shader,
+            pipeline_layout,
             bind_group_layout,
             sampler,
             uniform_buffer,
@@ -980,11 +951,30 @@ impl SubtitleOverlay {
             g.transform = transform;
         }
 
-        render_pass.set_pipeline(&self.pipeline);
+        let pipeline = if self.pq_output.load(std::sync::atomic::Ordering::Relaxed) {
+            self.pipeline_pq.get_or_init(|| {
+                build_pipeline(
+                    &self.device,
+                    &self.shader,
+                    &self.pipeline_layout,
+                    wgpu::TextureFormat::Rgba16Float,
+                    "fs_main_pq",
+                )
+            })
+        } else {
+            &self.pipeline
+        };
+        render_pass.set_pipeline(pipeline);
         render_pass.set_bind_group(0, &g.bind_group, &[]);
         render_pass.draw(0..6, 0..1);
         // suppress unused-warning on surface_format
         let _ = self.surface_format;
+    }
+
+    /// HDR output session on/off: cues are then drawn PQ-encoded into an
+    /// rgba16float target (SDR white → 203 nits). Takes effect next frame.
+    pub fn set_pq_output(&self, on: bool) {
+        self.pq_output.store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Allocate the texture/view/bind-group triple for a cue bitmap of the

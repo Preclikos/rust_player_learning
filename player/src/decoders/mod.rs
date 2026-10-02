@@ -27,6 +27,9 @@ pub mod mediacodec;
 pub mod mediacodec_audio;
 #[cfg(any(target_os = "ios", target_os = "macos"))]
 pub mod videotoolbox;
+// Apple direct mode (AVSampleBufferDisplayLayer) + the VT/direct selector.
+#[cfg(any(target_os = "ios", target_os = "macos"))]
+pub mod apple_direct;
 // Browser: WebCodecs for both video and audio.
 #[cfg(target_arch = "wasm32")]
 pub mod webcodecs;
@@ -92,6 +95,10 @@ pub struct VideoDecoderParams {
     /// reconstruction in the OS pipeline — and falls back to the HEVC
     /// base layer for profiles 7/8 when no DV decoder exists.
     pub dovi_profile: Option<u8>,
+    /// The raw DV configuration box (`dvvC`/`dvcC`) and its type, for
+    /// decoders that hand DV to the OS whole (Apple direct mode).
+    #[allow(dead_code)]
+    pub dovi_record: Option<([u8; 4], Vec<u8>)>,
     /// Largest picture of the video ladder (0 = unknown). A decoder that can
     /// switch resolution in place (Android adaptive playback) is configured
     /// for this size, so an ABR switch reuses it instead of building a new
@@ -207,6 +214,11 @@ pub enum PlatformFrame {
     /// the video renderer imports via CVMetalTextureCache zero-copy.
     #[cfg(any(target_os = "ios", target_os = "macos"))]
     CvPixelBuffer(CvPixelBufferOwned),
+    /// macOS / iOS direct mode: the sample is already in the host's
+    /// `AVSampleBufferDisplayLayer`; "rendering" the stamp re-anchors the
+    /// layer's timebase to this frame's present time.
+    #[cfg(any(target_os = "ios", target_os = "macos"))]
+    AppleDirect(apple_direct::AppleDirectFrame),
     /// Browser: the decoded frame stays on the GPU as the WebCodecs
     /// `VideoFrame`; the renderer copies it GPU→GPU with
     /// `copyExternalImageToTexture` (the browser does Y'CbCr → R'G'B' — and

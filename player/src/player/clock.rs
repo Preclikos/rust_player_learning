@@ -16,14 +16,15 @@ use crate::renderers::AudioSink;
 use super::StatsState;
 
 // Returns current CLOCK_MONOTONIC time in nanoseconds.
-// Used to compute absolute presentation timestamps for eglPresentationTimeANDROID.
-#[cfg(target_os = "android")]
+// Used to compute absolute presentation timestamps for eglPresentationTimeANDROID
+// and, on Apple, to anchor the direct-mode layer's timebase (apple_direct).
+#[cfg(any(target_os = "android", target_os = "macos", target_os = "ios"))]
 pub(crate) fn clock_monotonic_ns() -> i64 {
     let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
     ts.tv_sec as i64 * 1_000_000_000 + ts.tv_nsec as i64
 }
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_os = "macos", target_os = "ios")))]
 pub(crate) fn clock_monotonic_ns() -> i64 { 0 }
 
 /// Playback master clock — 0-based media time, audio-disciplined.

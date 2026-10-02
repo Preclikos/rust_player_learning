@@ -38,6 +38,21 @@ void *rustplayer_player_create(void *metal_layer, uint32_t width, uint32_t heigh
                        int32_t audio_passthrough, bool auto_select_subtitle,
                        rustplayer_intercept_cb intercept_cb, rustplayer_resolve_key_cb resolve_key_cb,
                        rustplayer_event_cb event_cb, void *user);
+// As above, plus direct mode: `video_layer` is an AVSampleBufferDisplayLayer*
+// placed UNDER `metal_layer` (null = none) and `display_hdr_types` the display
+// HDR mask (bit 0 = Dolby Vision, 1 = HDR10, 2 = HLG), both applied before
+// playback starts. With an HDR mask, HDR10 / HLG / Dolby Vision go through
+// the OS video pipeline straight to the display and `metal_layer` carries
+// subtitles only; otherwise (or if the layer fails) the player renders the
+// video itself (EDR output or tonemap).
+void *rustplayer_player_create_ex(void *metal_layer, void *video_layer, uint32_t display_hdr_types,
+                       uint32_t width, uint32_t height,
+                       const char *manifest_url, float start_fraction,
+                       int32_t audio_passthrough, bool auto_select_subtitle,
+                       rustplayer_intercept_cb intercept_cb, rustplayer_resolve_key_cb resolve_key_cb,
+                       rustplayer_event_cb event_cb, void *user);
+// Direct-mode layer after creation (applies from the next pipeline build).
+void rustplayer_player_set_video_output_layer(void *handle, void *video_layer);
 void rustplayer_player_set_size(void *handle, uint32_t width, uint32_t height, float scale);
 void rustplayer_player_destroy(void *handle);
 
@@ -73,6 +88,10 @@ void rustplayer_player_clear_subtitles(void *handle);
 // Generic knobs.
 void rustplayer_player_set_subtitle_style(void *handle, int32_t text_argb, int32_t outline_argb, float size_scale);
 void rustplayer_player_set_subtitle_safe_inset_bottom(void *handle, uint32_t bottom_px);
+// HDR formats the display presents natively (bit 1 = HDR10, bit 2 = HLG).
+// Bit 1 set → PQ is handed to the display through an EDR layer instead of
+// being tonemapped to SDR. 0 = SDR display (tonemap). Next frame onward.
+void rustplayer_player_set_display_hdr_types(void *handle, uint32_t mask);
 // Debug/compat: force HDR video to an 8-bit decode destination (tonemap
 // still runs, at 8-bit precision). Applies from the next pipeline
 // (re)build (play / retry / ABR swap).

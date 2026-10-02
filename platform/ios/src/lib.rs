@@ -275,6 +275,45 @@ pub extern "C" fn rustplayer_player_create(
     event_cb: EventCb,
     user: *mut c_void,
 ) -> *mut c_void {
+    rustplayer_player_create_ex(
+        metal_layer,
+        std::ptr::null_mut(),
+        0,
+        width,
+        height,
+        manifest_url,
+        start_fraction,
+        audio_passthrough,
+        auto_select_subtitle,
+        intercept_cb,
+        resolve_key_cb,
+        event_cb,
+        user,
+    )
+}
+
+/// [`rustplayer_player_create`] plus, applied before playback starts:
+/// `video_layer` — an `AVSampleBufferDisplayLayer*` under `metal_layer` for
+/// direct mode (null = none), and `display_hdr_types` — the display's HDR
+/// mask (bit 0 = Dolby Vision, 1 = HDR10, 2 = HLG). With both, HDR / DV
+/// video goes through the OS pipeline straight to the display; without,
+/// the player renders (EDR output or tonemap).
+#[no_mangle]
+pub extern "C" fn rustplayer_player_create_ex(
+    metal_layer: *mut c_void,
+    video_layer: *mut c_void,
+    display_hdr_types: u32,
+    width: u32,
+    height: u32,
+    manifest_url: *const c_char,
+    start_fraction: f32,        // < 0 = no resume
+    audio_passthrough: i32,     // -1 = default, 0 = off, 1 = on
+    auto_select_subtitle: bool,
+    intercept_cb: InterceptCb,
+    resolve_key_cb: ResolveKeyCb,
+    event_cb: EventCb,
+    user: *mut c_void,
+) -> *mut c_void {
     ffi_guard("rustplayer_player_create", std::ptr::null_mut(), move || {
         init_once();
         if metal_layer.is_null() {
@@ -297,6 +336,8 @@ pub extern "C" fn rustplayer_player_create(
 
         let _guard = runtime().enter();
         let player = Player::new_from_metal_layer(metal_layer, width.max(1), height.max(1));
+        player.set_display_hdr_types(display_hdr_types);
+        player.set_video_output_layer(video_layer);
         let config = StartConfig {
             start_position: None,
             start_fraction: if start_fraction >= 0.0 {
@@ -591,6 +632,31 @@ pub extern "C" fn rustplayer_player_set_subtitle_safe_inset_bottom(handle: *mut 
     ffi_guard("rustplayer_player_set_subtitle_safe_inset_bottom", (), move || {
         if let Some(h) = unsafe { handle_ref(handle) } {
             h.bridge.player().set_subtitle_safe_insets(bottom_px);
+        }
+    })
+}
+
+/// Direct mode layer (`AVSampleBufferDisplayLayer*`, null = none). Applies
+/// from the next pipeline build — prefer passing it to
+/// `rustplayer_player_create_ex`.
+#[no_mangle]
+pub extern "C" fn rustplayer_player_set_video_output_layer(handle: *mut c_void, layer: *mut c_void) {
+    ffi_guard("rustplayer_player_set_video_output_layer", (), move || {
+        if let Some(h) = unsafe { handle_ref(handle) } {
+            h.bridge.player().set_video_output_layer(layer);
+        }
+    })
+}
+
+/// HDR formats the display can present natively (bit 1 = HDR10, 2 = HLG;
+/// Android `Display.HdrCapabilities` order). With bit 1 set the renderer
+/// hands PQ to the display (rgba16float + BT.2100 PQ + EDR layer) instead
+/// of tonemapping; 0 = SDR display, tonemap. Applies from the next frame.
+#[no_mangle]
+pub extern "C" fn rustplayer_player_set_display_hdr_types(handle: *mut c_void, mask: u32) {
+    ffi_guard("rustplayer_player_set_display_hdr_types", (), move || {
+        if let Some(h) = unsafe { handle_ref(handle) } {
+            h.bridge.player().set_display_hdr_types(mask);
         }
     })
 }

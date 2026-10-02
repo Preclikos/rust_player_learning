@@ -36,6 +36,10 @@ mod utils;
 // canonical types — see PLAYER_INTEGRATION.md.
 pub use abr::{AbrStrategy, AbrVideoProfile};
 pub use capabilities::{capabilities, probe_capabilities, PlayerCapabilities};
+#[cfg(target_os = "macos")]
+mod macos_host;
+#[cfg(target_os = "macos")]
+pub use macos_host::{macos_display_hdr_types, macos_install_direct_video_layer};
 /// The track tree returned by [`Player::get_tracks`]. Adaptation/representation
 /// types stay reachable through its public `video`/`audio`/`text` fields — a
 /// consumer reads them via inference (no need to name the inner types).

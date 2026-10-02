@@ -34,6 +34,7 @@ let package = Package(
             linkerSettings: [
                 .linkedFramework("UIKit"),
                 .linkedFramework("QuartzCore"),
+                .linkedFramework("CoreGraphics"),
                 .linkedFramework("Metal"),
                 .linkedFramework("MetalKit"),
                 .linkedFramework("CoreVideo"),

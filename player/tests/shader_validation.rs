@@ -28,6 +28,16 @@ fn hdr_shader_validates() {
 }
 
 #[test]
+fn subtitle_shader_validates() {
+    validate("shader_subtitle", &player::shader_src::subtitle());
+}
+
+#[test]
+fn hdr_output_shader_validates() {
+    validate("shader_hdr_output", &player::shader_src::hdr_output());
+}
+
+#[test]
 fn hdr_detect_shader_validates() {
     validate("shader_hdr_detect (P010)", &player::shader_src::hdr_detect());
 }

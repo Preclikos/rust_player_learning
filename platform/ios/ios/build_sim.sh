@@ -121,6 +121,7 @@ xcrun --sdk iphonesimulator clang \
     -framework UIKit \
     -framework Foundation \
     -framework QuartzCore \
+    -framework CoreGraphics \
     -framework Metal \
     -framework MetalKit \
     -framework CoreFoundation \

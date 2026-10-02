@@ -579,6 +579,12 @@ pub struct Player<V: VideoSink = VideoRenderer, A: AudioSink = AudioRenderer> {
     /// hold an acquired ref for the player's lifetime (the AFR/Surface UAF).
     video_output_window: Arc<DirectWindow>,
 
+    /// Apple direct mode: the host's `AVSampleBufferDisplayLayer` and its
+    /// timebase (see `decoders::apple_direct`). Without a layer every
+    /// pipeline uses VideoToolbox + the player's own renderer.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    apple_direct: Arc<crate::decoders::apple_direct::AppleDirectOutput>,
+
     /// Adaptive frame rate (Android direct mode): when set, the player hints
     /// the video plane's content fps to the OS via `ANativeWindow_setFrameRate`
     /// so the display can switch to a matching refresh rate (24 -> 24/48/120
@@ -663,6 +669,8 @@ impl<V: VideoSink, A: AudioSink> Clone for Player<V, A> {
             external_text: Arc::clone(&self.external_text),
             next_external_id: Arc::clone(&self.next_external_id),
             video_output_window: Arc::clone(&self.video_output_window),
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            apple_direct: Arc::clone(&self.apple_direct),
             adaptive_frame_rate: Arc::clone(&self.adaptive_frame_rate),
             audio_passthrough: Arc::clone(&self.audio_passthrough),
             hdr_decode_8bit: Arc::clone(&self.hdr_decode_8bit),
@@ -863,6 +871,8 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             external_text: Arc::new(StdMutex::new(Vec::new())),
             next_external_id: Arc::new(AtomicU32::new(EXTERNAL_TEXT_ID_BASE)),
             video_output_window: Arc::new(DirectWindow::new()),
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            apple_direct: crate::decoders::apple_direct::AppleDirectOutput::new(),
             adaptive_frame_rate: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             audio_passthrough: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             hdr_decode_8bit: Arc::new(std::sync::atomic::AtomicBool::new(
@@ -1384,10 +1394,17 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
     /// natively (bitmask in `Display.HdrCapabilities` order: bit 0 = Dolby
     /// Vision, 1 = HDR10, 2 = HLG, 3 = HDR10+). On Android the GLES sink
     /// then passes PQ streams through to the display (BT2020_PQ surface
-    /// dataspace, no tonemap) instead of tonemapping to SDR. 0 (default) =
-    /// SDR display, tonemap in-shader.
+    /// dataspace, no tonemap) instead of tonemapping to SDR. On macOS / iOS
+    /// bit 1 (HDR10) lets the Metal renderer switch the layer to
+    /// rgba16float + BT.2100 PQ + EDR on the next HDR frame and hand the
+    /// signal through; clearing it switches back to the tonemap (see
+    /// `macos_display_hdr_types`, and the iOS Swift wrapper which sets it
+    /// from `UIScreen.potentialEDRHeadroom`). 0 (default) = SDR display,
+    /// tonemap in-shader. Any thread, any time; applies from the next frame.
     pub fn set_display_hdr_types(&self, mask: u32) {
         self.video_renderer.set_display_hdr_types(mask);
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        self.apple_direct.set_display_hdr_types(mask);
     }
 
     /// Bottom safe-area inset, in **device pixels of the overlay surface**,
@@ -1412,6 +1429,36 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
     pub fn set_subtitle_safe_insets(&self, bottom_px: u32) {
         log::info!("[subs] bottom safe inset {}px", bottom_px);
         self.video_renderer.set_subtitle_safe_bottom_px(bottom_px);
+    }
+
+    /// macOS / iOS direct playback mode: hand the player an
+    /// `AVSampleBufferDisplayLayer*` placed under the render layer. While the
+    /// display reports HDR10 or Dolby Vision ([`Self::set_display_hdr_types`])
+    /// compressed video goes into it and the OS pipeline decodes and shows
+    /// it — HDR10 / HLG / Dolby Vision (RPU dynamic metadata, profile 5
+    /// included) reach the display as AVFoundation delivers them. The render
+    /// layer then only carries subtitles (transparent elsewhere, so the host
+    /// must keep it non-opaque above the video layer — the Swift wrapper
+    /// does both). On an SDR display, or if the layer fails, playback uses
+    /// VideoToolbox + the player's tonemap instead. The player retains the
+    /// layer; null releases it.
+    ///
+    /// Set it before playback starts, and **again on every return to the
+    /// foreground**: iOS fails the layer when the app goes to the background
+    /// (`-11847 Operation Interrupted`) and the player falls back to its own
+    /// renderer; re-installing the layer re-arms direct mode and, with a
+    /// pipeline already playing, rebuilds it at the current position so the
+    /// OS pipeline takes over again. The Swift wrapper does this itself.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    pub fn set_video_output_layer(&self, layer: *mut std::ffi::c_void) {
+        self.apple_direct.set_layer(layer);
+        let live_renderer_pipeline =
+            self.pipeline_live.load(Ordering::Relaxed) && !self.apple_direct.is_feeding();
+        if !layer.is_null() && live_renderer_pipeline && self.apple_direct.eligible() {
+            log::info!("[direct] layer installed under a live renderer pipeline — rebuilding at the current position");
+            *self.rebuild_reason.lock().unwrap() = BufferingReason::TrackSwitch;
+            self.seek_internal(self.position());
+        }
     }
 
     /// Android direct playback mode: hand the decoder a dedicated video
@@ -2023,6 +2070,10 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
     /// the generic A/V sync loop. Only the concrete decoder types differ per
     /// platform; the rest of the pipeline is identical.
     pub fn play(&self) -> Result<JoinHandle<()>, Box<dyn Error>> {
+        // Direct mode: a fresh start (first play, replay after EndOfStream)
+        // begins with the layer flushed of whatever the last run left in it.
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        self.apple_direct.request_flush();
         let video_representation = match self.video_representation.lock().unwrap().as_ref() {
             Some(r) => r.clone(),
             None => return Err("Video Track not set".into()),
@@ -2120,10 +2171,12 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             }
             #[cfg(any(target_os = "ios", target_os = "macos"))]
             {
-                Arc::new(|| {
-                    let d = crate::decoders::videotoolbox::VideoToolboxDecoder::new()
-                        .expect("VideoToolboxDecoder::new");
-                    Box::new(d) as Box<dyn HwVideoDecoder>
+                // Direct mode (AVSampleBufferDisplayLayer) or VideoToolbox +
+                // renderer, decided per pipeline at configure.
+                let output = Arc::clone(&self.apple_direct);
+                Arc::new(move || {
+                    Box::new(crate::decoders::apple_direct::AppleVideoDecoder::new(Arc::clone(&output)))
+                        as Box<dyn HwVideoDecoder>
                 })
             }
             #[cfg(target_arch = "wasm32")]
@@ -2637,6 +2690,10 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         let audio_sink = self.audio_renderer.clone();
         let stop_epoch = Arc::clone(&self.stop_epoch);
         let epoch_at_call = stop_epoch.load(Ordering::SeqCst);
+        // Direct mode: the next decoder starts by flushing what the layer
+        // still holds from before the seek.
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        self.apple_direct.request_flush();
         self.rt.spawn(async move {
             {
                 let mut slot = seek_target.write().await;
@@ -2713,7 +2770,12 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         } else {
             format!("ImageReader + GLES into the overlay; {renderer_output}")
         };
-        #[cfg(not(target_os = "android"))]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let video_output = match self.apple_direct.debug_output() {
+            Some(direct) => format!("{direct}; render layer (subtitles): {renderer_output}"),
+            None => renderer_output,
+        };
+        #[cfg(not(any(target_os = "android", target_os = "macos", target_os = "ios")))]
         let video_output = renderer_output;
         let mut video = DebugVideo {
             decoder: st.decoder_name.lock().unwrap().clone(),

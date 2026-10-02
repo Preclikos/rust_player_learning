@@ -7,7 +7,7 @@ use tokio::sync::{
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 use video_frame::VideoFrame;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
-use video_metal::{MetalNV12Frame, MetalTextureCache};
+use video_metal::MetalTextureCache;
 #[cfg(target_arch = "wasm32")]
 use crate::decoders::WebVideoFrame;
 use wgpu::{Backends, Buffer};
@@ -71,6 +71,10 @@ impl Drop for VulkanFrameKeepalive {
 }
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 mod video_metal;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+mod apple_hdr_output;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+mod video_apple;
 
 use std::sync::Arc;
 
@@ -348,9 +352,13 @@ pub struct VideoRenderer {
     metal_cache: Option<Arc<MetalTextureCache>>,
     /// Bitmask of display-native HDR formats (Display.HdrCapabilities
     /// order: bit 0 = DV, 1 = HDR10, 2 = HLG, 3 = HDR10+) from the host.
-    /// 0 = SDR display → tonemap in-shader.
-    #[cfg(target_os = "android")]
+    /// 0 = SDR display → tonemap in-shader. Apple: bit 1 (HDR10) allows
+    /// an EDR output session (see `apple_hdr_output`).
+    #[cfg(any(target_os = "android", target_os = "macos", target_os = "ios"))]
     display_hdr_types: std::sync::atomic::AtomicU32,
+    /// Apple output state: EDR session and direct-mode overlay (`video_apple`).
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    apple_output: video_apple::AppleOutput,
     /// Bottom safe-area inset (device px) the host reported via
     /// `Player::set_subtitle_safe_insets`, threaded into the subtitle quad's
     /// anchor. 0 = unset → renderers fall back to a 10% TV title-safe margin.
@@ -464,12 +472,21 @@ struct HdrDetect {
 /// Pipeline set for [`VideoRenderer::draw_planes`].
 #[cfg(any(target_os = "macos", target_os = "ios", target_arch = "wasm32"))]
 #[allow(dead_code)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PlaneDraw {
     /// NV12 / SDR planes → shader.wgsl.
     Sdr,
     /// P010 / PQ planes → HDR tonemap + detection (SDR when unavailable).
     Hdr,
+    /// Apple HDR output session: PQ planes handed through (shader_hdr_output fs_pq).
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    OutPq,
+    /// Apple HDR output session: HLG planes → PQ.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    OutHlg,
+    /// Apple HDR output session: SDR NV12 planes → PQ (BT.2408).
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    OutSdr,
     /// Browser: RGBA8 the browser converted → passthrough quad.
     #[cfg(target_arch = "wasm32")]
     WebRgba,
@@ -1051,8 +1068,10 @@ impl VideoRenderer {
             ahb_keepalive,
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             metal_cache,
-            #[cfg(target_os = "android")]
+            #[cfg(any(target_os = "android", target_os = "macos", target_os = "ios"))]
             display_hdr_types: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            apple_output: video_apple::AppleOutput::new(),
             subtitle_safe_bottom_px: std::sync::atomic::AtomicU32::new(0),
             #[cfg(target_os = "android")]
             android_window: std::sync::atomic::AtomicUsize::new(0),
@@ -1466,8 +1485,10 @@ impl VideoRenderer {
             )),
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             metal_cache,
-            #[cfg(target_os = "android")]
+            #[cfg(any(target_os = "android", target_os = "macos", target_os = "ios"))]
             display_hdr_types: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            apple_output: video_apple::AppleOutput::new(),
             subtitle_safe_bottom_px: std::sync::atomic::AtomicU32::new(0),
             #[cfg(target_os = "android")]
             android_window: std::sync::atomic::AtomicUsize::new(0),
@@ -2018,6 +2039,14 @@ impl VideoRenderer {
             PlatformFrame::CvPixelBuffer(cv_buf) => {
                 self.render_cv_pixel_buffer(cv_buf, frame_color).await;
             }
+            #[cfg(any(target_os = "ios", target_os = "macos"))]
+            PlatformFrame::AppleDirect(direct) => {
+                // Direct mode: the sample is already in the video layer;
+                // pin its timebase to this frame's present time and keep
+                // the render layer down to subtitles.
+                direct.output.anchor(frame.pts_us, frame.desired_present_ns);
+                self.present_direct_overlay().await;
+            }
             #[cfg(target_arch = "wasm32")]
             PlatformFrame::WebVideoFrame(vf) => {
                 self.render_web_video_frame(vf, frame_color).await;
@@ -2438,64 +2467,6 @@ impl VideoRenderer {
             .on_submitted_work_done(move || drop((video_frame, frame)));
     }
 
-    /// Shared Apple Metal render path: draws an NV12 frame from two
-    /// single-plane textures (Y = R8Unorm, UV = Rg8Unorm) and hands
-    /// `metal_frame` back once the pass is submitted. The caller keeps it
-    /// (with its CVPixelBuffer) alive until the GPU is done with it.
-    ///
-    /// MetalNV12Frame is `Send` but not `Sync` (raw CFTypeRef), so we
-    /// take it by value instead of `&` to keep `render_frame`'s
-    /// returned future `Send` across the await.
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
-    async fn render_metal_nv12(
-        &self,
-        metal_frame: MetalNV12Frame,
-        color: crate::decoders::VideoColorInfo,
-    ) -> MetalNV12Frame {
-        let y_plane_view = metal_frame.y_texture.create_view(&Default::default());
-        let uv_plane_view = metal_frame.uv_texture.create_view(&Default::default());
-
-        // Pipeline selection follows the frame's signalled transfer
-        // (PQ/HLG → HDR tonemap + detection passes, mirroring the desktop
-        // P010 path), NOT the plane bit depth: VTDecompressionSession only
-        // converts pixel format, never colour, so when the 10-bit 'x420'
-        // destination is refused the 8-bit NV12 fallback still carries a
-        // PQ/BT.2020 signal that must be tonemapped (at 8-bit quantization
-        // cost). The shader's limited-range expansion is bit-depth-agnostic
-        // — R8Unorm and P010-in-R16Unorm normalise to the same [0,1] codes.
-        let is_hdr = color.is_hdr();
-        {
-            // One line whenever the (pipeline, plane depth) combination
-            // changes — makes the field-debug question "did the tonemap
-            // actually run, and on which planes?" answerable from logs.
-            use std::sync::atomic::{AtomicU8, Ordering};
-            static LAST: AtomicU8 = AtomicU8::new(u8::MAX);
-            let is_10bit = metal_frame.y_texture.format() == TextureFormat::R16Unorm;
-            let state = is_hdr as u8 | (is_10bit as u8) << 1;
-            if LAST.swap(state, Ordering::Relaxed) != state {
-                log::info!(
-                    "Metal NV12 path: {} planes → {} pipeline",
-                    if is_10bit { "10-bit" } else { "8-bit" },
-                    if is_hdr { "HDR tonemap" } else { "SDR" },
-                );
-            }
-        }
-        let (frame_w, frame_h) = (
-            metal_frame.y_texture.width(),
-            metal_frame.y_texture.height(),
-        );
-        self.draw_planes(
-            &y_plane_view,
-            &uv_plane_view,
-            frame_w,
-            frame_h,
-            if is_hdr { PlaneDraw::Hdr } else { PlaneDraw::Sdr },
-            None,
-        )
-        .await;
-        metal_frame
-    }
-
     /// Draw one frame given its two plane views (Y, interleaved UV) — the
     /// shared tail of the Apple zero-copy path and the browser GPU-frame
     /// path: pipeline selection (SDR vs HDR tonemap + detection passes), the
@@ -2556,6 +2527,11 @@ impl VideoRenderer {
                 Some(p) => (p, true, None, 0),
                 None => (sdr(), false, None, 0),
             },
+            // Only selected inside an EDR session, which built the pipelines.
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            PlaneDraw::OutPq | PlaneDraw::OutHlg | PlaneDraw::OutSdr => {
+                (self.apple_output.edr_pipeline(mode), false, None, 0)
+            }
             #[cfg(target_arch = "wasm32")]
             PlaneDraw::WebRgba => (
                 self.render_pipeline_rgba.as_ref().expect("no RGBA pipeline"),
@@ -2688,23 +2664,24 @@ impl VideoRenderer {
                 }
             };
 
-            let texture_view =
-                surface_texture
-                    .texture
-                    .create_view(&wgpu::TextureViewDescriptor {
-                        format: Some(self.surface_format),
-                        ..Default::default()
-                    });
-
-            let (surface_w, surface_h) = {
+            let (surface_w, surface_h, surface_format) = {
                 let cfg = self
                     .surface_config
                     .as_ref()
                     .expect("config in windowed mode")
                     .read()
                     .await;
-                (cfg.width, cfg.height)
+                // The live format: rgba16float during an HDR output session.
+                (cfg.width, cfg.height, cfg.format)
             };
+
+            let texture_view =
+                surface_texture
+                    .texture
+                    .create_view(&wgpu::TextureViewDescriptor {
+                        format: Some(surface_format),
+                        ..Default::default()
+                    });
 
             self.encode_and_submit(
                 &texture_view,
@@ -2725,41 +2702,6 @@ impl VideoRenderer {
             self.pre_present_notify();
             surface_texture.present();
         }
-    }
-
-    /// macOS / iOS: render a `CVPixelBufferOwned` from VTDecompressionSession.
-    /// Wraps the buffer into a `MetalNV12Frame` (two zero-copy MTLTextures)
-    /// and dispatches to the shared Metal NV12 helper. `color` is the
-    /// frame's signalled colour info — it decides SDR vs HDR-tonemap
-    /// pipeline (the plane bit depth alone can't: VT's 8-bit fallback
-    /// still carries a PQ/BT.2020 signal).
-    #[cfg(any(target_os = "ios", target_os = "macos"))]
-    pub async fn render_cv_pixel_buffer(
-        &self,
-        buf: crate::decoders::CvPixelBufferOwned,
-        color: crate::decoders::VideoColorInfo,
-    ) {
-        let cache = match &self.metal_cache {
-            Some(c) => c.clone(),
-            None => {
-                log::warn!("[renderer] metal_cache missing, dropping frame");
-                return;
-            }
-        };
-        let mf = match unsafe { MetalNV12Frame::new(&cache, &self.device, buf.as_ptr()) } {
-            Ok(f) => f,
-            Err(e) => {
-                log::warn!("[renderer] MetalNV12Frame::new (iOS) failed: {}", e);
-                return;
-            }
-        };
-        let mf = self.render_metal_nv12(mf, color).await;
-        // Apple requires the CVMetalTextures and the CVPixelBuffer to stay
-        // alive until the command buffer that samples them completes. A
-        // retained MTLTexture alone does not stop the decoder pool from
-        // recycling the IOSurface, which would show a later frame's picture.
-        // The callback fires from the maintain() of a later submit.
-        self.queue.on_submitted_work_done(move || drop((mf, buf)));
     }
 
     /// GLES zero-copy path: stores per-frame AHB data then calls queue.present().
@@ -3333,6 +3275,8 @@ impl VideoRenderer {
             Arc::new(self.queue.clone()),
             self.surface_format,
         ));
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        overlay.set_pq_output(self.apple_output.edr.is_active());
         *slot = Some(overlay.clone());
         overlay
     }
@@ -3403,11 +3347,15 @@ impl super::VideoSink for VideoRenderer {
         self.hdr_tonemap_params.store(Arc::new(params));
     }
 
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_os = "macos", target_os = "ios"))]
     fn set_display_hdr_types(&self, mask: u32) {
-        log::info!("[renderer] display HDR types mask = {:#06b}", mask);
-        self.display_hdr_types
-            .store(mask, std::sync::atomic::Ordering::Relaxed);
+        // Hosts may re-report on every window move; log changes only.
+        let old = self
+            .display_hdr_types
+            .swap(mask, std::sync::atomic::Ordering::Relaxed);
+        if old != mask {
+            log::info!("[renderer] display HDR types mask = {:#06b}", mask);
+        }
     }
 
     fn set_subtitle_safe_bottom_px(&self, px: u32) {

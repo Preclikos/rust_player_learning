@@ -168,7 +168,11 @@ pub(super) async fn video_prefetch(
         dovi.profile
     });
     if let Some(p) = dovi_profile {
-        if !matches!(p, 7 | 8) && !cfg!(target_os = "android") {
+        // Apple: the decoder decides — profile 5 plays in direct mode
+        // (AVSampleBufferDisplayLayer) and is refused by the VT path.
+        if !matches!(p, 7 | 8)
+            && !cfg!(any(target_os = "android", target_os = "macos", target_os = "ios"))
+        {
             return Err(format!(
                 "Dolby Vision profile {} has no backward-compatible base layer \
                  (needs a platform DV decoder) — unsupported on this target",
@@ -469,6 +473,7 @@ pub(super) fn video_decoder_params(
         color: pf.color,
         direct_window: direct_window.raw(),
         dovi_profile: pf.dovi_profile,
+        dovi_record: pf.dovi_profile.and_then(|_| crate::crypto::parse_dovi_record(&pf.init_data)),
         force_8bit_hdr: hdr_decode_8bit.load(Ordering::Relaxed),
         max_width: ladder_max.0.max(pf.width),
         max_height: ladder_max.1.max(pf.height),

@@ -12,6 +12,7 @@
 
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
+#import <AVFoundation/AVFoundation.h>
 #import <stdint.h>
 #import <stdbool.h>
 #import <string.h>
@@ -30,6 +31,14 @@ extern void *rustplayer_player_create(void *metal_layer, uint32_t width, uint32_
 
 // Bundled encrypted DASH test stream (smoke test only).
 #define TEST_MANIFEST_URL "https://preclikos.cz/examples/encrypted/manifest.mpd"
+extern void rustplayer_player_set_display_hdr_types(void *handle, uint32_t mask);
+extern void rustplayer_player_set_video_output_layer(void *handle, void *video_layer);
+extern void *rustplayer_player_create_ex(void *metal_layer, void *video_layer, uint32_t display_hdr_types,
+                              uint32_t width, uint32_t height,
+                              const char *manifest_url, float start_fraction,
+                              int32_t audio_passthrough, bool auto_select_subtitle,
+                              rustplayer_intercept_cb intercept_cb, rustplayer_resolve_key_cb resolve_key_cb,
+                              rustplayer_event_cb event_cb, void *user);
 extern void rustplayer_player_set_size(void *handle, uint32_t width, uint32_t height, float scale);
 extern void rustplayer_player_play(void *handle);
 extern void rustplayer_player_pause(void *handle);
@@ -75,6 +84,8 @@ extern void rustplayer_resolve_key_fail(uint64_t token, const char *message);
 @interface PlayerViewController : UIViewController
 @property(nonatomic, assign) void *handle;
 @property(nonatomic, strong) MetalView *metalView;
+// Direct mode: the system video layer under the render layer.
+@property(nonatomic, strong) AVSampleBufferDisplayLayer *videoLayer;
 @property(nonatomic, strong) UIButton *playPauseButton;
 @property(nonatomic, strong) UISlider *seekSlider;
 @property(nonatomic, strong) UILabel *timeLabel;
@@ -218,9 +229,50 @@ static void resolve_key_cb(void *user, const uint8_t *kid, uint64_t token) {
     }
     layer.drawableSize = CGSizeMake(w, h);
 
+    if (self.videoLayer == nil && self.metalView.superview != nil) {
+        // Direct mode: system video layer under the render layer, which
+        // then only carries subtitles (non-opaque).
+        self.videoLayer = [AVSampleBufferDisplayLayer layer];
+        self.videoLayer.videoGravity = AVLayerVideoGravityResizeAspect;
+        self.videoLayer.backgroundColor = UIColor.blackColor.CGColor;
+        [self.metalView.superview.layer insertSublayer:self.videoLayer below:layer];
+        layer.opaque = NO;
+        // iOS fails the layer in the background (-11847) and the player falls
+        // back to its renderer; re-installing it on return re-arms direct mode.
+        __weak typeof(self) weakSelf = self;
+        [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationWillEnterForegroundNotification
+                                                        object:nil queue:NSOperationQueue.mainQueue
+                                                    usingBlock:^(NSNotification *n) {
+            typeof(self) s = weakSelf;
+            if (s.handle != NULL && s.videoLayer != nil) {
+                rustplayer_player_set_video_output_layer(s.handle, (__bridge void *)s.videoLayer);
+            }
+        }];
+    }
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    self.videoLayer.frame = self.metalView.frame;
+    [CATransaction commit];
+
     if (self.handle == NULL) {
-        NSLog(@"[host] starting embedded player %ux%u (scale %.1f)", w, h, scale);
-        self.handle = rustplayer_player_create((__bridge void *)layer, w, h,
+        // HDR output when the panel has EDR headroom (same rule as the
+        // Swift wrapper's `displaySupportsHdr`); otherwise the tonemap.
+        // `-RustPlayerHdrForced YES` (launch argument) forces it — direct
+        // mode then plays HDR / DV even on an SDR panel (iOS tonemaps).
+        uint32_t mask = 0;
+        if (@available(iOS 16.0, *)) {
+            if (AVPlayer.eligibleForHDRPlayback && UIScreen.mainScreen.potentialEDRHeadroom > 1.0) {
+                mask = (1u << 1) | (1u << 2);
+                if (AVPlayer.availableHDRModes & AVPlayerHDRModeDolbyVision) mask |= 1u;
+            }
+        }
+        if ([NSUserDefaults.standardUserDefaults boolForKey:@"RustPlayerHdrForced"]) {
+            mask |= (1u << 1) | (1u << 2);
+        }
+        NSLog(@"[host] starting embedded player %ux%u (scale %.1f), display HDR mask %#x%@",
+              w, h, scale, mask, mask ? @" → direct mode" : @" (tonemap)");
+        self.handle = rustplayer_player_create_ex((__bridge void *)layer,
+                                       (__bridge void *)self.videoLayer, mask, w, h,
                                        TEST_MANIFEST_URL, -1.0f, -1, true,
                                        intercept_cb, resolve_key_cb, event_cb,
                                        (__bridge void *)self);

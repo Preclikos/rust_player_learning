@@ -593,6 +593,18 @@ pub fn parse_dovi_config(init_data: &[u8]) -> Option<DoviConfig> {
     })
 }
 
+/// The raw Dolby Vision configuration box (`dvvC` or `dvcC`) with its type —
+/// handed whole to an OS decoder that does DV itself (Apple direct mode).
+pub fn parse_dovi_record(init_data: &[u8]) -> Option<([u8; 4], Vec<u8>)> {
+    let moov = find_top_box(init_data, b"moov")?;
+    for kind in [*b"dvvC", *b"dvcC", *b"dvwC"] {
+        if let Some(b) = find_descendant(moov, &kind) {
+            return Some((kind, b.to_vec()));
+        }
+    }
+    None
+}
+
 /// Extract VPS/SPS/PPS NALUs from the `hvcC` box (HEVC decoder configuration record).
 /// The raw `hvcC` box payload (HEVCDecoderConfigurationRecord, ISO/IEC
 /// 14496-15 §8.3.3.1) from the init segment. Decoders that take the record

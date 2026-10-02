@@ -175,8 +175,11 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 # fork — jinak `Retained<ProtocolObject<dyn MTLTexture>>` co vyrobíme nesedne
 # do signature `texture_from_raw`.
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+# CLOCK_MONOTONIC: the sync loop's present stamps and the direct-mode timebase
+# anchor must read the same clock.
+libc = "0.2"
 objc2 = "0.6.3"
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["std"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSGeometry"] }
 objc2-metal = { version = "0.3.2", default-features = false, features = [
     "std",
     "MTLDevice",

@@ -51,6 +51,12 @@ impl ApplicationHandler for App {
             player.set_pre_present_hook(Box::new(move || w.pre_present_notify()));
         }
 
+        #[cfg(target_os = "macos")]
+        {
+            report_display_hdr(&window, &player);
+            install_direct_video_layer(&window, &player);
+        }
+
         self.player = Some(player.clone());
 
         // Hand the player off to the shared test-playback fixture, then
@@ -97,6 +103,12 @@ impl ApplicationHandler for App {
                 }
 
                 window.request_redraw();
+            }
+            // The window may have landed on a screen with (or without)
+            // EDR headroom — re-evaluate HDR output.
+            #[cfg(target_os = "macos")]
+            WindowEvent::Moved(_) | WindowEvent::ScaleFactorChanged { .. } => {
+                report_display_hdr(&window, player);
             }
             WindowEvent::Resized(size) => {
                 player.resize(player::PhysicalSize::new(size.width, size.height));
@@ -473,4 +485,30 @@ fn pick_audio(player: &Player, index: usize) {
         }
     }
     println!("invalid audio index");
+}
+
+/// macOS: tell the player whether the window's screen can show HDR (EDR
+/// headroom > 1) so it hands PQ through instead of tonemapping.
+#[cfg(target_os = "macos")]
+fn report_display_hdr(window: &Window, player: &Player) {
+    use winit::raw_window_handle::RawWindowHandle;
+    let view = match window.window_handle().map(|h| h.as_raw()) {
+        Ok(RawWindowHandle::AppKit(h)) => h.ns_view.as_ptr(),
+        _ => std::ptr::null_mut(),
+    };
+    let mask = unsafe { player::macos_display_hdr_types(view) };
+    player.set_display_hdr_types(mask);
+}
+
+/// macOS direct mode: an AVSampleBufferDisplayLayer under the render layer.
+/// The player only uses it while the display reports HDR (or with
+/// `RUST_PLAYER_DIRECT=1`); otherwise it stays empty underneath.
+#[cfg(target_os = "macos")]
+fn install_direct_video_layer(window: &Window, player: &Player) {
+    use winit::raw_window_handle::RawWindowHandle;
+    if let Ok(RawWindowHandle::AppKit(h)) = window.window_handle().map(|h| h.as_raw()) {
+        // Lives as long as the window (the process, here).
+        let layer = unsafe { player::macos_install_direct_video_layer(h.ns_view.as_ptr()) };
+        player.set_video_output_layer(layer);
+    }
 }

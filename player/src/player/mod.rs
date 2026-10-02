@@ -2083,6 +2083,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         // begins with the layer flushed of whatever the last run left in it.
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         self.apple_direct.request_flush();
+        self.video_renderer.begin_presentation();
         let video_representation = match self.video_representation.lock().unwrap().as_ref() {
             Some(r) => r.clone(),
             None => return Err("Video Track not set".into()),

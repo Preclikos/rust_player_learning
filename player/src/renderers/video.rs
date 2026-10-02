@@ -3370,4 +3370,12 @@ impl super::VideoSink for VideoRenderer {
         self.subtitle_safe_bottom_px
             .store(px, std::sync::atomic::Ordering::Relaxed);
     }
+
+    fn begin_presentation(&self) {
+        // Direct mode publishes / presents its overlay on change only; an
+        // unchanged (cue-less, same size) overlay from the previous title
+        // would otherwise publish nothing for the new one.
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        self.invalidate_direct_overlay();
+    }
 }

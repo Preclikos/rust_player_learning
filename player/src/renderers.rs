@@ -84,6 +84,12 @@ pub trait VideoSink: Send + Sync + 'static {
     /// its bottom edge here so cues clear TV overscan / system bars. Default:
     /// ignored (0 → renderer falls back to a 10% TV title-safe margin).
     fn set_subtitle_safe_bottom_px(&self, _px: u32) {}
+
+    /// A fresh playback start (`Player::play`): forget what was last shown,
+    /// so the first frame of the new presentation reaches the host even if
+    /// it looks the same — an offscreen host ends its loading state on that
+    /// frame's frame-ready callback. Default: nothing cached.
+    fn begin_presentation(&self) {}
 }
 
 /// A compressed-bitstream audio output (audio passthrough): the audio pipeline

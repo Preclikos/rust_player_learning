@@ -279,6 +279,12 @@ impl VideoRenderer {
 
     // ----- Direct mode overlay -----
 
+    /// The next direct-mode frame presents / publishes its overlay even if
+    /// it is unchanged (see `VideoSink::begin_presentation`).
+    pub(super) fn invalidate_direct_overlay(&self) {
+        self.apple_output.direct.invalidate();
+    }
+
     /// Direct mode on/off for the render layer: non-opaque (post-multiplied
     /// alpha) so the `AVSampleBufferDisplayLayer` below shows through, or
     /// back to the normal opaque video surface.

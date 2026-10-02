@@ -1,8 +1,8 @@
 # ABR switch keeps the hardware decoder (decoder reuse)
 
 Status 2026-10-02: Android verified on three devices, web verified functionally,
-Windows unchanged and checked. **macOS / iOS (VideoToolbox) implemented but neither
-compiled nor run** - this handoff is for that.
+Windows unchanged and checked. **macOS / iOS (VideoToolbox): compiled and run on
+the Mac Pro and the iPhone SE** — see "Apple outcome" at the end.
 
 ## What changed
 
@@ -119,3 +119,32 @@ decoder (expected 30).
 - **Amlogic:** the codec sometimes dies across Home (`dequeueInputBuffer -10000`
   or `input-buffer stall` after return). The supervisor recovers since 0.1.54;
   root cause not investigated.
+
+## Apple outcome (2026-10-02, Intel Mac Pro / RX 570, macOS 14.8; iPhone SE 1st gen, iOS 15.8.8)
+
+macOS: `example-desktop` (release) on the test stream, `abr off`, soft switches
+through the console (`s <i>`), log at info. iOS: a throwaway Swift harness on a
+`CAMetalLayer` (see `docs/handoff/macos-ios.md`), bridge default ABR armed, log
+from the device syslog.
+
+- `VTDecompressionSessionCanAcceptFormatDescription` says **no to every
+  resolution change** (720p→1080p, 1080p→480p, 480p→720p, 2160p→1440p — all
+  "session does not accept WxH, new session"). It says yes only for a rung of
+  the same size: the duplicate 2160p and 1440p rungs of the test ladder switch
+  with "session kept". So on Apple the reuse covers same-resolution bitrate
+  rungs only; a new session is the normal path.
+- That path has no hole: `NEW first frame` 26-85 ms after OLD teardown on
+  macOS (SDR 28-40 ms, HDR 10-bit 53-85 ms), 180-280 ms on the iPhone SE
+  (the A9 at 2160p/1440p); LATE 0 across 11 switches on macOS except one
+  150 ms late first frame on two of the 10-bit switches landing on the 30 s
+  boundary (2 drops, then clean). No flicker or wrong-frame report in the
+  logs; a visual check was not done.
+- Across groups (SDR 8-bit ↔ PQ 10-bit) the output format differs and the
+  session is rebuilt as designed (`new session for WxH (output format
+  differs)`).
+- Automatic ABR on the Mac: 720p → 2160p ~2 s after arming (EWMA ~100 Mb/s),
+  no drops, no LATE.
+- **iPhone SE: the 2160p climb is now handled** (see the ABR pixel cap in
+  `docs/handoff/macos-ios.md`): ABR climbs to 2160p at ~8 s, the device
+  presents 13 fps and drops 10-14 frames/s, after 3 s the cap fires and ABR
+  settles on 1440p, which then plays with 0 LATE to the end of the stream.

@@ -233,3 +233,40 @@ which 4 are not built on macOS was not checked).
   reproducible on a Mac with built-in output.
 - **Linux task 4 (cpal)**: the macOS side needs no change; the Linux agent
   should still check device loss and i16-only devices there.
+
+## Outcome, part 2 (2026-10-02): ABR on macOS and the iPhone SE
+
+Same Mac Pro and iPhone SE as above; Safari 26.6.1 on the Mac now (the web
+shell's WebGL2 fallback is fixed separately, commit cf52023).
+
+**ABR switches (decoder reuse, `docs/handoffs/DECODER_REUSE_ABR_SWITCH.md`)**:
+verified on both; the numbers are in that document's "Apple outcome".
+VideoToolbox keeps its session only for a same-resolution rung; every
+resolution change is a new session, 26-85 ms to the first frame on the Mac,
+no hole, LATE 0.
+
+**ABR climbs to 2160p on the iPhone SE — fixed with a device cap.** ABR is
+bandwidth-only, and the SE's link carries 2160p (EWMA 40-100 Mb/s), so it
+climbed at ~8 s and stayed there: 13 fps presented, 10-14 frames/s dropped
+as late, for the rest of playback (reproduced twice). The engine now watches
+the per-second frame counters per rung (`abr::DecodeOverloadDetector`): when
+for 3 consecutive seconds at least 25 % of the presented frames' worth are
+dropped as late (and at least 8 frames/s still get presented, so a hidden
+browser tab on its 250 ms fallback or a stall never counts), the rung's pixel
+count becomes a cap for the rest of the stream, and the switch down is not
+held back by the 8 s switch interval. Reset by `prepare()` (new stream).
+hls.js does the same under `capLevelOnFPSDrop`.
+
+| | before | after |
+| --- | --- | --- |
+| iPhone SE, auto ABR, 75 s | 720p → 2160p at 7.6 s; then 13 fps, +8…17 drops/s every second to the end | 720p → 2160p at 7.7 s; cap at 14.8 s (3 s after the first 2160p frame) → 1440p at 17.6 s; 0 LATE, 0 drops to end of stream |
+| Mac Pro, auto ABR, 80 s | 720p → 2160p at ~2 s, 0 drops | same, cap never fires |
+| Mac Pro, 3 SDR soft switches | first frame 28-40 ms, 0 LATE | same |
+
+`cargo test -p player --lib`: 205 passed (4 new tests for the detector).
+
+Open: the SE still spends ~7 s at 2160p before the cap (the switch interval
+plus 3 strikes). A capability pre-check (`VTIsHardwareDecodeSupported` says
+nothing about resolution; `AVPlayer`'s hint would be `maximumResolution`)
+could avoid the first climb; not done. The cap is per stream, not persisted
+across players.

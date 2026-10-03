@@ -20,6 +20,7 @@ mod hdr_tonemap;
 mod manifest;
 mod net;
 mod parsers;
+mod present_lead;
 pub mod prof;
 mod renderers;
 pub mod rt;

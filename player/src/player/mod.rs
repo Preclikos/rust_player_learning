@@ -242,6 +242,9 @@ enum StallSide {
 pub(crate) struct StatsState {
     /// Debug HUD counters and event log (see `crate::debug`).
     pub(crate) debug: crate::debug::DebugCounters,
+    /// Direct-mode release lead: display timing, decoder-starvation cap and
+    /// the released / rendered counters (see `crate::present_lead`).
+    pub(crate) present_lead: crate::present_lead::PresentLead,
     /// Buffer policy of the running play(), read by the download tasks:
     /// 0 = fill continuously, n = once the queue is full, wait until it holds
     /// fewer than n segments (hysteresis, `BufferConfig::min_secs`).
@@ -1572,6 +1575,46 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             .store(enabled, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Timing of the display the video plane is on, in nanoseconds (0 =
+    /// unknown): its vsync period, its presentation deadline (how long before
+    /// a vsync a buffer must be queued to make it — Android
+    /// `Display.getPresentationDeadlineNanos`) and the app vsync offset
+    /// (`getAppVsyncOffsetNanos`, informational). Android direct mode releases
+    /// each frame deadline + one vsync ahead of its display time (at least
+    /// 50 ms), lowered again if the decoder runs out of output buffers. Call it
+    /// again when the refresh rate changes. Takes effect from the next frame;
+    /// no effect on other platforms.
+    pub fn set_display_timing(&self, vsync_period_ns: i64, presentation_deadline_ns: i64, app_vsync_offset_ns: i64) {
+        self.stats
+            .present_lead
+            .set_display_timing(vsync_period_ns, presentation_deadline_ns, app_vsync_offset_ns);
+    }
+
+    /// A vsync timestamp of the display the video plane is on
+    /// (CLOCK_MONOTONIC ns, e.g. Android `Choreographer` frame time). With it
+    /// and the vsync period from [`Self::set_display_timing`], Android direct
+    /// mode snaps each frame's release stamp onto the vsync grid: frames sat
+    /// on a vsync boundary as the audio clock drifted against the display,
+    /// and SurfaceFlinger dropped and repeated frames for minutes at a time.
+    /// Report one every second or so; the grid only drifts slowly.
+    pub fn on_display_vsync(&self, frame_time_ns: i64) {
+        self.stats.present_lead.on_vsync(frame_time_ns);
+    }
+
+    /// Test only: skew direct-mode release stamps by `ppm` against the media
+    /// clock, so clock-vs-display drift crosses a whole vsync in seconds.
+    #[doc(hidden)]
+    pub fn set_test_present_skew_ppm(&self, ppm: i64) {
+        self.stats.present_lead.set_test_skew_ppm(ppm);
+    }
+
+    /// Test only: put direct-mode release stamps `percent` of a vsync before
+    /// the vsync they target (0 = the default).
+    #[doc(hidden)]
+    pub fn set_test_present_offset_percent(&self, percent: i64) {
+        self.stats.present_lead.set_test_offset_percent(percent);
+    }
+
     /// Opt into audio passthrough (bitstream): when enabled, a passthrough
     /// codec track (E-AC-3 / AC-3 / DTS) is sent to the audio output untouched
     /// for an HDMI AVR/soundbar to decode, instead of being decoded to PCM
@@ -2802,6 +2845,24 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             pipeline: pipeline(Track::Video, d.video_ahead_ms.load(Ordering::Relaxed)),
             ..Default::default()
         };
+        #[cfg(target_os = "android")]
+        if self.video_output_window.is_set() {
+            let p = st.present_lead.snapshot();
+            if p.lead_ms > 0 {
+                video.present = Some(crate::debug::DebugPresent {
+                    lead_ms: p.lead_ms,
+                    display_floor_ms: p.display_floor_ms,
+                    cap_ms: (p.cap_ms != 0).then_some(p.cap_ms),
+                    deadline_ms: p.deadline_ns as f64 / 1e6,
+                    vsync_ms: p.vsync_ns as f64 / 1e6,
+                    app_vsync_offset_ms: p.app_vsync_offset_ns as f64 / 1e6,
+                    decoder_starved: p.starved_events,
+                    released_per_s: p.released_per_s,
+                    shown_per_s: p.rendered_per_s,
+                    vsync_snap: p.vsync_snap,
+                });
+            }
+        }
         // Read the fields in place: cloning the representation would copy its
         // whole segment list.
         if let Some(r) = self.video_representation.lock().unwrap().as_ref() {

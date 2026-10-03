@@ -873,6 +873,72 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetAdapti
     })
 }
 
+/// Display vsync period, presentation deadline and app vsync offset (ns),
+/// from `android.view.Display`; sets the direct-mode release lead.
+#[no_mangle]
+pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetDisplayTiming(
+    _env: EnvUnowned,
+    _class: JClass,
+    handle: jlong,
+    vsync_period_ns: jlong,
+    presentation_deadline_ns: jlong,
+    app_vsync_offset_ns: jlong,
+) {
+    ffi_guard("nativeSetDisplayTiming", (), move || {
+        if let Some(h) = unsafe { handle_ref(handle) } {
+            h.bridge
+                .player()
+                .set_display_timing(vsync_period_ns, presentation_deadline_ns, app_vsync_offset_ns);
+        }
+    })
+}
+
+/// A vsync timestamp (`Choreographer` frame time, ns): direct-mode release
+/// stamps snap onto the vsync grid.
+#[no_mangle]
+pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeOnVsync(
+    _env: EnvUnowned,
+    _class: JClass,
+    handle: jlong,
+    frame_time_ns: jlong,
+) {
+    ffi_guard("nativeOnVsync", (), move || {
+        if let Some(h) = unsafe { handle_ref(handle) } {
+            h.bridge.player().on_display_vsync(frame_time_ns);
+        }
+    })
+}
+
+/// Test only: skew direct-mode release stamps by `ppm` (fast vsync-drift repro).
+#[no_mangle]
+pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetTestPresentSkewPpm(
+    _env: EnvUnowned,
+    _class: JClass,
+    handle: jlong,
+    ppm: jlong,
+) {
+    ffi_guard("nativeSetTestPresentSkewPpm", (), move || {
+        if let Some(h) = unsafe { handle_ref(handle) } {
+            h.bridge.player().set_test_present_skew_ppm(ppm);
+        }
+    })
+}
+
+/// Test only: release stamps `percent` of a vsync before their vsync.
+#[no_mangle]
+pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetTestPresentOffsetPercent(
+    _env: EnvUnowned,
+    _class: JClass,
+    handle: jlong,
+    percent: jlong,
+) {
+    ffi_guard("nativeSetTestPresentOffsetPercent", (), move || {
+        if let Some(h) = unsafe { handle_ref(handle) } {
+            h.bridge.player().set_test_present_offset_percent(percent);
+        }
+    })
+}
+
 /// ARGB ints (Android `Color`), like ExoPlayer `CaptionStyleCompat`.
 #[no_mangle]
 pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetSubtitleStyle(

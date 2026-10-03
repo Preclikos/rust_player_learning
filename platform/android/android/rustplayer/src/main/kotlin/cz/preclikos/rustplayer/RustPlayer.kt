@@ -1,8 +1,11 @@
 package cz.preclikos.rustplayer
 
 import android.content.Context
+import android.hardware.display.DisplayManager
 import android.os.Handler
 import android.os.Looper
+import android.view.Choreographer
+import android.view.Display
 import android.view.Surface
 import org.json.JSONObject
 
@@ -72,9 +75,29 @@ class RustPlayer(private val context: Context) {
 
     var listener: Listener? = null
 
+    /**
+     * Report the display's timing to the player (default on): direct mode then
+     * releases frames the display's presentation deadline plus one vsync early
+     * instead of a fixed 50 ms. Set before [start]; off = the fixed 50 ms.
+     */
+    var reportDisplayTiming: Boolean = true
+
+    /**
+     * Snap direct-mode frame releases onto the display's vsync grid (default
+     * on; needs [reportDisplayTiming]). Without it the media clock drifts
+     * against the display and, every hour or so, frames sit on a vsync boundary
+     * for minutes: the display drops and repeats them (micro-stutter). Set
+     * before [start].
+     */
+    var alignToVsync: Boolean = true
+
+    private var vsyncCallback: Choreographer.FrameCallback? = null
+
     private var handle: Long = 0L
     private val main = Handler(Looper.getMainLooper())
     private var bridge: PlayerBridge? = null
+    private var displayListener: DisplayManager.DisplayListener? = null
+    private var lastDisplayTiming: Triple<Long, Long, Long>? = null
 
     val isStarted: Boolean get() = handle != 0L
 
@@ -124,6 +147,96 @@ class RustPlayer(private val context: Context) {
             preferredAudioLang,
             preferredSubtitleLang,
         )
+        if (reportDisplayTiming) {
+            trackDisplayTiming()
+            if (alignToVsync) startVsyncSampling()
+        }
+    }
+
+    /**
+     * Report a vsync timestamp about once a second (the grid's phase; its
+     * period comes from the display timing). Choreographer frame times are
+     * vsync timestamps on CLOCK_MONOTONIC, the clock release stamps use.
+     */
+    private fun startVsyncSampling() {
+        main.post {
+            if (handle == 0L) return@post
+            val choreographer = Choreographer.getInstance()
+            val cb = object : Choreographer.FrameCallback {
+                override fun doFrame(frameTimeNanos: Long) {
+                    if (vsyncCallback !== this || handle == 0L) return
+                    NativeBridge.nativeOnVsync(handle, frameTimeNanos)
+                    main.postDelayed({
+                        if (vsyncCallback === this) choreographer.postFrameCallback(this)
+                    }, 1000)
+                }
+            }
+            vsyncCallback = cb
+            choreographer.postFrameCallback(cb)
+        }
+    }
+
+    /** Test only: skew release stamps by [ppm] (fast vsync-drift repro). */
+    fun setTestPresentSkewPpm(ppm: Long) {
+        if (handle != 0L) NativeBridge.nativeSetTestPresentSkewPpm(handle, ppm)
+    }
+
+    /** Test only: release stamps [percent] of a vsync before their vsync. */
+    fun setTestPresentOffsetPercent(percent: Long) {
+        if (handle != 0L) NativeBridge.nativeSetTestPresentOffsetPercent(handle, percent)
+    }
+
+    /**
+     * Report the display's vsync period, presentation deadline and app vsync
+     * offset to the player, now and whenever the display changes (adaptive
+     * frame rate switching 60 -> 24 Hz, HDMI hot-plug). Direct mode releases
+     * each frame the deadline plus one vsync before its display time; a fixed
+     * 50 ms was too late on displays with a long deadline at 24 Hz (frames
+     * shown a vsync late or dropped: micro-stutter).
+     */
+    /**
+     * Set the display timing by hand (nanoseconds) instead of reading the
+     * default display, e.g. when the video plane is on another display. Stops
+     * the automatic tracking; call it again on a refresh-rate change.
+     */
+    fun setDisplayTiming(vsyncPeriodNs: Long, presentationDeadlineNs: Long, appVsyncOffsetNs: Long = 0L) {
+        stopDisplayTiming()
+        if (handle != 0L) NativeBridge.nativeSetDisplayTiming(handle, vsyncPeriodNs, presentationDeadlineNs, appVsyncOffsetNs)
+    }
+
+    private fun stopDisplayTiming() {
+        displayListener?.let {
+            (context.getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager)?.unregisterDisplayListener(it)
+        }
+        displayListener = null
+        lastDisplayTiming = null
+    }
+
+    private fun trackDisplayTiming() {
+        val dm = context.getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager ?: return
+        val push = push@{
+            if (handle == 0L) return@push
+            val d = dm.getDisplay(Display.DEFAULT_DISPLAY) ?: return@push
+            val rate = d.refreshRate
+            val timing = Triple(
+                if (rate > 0f) (1_000_000_000.0 / rate).toLong() else 0L,
+                d.presentationDeadlineNanos,
+                d.appVsyncOffsetNanos,
+            )
+            if (timing == lastDisplayTiming) return@push
+            lastDisplayTiming = timing
+            NativeBridge.nativeSetDisplayTiming(handle, timing.first, timing.second, timing.third)
+        }
+        val listener = object : DisplayManager.DisplayListener {
+            override fun onDisplayAdded(displayId: Int) {}
+            override fun onDisplayRemoved(displayId: Int) {}
+            override fun onDisplayChanged(displayId: Int) {
+                if (displayId == Display.DEFAULT_DISPLAY) push()
+            }
+        }
+        dm.registerDisplayListener(listener, main)
+        displayListener = listener
+        push()
     }
 
     fun setSize(width: Int, height: Int) {
@@ -292,6 +405,8 @@ class RustPlayer(private val context: Context) {
     }
 
     fun release() {
+        stopDisplayTiming()
+        vsyncCallback = null
         if (handle != 0L) {
             NativeBridge.nativeDestroy(handle)
             handle = 0L

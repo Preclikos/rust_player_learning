@@ -147,11 +147,17 @@ pub(super) async fn video_sync_loop<V: VideoSink, A: AudioSink>(
     // eglPresentationTimeANDROID) then holds the frame until the exact VSync.
     const RENDER_BUDGET_MS: u64 = 20;
     // Direct mode: how far ahead of its display time a frame is released to
-    // the Surface (see the pacing sleep). ExoPlayer's window: every frame
-    // queued in SurfaceFlinger holds a codec output buffer, and on Amlogic
-    // (13 buffers, 8 needed for decoding) 100 ms starved the decoder.
+    // the Surface comes from `stats.present_lead` (display deadline + one
+    // vsync, capped while the decoder starves). A codec refusing input this
+    // long while no decoded frame waits here = every output buffer is out.
     #[cfg(target_os = "android")]
-    const DIRECT_RELEASE_LEAD_MS: u64 = 50;
+    const DECODER_STARVED_MS: u64 = 20;
+    // Released frames, and the codec's rendered count, at the last stats tick
+    // (per-second rates for the HUD / HEALTH line).
+    #[cfg(target_os = "android")]
+    let mut released_frames = 0u64;
+    #[cfg(target_os = "android")]
+    let mut last_rates: (u64, Option<u64>) = (0, crate::decoders::mediacodec::rendered_frames());
 
     // Frames behind the last presented one are dropped up to this far back
     // (see the BACKWARD check); a retry from the current position lands at
@@ -211,6 +217,16 @@ pub(super) async fn video_sync_loop<V: VideoSink, A: AudioSink>(
     // (last + Δpts) instead of inheriting the audio clock's frame-to-frame
     // wobble. Bounded to ±PRESENT_SMOOTH_NS of the raw value (see present block).
     let mut last_present: Option<(i64, i64)> = None;
+    // Display time of the previous frame (after vsync snapping), for the
+    // judder gauge.
+    let mut last_shown_ns: Option<i64> = None;
+    // Vsync the previous frame was snapped to (direct mode, see
+    // `snap_to_vsync`): the next frame never lands on it.
+    #[cfg(target_os = "android")]
+    let mut last_vsync: Option<i64> = None;
+    // Test-only stamp skew (`PresentLead::set_test_skew_ppm`) is measured from here.
+    #[cfg(target_os = "android")]
+    let mut test_skew_origin: Option<i64> = None;
     // Browser: present on the display's vsync (see VsyncCadence).
     #[cfg(target_arch = "wasm32")]
     let mut vsync = crate::av_sync::VsyncCadence::new();
@@ -435,6 +451,23 @@ pub(super) async fn video_sync_loop<V: VideoSink, A: AudioSink>(
             backward_dropped = 0;
         }
 
+        // Decoder starvation (direct mode): the codec refuses input and nothing
+        // decoded is waiting — its output buffers all sit in SurfaceFlinger or
+        // here. Released earlier, more of them wait there: cap the lead.
+        #[cfg(target_os = "android")]
+        if let crate::decoders::PlatformFrame::MediaCodecDirect(direct) = &frame.native {
+            if input_rx.is_empty() && direct.decoder_input_blocked_ms() >= DECODER_STARVED_MS {
+                if let Some(lead) = stats.present_lead.on_decoder_starved(std::time::Instant::now()) {
+                    log::info!(
+                        "[lead] decoder starved (input refused {} ms, no frame waiting) -> release lead {} ms",
+                        direct.decoder_input_blocked_ms(),
+                        lead
+                    );
+                    stats.debug.log("lead", format!("decoder starved -> lead {lead} ms"));
+                }
+            }
+        }
+
         if elapsed > pts_ms {
             let late_ms = elapsed - pts_ms;
             if late_ms > 80 {
@@ -491,7 +524,7 @@ pub(super) async fn video_sync_loop<V: VideoSink, A: AudioSink>(
                 frame.native,
                 crate::decoders::PlatformFrame::MediaCodecDirect(_)
             ) {
-                DIRECT_RELEASE_LEAD_MS
+                stats.present_lead.lead_ms(std::time::Instant::now())
             } else {
                 RENDER_BUDGET_MS
             };
@@ -597,11 +630,52 @@ pub(super) async fn video_sync_loop<V: VideoSink, A: AudioSink>(
         // frame N"). Clamping keeps the buffer flowing through SF regardless of
         // any clock discontinuity; pacing still comes from the sleep above.
         let present_ns = present_ns.min(clock_monotonic_ns() + MAX_PRESENT_LEAD_NS);
-        // Interval between this frame's and the previous frame's present
-        // stamps, ms (the judder gauge below; None on the first frame).
-        let present_interval_ms = last_present.map(|(last_ns, _)| (present_ns - last_ns) / 1_000_000);
+        // Direct mode: snap onto the display's vsync grid (`snap_to_vsync`).
+        // `shown_ns` = the vsync the frame is meant for, `stamp_ns` = what
+        // SurfaceFlinger gets (mid-gap before that vsync). The smoother keeps
+        // working on the unsnapped time.
+        #[cfg(target_os = "android")]
+        let (stamp_ns, shown_ns) = {
+            let mut t = present_ns;
+            let skew = stats.present_lead.test_skew_ppm();
+            if skew != 0 {
+                let origin = *test_skew_origin.get_or_insert(t);
+                t += (t - origin) * skew / 1_000_000;
+            }
+            let direct = matches!(frame.native, crate::decoders::PlatformFrame::MediaCodecDirect(_));
+            // This frame's duration from the media delta to the previous one.
+            let frame_ns = last_present.map_or(0, |(_, last_pts_us)| (pts_us_rel - last_pts_us) * 1_000);
+            let grid = stats
+                .present_lead
+                .vsync_grid()
+                .filter(|(period, _)| direct && crate::present_lead::whole_vsync_cadence(frame_ns, *period));
+            stats.present_lead.set_snapping(grid.is_some());
+            match grid {
+                Some((period, anchor)) => {
+                    let (vsync, stamp) = crate::present_lead::snap_to_vsync_at(
+                        t,
+                        period,
+                        anchor,
+                        last_vsync,
+                        stats.present_lead.offset_percent(),
+                    );
+                    last_vsync = Some(vsync);
+                    (stamp, vsync)
+                }
+                None => {
+                    last_vsync = None;
+                    (t, t)
+                }
+            }
+        };
+        #[cfg(not(target_os = "android"))]
+        let (stamp_ns, shown_ns) = (present_ns, present_ns);
+        // Interval between this frame's and the previous frame's display
+        // times, ms (the judder gauge below; None on the first frame).
+        let present_interval_ms = last_shown_ns.map(|last_ns| (shown_ns - last_ns) / 1_000_000);
+        last_shown_ns = Some(shown_ns);
         last_present = Some((present_ns, pts_us_rel));
-        frame.desired_present_ns = present_ns;
+        frame.desired_present_ns = stamp_ns;
 
         // DIAG (#23): first few frames' pacing — tells us whether the direct
         // pipeline renders promptly (releasing codec buffers) or schedules
@@ -626,12 +700,20 @@ pub(super) async fn video_sync_loop<V: VideoSink, A: AudioSink>(
         // before that the wall clock advances while the device (and the
         // audio-mastered picture) hold, and the whole start delay would read
         // as a permanent "drift" even though lip-sync is exact.
+        // Android measures at the frame's present time, not the wake-up: the
+        // release lead (how early we wake) changes at run time — display
+        // timing after an AFR switch, the starvation cap — and every change
+        // used to read as a step in the drift.
+        #[cfg(target_os = "android")]
+        let drift_at = render_start + ((shown_ns - clock_monotonic_ns()).max(0) / 1_000_000) as u64;
+        #[cfg(not(target_os = "android"))]
+        let drift_at = render_start;
         if let Some(played) = audio_sink.played_ms() {
             match drift_baseline {
                 None if audio_sink.played_since_flush_ms().unwrap_or(1) == 0 => {}
-                None => drift_baseline = Some((render_start, played)),
+                None => drift_baseline = Some((drift_at, played)),
                 Some((e0, p0)) => {
-                    let d = render_start.saturating_sub(e0) as i64
+                    let d = drift_at.saturating_sub(e0) as i64
                         - played.saturating_sub(p0) as i64;
                     drift_min_window = drift_min_window.min(d);
                 }
@@ -721,6 +803,10 @@ pub(super) async fn video_sync_loop<V: VideoSink, A: AudioSink>(
 
         let frame_w = frame.width;
         let frame_h = frame.height;
+        #[cfg(target_os = "android")]
+        if matches!(frame.native, crate::decoders::PlatformFrame::MediaCodecDirect(_)) {
+            released_frames += 1;
+        }
         renderer.render_frame(frame).await;
         stats.diag_video_ren.fetch_add(1, Ordering::Relaxed);
         // One frame is now on screen — from here the pause gate parks.
@@ -841,6 +927,36 @@ pub(super) async fn video_sync_loop<V: VideoSink, A: AudioSink>(
             last_health_dropped = dropped_total;
             last_health_decoded = decoded_total;
             let drift = drift_out.unwrap_or(0);
+            // Direct mode: frames released vs reported rendered this second.
+            // Fewer rendered than released = SurfaceFlinger dropped frames
+            // (released too late for their vsync).
+            #[cfg(target_os = "android")]
+            {
+                let rendered = crate::decoders::mediacodec::rendered_frames();
+                let released_delta = released_frames.saturating_sub(last_rates.0);
+                let rendered_delta = match (rendered, last_rates.1) {
+                    (Some(now), Some(before)) => Some(now.saturating_sub(before)),
+                    _ => None,
+                };
+                last_rates = (released_frames, rendered);
+                if released_delta > 0 {
+                    stats.present_lead.set_rates(released_delta, rendered_delta);
+                    if let Some(shown) = rendered_delta {
+                        if shown + 1 < released_delta {
+                            let p = stats.present_lead.snapshot();
+                            log::warn!(
+                                "[vsync gen {}] SHOWN {}/{} frames/s (lead {} ms, deadline {:.1} ms, vsync {:.1} ms)",
+                                gen,
+                                shown,
+                                released_delta,
+                                p.lead_ms,
+                                p.deadline_ns as f64 / 1e6,
+                                p.vsync_ns as f64 / 1e6
+                            );
+                        }
+                    }
+                }
+            }
             if dropped_delta > 0 || drift.abs() > 80 || net_stall > 0 {
                 log::warn!(
                     "[vsync gen {}] HEALTH drops=+{}/s decoded={}/s drift={}ms net_stall={}ms res={}x{}",

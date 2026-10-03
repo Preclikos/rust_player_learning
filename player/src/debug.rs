@@ -233,6 +233,30 @@ pub struct DebugVideo {
     /// Render intervals, ms: [<25, 25–41, 42–58, >58].
     pub interval_hist: [u64; 4],
     pub pipeline: DebugPipeline,
+    /// Android direct mode: release lead and frames released vs shown.
+    pub present: Option<DebugPresent>,
+}
+
+/// How early frames are released to the display, and whether it shows them
+/// (Android direct mode, see `crate::present_lead`).
+#[derive(Clone, Serialize, Default)]
+pub struct DebugPresent {
+    /// Lead applied to the last frame, ms.
+    pub lead_ms: u64,
+    /// The display's lower bound (deadline + jitter + one vsync, ≥ 50 ms).
+    pub display_floor_ms: u64,
+    /// Cap after decoder starvation, ms; `None` = no cap.
+    pub cap_ms: Option<u64>,
+    pub deadline_ms: f64,
+    pub vsync_ms: f64,
+    pub app_vsync_offset_ms: f64,
+    pub decoder_starved: u64,
+    /// Frames released to the display in the last second.
+    pub released_per_s: u64,
+    /// Frames the codec reported shown in the last second (`None` below API 33).
+    pub shown_per_s: Option<u64>,
+    /// Release stamps snapped to the display's vsync grid.
+    pub vsync_snap: bool,
 }
 
 #[derive(Clone, Serialize, Default)]
@@ -358,6 +382,22 @@ impl DebugSnapshot {
                 v.interval_hist[2],
                 v.interval_hist[3]
             ),
+        ];
+        if let Some(p) = &v.present {
+            out.push(format!(
+                "V present lead {} ms (display {} ms{})  deadline {:.1} ms  vsync {:.1} ms{}  starved {}  shown/released {}/{} per s",
+                p.lead_ms,
+                p.display_floor_ms,
+                p.cap_ms.map(|c| format!(", cap {c} ms")).unwrap_or_default(),
+                p.deadline_ms,
+                p.vsync_ms,
+                if p.vsync_snap { " snapped" } else { "" },
+                p.decoder_starved,
+                p.shown_per_s.map(|n| n.to_string()).unwrap_or_else(|| "-".into()),
+                p.released_per_s
+            ));
+        }
+        out.extend([
             format!(
                 "A {} {}ch {} Hz{}  repr {}  underruns {}",
                 a.codec,
@@ -397,7 +437,7 @@ impl DebugSnapshot {
                 self.session.pipeline_retries,
                 self.session.audio_output_rebuilds
             ),
-        ];
+        ]);
         let skip = self.events.len().saturating_sub(events);
         for e in &self.events[skip..] {
             out.push(format!("{:>6.1}s {:>5} {:<8} {}", e.t_s, mmss(e.position_ms), e.kind, e.text));

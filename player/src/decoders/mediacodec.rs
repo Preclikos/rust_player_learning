@@ -132,6 +132,73 @@ pub struct SharedDirectCodec {
     /// switching thread performs it right after the switch. Both sides go
     /// through this mutex, so a release can never be left behind.
     deferred: std::sync::Mutex<(bool, Vec<(usize, Option<i64>)>)>,
+    /// Since when (`uptime_ms`) the codec has been refusing input; 0 = it
+    /// takes input. With no decoded frame waiting, a refusal means every
+    /// output buffer is out (queued in SurfaceFlinger or held by us): the
+    /// release lead is starving the decoder (see `crate::present_lead`).
+    input_blocked_since_ms: std::sync::atomic::AtomicU64,
+}
+
+/// Monotonic ms since the first call, offset by 1 so 0 can mean "unset".
+fn uptime_ms() -> u64 {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    EPOCH.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64 + 1
+}
+
+/// Frames the direct codecs reported rendered on the display
+/// (`AMediaCodec_setOnFrameRenderedCallback`, API 33+): the frames the
+/// viewer actually got, against the ones released. Monotonic across codecs.
+static RENDERED_FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Whether a rendered callback is registered on the current codec.
+static RENDERED_CALLBACK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Frames reported rendered so far, or `None` without a rendered callback
+/// (API < 33, or the codec refused it).
+pub fn rendered_frames() -> Option<u64> {
+    RENDERED_CALLBACK
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .then(|| RENDERED_FRAMES.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+unsafe extern "C" fn on_frame_rendered(
+    _codec: *mut ndk_sys::AMediaCodec,
+    _userdata: *mut std::ffi::c_void,
+    _media_time_us: i64,
+    _system_nano: i64,
+) {
+    RENDERED_FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Count rendered frames of `codec` (API 33+, resolved at runtime: minSdk is
+/// below it). Batched and informational per the API, which is all a
+/// per-second rate needs.
+unsafe fn register_rendered_callback(codec: *mut ndk_sys::AMediaCodec) {
+    type SetFn = unsafe extern "C" fn(
+        *mut ndk_sys::AMediaCodec,
+        ndk_sys::AMediaCodecOnFrameRendered,
+        *mut std::ffi::c_void,
+    ) -> ndk_sys::media_status_t;
+    static SYM: std::sync::OnceLock<Option<SetFn>> = std::sync::OnceLock::new();
+    let f = SYM.get_or_init(|| {
+        let name = b"AMediaCodec_setOnFrameRenderedCallback ";
+        let mut sym = libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr() as *const _);
+        if sym.is_null() {
+            let lib = libc::dlopen(b"libmediandk.so ".as_ptr() as *const _, libc::RTLD_NOW);
+            if !lib.is_null() {
+                sym = libc::dlsym(lib, name.as_ptr() as *const _);
+            }
+        }
+        if sym.is_null() {
+            log::info!("[mc-direct] no AMediaCodec_setOnFrameRenderedCallback (API < 33): rendered frames not counted");
+            None
+        } else {
+            Some(std::mem::transmute::<*mut libc::c_void, SetFn>(sym))
+        }
+    });
+    let ok = f.is_some_and(|set| {
+        set(codec, Some(on_frame_rendered), std::ptr::null_mut()) == ndk_sys::media_status_t::AMEDIA_OK
+    });
+    RENDERED_CALLBACK.store(ok, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// The direct codec currently bound to the video plane ([C2]: at most one at
@@ -388,6 +455,14 @@ impl DirectVideoFrame {
     pub fn render_at(&self, present_ns: i64) {
         if !self.released.swap(true, std::sync::atomic::Ordering::AcqRel) {
             self.codec.release_at(self.index, present_ns);
+        }
+    }
+
+    /// How long the codec has been refusing input, ms (0 = it takes input).
+    pub fn decoder_input_blocked_ms(&self) -> u64 {
+        match self.codec.input_blocked_since_ms.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => 0,
+            since => uptime_ms().saturating_sub(since),
         }
     }
 }
@@ -768,7 +843,9 @@ impl MediaCodecDecoder {
                 size: (params.width as i32, params.height as i32),
                 placeholder: std::sync::Mutex::new(None),
                 deferred: std::sync::Mutex::new((false, Vec::new())),
+                input_blocked_since_ms: std::sync::atomic::AtomicU64::new(0),
             }));
+            register_rendered_callback(codec);
             if let Some(d) = &self.direct {
                 *LIVE_DIRECT.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::downgrade(d));
             }
@@ -831,11 +908,20 @@ impl MediaCodecDecoder {
                         ndk_sys::AMediaCodec_dequeueInputBuffer(direct.raw, 0)
                     };
                     if idx >= 0 {
+                        direct.input_blocked_since_ms.store(0, std::sync::atomic::Ordering::Relaxed);
                         break idx as usize;
                     }
                     if idx != -1 {
                         // Anything but AMEDIACODEC_INFO_TRY_AGAIN_LATER (-1).
                         return Err(format!("dequeueInputBuffer(direct): {}", idx).into());
+                    }
+                    if retries == 0 {
+                        let _ = direct.input_blocked_since_ms.compare_exchange(
+                            0,
+                            uptime_ms(),
+                            std::sync::atomic::Ordering::Relaxed,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
                     }
                     retries += 1;
                     let waited_ms = waiting_since.elapsed().as_millis() as u64;

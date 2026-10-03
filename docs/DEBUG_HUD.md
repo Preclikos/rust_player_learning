@@ -37,6 +37,7 @@ V out MediaCodec direct -> video plane; overlay (subtitles): wgpu Gl  surface 19
 V buf 11.2s  seg #9 (14 done)  queue 2/2  last 12080 KiB in 179 ms / 6006 ms media
 V frames 642  drop 1  late 3  prepare 51 ms  boundary stalls 1 (last 316 ms)
 V render gap max 240 ms  judder 213  int <25 42  25-41 272  42-58 311  >58 16
+V present lead 78 ms (display 78 ms)  deadline 34.0 ms  vsync 41.7 ms snapped  starved 0  shown/released 24/24 per s
 A ec-3 6ch 48000 Hz  PASSTHROUGH  repr 7  underruns 0
 A out passthrough E-AC-3 48000 Hz 6 ch (enc 6)  written 902 AUs = 28.9s (2.6 MiB)  consumed 26.7s  played 26.7s  in device 2159 ms
 A buf 11.2s  seg #9 (7 done)  queue 2/2  last 566 KiB in 12 ms / 5990 ms media
@@ -58,6 +59,12 @@ session stalls 0 (0 ms)  pipeline retries 0  audio output rebuilds 0
   desktop / web: wgpu backend and surface), frames decoded / dropped / late,
   the last segment's join + decrypt + parse time, segment-boundary stalls,
   render gap, judder and the interval histogram.
+- **V present** (Android direct mode only): how early frames are released
+  (the display's deadline + one vsync, a cap after decoder starvation),
+  the display's deadline and vsync, `snapped` while release stamps sit on
+  the vsync grid, decoder-starvation events, and frames the codec reported
+  shown vs released in the last second (`-` below API 33). Fewer shown
+  than released = the display dropped frames.
 - **A**: representation, codec, channels, rate, passthrough, and the output's
   own line: Android PCM AudioTrack (written / presented / in track / dropped),
   passthrough AudioTrack (codec, AUs and bytes written, consumed, played, held

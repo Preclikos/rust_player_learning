@@ -118,6 +118,10 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         readScenarioExtras()
         // --ez verbose true: engine debug lines (audio clock internals etc.).
         if (intent.getBooleanExtra("verbose", false)) player.setVerboseLogging(true)
+        // A/B of the display-timed release lead: false = the old fixed 50 ms.
+        player.reportDisplayTiming = intent.getBooleanExtra("display_timing", true)
+        // A/B of vsync-grid snapping: false = stamps straight from the clock.
+        player.alignToVsync = intent.getBooleanExtra("vsync_align", true)
         // Make sure the app's external files dir exists, so the adb-written
         // overrides the bridge reads (audio_passthrough.txt, video_pref.txt, …)
         // can be created on a fresh install (shell cannot mkdir it on Android 11+).
@@ -671,6 +675,24 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                     startFraction = startFraction,
                     audioPassthrough = passthroughExtra,
                 )
+                // --ei test_deadline_ms N: pretend the display needs N ms (keeps
+                // its real vsync) — raises the release lead to exercise the
+                // decoder-starvation cap on a device whose display gives 50 ms.
+                if (intent.hasExtra("test_deadline_ms")) {
+                    val d = (getSystemService(DISPLAY_SERVICE) as android.hardware.display.DisplayManager)
+                        .getDisplay(android.view.Display.DEFAULT_DISPLAY)
+                    val vsyncNs = (1_000_000_000.0 / d.refreshRate).toLong()
+                    player.setDisplayTiming(vsyncNs, intent.getIntExtra("test_deadline_ms", 0) * 1_000_000L)
+                }
+                // --ei test_skew_ppm N: release stamps run N ppm fast, so the
+                // clock-vs-display drift crosses a vsync in seconds.
+                if (intent.hasExtra("test_skew_ppm")) {
+                    player.setTestPresentSkewPpm(intent.getIntExtra("test_skew_ppm", 0).toLong())
+                }
+                // --ei test_snap_offset_pct N: stamp N % of a vsync before it.
+                if (intent.hasExtra("test_snap_offset_pct")) {
+                    player.setTestPresentOffsetPercent(intent.getIntExtra("test_snap_offset_pct", 0).toLong())
+                }
                 // --ei buffer_max / buffer_min / buffer_mb / outage (docs/BUFFERING.md).
                 // --es abr_profile sdr|8bit|10bit|hdr: limit auto quality (e.g. keep
                 // ABR within the 8-bit rungs while exercising in-place codec reuse).

@@ -58,6 +58,10 @@ object NativeBridge {
     external fun nativeSetOverlayWindow(handle: Long, surface: Surface?)
     external fun nativeSetSubtitleSafeInsetBottom(handle: Long, bottomPx: Int)
     external fun nativeSetAdaptiveFrameRate(handle: Long, enabled: Boolean)
+    external fun nativeSetDisplayTiming(handle: Long, vsyncPeriodNs: Long, presentationDeadlineNs: Long, appVsyncOffsetNs: Long)
+    external fun nativeOnVsync(handle: Long, frameTimeNanos: Long)
+    external fun nativeSetTestPresentSkewPpm(handle: Long, ppm: Long)
+    external fun nativeSetTestPresentOffsetPercent(handle: Long, percent: Long)
     external fun nativeSetSubtitleStyle(handle: Long, textArgb: Int, outlineArgb: Int, sizeScale: Float)
     external fun nativeSetVerboseLogging(enabled: Boolean)
 }

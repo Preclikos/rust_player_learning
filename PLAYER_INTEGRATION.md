@@ -143,6 +143,20 @@ Host responsibilities in direct mode:
   black bar.
 - **Display HDR caps**: pass `Display.getHdrCapabilities` types as a
   bitmask (bit 0 = Dolby Vision, 1 = HDR10, 2 = HLG, 3 = HDR10+).
+- **Display timing** (since 0.1.60): the Kotlin `RustPlayer` reads the
+  default display's vsync period, presentation deadline and app vsync
+  offset itself (again on every refresh-rate switch) and samples the
+  vsync phase from `Choreographer` about once a second. Direct mode then
+  releases each frame the deadline plus one vsync ahead (at least 50 ms)
+  and, when a frame lasts a whole number of vsyncs (24p on 24 Hz, 25p on
+  50 Hz), stamps it in the middle between two hardware vsyncs. Without
+  that, the audio clock's drift against the display parked the stamps on
+  SurfaceFlinger's decision boundary for ~15 minutes every hour (frames
+  dropped and repeated: micro-stutter). Nothing to do for the host; Rust
+  hosts call `Player::set_display_timing` and `Player::on_display_vsync`.
+  `reportDisplayTiming = false` / `alignToVsync = false` turn it off;
+  `setDisplayTiming(...)` overrides the numbers (e.g. a non-default
+  display).
 - **Window lifetime**: both `ANativeWindow` refs must outlive the
   player; release them after dropping it.
 - **Home → back with the player kept alive** (since 0.1.40): the system

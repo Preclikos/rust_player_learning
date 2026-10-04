@@ -32,7 +32,7 @@ mod subtitle_style;
 mod tracks;
 mod utils;
 
-// Public re-exports so downstream consumers (BlackZone Console etc.) can
+// Public re-exports so downstream consumers (desktop hosts etc.) can
 // implement RequestInterceptor / LicenseResolver against the player's
 // canonical types — see PLAYER_INTEGRATION.md.
 pub use abr::{AbrStrategy, AbrVideoProfile};

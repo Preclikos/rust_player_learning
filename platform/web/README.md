@@ -21,8 +21,8 @@ main thread (no `SharedArrayBuffer` / atomics needed).
 ## Build & run
 
 ```powershell
-./build.ps1                 # dev build → www/pkg/
-./build.ps1 -Serve          # …and serve www/ on http://localhost:8080/
+./build.ps1                 # dev build → examples/web/pkg/
+./build.ps1 -Serve          # …and serve examples/web/ on http://localhost:8080/
 ./build.ps1 -Profile release
 ```
 

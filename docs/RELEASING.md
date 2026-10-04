@@ -1,9 +1,38 @@
 # Releasing
 
-One version line covers Android, iOS and web: a release of any platform is
-`max(all android-v*/ios-v*/web-v* tags on the remote) + 1`, and the three are
-tagged together at the same commit. Tags trigger the self-hosted publish
-workflows; nothing else needs bumping in the tree.
+One version line covers Android, iOS, web and desktop: a release of any
+platform is `max(all android-v*/ios-v*/web-v*/desktop-v* tags on the remote) + 1`,
+and they are tagged together at the same commit. Tags trigger the self-hosted
+publish workflows; nothing else needs bumping in the tree.
+
+`desktop-vX.Y.Z` has no publish job. Rust hosts (desktop apps) depend on the
+engine straight from git and pin the tag instead of a bare commit:
+
+```toml
+player = { git = "https://github.com/Preclikos/rust_dash_player.git", tag = "desktop-v0.2.0" }
+```
+
+## Migrating to 0.2.0
+
+0.2.0 is the first release after the repo rename (`rust_player_learning` →
+`rust_dash_player`) and the package rename. Consumers update:
+
+| Platform | Before | From 0.2.0 |
+|---|---|---|
+| Android (Maven) | `cz.preclikos:rustplayer` | `io.github.preclikos:rustplayer` |
+| Android (Kotlin) | `cz.preclikos.rustplayer.*` | `io.github.preclikos.rustplayer.*` |
+| Android (Maven repo) | `maven.pkg.github.com/Preclikos/rust_player_learning` | `maven.pkg.github.com/Preclikos/rust_dash_player` |
+| iOS (SwiftPM) | `…/rust_player_learning` | `…/rust_dash_player` (product `RustPlayer` unchanged) |
+| Web (npm) | `@preclikos/rustplayer` | unchanged |
+| Desktop (cargo) | `git = "…/rust_player_learning.git", rev = "…"` | `git = "…/rust_dash_player.git", tag = "desktop-v0.2.0"` |
+
+The JNI exports moved with the Kotlin package, so an app cannot mix a 0.1.x AAR
+with 0.2.0 Kotlin sources (or vice versa). GitHub redirects git and
+release-download URLs of the old repo name, so 0.1.x pins keep resolving;
+update Maven/SwiftPM URLs anyway, since the redirect breaks if the old name is
+ever reused. Release it with
+`scripts/release.sh --version 0.2.0 --wait-and-bump-ios` (a plain run would
+compute 0.1.61).
 
 ## The script
 
@@ -96,7 +125,7 @@ Setup, once:
    Firebase project, JSON key downloaded.
 2. `gh secret set FIREBASE_SERVICE_ACCOUNT < key.json`, then delete the file.
 3. `CRASHLYTICS_APP_IDS` lists the Firebase app IDs of the consuming apps
-   (currently the BlackZone rust mobile and TV apps).
+   (one ID per app that embeds the AAR).
 
 Without the secret the upload step fails the job after the AAR is published,
 so a release without symbols is visible. Releases before 0.1.38 had no

@@ -1,4 +1,4 @@
-# rust_player_learning — Onboarding Guide
+# rust_dash_player — Onboarding Guide
 
 A cross-platform encrypted DASH video player written in Rust.
 Targets: Windows, Linux, macOS, Android (armeabi-v7a + arm64-v8a + x86_64), iOS.
@@ -15,11 +15,16 @@ WebVTT subtitles, pipeline retry-with-resume, A/V drift measurement.
 | Crate | Path | Role |
 |---|---|---|
 | **player** | `player/` | Core library: DASH/MPD, decoders, renderers, DRM, events |
-| **app** | `app/` | Desktop shell (Windows / Linux / macOS) + stdin console (`abr on/off`, track switching) |
-| **app-shared** | `app-shared/` | Test fixture shared by all shells (stream URL, keys, track pick) |
-| **app-android** | `app-android/` | Android embed shell: host Activity + two SurfaceViews + JNI |
-| **app-ios** | `app-ios/` | iOS shell (UIView + CAMetalLayer; simulator build script) |
-| **app-web** | `app-web/` | experimental |
+| **bridge** | `bridge/` | Platform-agnostic bridge core + smoke-test fixture (`fixture.rs`: stream URL, keys, track pick) |
+| **bridge-android** | `platform/android/` | JNI shell → `librustplayer.so` → `:rustplayer` AAR |
+| **bridge-ios** | `platform/ios/` | C FFI shell → `RustPlayerFFI.xcframework` + SwiftPM package |
+| **bridge-web** | `platform/web/` | wasm-bindgen shell → `@preclikos/rustplayer` |
+| **example-desktop** | `examples/desktop/` | Desktop app (Windows / Linux / macOS) + stdin console (`abr on/off`, track switching) |
+| — | `examples/android/` | Android demo app: host Activity + two SurfaceViews |
+| — | `examples/ios/` | iOS simulator host |
+| — | `examples/web/` | Browser smoke-test page |
+
+Lessons learned live in `docs/PITFALLS.md`, open items in `docs/KNOWN_ISSUES.md`.
 
 ---
 
@@ -194,28 +199,27 @@ GLES; ES 3.0 only (no compute).
 
 ### Prerequisites
 - Rust targets: `aarch64-linux-android`, `armv7-linux-androideabi`, `x86_64-linux-android`
-- `cargo-ndk`; Android NDK per `ndkVersion` in `app-android/android/app/build.gradle`
+- `cargo-ndk`; Android NDK per `ndkVersion` in `platform/android/android/rustplayer/build.gradle.kts`
 - JDK 17+ (`JAVA_HOME = C:\Program Files\Android\Android Studio\jbr` works)
 
 ### Build + install (PowerShell)
 ```powershell
 # one-shot helper: build → install → launch → filtered logcat
-.\test_android.ps1            # add -Release for release profile
+.\examples\android\run.ps1   # add -Release for release profile
 
 # or manually:
-cargo ndk -t arm64-v8a -o app-android\android\app\src\main\jniLibs build -p app-android
-cd app-android\android; .\gradlew.bat assembleDebug   # builds ALL ABIs via cargo-ndk
-adb install -r app\build\outputs\apk\debug\app-debug.apk
+cd platform\android\android; .\gradlew.bat :app:assembleDebug   # builds ALL ABIs via cargo-ndk
+adb install -r ..\..\..\examples\android\build\outputs\apk\debug\app-debug.apk
 ```
 
 ### Useful logcat filter
 ```powershell
-adb logcat | Select-String 'app_android|app_shared|player::|stall|LATE|BACKWARD'
+adb logcat | Select-String 'rustplayer|bridge|player::|stall|LATE|BACKWARD'
 ```
 Tags are Rust module paths (truncated to 23 chars): `player::decoders::med..`,
-`player::renderers::vi..`, `player  ` (player.rs), `app_shared`, `app_android`.
+`player::renderers::vi..`, `player  ` (player.rs), `bridge`, `rustplayer`.
 
-### Test-shell knobs (files in `/sdcard/Android/data/cz.preclikos.rust_player/files/`)
+### Test-shell knobs (files in `/sdcard/Android/data/io.github.preclikos.rustplayer.demo/files/`)
 | File | Values | Meaning |
 |---|---|---|
 | `video_pref.txt` | `hdr` / `dv` / rep index | representation pick (default: index 5 = 720p SDR) |
@@ -231,7 +235,7 @@ Encrypted DASH stream used for development:
 https://preclikos.cz/examples/encrypted/manifest.mpd
 ```
 
-ClearKey keys live in `app-shared/src/lib.rs` (single source for all
+ClearKey keys live in `bridge/src/fixture.rs` (single source for all
 shells). Adaptation set 0 = HEVC ladder (480p–4K; ≤1080p truly SDR,
 1440p/4K are PQ **despite the MPD claiming BT.709** — the player trusts
 the SPS VUI, not the manifest). Adaptation set 1 = Dolby Vision profile

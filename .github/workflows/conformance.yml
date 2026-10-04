@@ -26,7 +26,7 @@ env:
 jobs:
   # TODO(runner): a Windows job belongs here (D3D11VA is the most-exercised
   # path), but the Windows runner (DESKTOP-4I19ED1) is currently registered
-  # only to the BlackZoneDesktop repo — register it to this repo too
+  # only to another repo — register it to this repo too
   # (actions-runner config.cmd with a token from Settings → Actions →
   # Runners → New self-hosted runner), then restore the job from git
   # history. Until then Windows coverage = local runs of the harness.
@@ -60,9 +60,9 @@ jobs:
       - name: Vendored FFmpeg (player toolchain)
         run: |
           set -e
-          PLAYER_DIR="$HOME/blackzone-player-ffmpeg"
+          PLAYER_DIR="$HOME/rust-dash-player-ffmpeg"
           if [ ! -d "$PLAYER_DIR/.git" ]; then
-            git clone --depth 1 https://github.com/Preclikos/rust_player_learning.git "$PLAYER_DIR"
+            git clone --depth 1 https://github.com/Preclikos/rust_dash_player.git "$PLAYER_DIR"
           fi
           (cd "$PLAYER_DIR" && bash player/scripts/build-ffmpeg.sh linux) || true
           PREFIX="$PLAYER_DIR/player/vendor/linux-x64"
@@ -129,9 +129,9 @@ jobs:
             arm64) ARCH=arm64 ;;
             *) ARCH=x64 ;;
           esac
-          PLAYER_DIR="$HOME/blackzone-player-ffmpeg"
+          PLAYER_DIR="$HOME/rust-dash-player-ffmpeg"
           if [ ! -d "$PLAYER_DIR/.git" ]; then
-            git clone --depth 1 https://github.com/Preclikos/rust_player_learning.git "$PLAYER_DIR"
+            git clone --depth 1 https://github.com/Preclikos/rust_dash_player.git "$PLAYER_DIR"
           fi
           (cd "$PLAYER_DIR" && bash player/scripts/build-ffmpeg.sh "macos-$ARCH") || true
           PREFIX="$PLAYER_DIR/player/vendor/macos-$ARCH"

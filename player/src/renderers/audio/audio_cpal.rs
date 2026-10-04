@@ -42,7 +42,7 @@ use crate::av_sync::{AudioChunk, ChunkCursor, FlushState};
 ///
 /// Returns `None` if the class/selector is unavailable or the value is absurd,
 /// in which case the caller falls back to cpal's reported rate. AVFoundation is
-/// linked by the iOS build (see app-ios/ios/build_sim.sh). Best read AFTER the
+/// linked by the iOS build (see examples/ios/build_sim.sh). Best read AFTER the
 /// host has configured + activated the session, else it may report a default.
 #[cfg(target_os = "ios")]
 fn ios_output_sample_rate() -> Option<u32> {

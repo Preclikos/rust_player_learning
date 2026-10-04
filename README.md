@@ -1,4 +1,4 @@
-# rust_player_learning
+# rust_dash_player
 
 Cross-platform encrypted DASH video player in Rust.
 Targets: Windows, Linux, macOS, Android, iOS.
@@ -29,8 +29,8 @@ non-exhaustive match arms didn't cover. The fix is to build a
 known-good FFmpeg locally with the script bundled in this repo, then
 point cargo at it.
 
-The same script also lives in `BlackZoneConsole/vendor/build-ffmpeg.sh`
-(release pipeline). Keep both in sync if you change codec / hwaccel
+Downstream hosts that ship their own FFmpeg build should mirror this script
+in their release pipeline. Keep both in sync if you change codec / hwaccel
 selection — this one is the canonical version since the requirements
 are dictated by what the player crate calls into.
 
@@ -202,8 +202,8 @@ packetised access units), so iOS builds need the FFmpeg setup like
 macOS does.
 
 - Android: `ONBOARDING.md` → "Android build" (quick) or
-  `app-android/android/README.md` (gradle details)
-- iOS: `app-ios/ios/build_sim.sh` for the simulator xcframework build
+  `platform/android/android/README.md` (gradle details)
+- iOS: `examples/ios/build_sim.sh` for the simulator xcframework build
 
 ## Releasing
 
@@ -219,9 +219,9 @@ the gate's rules and how to run conformance locally: `docs/RELEASING.md`.
 If we eventually need FFmpeg 8.x APIs in the player:
 
 1. Bump `FFMPEG_VERSION` in `player/scripts/build-ffmpeg.sh` (and in
-   the BlackZoneConsole mirror).
+   any downstream mirror).
 2. Bump `ffmpeg-next` / `ffmpeg-sys-next` versions in
-   `player/Cargo.toml` and `app/Cargo.toml`.
+   `player/Cargo.toml` and `examples/desktop/Cargo.toml`.
 3. Bump the version-band assertion in
    `player/tests/ffmpeg_smoke.rs::ffmpeg_version_is_in_7_x_series`.
 4. Sanity-check that `ffmpeg-next` for the new major exists on

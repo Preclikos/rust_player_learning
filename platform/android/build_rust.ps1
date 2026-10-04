@@ -1,6 +1,6 @@
 #!/usr/bin/env pwsh
-# Cross-compile the app-android cdylib for Android arm64 without going
-# through Gradle. Outputs into app-android/android/app/src/main/jniLibs/
+# Cross-compile the bridge-android cdylib for Android arm64 without going
+# through Gradle. Outputs into android/rustplayer/src/main/jniLibs/
 # where the APK build can pick it up later.
 #
 # Usage: ./build_rust.ps1 [release]

@@ -5,7 +5,7 @@ import org.gradle.api.tasks.Exec
 // a normal Gradle dependency (an AAR from GitHub Packages) and never compile
 // Rust / run cargo-ndk / install the NDK themselves.
 //
-//   implementation("cz.preclikos:rustplayer:<version>")
+//   implementation("io.github.preclikos:rustplayer:<version>")
 //
 // The `:app` module here is just a smoke-test host that consumes this library.
 
@@ -16,7 +16,7 @@ plugins {
 }
 
 android {
-    namespace = "cz.preclikos.rustplayer"
+    namespace = "io.github.preclikos.rustplayer"
     compileSdk = libs.versions.compileSdk.get().toInt()
     ndkVersion = libs.versions.ndk.get()
 
@@ -232,9 +232,9 @@ tasks.named("clean").configure {
 publishing {
     publications {
         register<MavenPublication>("release") {
-            groupId = "cz.preclikos"
+            groupId = "io.github.preclikos"
             artifactId = "rustplayer"
-            version = (project.findProperty("rustplayer.version") as String?) ?: "0.1.0"
+            version = (project.findProperty("rustplayer.version") as String?) ?: "0.2.0"
             afterEvaluate { from(components["release"]) }
 
         }
@@ -242,7 +242,7 @@ publishing {
     repositories {
         maven {
             name = "GitHubPackages"
-            url = uri("https://maven.pkg.github.com/Preclikos/rust_player_learning")
+            url = uri("https://maven.pkg.github.com/Preclikos/rust_dash_player")
             credentials {
                 username = (project.findProperty("gpr.user") as String?)
                     ?: System.getenv("GITHUB_ACTOR")

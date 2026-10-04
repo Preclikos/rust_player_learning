@@ -15,7 +15,7 @@ per switch, whether the player honoured its two contracts:
 
 Usage:
     adb logcat -c
-    adb shell am start -n cz.preclikos.rust_player/cz.preclikos.rustplayer.MainActivity \
+    adb shell am start -n io.github.preclikos.rustplayer.demo/io.github.preclikos.rustplayer.MainActivity \
         --es scenario abr_soft --ei iterations 5
     adb logcat -d -s rustplayer_trace > run.log
     python scripts/switchcheck.py run.log

@@ -96,7 +96,7 @@ D3D11VA / VAAPI / VideoToolbox and tonemaps in the player's wgpu shader
 
 ### 3.2 Android — embed model with TWO surfaces
 
-The reference shell is `app-android` (`MainActivity.kt` + `lib.rs`).
+The reference shell is `platform/android` + `examples/android` (`MainActivity.kt` + `lib.rs`).
 A real host replicates this shape:
 
 ```
@@ -241,10 +241,10 @@ uses direct mode on any display — the OS then tonemaps HDR / DV to SDR
 itself; `RUST_PLAYER_DIRECT_FAIL_AFTER=N` simulates a layer failure after
 N samples to exercise the failover.
 
-### 3.4 Reference bridge core (`app-shared`)
+### 3.4 Reference bridge core (`bridge`)
 
 The bundled Android/iOS shells don't each re-implement the embed glue.
-The platform-agnostic part lives once in **`app_shared::bridge`** — a
+The platform-agnostic part lives once in **`bridge::bridge`** — a
 thin, reusable layer over the player that a host binds to by:
 
 1. constructing a `Player` for its surface (§3.2 / §3.3),
@@ -266,8 +266,8 @@ shell forwards that JSON to a Kotlin `PlayerBridge.onEvent(String)` and
 wraps it in a `RustPlayer` listener; the iOS shell forwards it through a
 C `event_cb`. Provider policy is delegated to the host the same way on
 both: Android via a synchronous JNI upcall (`resolveKey([B)[B`), iOS via
-an async oneshot token bridge (`bz_intercept_complete` /
-`bz_resolve_key_complete`). This is deliberately the shape a future
+an async oneshot token bridge (`rustplayer_intercept_complete` /
+`rustplayer_resolve_key_complete`). This is deliberately the shape a future
 generated **player → ready-made Kotlin/Swift binding** would wrap.
 
 ## 4. Network injection
@@ -449,7 +449,7 @@ higher than ExoPlayer's" reports more than once.
 **Matching a specific ExoPlayer app.** ExoPlayer has two common layouts and
 the anchor selects between them: `PlayerView` mounts `SubtitleView` inside
 the `AspectRatioFrameLayout` → `anchor = Picture`; an app with a
-full-screen `SubtitleView` (BlackZone's build, measured 2026-09-26 on a
+full-screen `SubtitleView` (measured 2026-09-26 on a
 Google TV Streamer) → `anchor = Screen`, the default. With the right anchor
 and inset the residual against ExoPlayer is ~1 % of the surface height.
 To verify, park a cue on screen (pause), `adb exec-out screencap -p`, and
@@ -543,7 +543,7 @@ symbolicated native frames once its Firebase app ID is added to that variable.
 
 The original guarantees hold: `NoopInterceptor` default,
 `set_clearkey` pre-populates the key cache, `events()` always valid,
-and the bundled test shells (`app/`, `app-android/`, `app-ios/`) play
+and the bundled test shells (`examples/`) play
 `https://preclikos.cz/examples/encrypted/manifest.mpd` end-to-end with
 hardcoded keys. Additions since the original spec are strictly
 additive; the only signature-level changes were new optional fields on

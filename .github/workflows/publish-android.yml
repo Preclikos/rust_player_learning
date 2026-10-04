@@ -1,9 +1,9 @@
 # Build the release .so for all ABIs and publish the :rustplayer AAR to GitHub
-# Packages (cz.preclikos:rustplayer:<version>). Consumers then add it as a plain
+# Packages (io.github.preclikos:rustplayer:<version>). Consumers then add it as a plain
 # Gradle dependency — no NDK / cargo / Rust on their side.
 #
 # Runs on the self-hosted Linux runner ("makak"). JDK + Android SDK are
-# provisioned per-job via setup-java / setup-android (same as BlackZoneAndroid);
+# provisioned per-job via setup-java / setup-android;
 # the NDK + Rust toolchain are added on top for our cargo-ndk cdylib build.
 # Trigger: push a tag `android-v1.2.3`, or run manually with an explicit version.
 name: Publish Android AAR

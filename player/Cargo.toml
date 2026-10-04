@@ -1,6 +1,6 @@
 [package]
 name = "player"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [lib]
@@ -145,7 +145,7 @@ web-sys = { version = "0.3", features = [
 # let the proven ffmpeg AAC / AC-3 / EAC-3 decoders handle that side.
 #
 # iOS links a STATIC, audio-only FFmpeg built by player/scripts/build-ffmpeg.sh
-# (ios-arm64 / ios-sim-*); see app-ios/ios/build_sim.sh for the cross link wiring.
+# (ios-arm64 / ios-sim-*); see examples/ios/build_sim.sh for the cross link wiring.
 #
 # Not below 8.1: ffmpeg-sys-next 7.1.x ships a bindgen that breaks against
 # LLVM 22+ libclang (opaque struct shells with broken layout asserts under
@@ -190,7 +190,7 @@ objc2-metal = { version = "0.3.2", default-features = false, features = [
 
 # Android-only: MediaCodec via the ndk crate, JNI binding for Java interop,
 # and rustls so reqwest doesn't need a cross-compiled OpenSSL. (No winit — the
-# host Activity owns the Surface; see app-android.)
+# host Activity owns the Surface; see platform/android.)
 [target.'cfg(target_os = "android")'.dependencies]
 # CENC decrypt fallback with a hardware AES backend for 32-bit ARM.
 #

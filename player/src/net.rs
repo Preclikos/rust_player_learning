@@ -54,7 +54,7 @@ pub struct PreparedRequest {
 
 /// Implemented by downstream consumers to add auth headers, rewrite
 /// pseudo‑URI segment URLs, transform license bodies, etc. The player
-/// crate itself ships only `NoopInterceptor` so the `app/` example
+/// crate itself ships only `NoopInterceptor` so the `examples/desktop` app
 /// keeps working without any consumer code.
 #[async_trait]
 pub trait RequestInterceptor: Send + Sync + 'static {

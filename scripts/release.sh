@@ -3,28 +3,29 @@
 # keeps forgetting. Runs anywhere with bash + git + gh (+ python3 for the
 # conformance gate): Git Bash on Windows, macOS, Linux.
 #
-#   scripts/release.sh [--version X.Y.Z] [--platforms android,ios,web]
+#   scripts/release.sh [--version X.Y.Z] [--platforms android,ios,web,desktop]
 #                      [--skip-conformance-check] [--wait-and-bump-ios]
 #                      [--dry-run] [--repo owner/name]
 #
-# One version line covers android/ios/web: the next release is max(all
+# One version line covers android/ios/web/desktop: the next release is max(all
 # *-v* tags on the REMOTE) + 1, never a remembered number. The script
 #   1. refuses a dirty tree or a HEAD that is not on origin/master;
 #   2. reads the remote tags and computes the next version (or takes --version);
 #   3. requires a green conformance run covering HEAD
 #      (scripts/conformance/require-green.sh) unless --skip-conformance-check;
-#   4. tags android-vX / ios-vX / web-vX at HEAD and pushes the tags;
+#   4. tags android-vX / ios-vX / web-vX / desktop-vX at HEAD and pushes them
+#      (desktop-vX has no publish job: Rust hosts pin it as a cargo git `tag`);
 #   5. with --wait-and-bump-ios, waits for the iOS publish run, reads the
 #      xcframework checksum from the GitHub release and commits the
 #      Package.swift pin — the step that was missed by hand four times.
 set -euo pipefail
 
 VERSION=""
-PLATFORMS="android,ios,web"
+PLATFORMS="android,ios,web,desktop"
 SKIP_CONFORMANCE=0
 WAIT_IOS=0
 DRY_RUN=0
-REPO="Preclikos/rust_player_learning"
+REPO="Preclikos/rust_dash_player"
 while [ $# -gt 0 ]; do
   case "$1" in
     --version) VERSION="$2"; shift 2 ;;
@@ -33,7 +34,7 @@ while [ $# -gt 0 ]; do
     --wait-and-bump-ios) WAIT_IOS=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
     --repo) REPO="$2"; shift 2 ;;
-    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,21p' "$0"; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
 done
@@ -59,7 +60,7 @@ if ! git merge-base --is-ancestor "$HEAD_SHA" FETCH_HEAD; then
 fi
 
 # 2. next version from the REMOTE tags
-MAX=$(g ls-remote --tags "$REMOTE" | tr -d '\r' | grep -oE 'refs/tags/(android|ios|web)-v[0-9]+\.[0-9]+\.[0-9]+$' | sed 's/.*-v//' | sort -V | tail -1)
+MAX=$(g ls-remote --tags "$REMOTE" | tr -d '\r' | grep -oE 'refs/tags/(android|ios|web|desktop)-v[0-9]+\.[0-9]+\.[0-9]+$' | sed 's/.*-v//' | sort -V | tail -1)
 MAX=${MAX:-0.0.0}
 if [ -z "$VERSION" ]; then
   IFS=. read -r a b c <<<"$MAX"

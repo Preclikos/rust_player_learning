@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build FFmpeg 7.1.1 from source with the minimal config the player
-# crate relies on. Mirrors BlackZoneConsole/vendor/build-ffmpeg.sh —
+# crate relies on. Hosts that ship their own FFmpeg should mirror it —
 # keep both in sync if you tweak codec / hwaccel selection.
 #
 # What the player actually uses (grep ffmpeg_audio.rs / ffmpeg_hw.rs):

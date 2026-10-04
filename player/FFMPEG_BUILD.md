@@ -8,13 +8,13 @@ non-exhaustive enum break when Linux CI's system FFmpeg jumped past
 ffmpeg-next's match arms.
 
 To avoid that, build a known-good FFmpeg locally with the same minimal
-config the BlackZone Console release pipeline ships. The smoke tests
+config a desktop host release pipeline ships. The smoke tests
 in `player/tests/ffmpeg_smoke.rs` then verify that build still contains
 everything the player calls into — so regressions are caught here, not
 two repos downstream during a release.
 
-The script at `player/scripts/build-ffmpeg.sh` mirrors
-`BlackZoneConsole/vendor/build-ffmpeg.sh`. Keep them in sync if you
+Downstream hosts that build their own FFmpeg should mirror
+`player/scripts/build-ffmpeg.sh`. Keep them in sync if you
 change codec or hwaccel selection.
 
 ## What the player needs from FFmpeg

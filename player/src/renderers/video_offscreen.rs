@@ -65,7 +65,7 @@ impl OffscreenTarget {
         (0..RING)
             .map(|_| {
                 device.create_texture(&wgpu::TextureDescriptor {
-                    label: Some("blackzone offscreen video"),
+                    label: Some("offscreen video"),
                     size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
                     mip_level_count: 1,
                     sample_count: 1,

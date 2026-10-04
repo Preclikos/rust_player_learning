@@ -12,7 +12,7 @@
 # REQUIRES macOS + full Xcode.app. NOT runnable on Windows/Linux — this is the
 # one Phase-1 piece that must be verified on a Mac (see the Phase-1 handoff).
 #
-# Usage:  app-ios/packaging/scripts/build_xcframework.sh
+# Usage:  platform/ios/packaging/scripts/build_xcframework.sh
 
 set -euo pipefail
 
@@ -30,7 +30,7 @@ xcode-select -p | grep -q "Xcode.app" || {
 
 mkdir -p "$OUT_DIR"
 
-# Build one slice: cross-build FFmpeg + the app-ios staticlib, then merge them
+# Build one slice: cross-build FFmpeg + the bridge-ios staticlib, then merge them
 # (an xcframework slice holds exactly ONE library) into one fat .a.
 #   $1 rust target   $2 ffmpeg platform   $3 sdk   $4 arch   $5 min-version flag
 build_lib() {
@@ -43,7 +43,7 @@ build_lib() {
     echo "==> [$rust_target] FFmpeg ($ff_platform)" >&2
     bash "$REPO_ROOT/player/scripts/build-ffmpeg.sh" "$ff_platform" >&2
 
-    echo "==> [$rust_target] cargo build -p app-ios --release" >&2
+    echo "==> [$rust_target] cargo build -p bridge-ios --release" >&2
     rustup target add "$rust_target" >/dev/null 2>&1
     # IPHONEOS_DEPLOYMENT_TARGET is what rustc/clang stamp the platform
     # min-version load command from — for BOTH device and simulator targets.

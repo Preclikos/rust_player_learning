@@ -12,7 +12,7 @@ RustPlayer` and never compile Rust / build FFmpeg.
 ## Build the binary (macOS, once per release)
 
 ```sh
-app-ios/packaging/scripts/build_xcframework.sh
+platform/ios/packaging/scripts/build_xcframework.sh
 ```
 
 Produces `RustPlayerFFI.xcframework` (device + simulator slices: Rust player +
@@ -41,4 +41,4 @@ player.seek(toMs: 30_000)
 ```
 
 The API mirrors the Android `RustPlayer` (Kotlin) and the unified
-`app_shared::bridge` event/JSON contract.
+`bridge::bridge` event/JSON contract.

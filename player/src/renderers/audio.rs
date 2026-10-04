@@ -102,7 +102,7 @@ pub struct AudioRenderer {
     /// (av_sync anchor gate / starvation gates / seek re-parks) arrive through
     /// the `AudioSink` TRAIT from generic code and only park the TRACK: halting
     /// consumption there risks backing the pipeline up into its startup convoy
-    /// (see docs/handoffs/AUDIO_PAUSE_WEDGE_AND_STARTUP_CONVOY.md).
+    /// (see docs/PITFALLS.md).
     #[cfg(target_os = "android")]
     host_paused: Arc<AtomicBool>,
 }

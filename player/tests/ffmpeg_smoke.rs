@@ -5,7 +5,7 @@
 //! var setup) so the test exercises that exact build.
 //!
 //! The point is to catch missing FFmpeg features here, not two repos
-//! downstream during a BlackZone Console release.
+//! downstream during a host release.
 
 #![cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
 

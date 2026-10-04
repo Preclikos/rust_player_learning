@@ -14,7 +14,7 @@
 set -euo pipefail
 
 SHA="${1:?usage: require-green.sh <sha>}"
-REPO="${GITHUB_REPOSITORY:-Preclikos/rust_player_learning}"
+REPO="${GITHUB_REPOSITORY:-Preclikos/rust_dash_player}"
 API="https://api.github.com/repos/${REPO}"
 AUTH="Authorization: Bearer ${GH_TOKEN:?GH_TOKEN is required}"
 

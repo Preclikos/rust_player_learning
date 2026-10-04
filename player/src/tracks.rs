@@ -21,7 +21,7 @@ use std::error::Error;
 use std::time::Duration;
 
 /// prepare() network fan-out bounds. Every representation needs one sidx
-/// range GET (and, behind a link-resolving interceptor like BlackZone's,
+/// range GET (and, behind a link-resolving interceptor,
 /// one CDN-resolution round trip in front of it). Doing them one at a time
 /// made prepare() cost ~2×N_reps serial round trips — the dominant share
 /// of time-to-first-frame on real manifests. Representations within an

@@ -137,7 +137,7 @@ fn parse_args() -> Args {
     a
 }
 
-/// Headless wgpu device — mirror of the BlackZone desktop host's shared-GPU
+/// Headless wgpu device — mirror of a desktop host's shared-GPU
 /// init (the player fork's wgpu carries non-upstream fields, so every field
 /// is spelled out).
 async fn headless_gpu() -> (wgpu::Device, wgpu::Queue, wgpu::Backend) {

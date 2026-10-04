@@ -1,6 +1,6 @@
 //! Platform-agnostic **bridge core**.
 //!
-//! The Android (`app-android`) and iOS (`app-ios`) shells used to each carry
+//! The Android (`platform/android`) and iOS (`platform/ios`) shells used to each carry
 //! their own copy of the open_url → prepare → pick-tracks → play() dance plus
 //! event forwarding. This module hoists all of that platform-agnostic logic
 //! into one place so the two thin shells stay in lock-step and so the shape is
@@ -12,7 +12,7 @@
 //!      provider policy — auth/URL-rewrite + DRM key resolution),
 //!   3. call [`start`] and drive the returned [`BridgeHandle`].
 //!
-//! The provider hooks (`intercept` / `resolve_key`) carry NO BlackZone-specific
+//! The provider hooks (`intercept` / `resolve_key`) carry NO product-specific
 //! logic here — the test shells implement them trivially (passthrough + baked
 //! ClearKeys). A product app implements real auth/license there. The player
 //! crate stays provider-agnostic exactly as before.
@@ -25,7 +25,7 @@ use async_trait::async_trait;
 use tokio::sync::{broadcast, mpsc, Notify};
 
 // Provider-facing types re-exported so a shell implements `BridgeHost` against
-// a single import path (`app_shared::bridge::{BoxError, PreparedRequest, …}`).
+// a single import path (`bridge::bridge::{BoxError, PreparedRequest, …}`).
 pub use player::{BoxError, PreparedRequest, RequestKind};
 
 use player::{
@@ -135,7 +135,7 @@ enum Cmd {
 
 /// Pre-`play()` configuration for [`start`]. `Default` reproduces the
 /// self-contained test-shell behaviour (file-flag audio passthrough,
-/// auto-select the first subtitle, no resume), so `app-android` / `app-ios`
+/// auto-select the first subtitle, no resume), so `platform/android` / `platform/ios`
 /// pass `StartConfig::default()` and are unchanged. A product host overrides
 /// these to drive resume, a real sink-gated passthrough decision, and its own
 /// (post-play) subtitle selection.
@@ -168,7 +168,7 @@ pub struct StartConfig {
     /// is not yet live. This is the rebuild-free way to honour a saved
     /// audio-language preference: picking it here means `play()` starts on the
     /// right track, with NO post-start `selectAudio()` (which would
-    /// `seek(position())`-rebuild on top of a resume — the BlackZone startup
+    /// `seek(position())`-rebuild on top of a resume — the classic startup
     /// stall). `None` keeps the codec-default pick. No match → codec default.
     pub preferred_audio_language: Option<String>,
     /// Preferred subtitle language (BCP-47) applied during default selection.

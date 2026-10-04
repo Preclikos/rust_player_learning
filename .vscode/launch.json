@@ -5,13 +5,13 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "Debug executable 'app'",
+      "name": "Debug example-desktop",
       "type": "lldb",
       "request": "launch",
       "args": [],
       "cwd": "${workspaceFolder}",
       "cargo": {
-        "args": ["build", "--bin=app", "--package=app"],
+        "args": ["build", "--bin=example-desktop", "--package=example-desktop"],
         "filter": {
           "kind": "bin"
         }

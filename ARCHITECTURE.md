@@ -14,7 +14,10 @@ platform/
   web/               PLATFORM — wasm-bindgen shell → rustplayer.js + rustplayer_bg.wasm
 examples/
   desktop/           EXAMPLE  — winit desktop app (reference consumer / smoke test)
-docs/handoffs/       working notes between sessions / integration
+  android/           EXAMPLE  — demo app (Gradle :app, built against the local :rustplayer)
+  ios/               EXAMPLE  — Obj-C simulator host (build_sim.sh)
+  web/               EXAMPLE  — smoke-test page (serves pkg/ from platform/web/build.ps1)
+docs/                guides, PITFALLS.md (lessons learned), KNOWN_ISSUES.md
 .github/workflows/   CI       — build + publish the AAR / XCFramework
 ```
 
@@ -50,20 +53,20 @@ app-specific concepts inside.
 
 - **`platform/android/`** — crate `bridge-android` (cdylib → `librustplayer.so`,
   `System.loadLibrary("rustplayer")`). JNI symbols
-  `Java_cz_preclikos_rustplayer_NativeBridge_*`. Inside `android/` is the Gradle
+  `Java_io_github_preclikos_rustplayer_NativeBridge_*`. Inside `android/` is the Gradle
   project: the **`:rustplayer`** library module (Kotlin `RustPlayer` /
   `RustPlayerProvider` API + the `.so`, published as the **AAR** to GitHub
-  Packages) and the **`:app`** smoke-test consumer (`MainActivity`).
+  Packages). The `:app` demo module is wired in from `examples/android/`.
 - **`platform/ios/`** — crate `bridge-ios` (staticlib → `librustplayer.a`, C FFI
-  `bz_player_*`). Inside: `ios/` (an Obj-C smoke-test host) and `packaging/` (the
+  `rustplayer_*`). Inside: `packaging/` (the
   SwiftPM **`RustPlayer`** package wrapping `RustPlayerFFI.xcframework`).
 - **`platform/web/`** — crate `bridge-web` (cdylib → `rustplayer_bg.wasm` +
   wasm-bindgen glue `rustplayer.js`, the JS class **`RustPlayer`**). The page owns
   a `<canvas>`; provider hooks are JS functions on a host object (`onEvent`,
-  `resolveKey`, optional `intercept`), awaited as promises. `www/` is the
-  smoke-test page. See `platform/web/README.md`.
+  `resolveKey`, optional `intercept`), awaited as promises. The smoke-test page is
+  `examples/web/`. See `platform/web/README.md`.
 
-A consuming app adds the AAR (`implementation("cz.preclikos:rustplayer:…")`),
+A consuming app adds the AAR (`implementation("io.github.preclikos:rustplayer:…")`),
 the SwiftPM package or the wasm-pack `pkg/` — **and compiles no Rust**.
 
 ## 4. `examples/` — reference consumers
@@ -71,6 +74,15 @@ the SwiftPM package or the wasm-pack `pkg/` — **and compiles no Rust**.
 - **`examples/desktop/`** — crate `example-desktop`: a winit app that plays the
   bundled test stream + a stdin track-control console. The desktop way to run
   the engine end to end.
+- **`examples/android/`** — the demo app (`MainActivity`, two SurfaceViews,
+  diagnostic intent extras). Gradle module `:app` of the
+  `platform/android/android` build; `run.ps1` builds, installs and tails logcat.
+- **`examples/ios/`** — Obj-C simulator host; `build_sim.sh` links `bridge-ios`
+  and launches it in the simulator.
+- **`examples/web/`** — `index.html` driving the wasm `RustPlayer`.
+
+All examples share the smoke-test fixture in `bridge/src/fixture.rs` (stream
+URL, ClearKeys, track pick).
 
 ## Build & distribution
 
@@ -80,7 +92,7 @@ the SwiftPM package or the wasm-pack `pkg/` — **and compiles no Rust**.
   off-target). The engine never names an executor directly: `player::rt` is
   Tokio on native and wasm-bindgen-futures + `setTimeout` in the browser (the
   engine's `tokio::sync` channels and `select!` are runtime-agnostic and shared).
-- Web: `platform/web/build.ps1` (wasm-pack → `platform/web/www/pkg/`);
+- Web: `platform/web/build.ps1` (wasm-pack → `examples/web/pkg/`);
   `.github/workflows/publish-web.yml` publishes `@preclikos/rustplayer` to GitHub
   Packages (npm) on a `web-vX.Y.Z` tag (version from the tag, like the others);
   `cargo check
@@ -91,24 +103,25 @@ the SwiftPM package or the wasm-pack `pkg/` — **and compiles no Rust**.
   `CpuPlanes` frame path in `renderers/video.rs`.
 - Android: `cargo ndk` cross-compiles `bridge-android` → the `:rustplayer`
   module's `jniLibs`; Gradle bundles the AAR. `.github/workflows/publish-android.yml`
-  publishes it. Local device run: `test_android.ps1`.
+  publishes it. Local device run: `examples/android/run.ps1`.
 - iOS (macOS only): `platform/ios/packaging/scripts/build_xcframework.sh` builds
   `bridge-ios` + FFmpeg into `RustPlayerFFI.xcframework`;
   `.github/workflows/publish-ios.yml` attaches it to a release. Simulator run:
-  `platform/ios/ios/build_sim.sh`.
+  `examples/ios/build_sim.sh`.
 
 ## Versioning across platforms
 
-One version line for all three shells, and the number means **the engine
+One version line for all platforms, and the number means **the engine
 state**, not a per-platform counter:
 
-- A release of ANY platform takes `max(all android-v*/ios-v*/web-v* tags) + 1`
+- A release of ANY platform takes `max(all android-v*/ios-v*/web-v*/desktop-v* tags) + 1`
   (patch bump; minor/major when the engine API changes).
 - A platform with no changes is simply not re-released and keeps its last
   number. The same number on two platforms is the same engine commit.
 - The version comes from the tag, nothing is bumped in a file
   (`android-v0.1.24` → AAR 0.1.24, `ios-v0.1.24` → SwiftPM 0.1.24,
-  `web-v0.1.24` → `@preclikos/rustplayer@0.1.24`).
+  `web-v0.1.24` → `@preclikos/rustplayer@0.1.24`, `desktop-v0.1.24` → the
+  cargo git `tag` desktop hosts pin; see `docs/RELEASING.md`).
 
 Check the current maximum before tagging: `git tag -l '*-v*' | sed 's/.*-v//' | sort -V | tail -1`.
 
@@ -118,4 +131,4 @@ Check the current maximum before tagging: `git tag -l '*-v*' | sed 's/.*-v//' | 
   `bridge-android` / `bridge-ios` / `bridge-web` (platform shells), `example-desktop`.
 - The shipped native lib is **`librustplayer`** on both platforms; the Android
   library module / Maven artifact is **`rustplayer`**.
-- Kotlin/Swift packages live under `cz.preclikos.rustplayer` / `RustPlayer`.
+- Kotlin/Swift packages live under `io.github.preclikos.rustplayer` / `RustPlayer`.

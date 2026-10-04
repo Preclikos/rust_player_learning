@@ -1,6 +1,6 @@
 //! Sets FFmpeg's libav* verbosity threshold and — on Linux — routes
 //! the messages through Rust's `log` crate so downstream binaries
-//! (Blackzone Console etc.) can subscribe without depending on
+//! (desktop hosts etc.) can subscribe without depending on
 //! ffmpeg-sys-next directly.
 //!
 //! Public surface: `LogLevel` + `set_log_level(...)`. Re-exported at

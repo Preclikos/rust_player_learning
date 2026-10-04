@@ -25,7 +25,11 @@ platform/android/android/rustplayer/src/main/jniLibs/
 platform/android/src/main/jniLibs/
 
 # iOS Simulator build output (RustPlayer.app bundle assembled by build_sim.sh)
-app-ios/ios/build/
+examples/ios/build/
+
+# wasm-pack output (platform/web/build.ps1 → examples/web/pkg, CI → platform/web/pkg)
+examples/web/pkg/
+platform/web/pkg/
 
 # firebase crashlytics:symbols:upload tool cache (dump_syms)
 .crashlytics/

@@ -12,7 +12,7 @@
 //! `host.intercept(url, kind) → {url?, headers?}`. (The demo page completes
 //! them synchronously — passthrough + the baked test ClearKeys.)
 //!
-//!   * Build with `./build.ps1` (wasm-pack → `www/pkg/`), serve `www/`.
+//!   * Build with `./build.ps1` (wasm-pack → `examples/web/pkg/`), serve `examples/web/`.
 //!
 //! On non-wasm targets this crate is a no-op so the workspace still builds.
 

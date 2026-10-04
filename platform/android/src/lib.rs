@@ -6,7 +6,7 @@
 // app-specific concepts (auth, CDN, DRM endpoints) live here — those go in the
 // host's provider hooks (`onRequest` / `resolveKey`), invisible to the player.
 //
-// JNI symbols: Java_cz_preclikos_rustplayer_NativeBridge_*. The idiomatic API
+// JNI symbols: Java_io_github_preclikos_rustplayer_NativeBridge_*. The idiomatic API
 // is the Kotlin `RustPlayer` wrapper; the `:app` smoke test is just one consumer.
 
 #![cfg(target_os = "android")]
@@ -87,7 +87,7 @@ impl BridgeHost for AndroidHost {
         // inline they block every runtime worker at once, the timer driver
         // included, and the whole pipeline (vsync pacing, audio feed, all
         // watchdogs) freezes into the ~1 fps startup convoy documented in
-        // docs/handoffs/AUDIO_PAUSE_WEDGE_AND_STARTUP_CONVOY.md.
+        // docs/PITFALLS.md.
         let cb = self.cb.clone();
         tokio::task::spawn_blocking(move || -> Result<PreparedRequest, BoxError> {
             vm_from_ndk_context().attach_current_thread(|env| -> Result<PreparedRequest, BoxError> {
@@ -178,7 +178,7 @@ fn vm_from_ndk_context() -> JavaVM {
 /// workers are held, the reactive tasks (vsync pacing, audio_sync, av_sync,
 /// every timer) stop being polled entirely and playback freezes at ~1 fps with
 /// the process idle. Observed as a ~40% startup race on the Google TV Streamer
-/// (see docs/handoffs/AUDIO_PAUSE_WEDGE_AND_STARTUP_CONVOY.md). The floor keeps
+/// (see docs/PITFALLS.md). The floor keeps
 /// headroom so the chronically-blocking polls can never exhaust the pool; the
 /// long-term fix is moving those dequeue loops onto `spawn_blocking`.
 fn runtime() -> &'static tokio::runtime::Runtime {
@@ -291,7 +291,7 @@ unsafe fn handle_ref<'a>(handle: jlong) -> Option<&'a Handle> {
 /// starts `manifestUrl`. `startFraction` < 0 = no resume; `audioPassthrough`
 /// -1 = library default, 0/1 = off/on. Returns an opaque handle or 0.
 #[no_mangle]
-pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeStart<'local>(
+pub extern "system" fn Java_io_github_preclikos_rustplayer_NativeBridge_nativeStart<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
     context: JObject<'local>,
@@ -433,7 +433,7 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeStart<'lo
 }
 
 #[no_mangle]
-pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetSize(
+pub extern "system" fn Java_io_github_preclikos_rustplayer_NativeBridge_nativeSetSize(
     _env: EnvUnowned,
     _class: JClass,
     handle: jlong,
@@ -450,7 +450,7 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetSize(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativePlay(
+pub extern "system" fn Java_io_github_preclikos_rustplayer_NativeBridge_nativePlay(
     _env: EnvUnowned,
     _class: JClass,
     handle: jlong,
@@ -464,7 +464,7 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativePlay(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativePause(
+pub extern "system" fn Java_io_github_preclikos_rustplayer_NativeBridge_nativePause(
     _env: EnvUnowned,
     _class: JClass,
     handle: jlong,
@@ -478,7 +478,7 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativePause(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeIsPaused(
+pub extern "system" fn Java_io_github_preclikos_rustplayer_NativeBridge_nativeIsPaused(
     _env: EnvUnowned,
     _class: JClass,
     handle: jlong,
@@ -489,7 +489,7 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeIsPaused(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSeekMs(
+pub extern "system" fn Java_io_github_preclikos_rustplayer_NativeBridge_nativeSeekMs(
     _env: EnvUnowned,
     _class: JClass,
     handle: jlong,
@@ -504,7 +504,7 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSeekMs(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativePositionMs(
+pub extern "system" fn Java_io_github_preclikos_rustplayer_NativeBridge_nativePositionMs(
     _env: EnvUnowned,
     _class: JClass,
     handle: jlong,
@@ -517,7 +517,7 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativePositionM
 }
 
 #[no_mangle]
-pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeDurationMs(
+pub extern "system" fn Java_io_github_preclikos_rustplayer_NativeBridge_nativeDurationMs(
     _env: EnvUnowned,
     _class: JClass,
     handle: jlong,
@@ -530,7 +530,7 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeDurationM
 }
 
 #[no_mangle]
-pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetVolume(
+pub extern "system" fn Java_io_github_preclikos_rustplayer_NativeBridge_nativeSetVolume(
     _env: EnvUnowned,
     _class: JClass,
     handle: jlong,
@@ -545,7 +545,7 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetVolume
 }
 
 #[no_mangle]
-pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeGetTracksJson<'local>(
+pub extern "system" fn Java_io_github_preclikos_rustplayer_NativeBridge_nativeGetTracksJson<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
     handle: jlong,
@@ -566,7 +566,7 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeGetTracks
 /// starts only once the manifest and init segments are in. A value <= 0 keeps
 /// that field's default; `minSecs` <= 0 means "fill continuously".
 #[no_mangle]
-pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetBufferConfig(
+pub extern "system" fn Java_io_github_preclikos_rustplayer_NativeBridge_nativeSetBufferConfig(
     _env: EnvUnowned,
     _class: JClass,
     handle: jlong,
@@ -590,7 +590,7 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetBuffer
 
 /// Debug HUD snapshot JSON (see `BridgeHandle::debug_json`), or `"{}"`.
 #[no_mangle]
-pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeDebugJson<'local>(
+pub extern "system" fn Java_io_github_preclikos_rustplayer_NativeBridge_nativeDebugJson<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
     handle: jlong,
@@ -608,7 +608,7 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeDebugJson
 
 /// Debug HUD text with the `events` newest event-log lines, or "".
 #[no_mangle]
-pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeDebugText<'local>(
+pub extern "system" fn Java_io_github_preclikos_rustplayer_NativeBridge_nativeDebugText<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
     handle: jlong,
@@ -626,7 +626,7 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeDebugText
 }
 
 #[no_mangle]
-pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetVideoTrack(
+pub extern "system" fn Java_io_github_preclikos_rustplayer_NativeBridge_nativeSetVideoTrack(
     _env: EnvUnowned,
     _class: JClass,
     handle: jlong,
@@ -646,7 +646,7 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetVideoT
 /// seamless path deterministically instead of having to provoke the bandwidth
 /// estimator into doing it.
 #[no_mangle]
-pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetVideoTrackSoft(
+pub extern "system" fn Java_io_github_preclikos_rustplayer_NativeBridge_nativeSetVideoTrackSoft(
     _env: EnvUnowned,
     _class: JClass,
     handle: jlong,
@@ -666,7 +666,7 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetVideoT
 /// (null/empty = scenario B). Call right after nativeStart. Returns false when
 /// the secret is malformed (key requests then fail with that reason).
 #[no_mangle]
-pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetWrappedLicence<'local>(
+pub extern "system" fn Java_io_github_preclikos_rustplayer_NativeBridge_nativeSetWrappedLicence<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
     handle: jlong,
@@ -694,7 +694,7 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetWrappe
 }
 
 #[no_mangle]
-pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetVideoAuto(
+pub extern "system" fn Java_io_github_preclikos_rustplayer_NativeBridge_nativeSetVideoAuto(
     _env: EnvUnowned,
     _class: JClass,
     handle: jlong,
@@ -711,7 +711,7 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetVideoA
 /// preferred) or anything else for the default (all). Takes effect from the
 /// next ABR decision.
 #[no_mangle]
-pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetAbrVideoProfile<'local>(
+pub extern "system" fn Java_io_github_preclikos_rustplayer_NativeBridge_nativeSetAbrVideoProfile<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
     handle: jlong,
@@ -733,7 +733,7 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetAbrVid
 }
 
 #[no_mangle]
-pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetAudioTrack(
+pub extern "system" fn Java_io_github_preclikos_rustplayer_NativeBridge_nativeSetAudioTrack(
     _env: EnvUnowned,
     _class: JClass,
     handle: jlong,
@@ -748,7 +748,7 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetAudioT
 }
 
 #[no_mangle]
-pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetSubtitleTrack(
+pub extern "system" fn Java_io_github_preclikos_rustplayer_NativeBridge_nativeSetSubtitleTrack(
     _env: EnvUnowned,
     _class: JClass,
     handle: jlong,
@@ -763,7 +763,7 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetSubtit
 }
 
 #[no_mangle]
-pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeClearSubtitles(
+pub extern "system" fn Java_io_github_preclikos_rustplayer_NativeBridge_nativeClearSubtitles(
     _env: EnvUnowned,
     _class: JClass,
     handle: jlong,
@@ -781,7 +781,7 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeClearSubt
 /// a surface swap / background→foreground; pass null to stop rendering to an
 /// abandoned window.
 #[no_mangle]
-pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetVideoOutputWindow(
+pub extern "system" fn Java_io_github_preclikos_rustplayer_NativeBridge_nativeSetVideoOutputWindow(
     env: EnvUnowned,
     _class: JClass,
     handle: jlong,
@@ -815,7 +815,7 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetVideoO
 /// renderer no longer touches the old window) and with the new Surface from
 /// `surfaceCreated`, e.g. after Home → back with the player kept alive.
 #[no_mangle]
-pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetOverlayWindow(
+pub extern "system" fn Java_io_github_preclikos_rustplayer_NativeBridge_nativeSetOverlayWindow(
     env: EnvUnowned,
     _class: JClass,
     handle: jlong,
@@ -846,7 +846,7 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetOverla
 }
 
 #[no_mangle]
-pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetSubtitleSafeInsetBottom(
+pub extern "system" fn Java_io_github_preclikos_rustplayer_NativeBridge_nativeSetSubtitleSafeInsetBottom(
     _env: EnvUnowned,
     _class: JClass,
     handle: jlong,
@@ -860,7 +860,7 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetSubtit
 }
 
 #[no_mangle]
-pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetAdaptiveFrameRate(
+pub extern "system" fn Java_io_github_preclikos_rustplayer_NativeBridge_nativeSetAdaptiveFrameRate(
     _env: EnvUnowned,
     _class: JClass,
     handle: jlong,
@@ -876,7 +876,7 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetAdapti
 /// Display vsync period, presentation deadline and app vsync offset (ns),
 /// from `android.view.Display`; sets the direct-mode release lead.
 #[no_mangle]
-pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetDisplayTiming(
+pub extern "system" fn Java_io_github_preclikos_rustplayer_NativeBridge_nativeSetDisplayTiming(
     _env: EnvUnowned,
     _class: JClass,
     handle: jlong,
@@ -896,7 +896,7 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetDispla
 /// A vsync timestamp (`Choreographer` frame time, ns): direct-mode release
 /// stamps snap onto the vsync grid.
 #[no_mangle]
-pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeOnVsync(
+pub extern "system" fn Java_io_github_preclikos_rustplayer_NativeBridge_nativeOnVsync(
     _env: EnvUnowned,
     _class: JClass,
     handle: jlong,
@@ -911,7 +911,7 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeOnVsync(
 
 /// Test only: skew direct-mode release stamps by `ppm` (fast vsync-drift repro).
 #[no_mangle]
-pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetTestPresentSkewPpm(
+pub extern "system" fn Java_io_github_preclikos_rustplayer_NativeBridge_nativeSetTestPresentSkewPpm(
     _env: EnvUnowned,
     _class: JClass,
     handle: jlong,
@@ -926,7 +926,7 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetTestPr
 
 /// Test only: release stamps `percent` of a vsync before their vsync.
 #[no_mangle]
-pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetTestPresentOffsetPercent(
+pub extern "system" fn Java_io_github_preclikos_rustplayer_NativeBridge_nativeSetTestPresentOffsetPercent(
     _env: EnvUnowned,
     _class: JClass,
     handle: jlong,
@@ -941,7 +941,7 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetTestPr
 
 /// ARGB ints (Android `Color`), like ExoPlayer `CaptionStyleCompat`.
 #[no_mangle]
-pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetSubtitleStyle(
+pub extern "system" fn Java_io_github_preclikos_rustplayer_NativeBridge_nativeSetSubtitleStyle(
     _env: EnvUnowned,
     _class: JClass,
     handle: jlong,
@@ -975,7 +975,7 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetSubtit
 
 /// Verbose logging toggle (default off → per-frame vsync/HEALTH spam gated).
 #[no_mangle]
-pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetVerboseLogging(
+pub extern "system" fn Java_io_github_preclikos_rustplayer_NativeBridge_nativeSetVerboseLogging(
     _env: EnvUnowned,
     _class: JClass,
     enabled: jboolean,
@@ -992,7 +992,7 @@ pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeSetVerbos
 
 /// `nativeDestroy(long)` — tear down and release the window refs.
 #[no_mangle]
-pub extern "system" fn Java_cz_preclikos_rustplayer_NativeBridge_nativeDestroy(
+pub extern "system" fn Java_io_github_preclikos_rustplayer_NativeBridge_nativeDestroy(
     _env: EnvUnowned,
     _class: JClass,
     handle: jlong,

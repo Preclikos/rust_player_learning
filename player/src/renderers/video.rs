@@ -783,8 +783,8 @@ impl VideoRenderer {
             .unwrap();
         // wgpu's default handler for an uncaptured error is panic!(), which
         // on Android aborts the whole app (SIGABRT) for what is often a
-        // recoverable presentation hiccup — a rotation once killed BlackZone
-        // mobile over one invalid Surface::configure. Log it and carry on;
+        // recoverable presentation hiccup — a rotation once killed a host app
+        // over one invalid Surface::configure. Log it and carry on;
         // the call sites that can act on a failure use error scopes.
         device.on_uncaptured_error(std::sync::Arc::new(|e: wgpu::Error| {
             log::error!("[renderer] wgpu error (continuing): {e}");

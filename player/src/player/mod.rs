@@ -2110,7 +2110,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         // play() loop re-reads the representation cells on (re)start, so the
         // new track is honored at startup WITHOUT a seek. This fires in the
         // wild because consumers apply a saved audio-language preference right
-        // after prepare() (e.g. BlackZone's applyLanguagePreference), i.e.
+        // after prepare() (a host's language-preference hook), i.e.
         // exactly between set_start_position() and the pipeline's first frame.
         if self.pipeline_live.load(Ordering::Relaxed) {
             *self.rebuild_reason.lock().unwrap() = BufferingReason::TrackSwitch;
@@ -2948,7 +2948,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
     /// subsequent `play()` would push samples into a closed channel,
     /// the cpal callback was no longer firing, and audio stayed silent
     /// forever. Consumers that drive multiple movies through a single
-    /// Player (BlackZone Console picks a movie, leaves the player
+    /// Player (a desktop host picks a movie, leaves the player
     /// screen via stop(), then picks another) hit this on movie #2.
     /// The cpal stream now stays alive across `stop()` and is only
     /// torn down when the AudioRenderer itself is dropped — i.e. when

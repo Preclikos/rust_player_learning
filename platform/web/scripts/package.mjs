@@ -9,7 +9,7 @@
 //   node scripts/package.mjs <pkg-dir> <version>
 //
 // Used by .github/workflows/publish-web.yml; runnable locally for a dry run:
-//   node scripts/package.mjs www/pkg 0.0.0-local && (cd www/pkg && npm pack --dry-run)
+//   node scripts/package.mjs ../../examples/web/pkg 0.0.0-local && (cd ../../examples/web/pkg && npm pack --dry-run)
 
 import { readFileSync, writeFileSync, copyFileSync, existsSync } from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
@@ -41,8 +41,8 @@ const out = {
   description:
     'DASH player engine (WebCodecs HEVC, WebGPU, Web Audio, ClearKey) — the same Rust core as the Android AAR and iOS XCFramework, for the browser.',
   license: 'UNLICENSED',
-  repository: { type: 'git', url: 'git+https://github.com/Preclikos/rust_player_learning.git' },
-  homepage: 'https://github.com/Preclikos/rust_player_learning/tree/master/platform/web',
+  repository: { type: 'git', url: 'git+https://github.com/Preclikos/rust_dash_player.git' },
+  homepage: 'https://github.com/Preclikos/rust_dash_player/tree/master/platform/web',
   publishConfig: { registry: 'https://npm.pkg.github.com', access: 'restricted' },
   type: pkg.type ?? 'module',
   main: pkg.main,

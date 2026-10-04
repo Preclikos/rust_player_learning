@@ -1,8 +1,8 @@
-// C ABI of the Rust player FFI (exported by app-ios/src/lib.rs, compiled into
+// C ABI of the Rust player FFI (exported by platform/ios/src/lib.rs, compiled into
 // the static lib bundled in RustPlayerFFI.xcframework). Imported as the Clang
 // module `RustPlayerFFI`; the Swift `RustPlayer` wrapper calls these.
 //
-// Keep in lock-step with app-ios/src/lib.rs.
+// Keep in lock-step with platform/ios/src/lib.rs.
 
 #ifndef RUSTPLAYER_FFI_H
 #define RUSTPLAYER_FFI_H

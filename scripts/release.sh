@@ -83,7 +83,9 @@ if [ "$DRY_RUN" = 1 ]; then
   echo "DRY RUN: would tag ${TAGS[*]} at ${HEAD_SHA:0:7} and push"; exit 0
 fi
 for t in "${TAGS[@]}"; do git tag "$t" "$HEAD_SHA"; done
-g push "$REMOTE" "${TAGS[@]}"
+# One push per tag: GitHub creates no push events (so no publish runs) when
+# more than three tags arrive in a single push.
+for t in "${TAGS[@]}"; do g push "$REMOTE" "refs/tags/$t"; done
 sleep 20
 gh run list --repo "$REPO" --limit 6 --json databaseId,name,status,headBranch \
   --jq '.[] | "\(.databaseId) \(.name) \(.status) \(.headBranch)"'

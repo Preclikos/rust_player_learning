@@ -157,10 +157,16 @@ fn movie_attributes<'l>(env: &mut jni::Env<'l>) -> Result<JObject<'l>, jni::erro
 /// new route supports it, downmixed by AudioFlinger when it doesn't — so no
 /// rebuild is needed. Devices without a Spatializer (TVs, older phones) keep
 /// the stereo track they have always had.
-fn pick_output_channels() -> u16 {
+fn pick_output_channels() -> (u16, Option<Global<JObject<'static>>>) {
+    // Developer A/B knob (not a host API): `adb shell setprop
+    // debug.rustplayer.spatial 0` keeps the stereo track, as before.
+    if system_property("debug.rustplayer.spatial").as_deref() == Some("0") {
+        log::info!("[audio-pcm] debug.rustplayer.spatial=0 — stereo PCM (A/B)");
+        return (2, None);
+    }
     let vm = android_vm();
     let res = vm.attach_current_thread(
-        |env| -> Result<Option<(i32, bool, bool)>, jni::errors::Error> {
+        |env| -> Result<Option<(i32, bool, bool, Global<JObject<'static>>)>, jni::errors::Error> {
             let sdk = env
                 .get_static_field(
                     jni::jni_str!("android/os/Build$VERSION"),
@@ -211,23 +217,49 @@ fn pick_output_channels() -> u16 {
             let available = env
                 .call_method(&spat, jni::jni_str!("isAvailable"), jni::jni_sig!("()Z"), &[])?
                 .z()?;
-            Ok(Some((level, enabled, available)))
+            Ok(Some((level, enabled, available, env.new_global_ref(&spat)?)))
         },
     );
     match res {
-        Ok(Some((level, enabled, available))) => {
+        Ok(Some((level, enabled, available, spat))) => {
             // SPATIALIZER_IMMERSIVE_LEVEL_NONE = 0: no spatializer on this device.
             let channels = if level != 0 { 6 } else { 2 };
             log::info!(
                 "[audio-pcm] spatializer: level={level} enabled={enabled} available_on_route={available} -> {channels}ch PCM"
             );
-            channels
+            (channels, (level != 0).then_some(spat))
         }
-        Ok(None) => 2,
+        Ok(None) => (2, None),
         Err(e) => {
             log::warn!("[audio-pcm] spatializer query failed ({e}); stereo PCM");
-            2
+            (2, None)
         }
+    }
+}
+
+/// An Android system property (`getprop`), `None` when unset.
+fn system_property(name: &str) -> Option<String> {
+    let name = std::ffi::CString::new(name).ok()?;
+    let mut buf = [0u8; 92]; // PROP_VALUE_MAX
+    let n = unsafe { libc::__system_property_get(name.as_ptr(), buf.as_mut_ptr().cast()) };
+    (n > 0).then(|| String::from_utf8_lossy(&buf[..n as usize]).into_owned())
+}
+
+/// Human name for an `AudioDeviceInfo.getType()` value (the common outputs).
+fn device_type_name(t: i32) -> &'static str {
+    match t {
+        2 => "speaker",
+        3 => "wired headset",
+        4 => "wired headphones",
+        8 => "Bluetooth A2DP",
+        9 => "HDMI",
+        10 => "HDMI ARC",
+        13 => "dock",
+        22 => "USB headset",
+        26 => "BLE headset",
+        27 => "BLE speaker",
+        29 => "HDMI eARC",
+        _ => "other",
     }
 }
 
@@ -256,6 +288,11 @@ pub struct AudioTrackPcmSink {
     /// Interleaved channels per frame: 2, or 6 on a device with a
     /// Spatializer (see `pick_output_channels`).
     channels: u16,
+    /// The device's Spatializer when the track was opened 5.1 for it; the
+    /// HUD reads its live state (enabled / available on the current route).
+    spatializer: Option<Global<JObject<'static>>>,
+    /// Last routed output seen by the writer heartbeat (logs route changes).
+    last_route: Mutex<String>,
     /// Final head positions of released (recreated-away) tracks — the new
     /// track's head restarts at 0, so `played_ms` adds this base to stay
     /// cumulative for `MediaClock`.
@@ -322,7 +359,12 @@ impl AudioTrackPcmSink {
     /// Create a paused 16-bit PCM `AudioTrack` at `sample_rate` with `channels`
     /// (2 or 6). Returns `None` on any failure (caller then has no audio; video
     /// uses the wall clock).
-    pub fn new(sample_rate: u32, channels: u16, flush_state: Arc<FlushState>) -> Option<Self> {
+    pub fn new(
+        sample_rate: u32,
+        channels: u16,
+        spatializer: Option<Global<JObject<'static>>>,
+        flush_state: Arc<FlushState>,
+    ) -> Option<Self> {
         match Self::build_track(sample_rate, channels) {
             Ok(track) => {
                 log::info!("[audio-pcm] AudioTrack PCM_16BIT configured (paused): {}Hz {}ch", sample_rate, channels);
@@ -332,6 +374,8 @@ impl AudioTrackPcmSink {
                     track: Mutex::new(track),
                     sample_rate,
                     channels,
+                    spatializer,
+                    last_route: Mutex::new(String::new()),
                     flush_state,
                     head_base: AtomicU64::new(0),
                     stopped: AtomicBool::new(false),
@@ -1159,6 +1203,87 @@ impl AudioTrackPcmSink {
     /// pipeline's video then holds its first frame until audio really starts
     /// instead of running ahead on the wall clock and lurching when the
     /// audio clock takes over.
+    /// Where the track is playing right now (`getRoutedDevice`), e.g.
+    /// "Bluetooth A2DP \"Galaxy Buds\"". `None` before routing / on error.
+    fn routed_device(&self) -> Option<String> {
+        if self.stopped.load(Ordering::Acquire) {
+            return None;
+        }
+        let track = self.track.lock().unwrap();
+        let vm = android_vm();
+        vm.attach_current_thread(|env| -> Result<Option<String>, jni::errors::Error> {
+            let dev = env
+                .call_method(
+                    track.as_obj(),
+                    jni::jni_str!("getRoutedDevice"),
+                    jni::jni_sig!("()Landroid/media/AudioDeviceInfo;"),
+                    &[],
+                )?
+                .l()?;
+            if dev.is_null() {
+                return Ok(None);
+            }
+            let t = env
+                .call_method(&dev, jni::jni_str!("getType"), jni::jni_sig!("()I"), &[])?
+                .i()?;
+            let name = env
+                .call_method(
+                    &dev,
+                    jni::jni_str!("getProductName"),
+                    jni::jni_sig!("()Ljava/lang/CharSequence;"),
+                    &[],
+                )?
+                .l()?;
+            let name = if name.is_null() {
+                String::new()
+            } else {
+                let s = env
+                    .call_method(&name, jni::jni_str!("toString"), jni::jni_sig!("()Ljava/lang/String;"), &[])?
+                    .l()?;
+                env.cast_local::<jni::objects::JString>(s)?.try_to_string(env)?
+            };
+            Ok(Some(format!("{} \"{}\"", device_type_name(t), name)))
+        })
+        .ok()
+        .flatten()
+    }
+
+    /// Live Spatializer state for the HUD: "spatializer on/off, route
+    /// spatialized/not". `None` when the track was not opened for it.
+    fn spatializer_state(&self) -> Option<String> {
+        let spat = self.spatializer.as_ref()?;
+        let vm = android_vm();
+        vm.attach_current_thread(|env| -> Result<String, jni::errors::Error> {
+            let enabled = env
+                .call_method(spat.as_obj(), jni::jni_str!("isEnabled"), jni::jni_sig!("()Z"), &[])?
+                .z()?;
+            let available = env
+                .call_method(spat.as_obj(), jni::jni_str!("isAvailable"), jni::jni_sig!("()Z"), &[])?
+                .z()?;
+            Ok(format!(
+                "spatializer {}, route {}",
+                if enabled { "on" } else { "off" },
+                if available { "spatialized" } else { "not spatialized (AudioFlinger downmix)" }
+            ))
+        })
+        .ok()
+    }
+
+    /// Log when the track's output route changes (headphones in/out).
+    fn log_route_change(&self) {
+        let route = self.routed_device().unwrap_or_else(|| "-".into());
+        let mut last = self.last_route.lock().unwrap();
+        if *last != route {
+            log::info!(
+                "[audio-pcm] output route: {} -> {route} ({}ch track{})",
+                if last.is_empty() { "-" } else { last.as_str() },
+                self.channels,
+                self.spatializer_state().map(|s| format!(", {s}")).unwrap_or_default()
+            );
+            *last = route;
+        }
+    }
+
     /// Debug HUD line: written vs presented, what the track still holds.
     pub fn debug_output(&self) -> String {
         let rate = self.sample_rate.max(1) as u64;
@@ -1167,9 +1292,15 @@ impl AudioTrackPcmSink {
         let in_track = presented
             .map(|p| format!("{} ms", written.saturating_sub(p) * 1000 / rate))
             .unwrap_or_else(|| "-".into());
+        let route = self.routed_device().unwrap_or_else(|| "-".into());
+        let spatial = self
+            .spatializer_state()
+            .map(|s| format!("  | 5.1 for {s}"))
+            .unwrap_or_else(|| "  | stereo (no spatializer)".into());
         format!(
-            "AudioTrack PCM16 {} Hz  written {:.1}s  presented {}  in track {}  dropped {}{}{}",
+            "AudioTrack PCM16 {} Hz {}ch on {route}{spatial}  written {:.1}s  presented {}  in track {}  dropped {}{}{}",
             self.sample_rate,
+            self.channels,
             written as f64 / rate as f64,
             presented.map(|p| format!("{:.1}s", p as f64 / rate as f64)).unwrap_or_else(|| "-".into()),
             in_track,
@@ -1276,13 +1407,14 @@ pub(super) fn start_output(
     volume: Arc<AtomicU32>,
 ) -> (Sender<AudioChunk>, u32, u16, Option<Arc<AudioTrackPcmSink>>) {
     let out_rate = 48_000u32;
-    let channels = pick_output_channels();
+    let (channels, spatializer) = pick_output_channels();
     let (sample_sender, sample_receiver) = mpsc::channel::<AudioChunk>(QUEUE_CHUNKS);
-    let mut sink = AudioTrackPcmSink::new(out_rate, channels, flush_state.clone()).map(Arc::new);
+    let mut sink =
+        AudioTrackPcmSink::new(out_rate, channels, spatializer, flush_state.clone()).map(Arc::new);
     // A HAL that refuses a multichannel PCM track still plays stereo.
     if sink.is_none() && channels != 2 {
         log::warn!("[audio-pcm] {channels}ch track refused; retrying stereo");
-        sink = AudioTrackPcmSink::new(out_rate, 2, flush_state.clone()).map(Arc::new);
+        sink = AudioTrackPcmSink::new(out_rate, 2, None, flush_state.clone()).map(Arc::new);
     }
     let channels = sink.as_ref().map_or(2, |s| s.channels);
 
@@ -1312,6 +1444,7 @@ pub(super) fn start_output(
                         };
                         if last_beat.elapsed() >= std::time::Duration::from_secs(5) {
                             last_beat = std::time::Instant::now();
+                            sink.log_route_change();
                             log::info!(
                                 "[audio-pcm] writer: host_paused={} sink_paused={} playing={} played_ms={:?} since_flush={:?}",
                                 host_paused.load(Ordering::Relaxed),

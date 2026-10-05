@@ -84,7 +84,7 @@ impl AudioDecoder for MediaCodecAudioDecoder {
         // some (E-)AC-3 / AAC decoders downmix to stereo unless asked for
         // more, which would leave a 5.1 sink with only its front pair.
         if params.output_channels > 2 {
-            format.set_i32("max-output-channel_count", params.output_channels as i32);
+            format.set_i32("max-output-channel-count", params.output_channels as i32);
         }
 
         codec

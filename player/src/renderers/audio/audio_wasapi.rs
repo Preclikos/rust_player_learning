@@ -39,6 +39,11 @@ const BUFFER_HNS: i64 = 1_000_000;
 /// spatial audio platform offers it a render stream). Errors and devices
 /// without the feature read as false.
 pub(super) fn spatial_sound_enabled() -> bool {
+    // A/B kill switch: RUST_PLAYER_SPATIAL=0 keeps the plain cpal output.
+    if std::env::var("RUST_PLAYER_SPATIAL").is_ok_and(|v| v == "0") {
+        log::info!("[audio] RUST_PLAYER_SPATIAL=0 — Windows spatial output disabled");
+        return false;
+    }
     let res = unsafe {
         (|| -> windows::core::Result<bool> {
             let _com = ComGuard::init();

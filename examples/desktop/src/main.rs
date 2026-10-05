@@ -17,7 +17,7 @@ struct App {
     last_frame_time: Instant,
     frame_count: u32,
     player: Option<Player>,
-    /// H toggles a 1 Hz debug HUD dump to the terminal.
+    /// H toggles a 1 Hz debug HUD dump to the terminal (RUST_PLAYER_HUD=1 starts it on).
     hud: bool,
     last_hud: Instant,
 }
@@ -183,7 +183,7 @@ async fn main() {
         last_frame_time: Instant::now(),
         frame_count: 0,
         player: None,
-        hud: false,
+        hud: std::env::var("RUST_PLAYER_HUD").is_ok_and(|v| v == "1"),
         last_hud: Instant::now(),
     };
     _ = event_loop.run_app(&mut app);
@@ -301,6 +301,7 @@ async fn run_console(player: Player) {
     println!("  abr on   — enable bandwidth-EWMA ABR (safety_factor=1.25)");
     println!("  abr off  — disable ABR (Manual)");
     println!("  p        — pause / resume (also: space in the window)");
+    println!("  spatial on|off — Windows 7.1 spatial-sound output (default on)");
     println!("  seek <ms>      — absolute seek; seek +<ms> / -<ms> — relative (also: arrows in the window)");
 
     let stdin = tokio::io::stdin();
@@ -315,6 +316,17 @@ async fn run_console(player: Player) {
         match cmd {
             "" => {}
             "l" | "list" => print_menu(&player),
+            "spatial" => match arg {
+                Some("on") => {
+                    player.set_spatial_audio(true);
+                    println!("spatial audio on");
+                }
+                Some("off") => {
+                    player.set_spatial_audio(false);
+                    println!("spatial audio off");
+                }
+                _ => println!("usage: spatial on|off"),
+            },
             "p" => {
                 if player.is_paused() {
                     player.resume();

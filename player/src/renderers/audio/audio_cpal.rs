@@ -117,6 +117,17 @@ struct OutputShared {
     last_callback_ms: AtomicU64,
     /// Set by the error callback: the stream reported itself broken.
     failed: AtomicBool,
+    /// Backend / device / last switch, for the debug HUD.
+    status: Arc<Mutex<super::OutputStatus>>,
+}
+
+impl OutputShared {
+    /// Record an output rebuild for the HUD.
+    fn note_switch(&self, what: String) {
+        let mut st = self.status.lock().unwrap();
+        st.switches += 1;
+        st.last_switch = Some((Instant::now(), what));
+    }
 }
 
 impl OutputShared {
@@ -177,6 +188,26 @@ fn fill<T: SizedSample + FromSample<f32>>(cb: &OutputShared, data: &mut [T]) {
     }
     // Publish the consumed-sample count once per buffer (the clock).
     cursor.commit();
+}
+
+/// Drop up to `ms` of queued audio as if the device had played it, so the
+/// consumed-sample clock catches up with the wall after an output gap (a
+/// stream rebuilt on another device plays nothing for hundreds of ms while
+/// the picture keeps going; without the skip audio stays that far behind for
+/// the rest of the pipeline). No-op while paused. Returns the ms skipped.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn skip_ms(cb: &OutputShared, ms: u64, rate: u32, channels: u16) -> u64 {
+    if ms == 0 || cb.paused_flag.load(Ordering::Relaxed) {
+        return 0;
+    }
+    let want = ms * rate as u64 * channels.max(1) as u64 / 1000;
+    let mut cursor = cb.cursor.lock().unwrap();
+    let mut n = 0u64;
+    while n < want && cursor.next_sample().is_some() {
+        n += 1;
+    }
+    cursor.commit();
+    n * 1000 / (rate.max(1) as u64 * channels.max(1) as u64)
 }
 
 fn build_stream<T: SizedSample + FromSample<f32>>(
@@ -246,6 +277,8 @@ fn start_audio(
     out_channels: u16,
     // Windows spatial sound: run the 7.1 WASAPI writer instead of cpal.
     #[cfg_attr(not(target_os = "windows"), allow(unused_variables))] spatial: bool,
+    #[cfg(target_os = "windows")] spatial_enabled: Arc<AtomicBool>,
+    output_status: Arc<Mutex<super::OutputStatus>>,
     volume: Arc<AtomicU32>,
     stop: Arc<Notify>,
     flush_state: Arc<FlushState>,
@@ -265,6 +298,7 @@ fn start_audio(
         epoch: Instant::now(),
         last_callback_ms: AtomicU64::new(0),
         failed: AtomicBool::new(false),
+        status: output_status,
     });
     // The decoders mix to exactly `out_channels` (AudioSink::channels()), so
     // the callback copies 1:1 whatever the device layout — stereo, mono, 5.1.
@@ -294,22 +328,33 @@ fn start_audio(
     #[cfg(target_os = "windows")]
     if spatial {
         drop(device);
-        wasapi::run(&shared, out_rate, &stopped);
+        wasapi::run(&shared, out_rate, &stopped, &spatial_enabled);
         return;
     }
 
     let mut device = Some(device);
     let mut stream: Option<cpal::Stream> = None;
+    // Why the previous stream was dropped, until the replacement opens (HUD).
+    let mut dead_reason: Option<String> = None;
     let mut failures = 0u32;
     while !stopped.load(Ordering::Relaxed) {
         if stream.is_none() {
-            let opened = device
+            let opened: Result<cpal::Stream, Box<dyn std::error::Error>> = device
                 .take()
                 .or_else(|| cpal::default_host().default_output_device())
                 .ok_or_else(|| "no output device".into())
-                .and_then(|d| open_stream(&d, stream_config, &shared));
+                .and_then(|d| {
+                    let s = open_stream(&d, stream_config, &shared)?;
+                    let mut st = shared.status.lock().unwrap();
+                    st.backend = "cpal".into();
+                    st.device = d.description().map(|n| n.to_string()).unwrap_or_default();
+                    Ok(s)
+                });
             match opened {
                 Ok(s) => {
+                    if let Some(why) = dead_reason.take() {
+                        shared.note_switch(format!("rebuilt after {why}"));
+                    }
                     if failures > 0 {
                         log::info!(
                             "[audio] output stream reopened after {failures} failed attempt(s)"
@@ -343,6 +388,7 @@ fn start_audio(
                     format!("no callback for {quiet_ms} ms")
                 };
                 log::warn!("[audio] output stream dead ({why}) — rebuilding it on the default device");
+                dead_reason = Some(why);
                 stream = None;
             }
         }
@@ -425,6 +471,8 @@ pub(super) fn start_thread(
     volume: Arc<AtomicU32>,
     samples_consumed: Arc<AtomicU64>,
     output_latency_ms: Arc<AtomicU64>,
+    #[cfg(target_os = "windows")] spatial_enabled: Arc<AtomicBool>,
+    output_status: Arc<Mutex<super::OutputStatus>>,
 ) -> (Sender<AudioChunk>, u32, u16) {
     let (sample_sender, sample_receiver) = mpsc::channel::<AudioChunk>(QUEUE_CHUNKS);
 
@@ -518,6 +566,9 @@ pub(super) fn start_thread(
                 out_rate,
                 out_channels,
                 spatial,
+                #[cfg(target_os = "windows")]
+                spatial_enabled,
+                output_status,
                 volume,
                 stop_cpal,
                 flush_state,

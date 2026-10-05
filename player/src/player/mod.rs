@@ -1628,6 +1628,18 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             .store(enabled, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Windows: allow the 7.1 spatial-sound output. Default ON. With
+    /// Windows Sonic / Dolby Atmos for Headphones / DTS Headphone:X enabled
+    /// for the default device, the player opens its output as 7.1 so the OS
+    /// renders surround tracks binaurally; switched off, it hands Windows a
+    /// stereo downmix like any other app. Takes effect immediately, mid-
+    /// playback included (the output stream is rebuilt, the pipeline is not).
+    /// Ignored on other platforms (Android always feeds 5.1 PCM to its
+    /// Spatializer where the device has one).
+    pub fn set_spatial_audio(&self, enabled: bool) {
+        self.audio_renderer.set_spatial_audio(enabled);
+    }
+
     /// Debug/compat switch: force HDR (PQ/HLG) video to decode to an
     /// 8-bit destination. The in-player HDR→SDR tonemap still runs — the
     /// picture stays colour-correct, just with 8-bit quantization of the

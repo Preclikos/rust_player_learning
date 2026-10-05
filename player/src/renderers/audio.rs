@@ -105,10 +105,32 @@ pub struct AudioRenderer {
     /// (see docs/PITFALLS.md).
     #[cfg(target_os = "android")]
     host_paused: Arc<AtomicBool>,
+    /// Windows only: host switch for the 7.1 spatial-sound output, read live
+    /// by the WASAPI writer (default on).
+    #[cfg(target_os = "windows")]
+    spatial_enabled: Arc<AtomicBool>,
+    #[cfg(not(any(target_os = "android", target_arch = "wasm32")))]
+    output_status: Arc<std::sync::Mutex<OutputStatus>>,
 }
 
 enum AudioRendererCommand {
     Stop,
+}
+
+/// What the desktop/iOS output is doing right now, for the debug HUD: which
+/// backend + device, and what the last output switch did. Written by the
+/// output thread, read by `debug_output`.
+#[cfg(not(any(target_os = "android", target_arch = "wasm32")))]
+#[derive(Default)]
+pub(super) struct OutputStatus {
+    /// "cpal", "WASAPI 7.1 (spatial sound)", "WASAPI stereo (spatial off)".
+    pub backend: String,
+    /// Friendly name of the device the stream is open on.
+    pub device: String,
+    /// Output streams rebuilt since the renderer started.
+    pub switches: u32,
+    /// When and what the last rebuild did (reason, gap, clock correction).
+    pub last_switch: Option<(std::time::Instant, String)>,
 }
 
 impl Default for AudioRenderer {
@@ -147,6 +169,10 @@ impl AudioRenderer {
         let output_latency_ms = Arc::new(AtomicU64::new(0));
         let (command_sender, command_receiver) = mpsc::channel(4);
 
+        #[cfg(target_os = "windows")]
+        let spatial_enabled = Arc::new(AtomicBool::new(true));
+        #[cfg(not(any(target_os = "android", target_arch = "wasm32")))]
+        let output_status = Arc::new(std::sync::Mutex::new(OutputStatus::default()));
         #[cfg(not(any(target_os = "android", target_arch = "wasm32")))]
         let (sample_sender, sample_rate, channels) = audio_cpal::start_thread(
             command_receiver,
@@ -156,6 +182,9 @@ impl AudioRenderer {
             volume.clone(),
             samples_consumed.clone(),
             output_latency_ms.clone(),
+            #[cfg(target_os = "windows")]
+            spatial_enabled.clone(),
+            output_status.clone(),
         );
         #[cfg(target_arch = "wasm32")]
         let output_running = Arc::new(AtomicBool::new(false));
@@ -206,6 +235,10 @@ impl AudioRenderer {
             host_paused,
             #[cfg(target_arch = "wasm32")]
             output_running,
+            #[cfg(target_os = "windows")]
+            spatial_enabled,
+            #[cfg(not(any(target_os = "android", target_arch = "wasm32")))]
+            output_status,
         }
     }
 
@@ -372,6 +405,11 @@ impl super::AudioSink for AudioRenderer {
         AudioRenderer::channels(self)
     }
 
+    fn set_spatial_audio(&self, _enabled: bool) {
+        #[cfg(target_os = "windows")]
+        self.spatial_enabled.store(_enabled, Ordering::Relaxed);
+    }
+
     fn played_ms(&self) -> Option<u64> {
         // Passthrough: the bitstream output's playback head is the clock source.
         if let Some(pt) = self.passthrough.lock().unwrap().as_ref() {
@@ -473,9 +511,27 @@ impl super::AudioSink for AudioRenderer {
                 "Web Audio (suspended: no user gesture yet?)"
             };
             #[cfg(not(target_arch = "wasm32"))]
-            let backend = "cpal";
+            let (backend, switches) = {
+                let st = self.output_status.lock().unwrap();
+                let backend = match (st.backend.is_empty(), st.device.is_empty()) {
+                    (true, _) => "cpal (opening)".to_string(),
+                    (false, true) => st.backend.clone(),
+                    (false, false) => format!("{} on \"{}\"", st.backend, st.device),
+                };
+                let switches = match &st.last_switch {
+                    Some((at, what)) => format!(
+                        "  | output switches {}, last {:.0}s ago: {what}",
+                        st.switches,
+                        at.elapsed().as_secs_f64()
+                    ),
+                    None => String::new(),
+                };
+                (backend, switches)
+            };
+            #[cfg(target_arch = "wasm32")]
+            let switches = "";
             format!(
-                "{backend} {} Hz {} ch  played {played}  device latency {} ms{}",
+                "{backend} {} Hz, decoders mix to {} ch  played {played}  device latency {} ms{}{switches}",
                 self.sample_rate,
                 self.channels,
                 AudioRenderer::output_latency_ms(self),

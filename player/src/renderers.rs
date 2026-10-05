@@ -144,6 +144,9 @@ pub trait AudioSink: Send + Sync + 'static {
     fn channels(&self) -> u16 {
         2
     }
+    /// Windows: allow the 7.1 spatial-sound output (see
+    /// `Player::set_spatial_audio`). Other sinks ignore it.
+    fn set_spatial_audio(&self, _enabled: bool) {}
     /// Media milliseconds the output device has actually PLAYED (samples
     /// consumed by the device callback; pause/underrun silence does not
     /// count). The device crystal is the clock the listener hears, so the

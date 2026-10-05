@@ -177,7 +177,7 @@ impl AudioRenderer {
         #[cfg(target_os = "android")]
         let host_paused = Arc::new(AtomicBool::new(false));
         #[cfg(target_os = "android")]
-        let (sample_sender, sample_rate, pcm_sink) = {
+        let (sample_sender, sample_rate, channels, pcm_sink) = {
             drop(command_receiver);
             drop(stop);
             audio_track_pcm::start_output(
@@ -186,11 +186,6 @@ impl AudioRenderer {
                 volume.clone(),
             )
         };
-        // The AudioTrack PCM path is stereo (CHANNEL_OUT_STEREO); 5.1 on
-        // Android goes through the compressed passthrough sink.
-        #[cfg(target_os = "android")]
-        let channels: u16 = 2;
-
         AudioRenderer {
             command_sender,
             sample_sender,

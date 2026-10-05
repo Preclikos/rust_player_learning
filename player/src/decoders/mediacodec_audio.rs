@@ -1,10 +1,10 @@
 // MediaCodec-based AAC / AC-3 / EAC-3 audio decoder for Android.
 //
-// Decodes raw access units (from DASH mdat) to interleaved stereo f32 PCM
-// at the stream's native sample rate. Multichannel input (typical for AC-3
-// and EAC-3 5.1) is downmixed to stereo here — the cpal AudioRenderer is
-// always stereo, so the decoder owns the downmix instead of relying on the
-// renderer to interpret arbitrary channel counts.
+// Decodes raw access units (from DASH mdat) to interleaved f32 PCM at the
+// output rate, remixed to the sink's channel count (`output_channels`):
+// stereo on most devices, 5.1 when the PCM track feeds the OS Spatializer.
+// The decoder owns the remix instead of relying on the renderer to
+// interpret arbitrary channel counts.
 //
 // The actual output channel count comes from MediaCodec's OutputFormatChanged
 // event, not the input hint — for EAC-3 streams the MPD often advertises
@@ -79,6 +79,12 @@ impl AudioDecoder for MediaCodecAudioDecoder {
         format.set_i32("sample-rate", params.input_sample_rate as i32);
         if !params.codec_specific_data.is_empty() {
             format.set_buffer("csd-0", &params.codec_specific_data);
+        }
+        // MediaFormat.KEY_MAX_OUTPUT_CHANNEL_COUNT (API 30+, ignored before):
+        // some (E-)AC-3 / AAC decoders downmix to stereo unless asked for
+        // more, which would leave a 5.1 sink with only its front pair.
+        if params.output_channels > 2 {
+            format.set_i32("max-output-channel_count", params.output_channels as i32);
         }
 
         codec

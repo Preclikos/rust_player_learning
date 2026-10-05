@@ -49,6 +49,7 @@ fn clock_monotonic_ns() -> i64 {
 /// works too, but there is no reason to leave the well-trodden path.
 const ENCODING_PCM_16BIT: i32 = 2;
 const CHANNEL_OUT_STEREO: i32 = 12;
+const CHANNEL_OUT_5POINT1: i32 = 252;
 // android.media.AudioAttributes
 const USAGE_MEDIA: i32 = 1;
 const CONTENT_TYPE_MOVIE: i32 = 3;
@@ -60,6 +61,174 @@ const WRITE_NON_BLOCKING: i32 = 1;
 fn android_vm() -> jni::JavaVM {
     let ctx = ndk_context::android_context();
     unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) }
+}
+
+fn channel_mask(channels: u16) -> i32 {
+    if channels == 6 { CHANNEL_OUT_5POINT1 } else { CHANNEL_OUT_STEREO }
+}
+
+/// `AudioFormat.Builder().setEncoding(PCM_16BIT).setSampleRate(sr).setChannelMask(mask).build()`
+fn pcm_format<'l>(
+    env: &mut jni::Env<'l>,
+    sample_rate: u32,
+    mask: i32,
+) -> Result<JObject<'l>, jni::errors::Error> {
+    let fb = env.new_object(
+        jni::jni_str!("android/media/AudioFormat$Builder"),
+        jni::jni_sig!("()V"),
+        &[],
+    )?;
+    let fb = env
+        .call_method(
+            &fb,
+            jni::jni_str!("setEncoding"),
+            jni::jni_sig!("(I)Landroid/media/AudioFormat$Builder;"),
+            &[ENCODING_PCM_16BIT.into()],
+        )?
+        .l()?;
+    let fb = env
+        .call_method(
+            &fb,
+            jni::jni_str!("setSampleRate"),
+            jni::jni_sig!("(I)Landroid/media/AudioFormat$Builder;"),
+            &[(sample_rate as i32).into()],
+        )?
+        .l()?;
+    let fb = env
+        .call_method(
+            &fb,
+            jni::jni_str!("setChannelMask"),
+            jni::jni_sig!("(I)Landroid/media/AudioFormat$Builder;"),
+            &[mask.into()],
+        )?
+        .l()?;
+    env.call_method(
+        &fb,
+        jni::jni_str!("build"),
+        jni::jni_sig!("()Landroid/media/AudioFormat;"),
+        &[],
+    )?
+    .l()
+}
+
+/// `AudioAttributes.Builder().setUsage(MEDIA).setContentType(MOVIE).build()`
+fn movie_attributes<'l>(env: &mut jni::Env<'l>) -> Result<JObject<'l>, jni::errors::Error> {
+    let ab = env.new_object(
+        jni::jni_str!("android/media/AudioAttributes$Builder"),
+        jni::jni_sig!("()V"),
+        &[],
+    )?;
+    let ab = env
+        .call_method(
+            &ab,
+            jni::jni_str!("setUsage"),
+            jni::jni_sig!("(I)Landroid/media/AudioAttributes$Builder;"),
+            &[USAGE_MEDIA.into()],
+        )?
+        .l()?;
+    let ab = env
+        .call_method(
+            &ab,
+            jni::jni_str!("setContentType"),
+            jni::jni_sig!("(I)Landroid/media/AudioAttributes$Builder;"),
+            &[CONTENT_TYPE_MOVIE.into()],
+        )?
+        .l()?;
+    env.call_method(
+        &ab,
+        jni::jni_str!("build"),
+        jni::jni_sig!("()Landroid/media/AudioAttributes;"),
+        &[],
+    )?
+    .l()
+}
+
+/// Channel count to open the PCM track with: 5.1 on any device that has an
+/// OS Spatializer (API 32+: binaural rendering for headphones, Samsung's
+/// Dolby Atmos / 360 audio, head tracking), else stereo. A stereo track hands
+/// the Spatializer an ITU downmix with nothing left to place around the
+/// listener; with a 5.1 track the decoder keeps the source layout and the OS
+/// renders it.
+///
+/// Deliberately NOT gated on the current route (`isAvailable` /
+/// `canBeSpatialized`) or the user toggle (`isEnabled`): headphones come and
+/// go mid-playback, and the renderer's layout is fixed for its lifetime. A
+/// 5.1 track follows every route change on its own — spatialized when the
+/// new route supports it, downmixed by AudioFlinger when it doesn't — so no
+/// rebuild is needed. Devices without a Spatializer (TVs, older phones) keep
+/// the stereo track they have always had.
+fn pick_output_channels() -> u16 {
+    let vm = android_vm();
+    let res = vm.attach_current_thread(
+        |env| -> Result<Option<(i32, bool, bool)>, jni::errors::Error> {
+            let sdk = env
+                .get_static_field(
+                    jni::jni_str!("android/os/Build$VERSION"),
+                    jni::jni_str!("SDK_INT"),
+                    jni::jni_sig!("I"),
+                )?
+                .i()?;
+            if sdk < 32 {
+                return Ok(None);
+            }
+            let raw_ctx = ndk_context::android_context().context();
+            if raw_ctx.is_null() {
+                return Ok(None);
+            }
+            // The process-wide Context global ref that ndk_context holds; a
+            // plain JObject never deletes the reference it wraps.
+            let ctx = unsafe { JObject::from_raw(env, raw_ctx.cast()) };
+            let name = env.new_string("audio")?;
+            let am = env
+                .call_method(
+                    &ctx,
+                    jni::jni_str!("getSystemService"),
+                    jni::jni_sig!("(Ljava/lang/String;)Ljava/lang/Object;"),
+                    &[(&name).into()],
+                )?
+                .l()?;
+            if am.is_null() {
+                return Ok(None);
+            }
+            let spat = env
+                .call_method(
+                    &am,
+                    jni::jni_str!("getSpatializer"),
+                    jni::jni_sig!("()Landroid/media/Spatializer;"),
+                    &[],
+                )?
+                .l()?;
+            if spat.is_null() {
+                return Ok(None);
+            }
+            let level = env
+                .call_method(&spat, jni::jni_str!("getImmersiveAudioLevel"), jni::jni_sig!("()I"), &[])?
+                .i()?;
+            // Diagnostics only (see above for why they don't decide).
+            let enabled = env
+                .call_method(&spat, jni::jni_str!("isEnabled"), jni::jni_sig!("()Z"), &[])?
+                .z()?;
+            let available = env
+                .call_method(&spat, jni::jni_str!("isAvailable"), jni::jni_sig!("()Z"), &[])?
+                .z()?;
+            Ok(Some((level, enabled, available)))
+        },
+    );
+    match res {
+        Ok(Some((level, enabled, available))) => {
+            // SPATIALIZER_IMMERSIVE_LEVEL_NONE = 0: no spatializer on this device.
+            let channels = if level != 0 { 6 } else { 2 };
+            log::info!(
+                "[audio-pcm] spatializer: level={level} enabled={enabled} available_on_route={available} -> {channels}ch PCM"
+            );
+            channels
+        }
+        Ok(None) => 2,
+        Err(e) => {
+            log::warn!("[audio-pcm] spatializer query failed ({e}); stereo PCM");
+            2
+        }
+    }
 }
 
 /// A 16-bit PCM `AudioTrack`. The clock source for the non-passthrough Android path.
@@ -84,6 +253,9 @@ pub struct AudioTrackPcmSink {
     /// repair (see `recreate_track`).
     track: Mutex<Global<JObject<'static>>>,
     sample_rate: u32,
+    /// Interleaved channels per frame: 2, or 6 on a device with a
+    /// Spatializer (see `pick_output_channels`).
+    channels: u16,
     /// Final head positions of released (recreated-away) tracks — the new
     /// track's head restarts at 0, so `played_ms` adds this base to stay
     /// cumulative for `MediaClock`.
@@ -147,17 +319,19 @@ unsafe impl Send for AudioTrackPcmSink {}
 unsafe impl Sync for AudioTrackPcmSink {}
 
 impl AudioTrackPcmSink {
-    /// Create a paused 16-bit PCM `AudioTrack` at `sample_rate` / stereo. Returns
-    /// `None` on any failure (caller then has no audio; video uses the wall clock).
-    pub fn new(sample_rate: u32, flush_state: Arc<FlushState>) -> Option<Self> {
-        match Self::build_track(sample_rate) {
+    /// Create a paused 16-bit PCM `AudioTrack` at `sample_rate` with `channels`
+    /// (2 or 6). Returns `None` on any failure (caller then has no audio; video
+    /// uses the wall clock).
+    pub fn new(sample_rate: u32, channels: u16, flush_state: Arc<FlushState>) -> Option<Self> {
+        match Self::build_track(sample_rate, channels) {
             Ok(track) => {
-                log::info!("[audio-pcm] AudioTrack PCM_16BIT configured (paused): {}Hz stereo", sample_rate);
+                log::info!("[audio-pcm] AudioTrack PCM_16BIT configured (paused): {}Hz {}ch", sample_rate, channels);
                 Some(Self {
                     clock_memo: Mutex::new(None),
                     write_array: Mutex::new(None),
                     track: Mutex::new(track),
                     sample_rate,
+                    channels,
                     flush_state,
                     head_base: AtomicU64::new(0),
                     stopped: AtomicBool::new(false),
@@ -183,8 +357,9 @@ impl AudioTrackPcmSink {
     /// stall heal's `recreate_track`).
     fn build_track(
         sample_rate: u32,
+        channels: u16,
     ) -> Result<Global<JObject<'static>>, jni::errors::Error> {
-        let mask = CHANNEL_OUT_STEREO;
+        let mask = channel_mask(channels);
         let vm = android_vm();
         vm.attach_current_thread(|env| {
                 // A tight buffer keeps the post-seek tail small (we never flush the
@@ -200,79 +375,12 @@ impl AudioTrackPcmSink {
                 let buffer_bytes = if min_buf > 0 {
                     min_buf * 2
                 } else {
-                    // Fallback ≈ 100 ms of f32 stereo.
-                    sample_rate as i32 * 2 * 4 / 10
+                    // Fallback ≈ 100 ms of 16-bit PCM.
+                    sample_rate as i32 * channels as i32 * 2 / 10
                 };
 
-                // AudioFormat.Builder().setEncoding(PCM_16BIT).setSampleRate(sr).setChannelMask(mask).build()
-                let fb = env.new_object(
-                    jni::jni_str!("android/media/AudioFormat$Builder"),
-                    jni::jni_sig!("()V"),
-                    &[],
-                )?;
-                let fb = env
-                    .call_method(
-                        &fb,
-                        jni::jni_str!("setEncoding"),
-                        jni::jni_sig!("(I)Landroid/media/AudioFormat$Builder;"),
-                        &[ENCODING_PCM_16BIT.into()],
-                    )?
-                    .l()?;
-                let fb = env
-                    .call_method(
-                        &fb,
-                        jni::jni_str!("setSampleRate"),
-                        jni::jni_sig!("(I)Landroid/media/AudioFormat$Builder;"),
-                        &[(sample_rate as i32).into()],
-                    )?
-                    .l()?;
-                let fb = env
-                    .call_method(
-                        &fb,
-                        jni::jni_str!("setChannelMask"),
-                        jni::jni_sig!("(I)Landroid/media/AudioFormat$Builder;"),
-                        &[mask.into()],
-                    )?
-                    .l()?;
-                let format = env
-                    .call_method(
-                        &fb,
-                        jni::jni_str!("build"),
-                        jni::jni_sig!("()Landroid/media/AudioFormat;"),
-                        &[],
-                    )?
-                    .l()?;
-
-                // AudioAttributes.Builder().setUsage(MEDIA).setContentType(MOVIE).build()
-                let ab = env.new_object(
-                    jni::jni_str!("android/media/AudioAttributes$Builder"),
-                    jni::jni_sig!("()V"),
-                    &[],
-                )?;
-                let ab = env
-                    .call_method(
-                        &ab,
-                        jni::jni_str!("setUsage"),
-                        jni::jni_sig!("(I)Landroid/media/AudioAttributes$Builder;"),
-                        &[USAGE_MEDIA.into()],
-                    )?
-                    .l()?;
-                let ab = env
-                    .call_method(
-                        &ab,
-                        jni::jni_str!("setContentType"),
-                        jni::jni_sig!("(I)Landroid/media/AudioAttributes$Builder;"),
-                        &[CONTENT_TYPE_MOVIE.into()],
-                    )?
-                    .l()?;
-                let attrs = env
-                    .call_method(
-                        &ab,
-                        jni::jni_str!("build"),
-                        jni::jni_sig!("()Landroid/media/AudioAttributes;"),
-                        &[],
-                    )?
-                    .l()?;
+                let format = pcm_format(env, sample_rate, mask)?;
+                let attrs = movie_attributes(env)?;
 
                 // new AudioTrack.Builder()…build()
                 let tb = env.new_object(
@@ -371,7 +479,7 @@ impl AudioTrackPcmSink {
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        let new_track = match Self::build_track(self.sample_rate) {
+        let new_track = match Self::build_track(self.sample_rate, self.channels) {
             Ok(t) => t,
             Err(e) => {
                 log::warn!("[audio-pcm] recreate failed to build a new track: {e}");
@@ -398,7 +506,8 @@ impl AudioTrackPcmSink {
         // Fill most of the device buffer (24624 frames) with silence: the
         // mixer pulls ~256 ms chunks and never touches a track holding less
         // than one chunk (BUFFER TIMEOUT removal).
-        let silence = vec![0i16; 8192];
+        let ch = self.channels.max(1) as usize;
+        let silence = vec![0i16; 8192 / ch * ch];
         let mut probe_samples = 0u64;
         for _ in 0..6 {
             // Non-blocking writes; a fresh track has ample space, so the
@@ -425,7 +534,7 @@ impl AudioTrackPcmSink {
             // take it back out of the accounting so `played_ms` stays aligned
             // with real PCM (`dropped` accumulated over the episode is far
             // larger than one probe, but guard the subtraction anyway).
-            let probe_frames = probe_samples / 2;
+            let probe_frames = probe_samples / ch as u64;
             let _ = self.dropped_frames.fetch_update(
                 Ordering::AcqRel,
                 Ordering::Acquire,
@@ -483,7 +592,7 @@ impl AudioTrackPcmSink {
         0
     }
 
-    /// Write interleaved-stereo f32 samples with the same back-pressure
+    /// Write interleaved f32 samples (`channels` per frame) with the same back-pressure
     /// behaviour as a blocking `AudioTrack.write` (the writer paces to the
     /// device's consumption rate, which makes the playback head a clock) — but
     /// implemented as NON-blocking writes in a retry loop that stays responsive:
@@ -533,9 +642,10 @@ impl AudioTrackPcmSink {
         // Whole frames only — `write` never accepts a trailing half frame and
         // retrying it returns 0 forever. The writer thread already carries odd
         // samples between batches; this guard protects any other caller.
-        if pcm.len() % 2 == 1 {
-            log::warn!("[audio-pcm] odd batch of {} samples — truncating to whole frames", pcm.len());
-            pcm.pop();
+        let ch = self.channels.max(1) as usize;
+        if pcm.len() % ch != 0 {
+            log::warn!("[audio-pcm] batch of {} samples is not whole {}ch frames — truncating", pcm.len(), ch);
+            pcm.truncate(pcm.len() / ch * ch);
         }
         let mut zero_streak = 0u32;
         let mut recreated_this_batch = false;
@@ -611,7 +721,7 @@ impl AudioTrackPcmSink {
             if written > 0 {
                 off += written as usize;
                 zero_streak = 0;
-                let frames = written as u64 / 2;
+                let frames = written as u64 / ch as u64;
                 self.written_frames.fetch_add(frames, Ordering::AcqRel);
                 if self.track_written.fetch_add(frames, Ordering::AcqRel) == 0 {
                     *self.track_first_write.lock().unwrap() = Some(std::time::Instant::now());
@@ -657,7 +767,7 @@ impl AudioTrackPcmSink {
     /// into the clock accounting and sleep out their realtime duration (in
     /// abort/teardown-responsive slices), mimicking a consuming device.
     fn discard_paced(&self, sample_count: usize, abort: &dyn Fn() -> bool) {
-        let frames = (sample_count as u64) / 2;
+        let frames = (sample_count as u64) / self.channels.max(1) as u64;
         self.written_frames.fetch_add(frames, Ordering::AcqRel);
         self.dropped_frames.fetch_add(frames, Ordering::AcqRel);
         let mut left_ms = frames * 1000 / self.sample_rate.max(1) as u64;
@@ -1152,7 +1262,7 @@ impl Drop for AudioTrackPcmSink {
 }
 
 /// Start the Android PCM output: create the [`AudioTrackPcmSink`] and a dedicated
-/// writer thread that pulls chunked stereo f32 from the channel and writes it
+/// writer thread that pulls chunked interleaved f32 from the channel and writes it
 /// to the track. The write paces to the device rate (so the playback head is a
 /// usable clock) but is built from NON-blocking writes internally and aborts
 /// when a flush supersedes the chunk's generation — a blocking write parked on
@@ -1164,10 +1274,17 @@ pub(super) fn start_output(
     flush_state: Arc<FlushState>,
     host_paused: Arc<AtomicBool>,
     volume: Arc<AtomicU32>,
-) -> (Sender<AudioChunk>, u32, Option<Arc<AudioTrackPcmSink>>) {
+) -> (Sender<AudioChunk>, u32, u16, Option<Arc<AudioTrackPcmSink>>) {
     let out_rate = 48_000u32;
+    let channels = pick_output_channels();
     let (sample_sender, sample_receiver) = mpsc::channel::<AudioChunk>(QUEUE_CHUNKS);
-    let sink = AudioTrackPcmSink::new(out_rate, flush_state.clone()).map(Arc::new);
+    let mut sink = AudioTrackPcmSink::new(out_rate, channels, flush_state.clone()).map(Arc::new);
+    // A HAL that refuses a multichannel PCM track still plays stereo.
+    if sink.is_none() && channels != 2 {
+        log::warn!("[audio-pcm] {channels}ch track refused; retrying stereo");
+        sink = AudioTrackPcmSink::new(out_rate, 2, flush_state.clone()).map(Arc::new);
+    }
+    let channels = sink.as_ref().map_or(2, |s| s.channels);
 
     match sink.clone() {
         Some(sink) => {
@@ -1246,13 +1363,14 @@ pub(super) fn start_output(
                             );
                         }
                         // Whole frames only — `AudioTrack.write` never accepts a
-                        // trailing half frame and retrying it returns 0 forever.
+                        // trailing partial frame and retrying it returns 0 forever.
                         // Chunks are whole decoded frames so this never trips;
-                        // dropping one sample would swap L/R for the remainder,
-                        // hence the loud warning if it ever does.
-                        if batch.len() % 2 == 1 {
-                            log::warn!("[audio-pcm] odd chunk of {} samples — truncating", batch.len());
-                            batch.pop();
+                        // dropping samples would rotate the channels for the
+                        // remainder, hence the loud warning if it ever does.
+                        let ch = channels as usize;
+                        if batch.len() % ch != 0 {
+                            log::warn!("[audio-pcm] chunk of {} samples is not whole {}ch frames — truncating", batch.len(), ch);
+                            batch.truncate(batch.len() / ch * ch);
                         }
                         if batch.is_empty() {
                             continue;
@@ -1276,5 +1394,5 @@ pub(super) fn start_output(
         ),
     }
 
-    (sample_sender, out_rate, sink)
+    (sample_sender, out_rate, channels, sink)
 }

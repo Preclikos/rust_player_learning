@@ -344,6 +344,11 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             }
         }
         override fun onPaused() { playPauseButton.text = "▶" }
+        // --ez loop true: replay from the start at the end (the 60 s
+        // conformance asset is too short for device-switch tests).
+        override fun onEnded() {
+            if (intent.getBooleanExtra("loop", false)) player.play()
+        }
         override fun onPosition(positionMs: Long, durationMs: Long) {
             if (durationMs > 0 && seekBar.max != durationMs.toInt()) seekBar.max = durationMs.toInt()
             if (!userSeeking) seekBar.progress = positionMs.toInt()
@@ -674,6 +679,9 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                     provider = TestProvider,
                     startFraction = startFraction,
                     audioPassthrough = passthroughExtra,
+                    // --es audio_lang cs: start on that language's track (the
+                    // conformance asset's "cs" track is E-AC-3 5.1).
+                    preferredAudioLang = intent.getStringExtra("audio_lang"),
                 )
                 // --ei test_deadline_ms N: pretend the display needs N ms (keeps
                 // its real vsync) — raises the release lead to exercise the
@@ -768,6 +776,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             // tearsofsteel_enc (examples/tearsofsteel_enc/keys.json)
             "5fe47a2b5a43523cb79bb96e0a15d106" to hex("9355c4ddaedb22347380f4835b1f77e5"),
             "643819c17e42b72a9fa50b617fa7db2b" to hex("635f62d75077894b3c193e5f8de0c9c1"),
+            // conformance asset (scripts/conformance/make-asset.ps1, test-only key)
+            "00112233445566778899aabbccddeeff" to hex("0123456789abcdef0123456789abcdef"),
         )
 
         override fun resolveKey(kid: ByteArray): ByteArray? = keys[kid.toHex()]

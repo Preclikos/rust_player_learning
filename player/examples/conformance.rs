@@ -268,11 +268,20 @@ struct TapAudio {
 impl TapAudio {
     fn detect_onsets(&self, samples: &[f32]) {
         let rate = self.inner.sample_rate().max(1) as f64;
-        let block = ((rate / 1000.0) as usize).max(1) * 2; // 1 ms of stereo
+        // Interleaved at the sink's layout (2 on most devices, 8 on Windows
+        // spatial sound). The beep sits in the front pair, so the RMS reads
+        // channels 0/1 only — the silent surrounds would dilute it.
+        let ch = self.inner.channels().max(1) as usize;
+        let front = ch.min(2);
+        let block = ((rate / 1000.0) as usize).max(1) * ch; // 1 ms of frames
         let mut queued = self.lip.queued_ms.lock().unwrap();
         let mut loud = self.lip.loud.load(Ordering::Relaxed);
         for (i, chunk) in samples.chunks(block).enumerate() {
-            let rms = (chunk.iter().map(|s| s * s).sum::<f32>() / chunk.len() as f32).sqrt();
+            let (sum, n) = chunk
+                .chunks(ch)
+                .flat_map(|f| f.iter().take(front))
+                .fold((0.0f32, 0usize), |(sum, n), s| (sum + s * s, n + 1));
+            let rms = (sum / n.max(1) as f32).sqrt();
             if !loud && rms > BEEP_ON_RMS {
                 loud = true;
                 let pos_ms = *queued + i as f64; // block i starts i ms into this batch
@@ -283,7 +292,7 @@ impl TapAudio {
             }
         }
         self.lip.loud.store(loud, Ordering::Relaxed);
-        *queued += (samples.len() / 2) as f64 * 1000.0 / rate;
+        *queued += (samples.len() / ch) as f64 * 1000.0 / rate;
     }
 
     /// Poll the sink's presented position; every pending onset it has passed
@@ -334,6 +343,9 @@ impl AudioSink for TapAudio {
     }
     fn sample_rate(&self) -> u32 {
         self.inner.sample_rate()
+    }
+    fn channels(&self) -> u16 {
+        self.inner.channels()
     }
     fn played_ms(&self) -> Option<u64> {
         self.inner.played_ms()

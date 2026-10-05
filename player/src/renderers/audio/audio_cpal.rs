@@ -28,6 +28,11 @@ use tokio::sync::{
 };
 
 use super::{AudioRendererCommand, QUEUE_CHUNKS};
+
+// Windows: own WASAPI client for 7.1 into the OS spatial-sound renderer.
+#[cfg(target_os = "windows")]
+#[path = "audio_wasapi.rs"]
+mod wasapi;
 use crate::av_sync::{AudioChunk, ChunkCursor, FlushState};
 
 /// iOS only: the OS-authoritative output sample rate, read from
@@ -147,6 +152,33 @@ fn open_stream(
     Ok(stream)
 }
 
+/// Fill one device buffer (interleaved, the stream's channel count) from the
+/// chunk queue. Shared by the cpal callback and the Windows multichannel
+/// WASAPI writer (`wasapi`).
+fn fill<T: SizedSample + FromSample<f32>>(cb: &OutputShared, data: &mut [T]) {
+    // Only one output locks the cursor at a time.
+    let mut cursor = cb.cursor.lock().unwrap();
+    // While paused, emit silence WITHOUT consuming live PCM — resume
+    // picks up exactly where we left off. Chunks a flush has already
+    // superseded ARE thrown away here, or a seek (flush + pause) leaves
+    // the bounded queue full of the old pipeline's audio and the new
+    // pipeline can never queue the pre-roll that unpauses the output
+    // (see `ChunkCursor::drop_stale`).
+    if cb.paused_flag.load(Ordering::Relaxed) {
+        cursor.drop_stale();
+        for sample in data.iter_mut() {
+            *sample = T::EQUILIBRIUM;
+        }
+        return;
+    }
+    let vol = f32::from_bits(cb.volume.load(Ordering::Relaxed));
+    for sample in data.iter_mut() {
+        *sample = T::from_sample(cursor.next_sample().unwrap_or(0.0) * vol);
+    }
+    // Publish the consumed-sample count once per buffer (the clock).
+    cursor.commit();
+}
+
 fn build_stream<T: SizedSample + FromSample<f32>>(
     device: &Device,
     config: StreamConfig,
@@ -173,27 +205,7 @@ fn build_stream<T: SizedSample + FromSample<f32>>(
         if ms > 0 && ms <= 1000 {
             cb.output_latency_ms.store(ms, Ordering::Relaxed);
         }
-        // Only this callback locks the cursor, one stream at a time.
-        let mut cursor = cb.cursor.lock().unwrap();
-        // While paused, emit silence WITHOUT consuming live PCM — resume
-        // picks up exactly where we left off. Chunks a flush has already
-        // superseded ARE thrown away here, or a seek (flush + pause) leaves
-        // the bounded queue full of the old pipeline's audio and the new
-        // pipeline can never queue the pre-roll that unpauses the output
-        // (see `ChunkCursor::drop_stale`).
-        if cb.paused_flag.load(Ordering::Relaxed) {
-            cursor.drop_stale();
-            for sample in data.iter_mut() {
-                *sample = T::EQUILIBRIUM;
-            }
-            return;
-        }
-        let vol = f32::from_bits(cb.volume.load(Ordering::Relaxed));
-        for sample in data.iter_mut() {
-            *sample = T::from_sample(cursor.next_sample().unwrap_or(0.0) * vol);
-        }
-        // Publish the consumed-sample count once per callback (the clock).
-        cursor.commit();
+        fill(&cb, data);
     };
 
     // RealtimeDenied (AAudio couldn't grant the low-latency/realtime
@@ -232,6 +244,8 @@ fn start_audio(
     // owns routing/downmix). Kept in lock-step with the resampler.
     out_rate: u32,
     out_channels: u16,
+    // Windows spatial sound: run the 7.1 WASAPI writer instead of cpal.
+    #[cfg_attr(not(target_os = "windows"), allow(unused_variables))] spatial: bool,
     volume: Arc<AtomicU32>,
     stop: Arc<Notify>,
     flush_state: Arc<FlushState>,
@@ -275,6 +289,13 @@ fn start_audio(
                 owner.unpark();
             })
             .expect("spawn audio stop thread");
+    }
+
+    #[cfg(target_os = "windows")]
+    if spatial {
+        drop(device);
+        wasapi::run(&shared, out_rate, &stopped);
+        return;
     }
 
     let mut device = Some(device);
@@ -459,7 +480,23 @@ pub(super) fn start_thread(
         1 | 2 | 6 | 8 => out_channels,
         _ => 2,
     };
-    log::info!("[audio] opening output {} Hz / {} ch", out_rate, out_channels);
+    // Windows spatial sound (Windows Sonic / Dolby Atmos for Headphones / DTS)
+    // virtualizes a 7.1 stream, but the endpoint still reports stereo and
+    // cpal can't label channels (it sends KSAUDIO_SPEAKER_DIRECTOUT), so a
+    // stereo device gets its own 7.1 WASAPI writer. Decided once per player:
+    // the writer's AUTOCONVERTPCM lets Windows downmix if the user switches
+    // to a device without spatial sound mid-playback.
+    #[cfg(target_os = "windows")]
+    let spatial = out_channels <= 2 && wasapi::spatial_sound_enabled();
+    #[cfg(not(target_os = "windows"))]
+    let spatial = false;
+    let out_channels = if spatial { 8 } else { out_channels };
+    log::info!(
+        "[audio] opening output {} Hz / {} ch{}",
+        out_rate,
+        out_channels,
+        if spatial { " (Windows spatial sound, 7.1 WASAPI)" } else { "" }
+    );
 
     let stop_cpal = stop.clone();
     // Run the cpal output stream on a DEDICATED OS thread, NOT a tokio
@@ -480,6 +517,7 @@ pub(super) fn start_thread(
                 device,
                 out_rate,
                 out_channels,
+                spatial,
                 volume,
                 stop_cpal,
                 flush_state,

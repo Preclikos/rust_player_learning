@@ -39,6 +39,7 @@
 //!     [--max-bursts 200]         # sub-5ms catch-up renders
 //!     [--max-lipsync-ms 80]      # worst allowed |flash − beep| per pair (0 = skip)
 //!     [--max-lipsync-median-ms 40] # allowed |median flash − beep| (the real offset)
+//!     [--mark-period-ms 2000]    # flash+beep spacing (Dolby AVSync streams: 3000)
 //!     [--max-late-pct 2.0]       # frames presented >45 ms late, % of decoded
 //!     [--allowed-stalls N]       # default = --seeks (a post-seek spinner is fine)
 //! ```
@@ -122,6 +123,10 @@ fn parse_args() -> Args {
                 a.max_lipsync_median_ms =
                     val("--max-lipsync-median-ms").parse().expect("--max-lipsync-median-ms")
             }
+            "--mark-period-ms" => MARK_PERIOD_MS.store(
+                val("--mark-period-ms").parse().expect("--mark-period-ms"),
+                Ordering::Relaxed,
+            ),
             "--max-late-pct" => a.max_late_pct = val("--max-late-pct").parse().expect("--max-late-pct"),
             "--allowed-stalls" => {
                 a.allowed_stalls = Some(val("--allowed-stalls").parse().expect("--allowed-stalls"))
@@ -212,7 +217,13 @@ async fn headless_gpu() -> (wgpu::Device, wgpu::Queue, wgpu::Backend) {
 // ---------------------------------------------------------------------------
 
 /// The asset's marks: a beep + flash starting at every even second.
-const MARK_PERIOD_MS: u64 = 2_000;
+/// `--mark-period-ms` changes it for other beep/flash content (the Dolby
+/// AVSync test streams mark every 3 s).
+static MARK_PERIOD_MS: AtomicU64 = AtomicU64::new(2_000);
+
+fn mark_period_ms() -> u64 {
+    MARK_PERIOD_MS.load(Ordering::Relaxed)
+}
 /// A frame is "the flash frame" when its pts falls within one 24p frame
 /// slot after the mark instant.
 const FLASH_WINDOW_MS: u64 = 42;
@@ -404,12 +415,12 @@ impl VideoSink for TapVideo {
         // Skip the mark at pts 0: the very first frame is painted at once as
         // the start preview while the audio device is still spinning up, so
         // it is not a lip-sync sample (every later mark is).
-        if pts_ms % MARK_PERIOD_MS < FLASH_WINDOW_MS && pts_ms >= FLASH_WINDOW_MS {
+        if pts_ms % mark_period_ms() < FLASH_WINDOW_MS && pts_ms >= FLASH_WINDOW_MS {
             // Only the FIRST frame of each mark (the flash onset) — at 24 fps
             // two frames fall inside the window.
-            let mark = pts_ms / MARK_PERIOD_MS;
+            let mark = pts_ms / mark_period_ms();
             let mut flashes = self.lip.flashes.lock().unwrap();
-            if flashes.last().map_or(true, |&(p, _)| p / MARK_PERIOD_MS != mark) {
+            if flashes.last().map_or(true, |&(p, _)| p / mark_period_ms() != mark) {
                 // The sync loop calls render RENDER_BUDGET_MS (20 ms) before the
                 // frame's clock time and the offscreen target paints at once,
                 // so "presented" = now + that budget. (A late frame is painted
@@ -476,7 +487,7 @@ fn lipsync_offsets(lip: &LipSync) -> Vec<(u64, i64, Instant)> {
             .min_by_key(|d| d.abs());
         // Pair only within half a mark period; otherwise the beep for this
         // flash was not detected (or the flash landed in a seek hole).
-        if let Some(d) = nearest.filter(|d| d.abs() < (MARK_PERIOD_MS / 2) as i64) {
+        if let Some(d) = nearest.filter(|d| d.abs() < (mark_period_ms() / 2) as i64) {
             out.push((pts_ms, d, t_flash));
         }
     }
@@ -494,7 +505,7 @@ fn silent_rebuild_windows(
     // A window must hold a whole mark period after the seek's own settle
     // time before a missing pair means anything.
     let settle = Duration::from_secs(2);
-    let min_len = settle + Duration::from_millis(MARK_PERIOD_MS * 2);
+    let min_len = settle + Duration::from_millis(mark_period_ms() * 2);
     let mut out = Vec::new();
     for (i, &from) in rebuilds.iter().enumerate() {
         let to = rebuilds.get(i + 1).copied().unwrap_or(end);
@@ -809,15 +820,20 @@ async fn main() {
             AUDIO_DEAD_AFTER_REBUILD.as_secs()
         ),
     );
-    check(
-        "lipsync-per-rebuild",
-        silent_windows.is_empty(),
-        format!(
-            "{} rebuild window(s) without a flash/beep pair: {:?}",
-            silent_windows.len(),
-            silent_windows
-        ),
-    );
+    // A flash/beep pair per rebuild window only exists on marked content;
+    // `--max-lipsync-ms 0` (content without marks) skips it like the other
+    // lip-sync checks.
+    if args.max_lipsync_ms > 0 {
+        check(
+            "lipsync-per-rebuild",
+            silent_windows.is_empty(),
+            format!(
+                "{} rebuild window(s) without a flash/beep pair: {:?}",
+                silent_windows.len(),
+                silent_windows
+            ),
+        );
+    }
     check(
         "pipeline-retries",
         s.pipeline_retries == 0,

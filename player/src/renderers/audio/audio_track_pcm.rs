@@ -293,6 +293,15 @@ pub struct AudioTrackPcmSink {
     spatializer: Option<Global<JObject<'static>>>,
     /// Last routed output seen by the writer heartbeat (logs route changes).
     last_route: Mutex<String>,
+    /// DIAG: last (ns, presented, head, latency) read, for `note_position_jump`.
+    last_presented: Mutex<Option<(i64, i64, i64, i64)>>,
+    /// Bumped whenever the clock's mapping to real time legitimately steps
+    /// (new output latency, track recreated): consumers that measure the
+    /// clock against the wall (the A/V drift gauge) re-baseline on a change.
+    clock_epoch: AtomicU64,
+    /// The current track has delivered an accepted timestamp (see the epoch
+    /// bump in `presented_frames_jni`); reset when the track is recreated.
+    ts_seen: AtomicBool,
     /// Final head positions of released (recreated-away) tracks — the new
     /// track's head restarts at 0, so `played_ms` adds this base to stay
     /// cumulative for `MediaClock`.
@@ -376,6 +385,9 @@ impl AudioTrackPcmSink {
                     channels,
                     spatializer,
                     last_route: Mutex::new(String::new()),
+                    last_presented: Mutex::new(None),
+                    clock_epoch: AtomicU64::new(0),
+                    ts_seen: AtomicBool::new(false),
                     flush_state,
                     head_base: AtomicU64::new(0),
                     stopped: AtomicBool::new(false),
@@ -531,6 +543,8 @@ impl AudioTrackPcmSink {
             }
         };
         *self.track.lock().unwrap() = new_track;
+        self.ts_seen.store(false, Ordering::Release);
+        self.bump_clock_epoch("track recreated");
         let head_base = self.head_base.fetch_add(old_head, Ordering::AcqRel) + old_head;
         let dropped = self.dropped_frames.load(Ordering::Acquire);
         let queued = self
@@ -1000,6 +1014,10 @@ impl AudioTrackPcmSink {
         // Process-wide: seeks/heals rebuild the sink, the device latency
         // doesn't change. 0 = not learned yet (raw head, today's behavior).
         static PCM_LATENCY_FRAMES: AtomicI64 = AtomicI64::new(0);
+        // A latency reading far from the trusted one, and when it was first
+        // seen: adopted only once it has held steady (see the "ts" arm).
+        static CANDIDATE_LAT: AtomicI64 = AtomicI64::new(0);
+        static CANDIDATE_SINCE_NS: AtomicI64 = AtomicI64::new(0);
         // Rate limiter for the diagnostic clock log below (ns of last line).
         static LAST_CLOCK_LOG_NS: AtomicI64 = AtomicI64::new(0);
         let clock_log = |src: &str, head: i64, presented: i64, lat: i64| {
@@ -1078,11 +1096,68 @@ impl AudioTrackPcmSink {
                 // corrected head instead.
                 if presented <= head {
                     let lat = head - presented;
-                    if lat < sample_rate * 2 {
-                        PCM_LATENCY_FRAMES.store(lat, Ordering::Relaxed);
+                    let trusted = PCM_LATENCY_FRAMES.load(Ordering::Relaxed);
+                    let ms = |f: i64| f * 1000 / sample_rate.max(1);
+                    // Only a STEADY latency is believed. On an output route
+                    // change Samsung keeps returning the dead route's frozen
+                    // timestamp for ~1.3 s while the head runs on, so
+                    // `head − presented` grows by real time (221 → 1257 ms
+                    // measured): taken at face value the clock stood still
+                    // (picture froze) and that bogus latency was learned for
+                    // the fallback paths. A reading near the trusted value is
+                    // used and nudges it (slow average); a different one must
+                    // hold within ±20 ms for 300 ms before it replaces it (a
+                    // real new route, e.g. Bluetooth's +110 ms) — a freeze
+                    // keeps growing and never qualifies. Meanwhile the head
+                    // minus the trusted latency stands in, so the clock keeps
+                    // real time through the transition.
+                    let accepted = if trusted == 0 || (lat - trusted).abs() <= sample_rate * 40 / 1000 {
+                        if trusted != 0 {
+                            PCM_LATENCY_FRAMES.store(trusted + (lat - trusted) / 16, Ordering::Relaxed);
+                        } else if lat < sample_rate * 2 {
+                            PCM_LATENCY_FRAMES.store(lat, Ordering::Relaxed);
+                            self.bump_clock_epoch("first timestamp latency");
+                        }
+                        CANDIDATE_LAT.store(0, Ordering::Relaxed);
+                        true
+                    } else {
+                        let now = clock_monotonic_ns();
+                        let cand = CANDIDATE_LAT.load(Ordering::Relaxed);
+                        if cand != 0 && (lat - cand).abs() <= sample_rate * 20 / 1000 {
+                            if now - CANDIDATE_SINCE_NS.load(Ordering::Relaxed) >= 300_000_000 && lat < sample_rate * 2 {
+                                log::info!(
+                                    "[audio-pcm] output latency {} -> {} ms (steady 300 ms): adopting it",
+                                    ms(trusted),
+                                    ms(lat)
+                                );
+                                PCM_LATENCY_FRAMES.store(lat, Ordering::Relaxed);
+                                CANDIDATE_LAT.store(0, Ordering::Relaxed);
+                                self.bump_clock_epoch("output latency changed");
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            CANDIDATE_LAT.store(lat, Ordering::Relaxed);
+                            CANDIDATE_SINCE_NS.store(now, Ordering::Relaxed);
+                            false
+                        }
+                    };
+                    if accepted {
+                        // The clock source just moved from the head-minus-
+                        // fallback-latency estimate to real timestamps: a
+                        // step the drift gauge must not count.
+                        if !self.ts_seen.swap(true, Ordering::AcqRel) {
+                            self.bump_clock_epoch("timestamps valid");
+                        }
+                        clock_log("ts", head, presented, lat);
+                        self.note_position_jump(presented, head, lat);
+                        Some(presented.max(0))
+                    } else {
+                        let trusted = PCM_LATENCY_FRAMES.load(Ordering::Relaxed);
+                        clock_log("ts-unsteady", head, head - trusted, trusted);
+                        Some((head - trusted).max(0))
                     }
-                    clock_log("ts", head, presented, lat);
-                    Some(presented.max(0))
                 } else {
                     let lat = PCM_LATENCY_FRAMES.load(Ordering::Relaxed);
                     clock_log("ts-transient", head, head - lat, lat);
@@ -1203,6 +1278,44 @@ impl AudioTrackPcmSink {
     /// pipeline's video then holds its first frame until audio really starts
     /// instead of running ahead on the wall clock and lurching when the
     /// audio clock takes over.
+    fn bump_clock_epoch(&self, why: &str) {
+        let e = self.clock_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        log::info!("[audio-pcm] clock epoch {e}: {why}");
+    }
+
+    /// See `clock_epoch`.
+    pub fn clock_epoch(&self) -> u64 {
+        self.clock_epoch.load(Ordering::Acquire)
+    }
+
+    /// DIAG: log when the presented position moves by more than the real time
+    /// that passed (a framework `restoreTrack` on an output route change
+    /// re-bases the track position) — the size of the jump vs what was
+    /// written / queued is what a lip-sync correction has to account for.
+    fn note_position_jump(&self, presented: i64, head: i64, lat: i64) {
+        let now = clock_monotonic_ns();
+        let rate = self.sample_rate.max(1) as i64;
+        let mut last = self.last_presented.lock().unwrap();
+        if let Some((t0, p0, h0, l0)) = *last {
+            let dt_ns = now - t0;
+            if dt_ns > 0 && dt_ns < 2_000_000_000 {
+                let expected = dt_ns * rate / 1_000_000_000;
+                let jump_ms = (presented - p0 - expected) * 1000 / rate;
+                if jump_ms.abs() >= 20 {
+                    let written = self.written_frames.load(Ordering::Acquire) as i64;
+                    log::info!(
+                        "[audio-pcm] position jump {jump_ms:+} ms over {} ms: presented {p0}->{presented}, head {h0}->{head}, lat {}->{} ms, written {written} (written-head {} ms)",
+                        dt_ns / 1_000_000,
+                        l0 * 1000 / rate,
+                        lat * 1000 / rate,
+                        (written - head) * 1000 / rate,
+                    );
+                }
+            }
+        }
+        *last = Some((now, presented, head, lat));
+    }
+
     /// Where the track is playing right now (`getRoutedDevice`), e.g.
     /// "Bluetooth A2DP \"Galaxy Buds\"". `None` before routing / on error.
     fn routed_device(&self) -> Option<String> {

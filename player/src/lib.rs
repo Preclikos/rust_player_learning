@@ -17,6 +17,7 @@ mod events;
 mod debug;
 mod ffmpeg_log;
 mod hdr_tonemap;
+mod lipsync_probe;
 mod manifest;
 mod net;
 mod parsers;

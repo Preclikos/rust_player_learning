@@ -175,6 +175,15 @@ pub(super) async fn video_sync_loop<V: VideoSink, A: AudioSink>(
     // A/V drift measurement: (video elapsed_ms, audio played_ms) at the
     // first stats tick — subsequent ticks compare ADVANCES from here.
     let mut drift_baseline: Option<(u64, u64)> = None;
+    // Sink clock epoch the baseline belongs to (see AudioSink::clock_epoch).
+    let mut drift_epoch = audio_sink.clock_epoch();
+    // No baseline before this: a starting (or freshly re-routed) output's
+    // position settles for about a second — timestamps converge on the real
+    // latency, so the position briefly runs faster than real time while the
+    // picture, paced on it, stays in sync. Measured from there that settling
+    // read as a permanent ~-150..-220 ms "drift" on Android.
+    const DRIFT_SETTLE: Duration = Duration::from_secs(2);
+    let mut drift_settle_until: Option<Instant> = None;
     let mut last_drift_warn: Option<Instant> = None;
     // Min A/V drift over the current 1Hz stats window (least-stale read of
     // the chunky audio-played counter ≈ the true offset).
@@ -239,6 +248,9 @@ pub(super) async fn video_sync_loop<V: VideoSink, A: AudioSink>(
     // once and the cadence re-bases — so this can never schedule meaningfully
     // further from reality than the proven raw formula already did.
     const PRESENT_SMOOTH_NS: i64 = 40_000_000;
+    // How strongly the smoothed present time converges on raw (see the
+    // present block): 1/16 of the gap per frame.
+    const PRESENT_PULL: i64 = 16;
     // Cap on how far in the future a frame's present stamp may point (see the
     // clamp in the present block). 250 ms ≈ 6 frames at 24 fps — well inside
     // the direct codec's 8-buffer output pool, so SurfaceFlinger can never be
@@ -611,10 +623,20 @@ pub(super) async fn video_sync_loop<V: VideoSink, A: AudioSink>(
         // moves further than the window) is followed at once and the cadence
         // re-bases on the next frame. The raw formula above is untouched, so the
         // sleep gate / LATE drain / clock all behave exactly as before.
+        //
+        // The ideal is pulled 1/PRESENT_PULL of the way toward raw every frame.
+        // A pure snap keeps whatever phase it had for as long as raw stays in
+        // the window: after a clock step smaller than the window (start-up
+        // settling, an output route change) the picture stayed parked on one
+        // edge for the rest of the pipeline — measured on a Galaxy S21 as two
+        // stable lip-sync states 73 ms apart (-50 / +23 ms) that only a new
+        // pipeline reset. The pull averages the zero-mean wobble out but lets
+        // no lasting offset stick (~0.7 s time constant at 24 fps).
         let present_ns = match last_present {
             Some((last_ns, last_pts_us)) => {
                 let ideal_ns = last_ns + (pts_us_rel - last_pts_us) * 1_000;
-                ideal_ns.clamp(
+                let pulled_ns = ideal_ns + (raw_present_ns - ideal_ns) / PRESENT_PULL;
+                pulled_ns.clamp(
                     raw_present_ns - PRESENT_SMOOTH_NS,
                     raw_present_ns + PRESENT_SMOOTH_NS,
                 )
@@ -675,6 +697,21 @@ pub(super) async fn video_sync_loop<V: VideoSink, A: AudioSink>(
         let present_interval_ms = last_shown_ns.map(|last_ns| (shown_ns - last_ns) / 1_000_000);
         last_shown_ns = Some(shown_ns);
         last_present = Some((present_ns, pts_us_rel));
+        // Debug lip-sync probe (off unless enabled, see `lipsync_probe`).
+        // Android hands in the vsync the frame is stamped for (CLOCK_MONOTONIC);
+        // elsewhere the renderer presents at once.
+        if let Some(probe) = crate::lipsync_probe::probe() {
+            #[cfg(target_os = "android")]
+            let shown = Some(shown_ns);
+            #[cfg(not(target_os = "android"))]
+            let shown = None;
+            probe.on_frame(
+                pts_ms,
+                shown,
+                audio_sink.played_since_flush_ms(),
+                audio_sink.output_latency_ms(),
+            );
+        }
         frame.desired_present_ns = stamp_ns;
 
         // DIAG (#23): first few frames' pacing — tells us whether the direct
@@ -708,10 +745,26 @@ pub(super) async fn video_sync_loop<V: VideoSink, A: AudioSink>(
         let drift_at = render_start + ((shown_ns - clock_monotonic_ns()).max(0) / 1_000_000) as u64;
         #[cfg(not(target_os = "android"))]
         let drift_at = render_start;
+        let epoch = audio_sink.clock_epoch();
+        if epoch != drift_epoch {
+            // The output's mapping to real time stepped on purpose (new
+            // device / latency): measuring across it would report the step
+            // as drift for the rest of the pipeline.
+            drift_epoch = epoch;
+            drift_baseline = None;
+            drift_min_window = i64::MAX;
+            drift_settle_until = Some(Instant::now() + DRIFT_SETTLE);
+            log::info!("[vsync] audio clock epoch {epoch}: re-baselining the A/V drift gauge");
+        }
         if let Some(played) = audio_sink.played_ms() {
             match drift_baseline {
                 None if audio_sink.played_since_flush_ms().unwrap_or(1) == 0 => {}
-                None => drift_baseline = Some((drift_at, played)),
+                None => match drift_settle_until {
+                    // Audio just became audible: start the settle window.
+                    None => drift_settle_until = Some(Instant::now() + DRIFT_SETTLE),
+                    Some(t) if Instant::now() >= t => drift_baseline = Some((drift_at, played)),
+                    Some(_) => {}
+                },
                 Some((e0, p0)) => {
                     let d = drift_at.saturating_sub(e0) as i64
                         - played.saturating_sub(p0) as i64;

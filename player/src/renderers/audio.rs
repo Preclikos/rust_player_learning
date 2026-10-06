@@ -286,6 +286,9 @@ impl AudioRenderer {
             return;
         }
         self.update_peaks(samples);
+        if let Some(probe) = crate::lipsync_probe::probe() {
+            probe.on_pcm(samples, self.channels, self.sample_rate);
+        }
         let chunk = AudioChunk {
             gen: self.flush_state.current_gen(),
             samples: samples.to_vec(),
@@ -302,6 +305,59 @@ impl AudioRenderer {
         let l = f32::from_bits(self.peak_l_db.load(Ordering::Relaxed));
         let r = f32::from_bits(self.peak_r_db.load(Ordering::Relaxed));
         Some([l, r])
+    }
+
+    /// The output line of the debug HUD (before the lip-sync probe's).
+    fn debug_output_inner(&self) -> String {
+        if let Some(pt) = self.passthrough.lock().unwrap().as_ref() {
+            return format!("passthrough {}", pt.debug_output());
+        }
+        #[cfg(target_os = "android")]
+        {
+            return match self.pcm_sink.as_ref() {
+                Some(s) => s.debug_output(),
+                None => "no AudioTrack (video on the wall clock)".to_string(),
+            };
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            let played = super::AudioSink::played_ms(self)
+                .map(|ms| format!("{:.1}s", ms as f64 / 1000.0))
+                .unwrap_or_else(|| "-".into());
+            #[cfg(target_arch = "wasm32")]
+            let backend = if self.output_running.load(Ordering::Relaxed) {
+                "Web Audio (running)"
+            } else {
+                "Web Audio (suspended: no user gesture yet?)"
+            };
+            #[cfg(not(target_arch = "wasm32"))]
+            let (backend, switches) = {
+                let st = self.output_status.lock().unwrap();
+                let backend = match (st.backend.is_empty(), st.device.is_empty()) {
+                    (true, _) => "cpal (opening)".to_string(),
+                    (false, true) => st.backend.clone(),
+                    (false, false) => format!("{} on \"{}\"", st.backend, st.device),
+                };
+                let switches = match &st.last_switch {
+                    Some((at, what)) => format!(
+                        "  | output switches {}, last {:.0}s ago: {what}",
+                        st.switches,
+                        at.elapsed().as_secs_f64()
+                    ),
+                    None => String::new(),
+                };
+                (backend, switches)
+            };
+            #[cfg(target_arch = "wasm32")]
+            let switches = "";
+            format!(
+                "{backend} {} Hz, decoders mix to {} ch  played {played}  device latency {} ms{}{switches}",
+                self.sample_rate,
+                self.channels,
+                AudioRenderer::output_latency_ms(self),
+                if self.paused_flag.load(Ordering::Relaxed) { "  paused" } else { "" }
+            )
+        }
     }
 
     pub fn sample_rate(&self) -> u32 {
@@ -332,6 +388,9 @@ impl AudioRenderer {
     pub fn flush(&self) {
         let gen = self.flush_state.flush();
         log::debug!("[audio] flush → generation {}", gen);
+        if let Some(probe) = crate::lipsync_probe::probe() {
+            probe.on_flush();
+        }
     }
 
     /// Media ms of the current generation's PCM presented so far (0 while
@@ -403,6 +462,24 @@ impl super::AudioSink for AudioRenderer {
 
     fn channels(&self) -> u16 {
         AudioRenderer::channels(self)
+    }
+
+    fn clock_epoch(&self) -> u64 {
+        if self.passthrough.lock().unwrap().is_some() {
+            return 0;
+        }
+        #[cfg(target_os = "android")]
+        {
+            self.pcm_sink.as_ref().map_or(0, |s| s.clock_epoch())
+        }
+        #[cfg(not(any(target_os = "android", target_arch = "wasm32")))]
+        {
+            self.output_status.lock().unwrap().switches as u64
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            0
+        }
     }
 
     fn set_spatial_audio(&self, _enabled: bool) {
@@ -489,54 +566,10 @@ impl super::AudioSink for AudioRenderer {
     }
 
     fn debug_output(&self) -> String {
-        if let Some(pt) = self.passthrough.lock().unwrap().as_ref() {
-            return format!("passthrough {}", pt.debug_output());
-        }
-        #[cfg(target_os = "android")]
-        {
-            return match self.pcm_sink.as_ref() {
-                Some(s) => s.debug_output(),
-                None => "no AudioTrack (video on the wall clock)".to_string(),
-            };
-        }
-        #[cfg(not(target_os = "android"))]
-        {
-            let played = super::AudioSink::played_ms(self)
-                .map(|ms| format!("{:.1}s", ms as f64 / 1000.0))
-                .unwrap_or_else(|| "-".into());
-            #[cfg(target_arch = "wasm32")]
-            let backend = if self.output_running.load(Ordering::Relaxed) {
-                "Web Audio (running)"
-            } else {
-                "Web Audio (suspended: no user gesture yet?)"
-            };
-            #[cfg(not(target_arch = "wasm32"))]
-            let (backend, switches) = {
-                let st = self.output_status.lock().unwrap();
-                let backend = match (st.backend.is_empty(), st.device.is_empty()) {
-                    (true, _) => "cpal (opening)".to_string(),
-                    (false, true) => st.backend.clone(),
-                    (false, false) => format!("{} on \"{}\"", st.backend, st.device),
-                };
-                let switches = match &st.last_switch {
-                    Some((at, what)) => format!(
-                        "  | output switches {}, last {:.0}s ago: {what}",
-                        st.switches,
-                        at.elapsed().as_secs_f64()
-                    ),
-                    None => String::new(),
-                };
-                (backend, switches)
-            };
-            #[cfg(target_arch = "wasm32")]
-            let switches = "";
-            format!(
-                "{backend} {} Hz, decoders mix to {} ch  played {played}  device latency {} ms{}{switches}",
-                self.sample_rate,
-                self.channels,
-                AudioRenderer::output_latency_ms(self),
-                if self.paused_flag.load(Ordering::Relaxed) { "  paused" } else { "" }
-            )
+        let out = self.debug_output_inner();
+        match crate::lipsync_probe::probe() {
+            Some(probe) => format!("{out}  | {}", probe.hud()),
+            None => out,
         }
     }
 

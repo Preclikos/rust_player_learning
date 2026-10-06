@@ -144,6 +144,12 @@ pub trait AudioSink: Send + Sync + 'static {
     fn channels(&self) -> u16 {
         2
     }
+    /// Bumped when the sink's clock legitimately steps against the wall (a
+    /// new output device / latency, a recreated stream). The A/V drift gauge
+    /// re-baselines on a change instead of reporting the step as drift.
+    fn clock_epoch(&self) -> u64 {
+        0
+    }
     /// Windows: allow the 7.1 spatial-sound output (see
     /// `Player::set_spatial_audio`). Other sinks ignore it.
     fn set_spatial_audio(&self, _enabled: bool) {}

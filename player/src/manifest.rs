@@ -239,8 +239,15 @@ pub fn find_switchable_ids(block: &str) -> Vec<u32> {
     out
 }
 
-/// Return the integer value of the FIRST `<AudioChannelConfiguration value="N"/>`
+/// Return the channel count of the FIRST usable `<AudioChannelConfiguration>`
 /// in `block`, e.g. for parsing audio channel counts from a Representation.
+///
+/// The MPEG scheme (`urn:mpeg:dash:23003:3:audio_channel_configuration:2011`)
+/// carries the count as a decimal. Dolby's schemes
+/// (`tag:dolby.com,2014:dash:audio_channel_configuration:2011`,
+/// `urn:dolby:dash:audio_channel_configuration:2011`), which (E-)AC-3 and
+/// Atmos manifests use, carry a hex speaker mask instead (`F801` = 5.1) —
+/// read as a decimal, `4000` (mono) would come out as 4000 channels.
 pub fn find_audio_channel_count(block: &str) -> Option<u32> {
     let mut cursor = block;
     while let Some(open) = cursor.find("<AudioChannelConfiguration") {
@@ -250,7 +257,13 @@ pub fn find_audio_channel_count(block: &str) -> Option<u32> {
         if let Some(val_start) = tag.find("value=\"") {
             let rest = &tag[val_start + 7..];
             if let Some(val_end) = rest.find('"') {
-                if let Ok(n) = rest[..val_end].parse::<u32>() {
+                let value = &rest[..val_end];
+                let count = if tag.contains("dolby") {
+                    dolby_channel_mask_count(value)
+                } else {
+                    value.parse::<u32>().ok()
+                };
+                if let Some(n) = count {
                     return Some(n);
                 }
             }
@@ -258,6 +271,32 @@ pub fn find_audio_channel_count(block: &str) -> Option<u32> {
         cursor = &after[tag_end + 1..];
     }
     None
+}
+
+/// Channel count of a Dolby `audio_channel_configuration` value: the 16-bit
+/// E-AC-3 `chanmap` (ETSI TS 102 366 Table E.1.4) as 4 hex digits, bit 0 =
+/// MSB. Some bits stand for a speaker pair (Lc/Rc, Lrs/Rrs, Lsd/Rsd, Lw/Rw,
+/// Vhl/Vhr, Lts/Rts) and count twice: `F801` = L C R Ls Rs LFE = 6,
+/// `FA01` = + Lrs/Rrs = 8.
+pub fn dolby_channel_mask_count(value: &str) -> Option<u32> {
+    if value.len() != 4 {
+        return None;
+    }
+    let mask = u16::from_str_radix(value, 16).ok()?;
+    const PAIRS: [u32; 6] = [5, 6, 9, 10, 11, 13];
+    let count = (0..16u32)
+        .filter(|bit| mask & (0x8000 >> bit) != 0)
+        .map(|bit| if PAIRS.contains(&bit) { 2 } else { 1 })
+        .sum();
+    (count > 0).then_some(count)
+}
+
+/// Whether `block` signals Dolby Atmos in E-AC-3 (Joint Object Coding):
+/// `<SupplementalProperty schemeIdUri="tag:dolby.com,2018:dash:EC3_ExtensionType:2018" value="JOC"/>`.
+pub fn signals_eac3_joc(block: &str) -> bool {
+    find_descriptor_values(block, "EC3_ExtensionType")
+        .iter()
+        .any(|v| v.eq_ignore_ascii_case("JOC"))
 }
 
 #[cfg(test)]
@@ -464,6 +503,35 @@ mod tests {
         // Spec-wise we only expect one per Representation, but if there
         // are two the helper picks the first (consistent, predictable).
         assert_eq!(find_audio_channel_count(frag), Some(2));
+    }
+
+    #[test]
+    fn find_audio_channel_count_reads_dolby_hex_mask() {
+        let frag = r#"<Representation codecs="ec-3">
+            <AudioChannelConfiguration schemeIdUri="tag:dolby.com,2014:dash:audio_channel_configuration:2011" value="F801"/>
+        </Representation>"#;
+        assert_eq!(find_audio_channel_count(frag), Some(6));
+        let frag = r#"<AudioChannelConfiguration schemeIdUri="urn:dolby:dash:audio_channel_configuration:2011" value="4000"/>"#;
+        assert_eq!(find_audio_channel_count(frag), Some(1));
+    }
+
+    #[test]
+    fn dolby_channel_mask_counts_pairs_twice() {
+        assert_eq!(dolby_channel_mask_count("4000"), Some(1)); // C
+        assert_eq!(dolby_channel_mask_count("A000"), Some(2)); // L R
+        assert_eq!(dolby_channel_mask_count("F801"), Some(6)); // 5.1
+        assert_eq!(dolby_channel_mask_count("fa01"), Some(8)); // 7.1 (Lrs/Rrs pair)
+        assert_eq!(dolby_channel_mask_count("0000"), None);
+        assert_eq!(dolby_channel_mask_count("6"), None);
+    }
+
+    #[test]
+    fn signals_eac3_joc_reads_dolby_extension_type() {
+        let frag = r#"<AdaptationSet>
+            <SupplementalProperty schemeIdUri="tag:dolby.com,2018:dash:EC3_ExtensionType:2018" value="JOC"/>
+        </AdaptationSet>"#;
+        assert!(signals_eac3_joc(frag));
+        assert!(!signals_eac3_joc(REAL_MPD));
     }
 
     // -------------------------------------------------------------------

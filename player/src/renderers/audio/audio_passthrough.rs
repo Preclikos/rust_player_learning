@@ -1,6 +1,6 @@
 //! Android audio passthrough sink.
 //!
-//! Feeds a compressed bitstream (E-AC-3 / AC-3) straight to an `AudioTrack`
+//! Feeds a compressed bitstream (E-AC-3 [JOC] / AC-3) straight to an `AudioTrack`
 //! configured with the matching `ENCODING_*`, so the HDMI AVR/soundbar decodes
 //! it — instead of decoding to PCM here. The playback head of the track is the
 //! clock source: `played_ms()` lets `MediaClock` pace video to the receiver's
@@ -17,6 +17,8 @@ use jni::refs::Global;
 // android.media.AudioFormat
 pub const ENCODING_AC3: i32 = 5;
 pub const ENCODING_E_AC3: i32 = 6;
+/// E-AC-3 with Joint Object Coding (Dolby Atmos), API 28+.
+pub const ENCODING_E_AC3_JOC: i32 = 18;
 const CHANNEL_OUT_STEREO: i32 = 12;
 const CHANNEL_OUT_5POINT1: i32 = 252;
 // android.media.AudioAttributes
@@ -45,6 +47,128 @@ fn clock_monotonic_ns() -> i64 {
     let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
     ts.tv_sec as i64 * 1_000_000_000 + ts.tv_nsec as i64
+}
+
+fn channel_mask(channels: u16) -> i32 {
+    if channels > 2 {
+        CHANNEL_OUT_5POINT1
+    } else {
+        CHANNEL_OUT_STEREO
+    }
+}
+
+/// `AudioFormat.Builder().setEncoding(enc).setSampleRate(sr).setChannelMask(mask).build()`
+fn bitstream_format<'l>(
+    env: &mut jni::Env<'l>,
+    encoding: i32,
+    sample_rate: u32,
+    mask: i32,
+) -> Result<JObject<'l>, jni::errors::Error> {
+    let fb = env.new_object(
+        jni::jni_str!("android/media/AudioFormat$Builder"),
+        jni::jni_sig!("()V"),
+        &[],
+    )?;
+    let fb = env
+        .call_method(
+            &fb,
+            jni::jni_str!("setEncoding"),
+            jni::jni_sig!("(I)Landroid/media/AudioFormat$Builder;"),
+            &[encoding.into()],
+        )?
+        .l()?;
+    let fb = env
+        .call_method(
+            &fb,
+            jni::jni_str!("setSampleRate"),
+            jni::jni_sig!("(I)Landroid/media/AudioFormat$Builder;"),
+            &[(sample_rate as i32).into()],
+        )?
+        .l()?;
+    let fb = env
+        .call_method(
+            &fb,
+            jni::jni_str!("setChannelMask"),
+            jni::jni_sig!("(I)Landroid/media/AudioFormat$Builder;"),
+            &[mask.into()],
+        )?
+        .l()?;
+    env.call_method(
+        &fb,
+        jni::jni_str!("build"),
+        jni::jni_sig!("()Landroid/media/AudioFormat;"),
+        &[],
+    )?
+    .l()
+}
+
+/// `AudioAttributes.Builder().setUsage(MEDIA).setContentType(MOVIE).build()`
+fn movie_attributes<'l>(env: &mut jni::Env<'l>) -> Result<JObject<'l>, jni::errors::Error> {
+    let ab = env.new_object(
+        jni::jni_str!("android/media/AudioAttributes$Builder"),
+        jni::jni_sig!("()V"),
+        &[],
+    )?;
+    let ab = env
+        .call_method(
+            &ab,
+            jni::jni_str!("setUsage"),
+            jni::jni_sig!("(I)Landroid/media/AudioAttributes$Builder;"),
+            &[USAGE_MEDIA.into()],
+        )?
+        .l()?;
+    let ab = env
+        .call_method(
+            &ab,
+            jni::jni_str!("setContentType"),
+            jni::jni_sig!("(I)Landroid/media/AudioAttributes$Builder;"),
+            &[CONTENT_TYPE_MOVIE.into()],
+        )?
+        .l()?;
+    env.call_method(
+        &ab,
+        jni::jni_str!("build"),
+        jni::jni_sig!("()Landroid/media/AudioAttributes;"),
+        &[],
+    )?
+    .l()
+}
+
+/// Whether the current route can play `encoding` as a direct (bitstream)
+/// track: `AudioTrack.isDirectPlaybackSupported` (API 29+). `false` below
+/// API 29 or when the query fails. Asked before opening an E-AC-3 JOC track,
+/// so JOC is only requested where the route advertises it; everywhere else
+/// the same bytes go out as plain E-AC-3, exactly as before Atmos was known.
+pub fn direct_playback_supported(encoding: i32, sample_rate: u32, channels: u16) -> bool {
+    let vm = android_vm();
+    let res = vm.attach_current_thread(|env| -> Result<bool, jni::errors::Error> {
+        let sdk = env
+            .get_static_field(
+                jni::jni_str!("android/os/Build$VERSION"),
+                jni::jni_str!("SDK_INT"),
+                jni::jni_sig!("I"),
+            )?
+            .i()?;
+        if sdk < 29 {
+            return Ok(false);
+        }
+        let format = bitstream_format(env, encoding, sample_rate, channel_mask(channels))?;
+        let attrs = movie_attributes(env)?;
+        env.call_static_method(
+            jni::jni_str!("android/media/AudioTrack"),
+            jni::jni_str!("isDirectPlaybackSupported"),
+            jni::jni_sig!("(Landroid/media/AudioFormat;Landroid/media/AudioAttributes;)Z"),
+            &[(&format).into(), (&attrs).into()],
+        )?
+        .z()
+    });
+    match res {
+        Ok(supported) => supported,
+        Err(e) => {
+            log::warn!("[audio-pt] isDirectPlaybackSupported(encoding={encoding}) failed: {e}");
+            false
+        }
+    }
 }
 
 /// A compressed-bitstream `AudioTrack`. The clock source for passthrough.
@@ -98,85 +222,14 @@ unsafe impl Sync for AudioTrackSink {}
 
 impl AudioTrackSink {
     /// Create + start an AudioTrack for the given compressed `encoding`
-    /// (`ENCODING_E_AC3` / `ENCODING_AC3`). Returns `None` on any failure
+    /// (`ENCODING_E_AC3_JOC` / `ENCODING_E_AC3` / `ENCODING_AC3`). Returns `None` on any failure
     /// (caller falls back to PCM decode).
     pub fn new(encoding: i32, sample_rate: u32, channels: u16) -> Option<Self> {
-        let mask = if channels > 2 {
-            CHANNEL_OUT_5POINT1
-        } else {
-            CHANNEL_OUT_STEREO
-        };
+        let mask = channel_mask(channels);
         let vm = android_vm();
         let res: Result<Global<JObject<'static>>, jni::errors::Error> = vm.attach_current_thread(|env| {
-            // AudioFormat.Builder().setEncoding(enc).setSampleRate(sr).setChannelMask(mask).build()
-            let fb = env.new_object(
-                jni::jni_str!("android/media/AudioFormat$Builder"),
-                jni::jni_sig!("()V"),
-                &[],
-            )?;
-            let fb = env
-                .call_method(
-                    &fb,
-                    jni::jni_str!("setEncoding"),
-                    jni::jni_sig!("(I)Landroid/media/AudioFormat$Builder;"),
-                    &[encoding.into()],
-                )?
-                .l()?;
-            let fb = env
-                .call_method(
-                    &fb,
-                    jni::jni_str!("setSampleRate"),
-                    jni::jni_sig!("(I)Landroid/media/AudioFormat$Builder;"),
-                    &[(sample_rate as i32).into()],
-                )?
-                .l()?;
-            let fb = env
-                .call_method(
-                    &fb,
-                    jni::jni_str!("setChannelMask"),
-                    jni::jni_sig!("(I)Landroid/media/AudioFormat$Builder;"),
-                    &[mask.into()],
-                )?
-                .l()?;
-            let format = env
-                .call_method(
-                    &fb,
-                    jni::jni_str!("build"),
-                    jni::jni_sig!("()Landroid/media/AudioFormat;"),
-                    &[],
-                )?
-                .l()?;
-
-            // AudioAttributes.Builder().setUsage(MEDIA).setContentType(MOVIE).build()
-            let ab = env.new_object(
-                jni::jni_str!("android/media/AudioAttributes$Builder"),
-                jni::jni_sig!("()V"),
-                &[],
-            )?;
-            let ab = env
-                .call_method(
-                    &ab,
-                    jni::jni_str!("setUsage"),
-                    jni::jni_sig!("(I)Landroid/media/AudioAttributes$Builder;"),
-                    &[USAGE_MEDIA.into()],
-                )?
-                .l()?;
-            let ab = env
-                .call_method(
-                    &ab,
-                    jni::jni_str!("setContentType"),
-                    jni::jni_sig!("(I)Landroid/media/AudioAttributes$Builder;"),
-                    &[CONTENT_TYPE_MOVIE.into()],
-                )?
-                .l()?;
-            let attrs = env
-                .call_method(
-                    &ab,
-                    jni::jni_str!("build"),
-                    jni::jni_sig!("()Landroid/media/AudioAttributes;"),
-                    &[],
-                )?
-                .l()?;
+            let format = bitstream_format(env, encoding, sample_rate, mask)?;
+            let attrs = movie_attributes(env)?;
 
             // new AudioTrack.Builder().setAudioAttributes(a).setAudioFormat(f)
             //     .setBufferSizeInBytes(n).setTransferMode(STREAM).build()

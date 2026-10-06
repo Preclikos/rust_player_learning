@@ -4,7 +4,7 @@ pub mod text;
 pub mod video;
 
 use crate::manifest::{
-    find_audio_channel_count, find_descriptor_values, find_switchable_ids,
+    find_audio_channel_count, find_descriptor_values, find_switchable_ids, signals_eac3_joc,
     slice_adaptation_set, slice_representation, AdaptationSet, Representation, MPD,
 };
 use crate::net::{HttpClient, RequestKind};
@@ -365,6 +365,29 @@ impl Tracks {
                 adaptation_block.and_then(find_audio_channel_count)
             });
 
+        // Dolby Atmos over DASH is E-AC-3 with Joint Object Coding: a plain
+        // 5.1/7.1 E-AC-3 stream plus object metadata that only an Atmos
+        // decoder reads. Packagers signal it with the `ec+3` codecs string or
+        // the Dolby EC3_ExtensionType=JOC property (on the Representation, or
+        // in the AdaptationSet's own header, before its first Representation).
+        // `ec+3` is folded into `ec-3` here so every decoder, support probe and
+        // passthrough check downstream treats it as the E-AC-3 it is; the
+        // `atmos` flag keeps what it said — if it is plausible at all.
+        let rep_block = adaptation_block.and_then(|b| slice_representation(b, representation.id));
+        let adaptation_header = adaptation_block
+            .map(|b| b.find("<Representation").map_or(b, |i| &b[..i]));
+        let signalled = codecs == "ec+3"
+            || rep_block.is_some_and(signals_eac3_joc)
+            || adaptation_header.is_some_and(signals_eac3_joc);
+        let codecs = if codecs == "ec+3" { "ec-3".to_string() } else { codecs };
+        let atmos = is_plausible_atmos(signalled, &codecs, channels);
+        if signalled && !atmos {
+            log::warn!(
+                "[tracks] audio rep {} signals Atmos (JOC) but is {} {:?}ch; not labelled Atmos",
+                representation.id, codecs, channels
+            );
+        }
+
         let audio_representation = AudioRepresentation {
             id: representation.id,
             base_url: url_base,
@@ -377,6 +400,7 @@ impl Tracks {
             segment_range: index_segment,
             segments,
             channels,
+            atmos,
         };
 
         Ok(audio_representation)
@@ -884,8 +908,29 @@ fn merge_video_adaptation_group(members: Vec<VideoAdaptation>) -> VideoAdaptatio
     base
 }
 
+/// Whether a representation that `signalled` Atmos (E-AC-3 JOC) really can
+/// be one: JOC exists only in E-AC-3 and carries at least a 5.1 bed. A JOC
+/// property on an AC-3 or stereo rep (a packager copying the AdaptationSet's
+/// descriptors to every rep, say) must not put "Atmos" on its label or open
+/// a JOC passthrough track. An unknown channel count is given the benefit
+/// of the doubt — the signal is then the only information there is.
+fn is_plausible_atmos(signalled: bool, codecs: &str, channels: Option<u32>) -> bool {
+    signalled && codecs == "ec-3" && channels.map_or(true, |n| n >= 6)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn atmos_only_for_eac3_with_a_surround_bed() {
+        use super::is_plausible_atmos;
+        assert!(is_plausible_atmos(true, "ec-3", Some(6)));
+        assert!(is_plausible_atmos(true, "ec-3", Some(8)));
+        assert!(is_plausible_atmos(true, "ec-3", None));
+        assert!(!is_plausible_atmos(true, "ec-3", Some(2)));
+        assert!(!is_plausible_atmos(true, "ac-3", Some(6)));
+        assert!(!is_plausible_atmos(false, "ec-3", Some(6)));
+    }
+
     use super::*;
     use crate::tracks::segment::Segment;
 

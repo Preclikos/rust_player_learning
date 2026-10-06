@@ -50,6 +50,12 @@ pub struct AudioRepresentation {
     /// Channel count pulled from `<AudioChannelConfiguration value="N"/>`.
     /// `None` when the manifest omits the descriptor.
     pub channels: Option<u32>,
+
+    /// Dolby Atmos (E-AC-3 JOC): signalled by `ec+3` or the Dolby
+    /// EC3_ExtensionType=JOC property. `codecs` is `ec-3` either way — any
+    /// E-AC-3 decoder plays the 5.1/7.1 bed; only passthrough to an Atmos
+    /// receiver keeps the objects.
+    pub atmos: bool,
 }
 
 impl AudioRepresentation {
@@ -89,10 +95,15 @@ impl AudioRepresentation {
             None => String::new(),
         };
         let kbps = (self.bandwidth as f64 / 1000.0).round() as u64;
-        if layout.is_empty() {
-            format!("{} · {} kbps", self.codec_short(), kbps)
+        let codec = if self.atmos {
+            format!("{} Atmos", self.codec_short())
         } else {
-            format!("{} · {} · {} kbps", layout, self.codec_short(), kbps)
+            self.codec_short().to_string()
+        };
+        if layout.is_empty() {
+            format!("{} · {} kbps", codec, kbps)
+        } else {
+            format!("{} · {} · {} kbps", layout, codec, kbps)
         }
     }
 }

@@ -2589,17 +2589,28 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                 {
                     let pt_sink: Option<Arc<dyn crate::renderers::AudioPassthrough>> =
                         if want_passthrough {
+                            use crate::renderers::audio::audio_passthrough as pt;
+                            let rate = audio_representation.audio_sampling_rate;
+                            let channels = audio_representation.channels.unwrap_or(6) as u16;
                             let enc = if audio_representation.codecs == "ac-3" {
-                                crate::renderers::audio::audio_passthrough::ENCODING_AC3
+                                pt::ENCODING_AC3
                             } else {
-                                crate::renderers::audio::audio_passthrough::ENCODING_E_AC3
+                                pt::ENCODING_E_AC3
                             };
-                            crate::renderers::audio::audio_passthrough::AudioTrackSink::new(
-                                enc,
-                                audio_representation.audio_sampling_rate,
-                                audio_representation.channels.unwrap_or(6) as u16,
-                            )
-                            .map(|s| Arc::new(s) as Arc<dyn crate::renderers::AudioPassthrough>)
+                            // Atmos (E-AC-3 JOC): open the track as JOC where the
+                            // route says it takes it, so MS12 sinks keep the
+                            // objects instead of handling it as 5.1 E-AC-3. The
+                            // bitstream is the same either way; any failure falls
+                            // back to the plain E-AC-3 track.
+                            let joc = audio_representation.atmos
+                                && pt::direct_playback_supported(pt::ENCODING_E_AC3_JOC, rate, channels);
+                            if audio_representation.atmos {
+                                log::info!("[audio] Atmos (E-AC-3 JOC) track, direct JOC output supported: {joc}");
+                            }
+                            joc.then(|| pt::AudioTrackSink::new(pt::ENCODING_E_AC3_JOC, rate, channels))
+                                .flatten()
+                                .or_else(|| pt::AudioTrackSink::new(enc, rate, channels))
+                                .map(|s| Arc::new(s) as Arc<dyn crate::renderers::AudioPassthrough>)
                         } else {
                             None
                         };
@@ -2894,7 +2905,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         };
         if let Some(r) = self.audio_representation.lock().unwrap().as_ref() {
             audio.representation = Some(r.id);
-            audio.codec = r.codecs.clone();
+            audio.codec = if r.atmos { format!("{} (Atmos JOC)", r.codecs) } else { r.codecs.clone() };
             audio.channels = r.channels;
             audio.decoder_channels = match crate::decoders::DECODER_OUT_CHANNELS
                 .load(Ordering::Relaxed)

@@ -137,11 +137,29 @@ pub(super) fn mp4_sample_table(
             (
                 s.offset as usize,
                 s.size as usize,
-                s.composition_timestamp,
+                s.decode_timestamp + signed_composition_offset(s.composition_timestamp - s.decode_timestamp),
                 s.timescale,
             )
         })
         .collect())
+}
+
+/// The sample's composition offset (pts − dts), read as the signed 32-bit
+/// value it is.
+///
+/// re_mp4 (0.5.x) reads `trun.sample_composition_time_offset` as `u32` in both
+/// box versions, but in a version-1 `trun` it is signed: encoders that keep
+/// pts ≥ dts without an edit list (Dolby's DASH kits, among others) write the
+/// B-frames' offsets negative. Read unsigned, −1 tick becomes +4294967295
+/// ticks, every B-frame lands ~2^32 ticks in the future, and playback stalls
+/// after the first few frames. No real offset is anywhere near 2^31 ticks,
+/// so a value past it is a wrapped negative one.
+fn signed_composition_offset(offset: i64) -> i64 {
+    if offset > i32::MAX as i64 && offset <= u32::MAX as i64 {
+        offset - (1i64 << 32)
+    } else {
+        offset
+    }
 }
 
 /// Init concat + CENC decrypt + mp4 parse, on a BLOCKING thread.
@@ -806,6 +824,16 @@ pub(super) async fn audio_decoder_task(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn composition_offset_wrapped_by_unsigned_read_is_negative() {
+        assert_eq!(signed_composition_offset(0), 0);
+        assert_eq!(signed_composition_offset(2), 2);
+        assert_eq!(signed_composition_offset(u32::MAX as i64), -1);
+        assert_eq!(signed_composition_offset((1i64 << 32) - 1001), -1001);
+        // Already-correct negatives (a fixed re_mp4) pass through.
+        assert_eq!(signed_composition_offset(-1), -1);
+    }
 
     struct NullDecoder;
     impl HwVideoDecoder for NullDecoder {

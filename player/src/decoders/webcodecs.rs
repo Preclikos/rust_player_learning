@@ -435,6 +435,7 @@ fn on_audio_output(shared: &AudioShared, data: web_sys::AudioData) {
 
 fn on_audio_output_inner(shared: &AudioShared, data: web_sys::AudioData) {
     let channels = data.number_of_channels() as usize;
+    super::note_decoder_channels(channels);
     let frames = data.number_of_frames() as usize;
     let rate = data.sample_rate().round() as u32;
     let pts_ms = (data.timestamp() / 1000.0) as i64;

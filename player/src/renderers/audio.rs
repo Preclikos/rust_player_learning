@@ -127,6 +127,9 @@ pub(super) struct OutputStatus {
     pub backend: String,
     /// Friendly name of the device the stream is open on.
     pub device: String,
+    /// Channels of the stream the device really gets (2 when the Windows
+    /// writer folds the 7.1 queue down, else the queue's layout).
+    pub stream_channels: u16,
     /// Output streams rebuilt since the renderer started.
     pub switches: u32,
     /// When and what the last rebuild did (reason, gap, clock correction).
@@ -321,9 +324,6 @@ impl AudioRenderer {
         }
         #[cfg(not(target_os = "android"))]
         {
-            let played = super::AudioSink::played_ms(self)
-                .map(|ms| format!("{:.1}s", ms as f64 / 1000.0))
-                .unwrap_or_else(|| "-".into());
             #[cfg(target_arch = "wasm32")]
             let backend = if self.output_running.load(Ordering::Relaxed) {
                 "Web Audio (running)"
@@ -331,29 +331,24 @@ impl AudioRenderer {
                 "Web Audio (suspended: no user gesture yet?)"
             };
             #[cfg(not(target_arch = "wasm32"))]
-            let (backend, switches) = {
+            let (backend, stream_ch) = {
+                // Output switches themselves go to the log; the HUD shows the
+                // state now.
                 let st = self.output_status.lock().unwrap();
                 let backend = match (st.backend.is_empty(), st.device.is_empty()) {
-                    (true, _) => "cpal (opening)".to_string(),
+                    (true, _) => "opening".to_string(),
                     (false, true) => st.backend.clone(),
-                    (false, false) => format!("{} on \"{}\"", st.backend, st.device),
+                    (false, false) => format!("{} \"{}\"", st.backend, st.device),
                 };
-                let switches = match &st.last_switch {
-                    Some((at, what)) => format!(
-                        "  | output switches {}, last {:.0}s ago: {what}",
-                        st.switches,
-                        at.elapsed().as_secs_f64()
-                    ),
-                    None => String::new(),
-                };
-                (backend, switches)
+                let ch = if st.stream_channels > 0 { st.stream_channels } else { self.channels };
+                (backend, ch)
             };
             #[cfg(target_arch = "wasm32")]
-            let switches = "";
+            let stream_ch = self.channels;
             format!(
-                "{backend} {} Hz, decoders mix to {} ch  played {played}  device latency {} ms{}{switches}",
+                "{backend}  {} ch {} Hz  latency {} ms{}",
+                stream_ch,
                 self.sample_rate,
-                self.channels,
                 AudioRenderer::output_latency_ms(self),
                 if self.paused_flag.load(Ordering::Relaxed) { "  paused" } else { "" }
             )

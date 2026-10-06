@@ -190,16 +190,13 @@ impl Probe {
     /// One line for the debug HUD.
     pub(crate) fn hud(&self) -> String {
         let st = self.st.lock().unwrap();
-        let Some((mark, d)) = st.last else {
-            return "lipsync probe: no pair yet".into();
+        let Some((_, d)) = st.last else {
+            return "lipsync -".into();
         };
         let mut sorted = st.offsets.clone();
         sorted.sort_unstable();
         let median = sorted[sorted.len() / 2];
         let max = sorted.iter().map(|d| d.abs()).max().unwrap_or(0);
-        format!(
-            "lipsync last {d:+} ms @{mark}s  median {median:+} ms  max |{max}| ms  n={}  (+ = picture late)",
-            sorted.len()
-        )
+        format!("lipsync {d:+} ms (median {median:+}, max {max}, n={})", sorted.len())
     }
 }

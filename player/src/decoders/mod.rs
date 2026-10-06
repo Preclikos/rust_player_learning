@@ -37,6 +37,15 @@ pub mod webcodecs;
 // us PCM in the source layout (MediaCodec, WebCodecs) rather than through a
 // resampling library (FFmpeg's swresample).
 pub mod pcm;
+
+/// Channels the active audio decoder really outputs (its decoded layout, not
+/// the manifest hint), for the debug HUD. 0 = not known yet.
+pub(crate) static DECODER_OUT_CHANNELS: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+pub(crate) fn note_decoder_channels(channels: usize) {
+    DECODER_OUT_CHANNELS.store(channels as u32, std::sync::atomic::Ordering::Relaxed);
+}
 // Platform decoder-support probe applied to the track tree in `prepare()`.
 pub(crate) mod support;
 

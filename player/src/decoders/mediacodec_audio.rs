@@ -243,6 +243,7 @@ impl MediaCodecAudioDecoder {
                     self.channels = ch as usize;
                 }
                 self.resampler = None;
+                super::note_decoder_channels(self.channels);
                 log::info!(
                     "audio output format: {}Hz {}ch (decoder-reported)",
                     self.input_rate, self.channels

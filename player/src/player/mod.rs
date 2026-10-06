@@ -2896,6 +2896,12 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             audio.representation = Some(r.id);
             audio.codec = r.codecs.clone();
             audio.channels = r.channels;
+            audio.decoder_channels = match crate::decoders::DECODER_OUT_CHANNELS
+                .load(Ordering::Relaxed)
+            {
+                0 => None,
+                n => Some(n),
+            };
             audio.sample_rate = r.audio_sampling_rate;
         }
         let measured = self.video_frames_measured();

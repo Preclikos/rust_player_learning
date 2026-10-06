@@ -347,6 +347,7 @@ fn start_audio(
                     let s = open_stream(&d, stream_config, &shared)?;
                     let mut st = shared.status.lock().unwrap();
                     st.backend = "cpal".into();
+                    st.stream_channels = stream_config.channels;
                     st.device = d.description().map(|n| n.to_string()).unwrap_or_default();
                     Ok(s)
                 });

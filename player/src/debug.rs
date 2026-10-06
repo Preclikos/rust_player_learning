@@ -264,6 +264,8 @@ pub struct DebugAudio {
     pub representation: Option<u32>,
     pub codec: String,
     pub channels: Option<u32>,
+    /// What the decoder really outputs (decoded layout), when known.
+    pub decoder_channels: Option<u32>,
     pub sample_rate: u32,
     pub passthrough: bool,
     /// The output as the sink describes itself (backend, format, written /
@@ -399,10 +401,11 @@ impl DebugSnapshot {
         }
         out.extend([
             format!(
-                "A {} {}ch {} Hz{}  repr {}  underruns {}",
+                "A {} {}ch {} Hz  decoder {}ch{}  repr {}  underruns {}",
                 a.codec,
                 a.channels.map(|c| c.to_string()).unwrap_or_else(|| "?".into()),
                 a.sample_rate,
+                a.decoder_channels.map(|c| c.to_string()).unwrap_or_else(|| "?".into()),
                 if a.passthrough { "  PASSTHROUGH" } else { "" },
                 a.representation.map(|r| r.to_string()).unwrap_or_else(|| "-".into()),
                 a.underruns

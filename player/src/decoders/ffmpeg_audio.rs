@@ -77,6 +77,7 @@ impl FfmpegAudioDecoder {
         self.resampler_in_rate = in_rate;
         self.resampler_in_layout_bits = in_layout.bits();
         self.resampler = Some(resampler);
+        super::note_decoder_channels(in_layout.channels() as usize);
         log::info!(
             "FfmpegAudioDecoder: resampler {}Hz {}ch -> {}Hz {}ch",
             in_rate, in_layout.channels(), self.output_sample_rate, self.output_channels

@@ -104,16 +104,13 @@ pub(super) fn run(shared: &OutputShared, rate: u32, stopped: &AtomicBool, enable
         let spatial = enabled.load(Ordering::Relaxed);
         match unsafe { Stream::open(rate, spatial) } {
             Ok(stream) => {
-                let backend = if spatial {
-                    "WASAPI 7.1 stream (spatial sound)"
-                } else {
-                    "WASAPI stereo stream, 7.1 folded down (spatial off by host)"
-                };
+                let backend = if spatial { "WASAPI spatial" } else { "WASAPI (spatial off)" };
                 log::info!("[audio] {backend} on \"{}\"", stream.device_name);
                 {
                     let mut st = shared.status.lock().unwrap();
                     st.backend = backend.into();
                     st.device = stream.device_name.clone();
+                    st.stream_channels = stream.out_channels;
                 }
                 if let Some((from, lost_ms, why)) = gap_from.take() {
                     // The clock counted the old stream's queue as played at the

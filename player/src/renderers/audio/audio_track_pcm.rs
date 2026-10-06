@@ -1361,8 +1361,8 @@ impl AudioTrackPcmSink {
         .flatten()
     }
 
-    /// Live Spatializer state for the HUD: "spatializer on/off, route
-    /// spatialized/not". `None` when the track was not opened for it.
+    /// Live Spatializer state for the HUD ("spatialized", "spatializer off",
+    /// "downmix on this route"). `None` when the track was not opened for it.
     fn spatializer_state(&self) -> Option<String> {
         let spat = self.spatializer.as_ref()?;
         let vm = android_vm();
@@ -1373,11 +1373,12 @@ impl AudioTrackPcmSink {
             let available = env
                 .call_method(spat.as_obj(), jni::jni_str!("isAvailable"), jni::jni_sig!("()Z"), &[])?
                 .z()?;
-            Ok(format!(
-                "spatializer {}, route {}",
-                if enabled { "on" } else { "off" },
-                if available { "spatialized" } else { "not spatialized (AudioFlinger downmix)" }
-            ))
+            Ok(match (enabled, available) {
+                (true, true) => "spatialized",
+                (false, _) => "spatializer off (downmix)",
+                (true, false) => "downmix on this route",
+            }
+            .to_string())
         })
         .ok()
     }
@@ -1406,18 +1407,13 @@ impl AudioTrackPcmSink {
             .map(|p| format!("{} ms", written.saturating_sub(p) * 1000 / rate))
             .unwrap_or_else(|| "-".into());
         let route = self.routed_device().unwrap_or_else(|| "-".into());
-        let spatial = self
-            .spatializer_state()
-            .map(|s| format!("  | 5.1 for {s}"))
-            .unwrap_or_else(|| "  | stereo (no spatializer)".into());
+        let spatial = self.spatializer_state().map(|s| format!("  {s}")).unwrap_or_default();
+        let dropped = self.dropped_frames.load(Ordering::Acquire);
         format!(
-            "AudioTrack PCM16 {} Hz {}ch on {route}{spatial}  written {:.1}s  presented {}  in track {}  dropped {}{}{}",
-            self.sample_rate,
+            "AudioTrack {} ch {} Hz  {route}{spatial}  in track {in_track}{}{}{}",
             self.channels,
-            written as f64 / rate as f64,
-            presented.map(|p| format!("{:.1}s", p as f64 / rate as f64)).unwrap_or_else(|| "-".into()),
-            in_track,
-            self.dropped_frames.load(Ordering::Acquire),
+            self.sample_rate,
+            if dropped > 0 { format!("  dropped {} ms", dropped * 1000 / rate) } else { String::new() },
             if self.paused.load(Ordering::Acquire) { "  paused" } else { "" },
             if self.primed.load(Ordering::Acquire) { "" } else { "  unprimed" },
         )

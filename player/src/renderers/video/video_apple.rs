@@ -313,7 +313,12 @@ impl VideoRenderer {
             cfg.view_formats = vec![format];
             surface.configure(&self.device, &cfg);
         }
-        self.ensure_subtitle_overlay().set_direct_output(on);
+        // Only the render LAYER switches to DIRECT_OVERLAY_FORMAT. Offscreen,
+        // cues still draw into the published OFFSCREEN_FORMAT texture
+        // (Rgba8Unorm, 8-bit alpha already) — a bgra8 pipeline there is a
+        // wgpu validation error at the first cue, fatal under wgpu's default
+        // handler (desktop: picture gone as soon as a subtitle showed).
+        self.ensure_subtitle_overlay().set_direct_output(on && self.offscreen.is_none());
         direct.active.store(on, Ordering::Relaxed);
         direct.invalidate();
         log::info!(

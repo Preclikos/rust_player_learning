@@ -503,6 +503,24 @@ pub enum VideoRendererCommand {
     ChangeFrameSize(PhysicalSize<u32>),
 }
 
+/// The sampler every video plane is drawn with. Bilinear: the frame is
+/// almost never drawn 1:1 (a 1080p frame on a 1440p/4K canvas, a browser
+/// canvas at `devicePixelRatio` 1.5-2, a window smaller than the video), and
+/// wgpu's default `Nearest` turned every upscale into visible pixel blocks
+/// and every downscale into shimmer. The layouts already declare a filtering
+/// sampler over filterable planes, so this changes no validation rule.
+fn video_sampler(device: &wgpu::Device) -> Sampler {
+    device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("video sampler"),
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        ..Default::default()
+    })
+}
+
 impl VideoRenderer {
     /// Desktop / any host that can hand over raw window + display handles
     /// (e.g. winit). The player never touches winit; the host keeps the
@@ -814,12 +832,7 @@ impl VideoRenderer {
 
         //let surface_format = cap.formats[4]; //.last().unwrap();
 
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            ..Default::default()
-        });
+        let sampler = video_sampler(&device);
 
         let surface_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -1440,12 +1453,7 @@ impl VideoRenderer {
             hdr_detect,
         ) = Self::build_render_resources(&device, surface_format, true);
 
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            ..Default::default()
-        });
+        let sampler = video_sampler(&device);
 
         let offscreen = OffscreenTarget::new(device.clone(), size);
         let (command_sender, command_receiver) = mpsc::channel(32);

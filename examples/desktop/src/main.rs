@@ -41,8 +41,11 @@ impl ApplicationHandler for App {
             .display_handle()
             .expect("display handle")
             .as_raw();
-        let player =
+        // The manifest GET runs while the renderers are being built.
+        let prefetch = ::player::ManifestPrefetch::start(bridge::test_manifest_url(), None);
+        let mut player =
             Player::new_from_raw_handle(window_handle, display_handle, size.width, size.height);
+        player.adopt_manifest_prefetch(prefetch);
 
         // Keep winit's frame-pacing hint: call pre_present_notify right before
         // each present from inside the player's render loop.

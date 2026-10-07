@@ -385,7 +385,10 @@ pub extern "system" fn Java_io_github_preclikos_rustplayer_NativeBridge_nativeSt
         let host = Arc::new(AndroidHost { vm, cb: Arc::new(cb) });
 
         let _guard = runtime().enter();
-        let player = Player::new_from_android_surface(native_window as *mut c_void, w, h);
+        // The manifest GET runs while the renderers are being built.
+        let prefetch = bridge::prefetch_manifest(&manifest, host.clone());
+        let mut player = Player::new_from_android_surface(native_window as *mut c_void, w, h);
+        player.adopt_manifest_prefetch(prefetch);
 
         if display_hdr_types != 0 {
             player.set_display_hdr_types(display_hdr_types as u32);

@@ -163,12 +163,18 @@ fn spawn_event_log(player: &Player) {
     });
 }
 
+/// The stream [`run_test_playback`] opens: `RUST_PLAYER_URL`, else the
+/// public test manifest. Exposed so a shell can prefetch it.
+pub fn test_manifest_url() -> String {
+    std::env::var("RUST_PLAYER_URL").unwrap_or_else(|_| TEST_MANIFEST_URL.to_string())
+}
+
 pub async fn run_test_playback(mut player: Player) {
     spawn_event_log(&player);
     // RUST_PLAYER_URL / RUST_PLAYER_CLEARKEY (`kidhex:keyhex`, repeatable
     // with `,`) point the fixture at another stream — e.g. the conformance
     // asset served locally, when the public test stream is out of reach.
-    let url = std::env::var("RUST_PLAYER_URL").unwrap_or_else(|_| TEST_MANIFEST_URL.to_string());
+    let url = test_manifest_url();
     let keys = match std::env::var("RUST_PLAYER_CLEARKEY") {
         Ok(spec) => spec
             .split(',')

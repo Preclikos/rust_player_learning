@@ -20,6 +20,11 @@ impl Manifest {
             .map_err(|e| -> Box<dyn std::error::Error> {
                 format!("manifest download: {}", e).into()
             })?;
+        Self::from_content(content)
+    }
+
+    /// Parse an already-downloaded MPD (see [`ManifestPrefetch`]).
+    pub(crate) fn from_content(content: String) -> Result<Self, Box<dyn std::error::Error>> {
         let mpd = Self::parse(&content)?;
         Ok(Manifest { content, mpd })
     }
@@ -29,6 +34,49 @@ impl Manifest {
             log::error!("Failed to parse MPD: {}", e);
             "Failed to parse MPD".into()
         })
+    }
+}
+
+/// A manifest download started before the [`Player`](crate::Player) exists.
+///
+/// Building the player means building its renderers (GPU device, shaders,
+/// audio output) — ~120 ms on a Galaxy S21, more on TV SoCs and in the
+/// browser — and the manifest GET used to wait for all of it. A shell that
+/// knows the URL starts this first, builds the player, then hands it over
+/// with [`Player::adopt_manifest_prefetch`](crate::Player::adopt_manifest_prefetch):
+/// the download overlaps the renderer set-up. Must be started inside the
+/// player's runtime (it spawns on [`crate::rt`]).
+pub struct ManifestPrefetch {
+    pub(crate) url: String,
+    /// Becomes the player's client on adoption: same interceptor, and its
+    /// pool keeps the connection the manifest warmed.
+    pub(crate) http: std::sync::Arc<HttpClient>,
+    pub(crate) rx: tokio::sync::oneshot::Receiver<Result<String, String>>,
+}
+
+impl ManifestPrefetch {
+    /// Start downloading `url` through `interceptor` (the one the player
+    /// will use — a link-resolving / header-adding interceptor must see the
+    /// manifest request as usual).
+    pub fn start(
+        url: impl Into<String>,
+        interceptor: Option<std::sync::Arc<dyn crate::net::RequestInterceptor>>,
+    ) -> Self {
+        let url = url.into();
+        let http = std::sync::Arc::new(HttpClient::new());
+        if let Some(interceptor) = interceptor {
+            http.set_interceptor(interceptor);
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (client, target) = (std::sync::Arc::clone(&http), url.clone());
+        crate::rt::spawn(async move {
+            let res = client
+                .get_text(target, RequestKind::Manifest)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(res);
+        });
+        Self { url, http, rx }
     }
 }
 

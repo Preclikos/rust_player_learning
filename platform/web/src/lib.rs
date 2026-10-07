@@ -341,7 +341,11 @@ impl RustPlayer {
         let buffer = read_buffer_option(&options);
         let (w, h) = (canvas.width().max(1), canvas.height().max(1));
         log::info!("[web] creating player on {}x{} canvas for {} (hdr policy {:?})", w, h, manifest_url, hdr);
-        let player = Player::new_from_canvas(canvas, w, h).await;
+        // The manifest GET runs while WebGPU hands out its adapter/device.
+        let host: Arc<dyn BridgeHost> = Arc::new(WebHost { host, keys });
+        let prefetch = bridge::prefetch_manifest(&manifest_url, host.clone());
+        let mut player = Player::new_from_canvas(canvas, w, h).await;
+        player.adopt_manifest_prefetch(prefetch);
         let engine_tonemap = player.web_hdr_tonemap_available();
         match hdr {
             WebHdrPolicy::Auto if engine_tonemap => {
@@ -360,7 +364,6 @@ impl RustPlayer {
         if let Some(cfg) = buffer {
             player.set_buffer_config(cfg);
         }
-        let host: Arc<dyn BridgeHost> = Arc::new(WebHost { host, keys });
         let handle = bridge::start(player, manifest_url, host, config);
         Ok(RustPlayer { handle })
     }

@@ -464,6 +464,9 @@ pub struct Player<V: VideoSink = VideoRenderer, A: AudioSink = AudioRenderer> {
     /// fetch. Owns the single `reqwest::Client` connection pool and
     /// applies the configured `RequestInterceptor` + `RetryPolicy`.
     http: Arc<HttpClient>,
+    /// A manifest download adopted from a [`crate::ManifestPrefetch`]; the
+    /// next `open_url` of the same URL takes it instead of fetching again.
+    manifest_prefetch: Arc<StdMutex<Option<(String, tokio::sync::oneshot::Receiver<Result<String, String>>)>>>,
 
     /// Broadcast(64) sender for `PlayerEvent`s. Cloning a `Player` shares
     /// the same channel, so every subscriber sees every event regardless
@@ -642,6 +645,7 @@ impl<V: VideoSink, A: AudioSink> Clone for Player<V, A> {
             manifest: self.manifest.clone(),
             tracks: Arc::clone(&self.tracks),
             http: Arc::clone(&self.http),
+            manifest_prefetch: Arc::clone(&self.manifest_prefetch),
             events: Arc::clone(&self.events),
             paused: Arc::clone(&self.paused),
             surface_hold: Arc::clone(&self.surface_hold),
@@ -838,6 +842,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             manifest: None,
             tracks: Arc::new(StdMutex::new(None)),
             http: Arc::new(HttpClient::new()),
+            manifest_prefetch: Arc::new(StdMutex::new(None)),
             events,
             paused: Arc::new(AtomicBool::new(false)),
             surface_hold: Arc::new(SurfaceHold::default()),
@@ -1004,6 +1009,16 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         Ok(url.to_string() + "/")
     }
 
+    /// Take over a [`crate::ManifestPrefetch`] started before this player
+    /// was built: its HTTP client (same interceptor, warm connection)
+    /// becomes the player's, and the next `open_url` of the same URL uses its
+    /// download. Call before cloning the player or setting an interceptor /
+    /// retry policy on it — those live on the client being replaced.
+    pub fn adopt_manifest_prefetch(&mut self, prefetch: crate::ManifestPrefetch) {
+        self.http = prefetch.http;
+        *self.manifest_prefetch.lock().unwrap() = Some((prefetch.url, prefetch.rx));
+    }
+
     pub async fn open_url(&mut self, url: &str) -> Result<(), Box<dyn Error>> {
         // Sidecar subtitles were picked for the stream being replaced;
         // carrying them over would show cues timed against other media.
@@ -1011,7 +1026,20 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         let base_url = Self::parse_base_url(url)?;
         self.base_url = Some(base_url);
         let url = url.to_string();
-        let manifest = match Manifest::new(url, &self.http).await {
+        let prefetched = self.manifest_prefetch.lock().unwrap().take();
+        let manifest = match prefetched {
+            Some((prefetch_url, rx)) if prefetch_url == url => match rx.await {
+                Ok(Ok(content)) => Manifest::from_content(content),
+                // A failed prefetch gets the normal download (and its retries).
+                Ok(Err(e)) => {
+                    log::warn!("[manifest] prefetch failed ({e}) — downloading again");
+                    Manifest::new(url, &self.http).await
+                }
+                Err(_) => Manifest::new(url, &self.http).await,
+            },
+            _ => Manifest::new(url, &self.http).await,
+        };
+        let manifest = match manifest {
             Ok(m) => m,
             Err(e) => {
                 self.emit_error(PlayerErrorKind::ManifestParse, format!("manifest: {}", e));

@@ -335,7 +335,10 @@ pub extern "C" fn rustplayer_player_create_ex(
         });
 
         let _guard = runtime().enter();
-        let player = Player::new_from_metal_layer(metal_layer, width.max(1), height.max(1));
+        // The manifest GET runs while the renderers are being built.
+        let prefetch = bridge::prefetch_manifest(&manifest, host.clone());
+        let mut player = Player::new_from_metal_layer(metal_layer, width.max(1), height.max(1));
+        player.adopt_manifest_prefetch(prefetch);
         player.set_display_hdr_types(display_hdr_types);
         player.set_video_output_layer(video_layer);
         let config = StartConfig {

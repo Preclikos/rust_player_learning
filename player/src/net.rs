@@ -177,9 +177,14 @@ fn build_client() -> Client {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let tls = rustls::ClientConfig::builder()
+    let mut tls = rustls::ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
+    // reqwest fills in ALPN only for TLS configs it builds itself; a
+    // preconfigured one goes out without it, so HTTP/2 was never negotiated
+    // and every concurrent request (sidx fan-out, init, segments) paid its
+    // own TCP + TLS handshake. Offer h2, fall back to HTTP/1.1.
+    tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     Client::builder()
         .use_preconfigured_tls(tls)
         // A request whose connection goes idle mid-body must FAIL, not hang

@@ -226,6 +226,14 @@ pub struct BridgeHandle {
     ended: Arc<AtomicBool>,
 }
 
+/// Start the manifest download through the host's interceptor BEFORE the
+/// player (and its renderers) is built — see [`player::ManifestPrefetch`].
+/// The shell hands the result to `Player::adopt_manifest_prefetch` before
+/// [`start`], which then finds the manifest already on its way.
+pub fn prefetch_manifest(manifest_url: &str, host: Arc<dyn BridgeHost>) -> player::ManifestPrefetch {
+    player::ManifestPrefetch::start(manifest_url, Some(Arc::new(HostInterceptor(host))))
+}
+
 /// Wire the host's provider hooks into `player`, spawn the event pump and the
 /// open_url → prepare → tracks → play() orchestrator, and return a handle. The
 /// caller's `player` clone must keep its surface alive until the handle (and

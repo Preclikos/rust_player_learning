@@ -45,6 +45,7 @@ pub use macos_host::{macos_display_hdr_types, macos_install_direct_video_layer};
 /// The track tree returned by [`Player::get_tracks`]. Adaptation/representation
 /// types stay reachable through its public `video`/`audio`/`text` fields — a
 /// consumer reads them via inference (no need to name the inner types).
+pub use manifest::ManifestPrefetch;
 pub use tracks::Tracks;
 pub use debug::{
     DebugAbr, DebugAudio, DebugLogEntry, DebugNetwork, DebugPipeline, DebugSession, DebugSnapshot, DebugSync, DebugVideo,

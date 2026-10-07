@@ -915,8 +915,28 @@ impl AudioTrackPcmSink {
     /// pulled and AudioFlinger removes it with `BUFFER TIMEOUT` — the whole
     /// "wedged track" family. ~340 ms (16384 frames @48k) is the amount the
     /// probe empirically delivered; prime to that.
+    ///
+    /// Capped at 7/8 of the track's own buffer: on a phone (S21: 7696 frames,
+    /// 160 ms) 340 ms never fits, so priming fell through to the 50 × 10 ms
+    /// zero-write streak below — 500 ms of frozen startup with a full buffer.
     fn prime_frames(&self) -> u64 {
-        self.sample_rate as u64 * 340 / 1000
+        let want = self.sample_rate as u64 * 340 / 1000;
+        match self.buffer_frames() {
+            Some(cap) if cap > 0 => want.min(cap - cap / 8),
+            _ => want,
+        }
+    }
+
+    /// `getBufferSizeInFrames` of the CURRENT track, `None` on JNI failure.
+    fn buffer_frames(&self) -> Option<u64> {
+        let track = self.track.lock().unwrap();
+        let vm = android_vm();
+        vm.attach_current_thread(|env| -> Result<i32, jni::errors::Error> {
+            env.call_method(track.as_obj(), jni::jni_str!("getBufferSizeInFrames"), jni::jni_sig!("()I"), &[])?
+                .i()
+        })
+        .ok()
+        .and_then(|n| u64::try_from(n).ok())
     }
 
     /// Flip `primed` once the current track holds ≥ `prime_frames`, or the

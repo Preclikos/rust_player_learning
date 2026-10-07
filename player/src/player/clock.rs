@@ -303,8 +303,11 @@ impl<A: AudioSink> MediaClock<A> {
         // Only while really playing: paused / starving, or before the audio has
         // ever advanced (start-up: not audible yet), the clock must read p0
         // exactly, or video would run ahead of sound.
+        // The sub-cap branch obeys the ever-advanced rule too: interpolating a
+        // never-moved start position ran the first frames up to 80 ms ahead,
+        // then stepped back to p0 — the visible hitch right after start.
         const INTERP_CAP: Duration = Duration::from_millis(80);
-        let pos_us = if since < INTERP_CAP {
+        let pos_us = if since < INTERP_CAP && st.ever_advanced {
             p0 as i64 * 1_000 + since.as_micros() as i64
         } else if !held && st.ever_advanced {
             p0 as i64 * 1_000 + INTERP_CAP.as_micros() as i64
@@ -406,6 +409,9 @@ mod tests {
         // moves at all, so a 1.5 s standstill must not trip the fallback.
         let fx = fixture(0);
         assert_eq!(fx.clock.audio_now_us(Duration::ZERO), Some(0));
+        // Inside the interpolation window too: no run-ahead to step back from.
+        stand_still_for(&fx, 0, 50, false);
+        assert_eq!(fx.clock.audio_now_us(Duration::ZERO), Some(0), "no interpolation before audio moves");
         stand_still_for(&fx, 0, 1_500, false);
         assert_eq!(
             fx.clock.audio_now_us(Duration::ZERO),

@@ -81,22 +81,6 @@ fn enabled() -> bool {
     std::env::var("RUST_PLAYER_LIPSYNC").is_ok_and(|v| v == "1")
 }
 
-/// Probe time, ns. CLOCK_MONOTONIC on Android (the timebase of the frame
-/// present stamps handed in); a process-local monotonic clock elsewhere.
-fn now_ns() -> i64 {
-    #[cfg(target_os = "android")]
-    {
-        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
-        ts.tv_sec as i64 * 1_000_000_000 + ts.tv_nsec as i64
-    }
-    #[cfg(not(target_os = "android"))]
-    {
-        static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
-        EPOCH.get_or_init(std::time::Instant::now).elapsed().as_nanos() as i64
-    }
-}
-
 impl Probe {
     /// A flush: the queued axis restarts with the next pipeline's audio.
     pub(crate) fn on_flush(&self) {
@@ -136,7 +120,8 @@ impl Probe {
     /// `shown_ns`: when the frame reaches the display, on the probe clock;
     /// `None` = now (renderers that present at once).
     pub(crate) fn on_frame(&self, pts_ms: u64, shown_ns: Option<i64>, played: Option<u64>, latency_ms: u64) {
-        let now = now_ns();
+        // CLOCK_MONOTONIC on Android = the timebase of the present stamps handed in.
+        let now = crate::player::clock_monotonic_ns();
         let mut st = self.st.lock().unwrap();
         if let Some(played) = played {
             let played = played as f64;

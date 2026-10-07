@@ -40,14 +40,10 @@ fn android_vm() -> jni::JavaVM {
     unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) }
 }
 
-/// CLOCK_MONOTONIC now, in ns — the timebase of `AudioTimestamp.nanoTime`
-/// (TIMEBASE_MONOTONIC, the default), so we can interpolate the timestamp's
-/// frame position to the current instant.
-fn clock_monotonic_ns() -> i64 {
-    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
-    ts.tv_sec as i64 * 1_000_000_000 + ts.tv_nsec as i64
-}
+// CLOCK_MONOTONIC on Android — the timebase of `AudioTimestamp.nanoTime`
+// (TIMEBASE_MONOTONIC, the default), so the timestamp's frame position can be
+// interpolated to the current instant.
+use crate::player::clock_monotonic_ns;
 
 fn channel_mask(channels: u16) -> i32 {
     if channels > 2 {

@@ -32,15 +32,10 @@ use tokio::sync::mpsc::{self, Sender};
 use super::QUEUE_CHUNKS;
 use crate::av_sync::{AudioChunk, ChunkCursor, FlushState, Pulled};
 
-/// CLOCK_MONOTONIC now, in ns — the timebase of `AudioTimestamp.nanoTime`
-/// (TIMEBASE_MONOTONIC, the default), so the timestamp's frame position can
-/// be interpolated to the current instant. Same local copy as
-/// audio_passthrough.rs.
-fn clock_monotonic_ns() -> i64 {
-    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
-    ts.tv_sec as i64 * 1_000_000_000 + ts.tv_nsec as i64
-}
+// CLOCK_MONOTONIC on Android — the timebase of `AudioTimestamp.nanoTime`
+// (TIMEBASE_MONOTONIC, the default), so the timestamp's frame position can be
+// interpolated to the current instant.
+use crate::player::clock_monotonic_ns;
 
 // android.media.AudioFormat
 /// 16-bit PCM — the conventional Android output format (what every ExoPlayer

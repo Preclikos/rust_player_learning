@@ -288,6 +288,14 @@ impl Future for AnimationFrame {
     }
 }
 
+/// `performance.now()`, ms — the timebase of animation-frame timestamps.
+pub fn perf_now_ms() -> f64 {
+    js_sys::global()
+        .dyn_ref::<web_sys::Window>()
+        .and_then(|w| w.performance())
+        .map_or(0.0, |p| p.now())
+}
+
 pub fn animation_frame() -> AnimationFrame {
     let promise = js_sys::Promise::new(&mut |resolve, _reject| {
         let global = js_sys::global();

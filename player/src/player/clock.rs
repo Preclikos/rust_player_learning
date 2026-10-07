@@ -24,8 +24,20 @@ pub(crate) fn clock_monotonic_ns() -> i64 {
     unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
     ts.tv_sec as i64 * 1_000_000_000 + ts.tv_nsec as i64
 }
+// Windows / Linux / web: a process-local monotonic epoch (`performance.now()`
+// in the browser). Nothing hands these to an OS presentation API; the sync
+// loop's de-judder smoothing and its precise pacing wait only need a steady ns
+// axis (a constant 0 here made the smoother clamp against garbage and left
+// pacing on the raw audio clock).
 #[cfg(not(any(target_os = "android", target_os = "macos", target_os = "ios")))]
-pub(crate) fn clock_monotonic_ns() -> i64 { 0 }
+pub(crate) fn clock_monotonic_ns() -> i64 {
+    // Real time, never tokio's (a paused test clock would stall the pacing
+    // spin); `crate::rt::Instant` IS web_time's on wasm.
+    #[cfg(not(target_arch = "wasm32"))]
+    use std::time::Instant;
+    static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    EPOCH.get_or_init(Instant::now).elapsed().as_nanos() as i64
+}
 
 /// Playback master clock — 0-based media time, audio-disciplined.
 ///

@@ -225,8 +225,24 @@ impl VsyncCadence {
     /// screen one period later, at the upcoming vsync. The frame is due when
     /// that vsync is the nearest one to its clock time — within half a
     /// period either side of `now + period`.
-    pub fn frame_due(&self, pts_ms: u64, now_ms: u64) -> bool {
-        pts_ms as f64 <= now_ms as f64 + self.period_ms * 1.5
+    pub fn frame_due(&self, pts_ms: f64, now_ms: f64) -> bool {
+        pts_ms <= now_ms + self.period_ms * 1.5
+    }
+
+    /// The media clock as it read AT the last tick: `clock_ms` was read at
+    /// `perf_now_ms` (`performance.now()`, the animation-frame timebase), which
+    /// trails the tick by however late the task resumed — usually < 0.5 ms,
+    /// sometimes 10 ms (measured). Reading the clock late flips borderline
+    /// 3:2 frames onto the wrong tick; every decision in one tick must use the
+    /// same instant. Outside a tick (no tick yet, or more than a period ago)
+    /// the reading is used as is.
+    pub fn clock_at_tick(&self, clock_ms: f64, perf_now_ms: f64) -> f64 {
+        match self.last_tick_ms {
+            Some(tick) if (0.0..self.period_ms).contains(&(perf_now_ms - tick)) => {
+                clock_ms - (perf_now_ms - tick)
+            }
+            _ => clock_ms,
+        }
     }
 }
 
@@ -624,7 +640,7 @@ mod tests {
             // The clock at this tick; what is drawn now shows at t + period.
             let now_ms = t.round() as u64;
             let pts_ms = (pts0 + next_frame as f64 * frame).round() as u64;
-            if v.frame_due(pts_ms, now_ms) {
+            if v.frame_due(pts_ms as f64, now_ms as f64) {
                 shown_at.push(t + period);
                 next_frame += 1;
             }
@@ -639,6 +655,50 @@ mod tests {
         assert!(gaps.iter().all(|g| *g == 2 || *g == 3), "{gaps:?}");
     }
     use std::sync::Arc;
+
+    /// The task resumes 0–10 ms after the animation-frame tick (measured in
+    /// Chrome) and reads the clock then. Deciding on that late reading, in
+    /// whole ms, breaks the 3:2 cadence of 23.976 fps on 60 Hz; deciding on
+    /// the clock at the tick, in full precision, keeps it exact.
+    #[test]
+    fn decisions_on_the_tick_clock_keep_3_2_despite_late_wakeups() {
+        fn breaks(at_tick: bool) -> usize {
+            let mut v = VsyncCadence::new();
+            let period = 1000.0 / 60.0;
+            let frame = 1001.0 / 24.0;
+            let mut rng = 0x2545_F491_4F6C_DD1Du64;
+            let mut next_frame = 0usize;
+            let mut shown = Vec::new();
+            for tick in 0..3600 {
+                let t = tick as f64 * period;
+                v.observe_tick(t);
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                // Mostly prompt, now and then a long resume.
+                let delay = if rng % 10 == 0 { (rng % 1000) as f64 / 100.0 } else { (rng % 50) as f64 / 100.0 };
+                let perf_now = t + delay;
+                let clock = perf_now; // clock == wall
+                let pts = 100.0 + next_frame as f64 * frame;
+                let due = if at_tick {
+                    v.frame_due(pts, v.clock_at_tick(clock, perf_now))
+                } else {
+                    v.frame_due(pts.floor(), clock.floor())
+                };
+                if due {
+                    shown.push(tick);
+                    next_frame += 1;
+                }
+            }
+            let gaps: Vec<usize> = shown.windows(2).map(|w| w[1] - w[0]).collect();
+            gaps.windows(2).filter(|g| g[0] == g[1] || !(2..=3).contains(&g[0])).count()
+        }
+        let (late, at_tick) = (breaks(false), breaks(true));
+        assert!(late > 20, "late whole-ms reads should break the cadence: {late}");
+        // 23.976 against 60 Hz itself slips a step now and then (measured 7
+        // over the minute with the tick clock, 125 with late whole-ms reads).
+        assert!(at_tick * 10 < late, "tick clock: {at_tick} breaks (late reads: {late})");
+    }
 
     // ---------------- FlushState / played_since_flush ----------------
 

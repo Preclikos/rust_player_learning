@@ -146,6 +146,11 @@ pub(super) async fn video_sync_loop<V: VideoSink, A: AudioSink>(
     // to finish before the VSync deadline. The compositor (via
     // eglPresentationTimeANDROID) then holds the frame until the exact VSync.
     const RENDER_BUDGET_MS: u64 = 20;
+    // Desktop: how much earlier than RENDER_BUDGET_MS the raw-clock sleep
+    // wakes, leaving the rest to the smoothed wait (> the raw clock's p99
+    // per-frame wobble, ~9 ms measured on Windows).
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+    const DESKTOP_WAKE_EARLY_MS: u64 = 15;
     // Direct mode: how far ahead of its display time a frame is released to
     // the Surface comes from `stats.present_lead` (display deadline + one
     // vsync, capped while the decoder starves). A codec refusing input this
@@ -480,6 +485,10 @@ pub(super) async fn video_sync_loop<V: VideoSink, A: AudioSink>(
             }
         }
 
+        // Desktop: this frame went through the pacing sleep (not late), so the
+        // final wait below may land it on the smoothed present time.
+        #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+        let mut paced = false;
         if elapsed > pts_ms {
             let late_ms = elapsed - pts_ms;
             if late_ms > 80 {
@@ -542,6 +551,14 @@ pub(super) async fn video_sync_loop<V: VideoSink, A: AudioSink>(
             };
             #[cfg(not(target_os = "android"))]
             let render_budget_ms = RENDER_BUDGET_MS;
+            // Desktop wakes a little early on the raw clock and does the last
+            // stretch on the smoothed present time (see the wait after the
+            // present block), so the margin must cover the raw clock's wobble.
+            #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+            let render_budget_ms = {
+                paced = true;
+                render_budget_ms + DESKTOP_WAKE_EARLY_MS
+            };
             #[cfg(not(target_arch = "wasm32"))]
             {
                 let target_wake_ms = pts_ms.saturating_sub(render_budget_ms);
@@ -574,8 +591,13 @@ pub(super) async fn video_sync_loop<V: VideoSink, A: AudioSink>(
                 let mut need_tick = drew_this_tick;
                 loop {
                     if !need_tick {
-                        let now_ms = (clock.now_us(pause_skew) / 1_000) as u64;
-                        if vsync.frame_due(pts_ms, now_ms) {
+                        // Decide in full precision on the clock as it read
+                        // at the tick (see VsyncCadence::clock_at_tick): whole
+                        // ms and a late read flip borderline 3:2 frames.
+                        let clock_ms = clock.now_us(pause_skew) as f64 / 1_000.0;
+                        let now_ms = vsync.clock_at_tick(clock_ms, crate::rt::perf_now_ms());
+                        let pts = (frame.pts_us - origin_us).max(0) as f64 / 1_000.0;
+                        if vsync.frame_due(pts, now_ms) {
                             break;
                         }
                     }
@@ -652,6 +674,32 @@ pub(super) async fn video_sync_loop<V: VideoSink, A: AudioSink>(
         // frame N"). Clamping keeps the buffer flowing through SF regardless of
         // any clock discontinuity; pacing still comes from the sleep above.
         let present_ns = present_ns.min(clock_monotonic_ns() + MAX_PRESENT_LEAD_NS);
+        // Desktop: the frame is drawn at once and the UI shows it at the next
+        // vsync, so WHEN we render is what the viewer sees. The raw clock
+        // carries the audio callback staircase (measured sd ≈ 4 ms per frame on
+        // Windows), enough to push a 24 fps frame across a 60 Hz vsync boundary
+        // and break the 3:2 cadence on ~1 frame in 5. Finish the wait on the
+        // smoothed present time instead.
+        #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+        if paced {
+            let wake_ns = present_ns - RENDER_BUDGET_MS as i64 * 1_000_000;
+            // The timer only has ms resolution (sd ≈ 0.85 ms measured): sleep
+            // to within SPIN_NS, then yield-spin the rest.
+            const SPIN_NS: i64 = 1_500_000;
+            let wait_ns = wake_ns - SPIN_NS - clock_monotonic_ns();
+            if wait_ns > 0 {
+                tokio::select! {
+                    _ = crate::rt::sleep(Duration::from_nanos(wait_ns as u64)) => {}
+                    _ = stop.notified() => break,
+                }
+                if stop_flag.load(Ordering::Relaxed) {
+                    break;
+                }
+            }
+            while clock_monotonic_ns() < wake_ns {
+                tokio::task::yield_now().await;
+            }
+        }
         // Direct mode: snap onto the display's vsync grid (`snap_to_vsync`).
         // `shown_ns` = the vsync the frame is meant for, `stamp_ns` = what
         // SurfaceFlinger gets (mid-gap before that vsync). The smoother keeps

@@ -1734,14 +1734,10 @@ mod tests {
 /// GPU regression cover for the wgpu cue path (desktop, web, Apple), run on
 /// whatever adapter the machine has; skipped when there is none.
 ///
-/// The bug it guards (BlackZoneDesktop, Intel Iris Xe, player <= 0.2.9): a
-/// fresh texture per cue size meant a create/destroy on a device shared with
-/// the host UI at nearly every subtitle line, and on that driver some cues
-/// showed with a light box behind them. Since 0.2.10 one texture is reused.
-/// The driver fault itself can't be reproduced here; what is asserted is the
-/// mechanism and the visible result: few allocations over many cue sizes,
-/// and nothing but the cue's own ink changes the picture — no box, and no
-/// older, larger cue bleeding in around a smaller one.
+/// One cue texture serves every cue (it only grows). Asserted: few texture
+/// allocations over many cue sizes, and nothing but the cue's own ink changes
+/// the picture - no box behind it, and no older, larger cue bleeding in
+/// around a smaller one.
 #[cfg(all(test, not(target_os = "android"), not(target_arch = "wasm32")))]
 mod gpu_tests {
     use super::*;

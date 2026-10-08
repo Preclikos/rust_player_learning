@@ -1318,7 +1318,7 @@ impl AudioTrackPcmSink {
                 let jump_ms = (presented - p0 - expected) * 1000 / rate;
                 if jump_ms.abs() >= 20 {
                     let written = self.written_frames.load(Ordering::Acquire) as i64;
-                    log::info!(
+                    log::debug!(
                         "[audio-pcm] position jump {jump_ms:+} ms over {} ms: presented {p0}->{presented}, head {h0}->{head}, lat {}->{} ms, written {written} (written-head {} ms)",
                         dt_ns / 1_000_000,
                         l0 * 1000 / rate,
@@ -1555,7 +1555,7 @@ pub(super) fn start_output(
                         flush_state.clone(),
                         Arc::new(AtomicU64::new(0)),
                     );
-                    // DIAG heartbeat (sparse): sink/track state while samples flow.
+                    // Sparse heartbeat (debug log): sink/track state while samples flow.
                     let mut last_beat = std::time::Instant::now();
                     // Blocks until a chunk of the live generation arrives; chunks
                     // queued before the last flush are dropped by the cursor.
@@ -1569,7 +1569,7 @@ pub(super) fn start_output(
                         if last_beat.elapsed() >= std::time::Duration::from_secs(5) {
                             last_beat = std::time::Instant::now();
                             sink.log_route_change();
-                            log::info!(
+                            log::debug!(
                                 "[audio-pcm] writer: host_paused={} sink_paused={} playing={} played_ms={:?} since_flush={:?}",
                                 host_paused.load(Ordering::Relaxed),
                                 sink.paused.load(Ordering::Acquire),

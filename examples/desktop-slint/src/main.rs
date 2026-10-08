@@ -16,14 +16,10 @@
 //! cargo run --release -- [--url MPD] [--key KID:KEY]... [--sub file.vtt] [--sub-offset-ms N]
 //!                        [--secs N] [--ui-load-ms N] [--no-abr] [--no-play]
 //!                        [--backend vulkan|dx12] [--json out.json]
-//! cargo run --release -- --bench [--json out.json]
 //! ```
 //! * `--ui-load-ms N` stalls every Slint render by a random 0..N ms on the UI
 //!   thread — a slow machine on demand. `--secs 0` runs until the window closes.
 //! * `--no-play`: UI only, no decoder — tells UI-side issues from player ones.
-//! * `--bench`: per-operation cost of the device's memory policy (small
-//!   buffer writes, texture uploads/creation), then exit — the A/B that showed
-//!   DX12 without suballocation costing ~2 ms per Slint frame.
 //!
 //! Own workspace (Slint stays out of the engine's): build from this directory.
 
@@ -100,7 +96,6 @@ struct Args {
     abr: bool,
     json: Option<String>,
     no_play: bool,
-    bench: bool,
     /// Windows only: "vulkan" (default) or "dx12".
     backend: String,
 }
@@ -116,7 +111,6 @@ fn parse_args() -> Args {
         abr: true,
         json: None,
         no_play: false,
-        bench: false,
         backend: "vulkan".into(),
     };
     let mut it = std::env::args().skip(1);
@@ -136,7 +130,6 @@ fn parse_args() -> Args {
             "--json" => a.json = Some(val()),
             "--no-abr" => a.abr = false,
             "--no-play" => a.no_play = true,
-            "--bench" => a.bench = true,
             "--backend" => a.backend = val(),
             other => panic!("unknown argument {other}"),
         }
@@ -289,14 +282,6 @@ fn main() {
     let args = parse_args();
 
     let gpu = pollster::block_on(shared_gpu(&args.backend));
-    if args.bench {
-        let out = bench(&gpu.device, &gpu.queue);
-        println!("{out}");
-        if let Some(path) = &args.json {
-            let _ = std::fs::write(path, &out);
-        }
-        return;
-    }
     slint::BackendSelector::new()
         .require_wgpu_29(slint::wgpu_29::WGPUConfiguration::Manual {
             instance: gpu.instance.clone(),
@@ -599,125 +584,5 @@ fn summary_json(s: &PlayerStats, g: &UiPresent, p: &Player) -> String {
         load(&g.int_lt25), load(&g.int_25_41), load(&g.int_42_58), load(&g.int_gt58),
         load(&WGPU_ERRORS),
         p.debug_snapshot().to_json(),
-    )
-}
-
-/// `--bench`: what the device's memory policy costs per operation, on the
-/// shared device, before any UI exists. Each case is timed end to end
-/// (encode + submit + wait), the way a frame pays for it.
-fn bench(dev: &wgpu::Device, queue: &wgpu::Queue) -> String {
-    fn wait(dev: &wgpu::Device) {
-        let _ = dev.poll(wgpu::PollType::wait_indefinitely());
-    }
-    fn time_us(n: u32, mut f: impl FnMut(u32)) -> f64 {
-        for i in 0..(n / 10).max(3) {
-            f(i); // warm-up
-        }
-        let t = Instant::now();
-        for i in 0..n {
-            f(i);
-        }
-        t.elapsed().as_secs_f64() * 1e6 / n as f64
-    }
-
-    let ubo = dev.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("bench ubo"),
-        size: 64 * 1024,
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    let small = vec![7u8; 256];
-    let vbuf = vec![7u8; 64 * 1024];
-    let tex_desc = |w: u32, h: u32| wgpu::TextureDescriptor {
-        label: Some("bench tex"),
-        size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8Unorm,
-        // What FemtoVG uses for its images.
-        usage: wgpu::TextureUsages::TEXTURE_BINDING
-            | wgpu::TextureUsages::COPY_DST
-            | wgpu::TextureUsages::RENDER_ATTACHMENT,
-        view_formats: &[],
-    };
-    let img = vec![128u8; 512 * 512 * 4];
-    let fixed = dev.create_texture(&tex_desc(512, 512));
-    let write_tex = |t: &wgpu::Texture, w: u32, h: u32| {
-        queue.write_texture(
-            t.as_image_copy(),
-            &img[..(w * h * 4) as usize],
-            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 4), rows_per_image: Some(h) },
-            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-        );
-    };
-
-    // Per-frame patterns: a few small uniform/vertex uploads, one submit.
-    let frame_small = time_us(2000, |_| {
-        for _ in 0..8 {
-            queue.write_buffer(&ubo, 0, &small);
-        }
-        queue.submit([]);
-        wait(dev);
-    });
-    let frame_vertex = time_us(1000, |_| {
-        queue.write_buffer(&ubo, 0, &vbuf);
-        queue.submit([]);
-        wait(dev);
-    });
-    // Re-upload into an existing texture (glyph atlas / cue texture update).
-    let upload_existing = time_us(500, |_| {
-        write_tex(&fixed, 512, 512);
-        queue.submit([]);
-        wait(dev);
-    });
-    // New texture + first upload (image load, cue of a new size).
-    let create_small = time_us(300, |_| {
-        let t = dev.create_texture(&tex_desc(128, 128));
-        write_tex(&t, 128, 128);
-        queue.submit([]);
-        wait(dev);
-    });
-    let create_large = time_us(100, |_| {
-        let t = dev.create_texture(&tex_desc(512, 512));
-        write_tex(&t, 512, 512);
-        queue.submit([]);
-        wait(dev);
-    });
-    // A full-HD render target (offscreen ring resize) - no upload.
-    let create_rt_1080 = time_us(30, |_| {
-        let t = dev.create_texture(&wgpu::TextureDescriptor {
-            label: Some("bench rt"),
-            size: wgpu::Extent3d { width: 1920, height: 1080, depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        let view = t.create_view(&Default::default());
-        let mut enc = dev.create_command_encoder(&Default::default());
-        drop(enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: None,
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &view,
-                resolve_target: None,
-                depth_slice: None,
-                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        }));
-        queue.submit([enc.finish()]);
-        wait(dev);
-    });
-    format!(
-        "{{\"bench_us\":{{\"frame_8x256B_writes\":{frame_small:.1},\"frame_64KiB_write\":{frame_vertex:.1},\
-         \"reupload_512px\":{upload_existing:.1},\"new_tex_128px\":{create_small:.1},\
-         \"new_tex_512px\":{create_large:.1},\"new_rt_1080p\":{create_rt_1080:.1}}},\"wgpu_errors\":{}}}",
-        load(&WGPU_ERRORS)
     )
 }

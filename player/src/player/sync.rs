@@ -874,7 +874,7 @@ pub(super) async fn video_sync_loop<V: VideoSink, A: AudioSink>(
         // 24fps; jitter here = judder), elapsed = master clock, pts_to_go = the
         // scheduled lead. Reveals clock-jitter judder that doesn't trip LATE.
         if frame_idx.is_multiple_of(60) {
-            log::info!(
+            log::debug!(
                 "[vsync] f#{} pts={}ms elapsed={}ms interval={}ms dpts={}ms pts_to_go={}ms",
                 frame_idx, pts_ms, elapsed_us / 1000, interval_ms, delta_pts,
                 pts_to_go_ns / 1_000_000
@@ -1315,7 +1315,7 @@ pub(super) async fn av_sync_handler<V: VideoSink, A: AudioSink>(
                     if !alive.load(Ordering::Relaxed) {
                         break;
                     }
-                    log::info!(
+                    log::debug!(
                         "[watchdog gen {}] a_seg={} a_dec={} a_sync={} a_sunk={} | v_seg={} v_dec={} v_ren={} | pos={}ms",
                         gen,
                         stats.diag_audio_seg.load(Ordering::Relaxed),

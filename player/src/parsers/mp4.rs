@@ -122,7 +122,7 @@ pub fn parse_sidx(data: &mut &[u8]) -> Result<SidxBox, Box<dyn Error>> {
     // Diagnostic: a version-1 box that previously mis-parsed produced 0
     // entries (→ no media segments). Logging version + entry count makes that
     // failure mode obvious in a single line.
-    log::info!(
+    log::debug!(
         "[sidx] version={} timescale={} entries={} ept={} first_offset={}",
         version,
         timescale,

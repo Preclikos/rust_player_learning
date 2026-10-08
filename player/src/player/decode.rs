@@ -560,7 +560,7 @@ pub(super) async fn video_decoder_task(
             breathe!(decoder, stop_flag);
         }
         if let Some(first) = first_pts_us {
-            log::info!("[dec] seg done: pts {}..{}ms", first / 1000, last_pts_us / 1000);
+            log::debug!("[dec] seg done: pts {}..{}ms", first / 1000, last_pts_us / 1000);
         }
     }
 

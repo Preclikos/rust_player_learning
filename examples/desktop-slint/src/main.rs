@@ -15,16 +15,11 @@
 //! ```text
 //! cargo run --release -- [--url MPD] [--key KID:KEY]... [--sub file.vtt] [--sub-offset-ms N]
 //!                        [--secs N] [--ui-load-ms N] [--no-abr] [--no-play]
-//!                        [--churn-ms N] [--json out.json]
+//!                        [--json out.json]
 //! cargo run --release -- --bench [--json out.json]
 //! ```
 //! * `--ui-load-ms N` stalls every Slint render by a random 0..N ms on the UI
 //!   thread — a slow machine on demand. `--secs 0` runs until the window closes.
-//! * Image panel (top right): images re-uploaded as new textures every
-//!   `--churn-ms` (default 500) over gray and black — a broken alpha channel
-//!   shows as a box around them (the Intel Xe bug, fixed in the wgpu fork by
-//!   clearing a texture before its first write). Put any `monogram.png` next
-//!   to the executable to add a logo; generated alpha images are always shown.
 //! * `--no-play`: UI only, no decoder — tells UI-side issues from player ones.
 //! * `--bench`: per-operation cost of the device's memory policy (small
 //!   buffer writes, texture uploads/creation), then exit — the A/B that showed
@@ -48,13 +43,6 @@ slint::slint! {
         background: #000000;
         in property <image> video_frame;
         in property <string> hud;
-        // Image panel (alpha check): the logo uploaded once, the same logo
-        // re-uploaded as a NEW texture every --churn-ms, and a generated
-        // alpha ramp, each over mid-gray and over black. A broken alpha
-        // channel shows as a light/dark box around the images.
-        in property <image> logo_static;
-        in property <image> logo_churn;
-        in property <image> ramp;
         callback video_size_changed(float, float);
 
         // Same structure as BlackZone's player screen: black rect, the video
@@ -88,21 +76,6 @@ slint::slint! {
                     Rectangle { x: 0; width: parent.width * 0.35; background: #E50914; }
                 }
             }
-            for bg[i] in [#808080, #000000]: Rectangle {
-                x: parent.width - 420px;
-                y: 12px + i * 110px;
-                width: 408px;
-                height: 100px;
-                background: bg;
-                border-radius: 8px;
-                HorizontalLayout {
-                    padding: 10px;
-                    spacing: 12px;
-                    Image { source: root.logo_static; width: 80px; height: 80px; }
-                    Image { source: root.logo_churn; width: 80px; height: 80px; }
-                    Image { source: root.ramp; width: 196px; height: 80px; image-fit: fill; }
-                }
-            }
             Text {
                 x: 12px;
                 y: 12px;
@@ -128,7 +101,6 @@ struct Args {
     json: Option<String>,
     no_play: bool,
     bench: bool,
-    churn_ms: u64,
 }
 
 fn parse_args() -> Args {
@@ -143,7 +115,6 @@ fn parse_args() -> Args {
         json: None,
         no_play: false,
         bench: false,
-        churn_ms: 500,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -163,7 +134,6 @@ fn parse_args() -> Args {
             "--no-abr" => a.abr = false,
             "--no-play" => a.no_play = true,
             "--bench" => a.bench = true,
-            "--churn-ms" => a.churn_ms = val().parse().expect("--churn-ms"),
             other => panic!("unknown argument {other}"),
         }
     }
@@ -493,30 +463,6 @@ fn main() {
         }
     }
 
-    // Image panel: static logo (one upload), churned logo (a new texture
-    // per tick, like images reloaded by a UI), alpha ramp.
-    let logo_px = load_logo();
-    if let Some((w, h, px)) = &logo_px {
-        ui.set_logo_static(rgba_image(*w, *h, px));
-        ui.set_logo_churn(rgba_image(*w, *h, px));
-    }
-    ui.set_ramp(alpha_ramp());
-    let churn_timer = slint::Timer::default();
-    if args.churn_ms > 0 {
-        let ui_weak = ui.as_weak();
-        let mut flip = false;
-        churn_timer.start(slint::TimerMode::Repeated, Duration::from_millis(args.churn_ms), move || {
-            let Some(ui) = ui_weak.upgrade() else { return };
-            if let Some((w, h, px)) = &logo_px {
-                ui.set_logo_churn(rgba_image(*w, *h, px));
-            }
-            // The ramp alternates width, so its texture is re-created at a
-            // new size too (the per-size churn the subtitles used to cause).
-            flip = !flip;
-            ui.set_ramp(if flip { alpha_ramp_w(250) } else { alpha_ramp() });
-        });
-    }
-
     // Open → prepare → pick tracks → sidecar → play, on the runtime.
     let started = Arc::new(Mutex::new(None::<Instant>));
     if args.no_play {
@@ -640,56 +586,6 @@ fn summary_json(s: &PlayerStats, g: &UiPresent, p: &Player) -> String {
         load(&WGPU_ERRORS),
         p.debug_snapshot().to_json(),
     )
-}
-
-/// `monogram.png` next to the executable (or in the crate dir when run via
-/// cargo), decoded to straight-alpha RGBA.
-fn load_logo() -> Option<(u32, u32, Vec<u8>)> {
-    let mut candidates = Vec::new();
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            candidates.push(dir.join("monogram.png"));
-        }
-    }
-    candidates.push(std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/monogram.png")));
-    for path in candidates {
-        if let Ok(img) = slint::Image::load_from_path(&path) {
-            if let Some(buf) = img.to_rgba8() {
-                return Some((buf.width(), buf.height(), buf.as_bytes().to_vec()));
-            }
-        }
-    }
-    log::warn!("monogram.png not found next to the executable — logo panel empty");
-    None
-}
-
-/// A fresh image (and so a fresh GPU texture) from straight-alpha RGBA.
-fn rgba_image(w: u32, h: u32, px: &[u8]) -> slint::Image {
-    slint::Image::from_rgba8(slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(px, w, h))
-}
-
-fn alpha_ramp() -> slint::Image {
-    alpha_ramp_w(256)
-}
-
-/// White with alpha 0→255 left to right, plus a soft-edged dot.
-fn alpha_ramp_w(w: u32) -> slint::Image {
-    let h = 64u32;
-    let mut px = Vec::with_capacity((w * h * 4) as usize);
-    for y in 0..h {
-        for x in 0..w {
-            let ramp = (x * 255 / (w - 1)) as u8;
-            let (dx, dy) = (x as f32 - w as f32 * 0.8, y as f32 - h as f32 * 0.5);
-            let d = (dx * dx + dy * dy).sqrt();
-            let dot = (1.0 - ((d - 14.0) / 6.0).clamp(0.0, 1.0)) * 255.0;
-            if dot > ramp as f32 {
-                px.extend_from_slice(&[229, 9, 20, dot as u8]);
-            } else {
-                px.extend_from_slice(&[255, 255, 255, ramp]);
-            }
-        }
-    }
-    rgba_image(w, h, &px)
 }
 
 /// `--bench`: what the device's memory policy costs per operation, on the

@@ -383,6 +383,10 @@ pub struct SubtitleOverlay {
     /// which case cues simply never rasterize (rendering degrades to no
     /// subtitles rather than stalling the frame).
     worker: Option<std::thread::JoinHandle<()>>,
+    /// Cue textures allocated so far (the regression gauge for the shared,
+    /// grow-only texture: a handful per session, not one per cue).
+    #[cfg_attr(not(test), allow(dead_code))]
+    texture_allocs: std::sync::atomic::AtomicU64,
 }
 
 /// State the render path, the host-facing setters and the rasterizer
@@ -738,6 +742,7 @@ impl SubtitleOverlay {
             pq_output: std::sync::atomic::AtomicBool::new(false),
             pipeline_direct: std::sync::OnceLock::new(),
             direct_output: std::sync::atomic::AtomicBool::new(false),
+            texture_allocs: std::sync::atomic::AtomicU64::new(0),
             shader,
             pipeline_layout,
             bind_group_layout,
@@ -1023,6 +1028,7 @@ impl SubtitleOverlay {
     /// does not fit the current one.
     #[cfg_attr(target_os = "android", allow(dead_code))]
     fn create_gpu_cue(&self, cap_w: u32, cap_h: u32) -> GpuCue {
+        self.texture_allocs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("subtitle_cue_texture"),
             size: wgpu::Extent3d {
@@ -1722,5 +1728,210 @@ mod tests {
         let p = CueParent::fit(1920, 1080, 640, 480, 0, SubtitleAnchor::Picture);
         assert_eq!(place_cue(200, 50, 25, &CueLayout::parse("align:left"), &p).0, 240.0);
         assert_eq!(place_cue(200, 50, 25, &CueLayout::parse("align:right"), &p).0, 1480.0);
+    }
+}
+
+/// GPU regression cover for the wgpu cue path (desktop, web, Apple), run on
+/// whatever adapter the machine has; skipped when there is none.
+///
+/// The bug it guards (BlackZoneDesktop, Intel Iris Xe, player <= 0.2.9): a
+/// fresh texture per cue size meant a create/destroy on a device shared with
+/// the host UI at nearly every subtitle line, and on that driver some cues
+/// showed with a light box behind them. Since 0.2.10 one texture is reused.
+/// The driver fault itself can't be reproduced here; what is asserted is the
+/// mechanism and the visible result: few allocations over many cue sizes,
+/// and nothing but the cue's own ink changes the picture — no box, and no
+/// older, larger cue bleeding in around a smaller one.
+#[cfg(all(test, not(target_os = "android"), not(target_arch = "wasm32")))]
+mod gpu_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    const W: u32 = 1280;
+    const H: u32 = 720;
+    /// Opaque mid-gray: a light box (additive or opaque) and a dark one
+    /// both show up as a run of changed pixels.
+    const BG: [u8; 4] = [128, 128, 128, 255];
+
+    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(fut)
+    }
+
+    fn device() -> Option<(Arc<wgpu::Device>, Arc<wgpu::Queue>)> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::PRIMARY,
+            flags: wgpu::InstanceFlags::default(),
+            memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+            backend_options: wgpu::BackendOptions::default(),
+            display: None,
+        });
+        let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))
+        .ok()?;
+        let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()?;
+        Some((Arc::new(device), Arc::new(queue)))
+    }
+
+    /// Clear to `BG`, draw the overlay, read the target back (RGBA rows).
+    fn frame(dev: &wgpu::Device, queue: &wgpu::Queue, overlay: &SubtitleOverlay, target: &wgpu::Texture) -> Vec<u8> {
+        let view = target.create_view(&Default::default());
+        let parent = CueParent::fit(W, H, W, H, 0, SubtitleAnchor::default());
+        let mut enc = dev.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: BG[0] as f64 / 255.0,
+                            g: BG[1] as f64 / 255.0,
+                            b: BG[2] as f64 / 255.0,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            overlay.draw_into(&mut pass, &parent);
+        }
+        let padded = (W * 4).div_ceil(256) * 256;
+        let buf = dev.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: (padded * H) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        enc.copy_texture_to_buffer(
+            target.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buf,
+                layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(padded), rows_per_image: Some(H) },
+            },
+            wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+        );
+        queue.submit([enc.finish()]);
+        let slice = buf.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        let _ = dev.poll(wgpu::PollType::wait_indefinitely());
+        let data = slice.get_mapped_range();
+        let mut out = Vec::with_capacity((W * H * 4) as usize);
+        for y in 0..H {
+            let s = (y * padded) as usize;
+            out.extend_from_slice(&data[s..s + (W * 4) as usize]);
+        }
+        out
+    }
+
+    /// Bounding box of every pixel the cue changed, and how many it changed.
+    fn changed(px: &[u8]) -> Option<((u32, u32, u32, u32), usize)> {
+        let (mut x0, mut y0, mut x1, mut y1, mut n) = (u32::MAX, u32::MAX, 0, 0, 0);
+        for (i, p) in px.chunks(4).enumerate() {
+            if p[..3] != BG[..3] {
+                let (x, y) = (i as u32 % W, i as u32 / W);
+                (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
+                n += 1;
+            }
+        }
+        (n > 0).then_some(((x0, y0, x1, y1), n))
+    }
+
+    #[test]
+    fn cue_texture_is_reused_and_nothing_but_ink_changes_the_picture() {
+        let Some((dev, queue)) = device() else {
+            eprintln!("SKIP: no GPU adapter");
+            return;
+        };
+        let overlay = SubtitleOverlay::new(Arc::clone(&dev), Arc::clone(&queue), wgpu::TextureFormat::Rgba8Unorm);
+        let target = dev.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        // Big and tiny cues alternating: every cue changes the bitmap size,
+        // and every tiny one lands in a texture that last held a big one.
+        let big = "You don't touch anything.\nYou don't move anything.\nAnd you never, ever look back.";
+        let texts: Vec<&str> = (0..16).map(|i| if i % 2 == 0 { big } else { "Ok." }).collect();
+        let cues = texts
+            .iter()
+            .enumerate()
+            .map(|(i, t)| VttCue {
+                start_ms: i as i64 * 1000,
+                end_ms: i as i64 * 1000 + 999,
+                text: t.to_string(),
+                settings: String::new(),
+                layout: CueLayout::DEFAULT,
+            })
+            .collect();
+        overlay.queue_cues(cues);
+
+        // Reference picture of each text from an overlay that has only ever
+        // seen that one cue: no reused texture, no history.
+        let reference = |text: &str| -> Vec<u8> {
+            let fresh = SubtitleOverlay::new(Arc::clone(&dev), Arc::clone(&queue), wgpu::TextureFormat::Rgba8Unorm);
+            fresh.queue_cues(vec![VttCue {
+                start_ms: 0,
+                end_ms: 999,
+                text: text.to_string(),
+                settings: String::new(),
+                layout: CueLayout::DEFAULT,
+            }]);
+            fresh.set_pts_ms(500);
+            for _ in 0..400 {
+                let px = frame(&dev, &queue, &fresh, &target);
+                if changed(&px).is_some() {
+                    return px;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            panic!("reference for {text:?} never drawn");
+        };
+        let (ref_big, ref_tiny) = (reference(big), reference("Ok."));
+        for (name, px) in [("big", &ref_big), ("tiny", &ref_tiny)] {
+            let ((x0, y0, x1, y1), n) = changed(px).unwrap();
+            let area = ((x1 - x0 + 1) * (y1 - y0 + 1)) as usize;
+            // Ink (fill + shadow + antialiasing) covers well under half of
+            // its own bounding box; a box behind the text covers all of it.
+            assert!(n * 10 < area * 6, "{name} cue: {n} of {area} px in its box changed — a filled box, not text");
+        }
+
+        for (i, text) in texts.iter().enumerate() {
+            overlay.set_pts_ms(i as i64 * 1000 + 500);
+            let want = if *text == big { &ref_big } else { &ref_tiny };
+            // The worker rasterizes off-thread; redraw until this cue lands.
+            // With the shared texture it must land EXACTLY as a fresh overlay
+            // draws it: an older, larger cue left in the texture must not
+            // show through (bleed at the edge, or the whole texture sampled).
+            let mut last = Vec::new();
+            let mut ok = false;
+            for _ in 0..400 {
+                last = frame(&dev, &queue, &overlay, &target);
+                if &last == want {
+                    ok = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            if !ok {
+                let diff = last.chunks(4).zip(want.chunks(4)).filter(|(a, b)| a != b).count();
+                panic!("cue {i} ({text:?}) differs from a fresh overlay's rendering in {diff} px");
+            }
+        }
+        let allocs = overlay.texture_allocs.load(Ordering::Relaxed);
+        assert!(allocs <= 2, "{allocs} cue textures allocated for {} cues — expected reuse", texts.len());
     }
 }

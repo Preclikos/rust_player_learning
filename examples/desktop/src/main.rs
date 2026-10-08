@@ -305,6 +305,7 @@ async fn run_console(player: Player) {
     println!("  abr off  — disable ABR (Manual)");
     println!("  p        — pause / resume (also: space in the window)");
     println!("  spatial on|off — Windows 7.1 spatial-sound output (default on)");
+    println!("  subfile <path> [offset_ms] — load + show a sidecar .vtt/.srt");
     println!("  seek <ms>      — absolute seek; seek +<ms> / -<ms> — relative (also: arrows in the window)");
 
     let stdin = tokio::io::stdin();
@@ -350,6 +351,23 @@ async fn run_console(player: Player) {
             "a" => match arg.and_then(|s| s.parse::<usize>().ok()) {
                 Some(i) => pick_audio(&player, i),
                 None => println!("usage: a <index>"),
+            },
+            // subfile <path> [offset_ms]: load a sidecar .vtt/.srt and show it.
+            "subfile" => match arg {
+                Some(path) => {
+                    let offset = parts.next().and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+                    match std::fs::read(path) {
+                        Ok(bytes) => match player.add_external_subtitle_track(
+                            &bytes,
+                            player::ExternalSubtitleOptions { time_offset_ms: offset, ..Default::default() },
+                        ) {
+                            Ok(track) => player.set_subtitle_track(&track),
+                            Err(e) => println!("subfile: {e}"),
+                        },
+                        Err(e) => println!("subfile: {path}: {e}"),
+                    }
+                }
+                None => println!("usage: subfile <path> [offset_ms]"),
             },
             "seek" => match arg {
                 Some(a) if a.starts_with('+') || a.starts_with('-') => match a.parse::<i64>() {

@@ -1,0 +1,41 @@
+[package]
+name = "desktop-slint"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Slint in-app host mirroring BlackZoneDesktop: repro + perf regression harness for the offscreen path"
+
+# Its own workspace on purpose: Slint (and its wgpu patch) stays out of the
+# engine workspace, its lockfile and CI. Build from this directory.
+[workspace]
+
+[dependencies]
+player = { path = "../../player" }
+# Same versions/features as BlackZoneDesktop (app/Cargo.toml) — the point of
+# this harness is to composite exactly the way the product does.
+slint = { version = "=1.17.1", features = ["unstable-wgpu-29", "unstable-winit-030", "backend-winit", "renderer-femtovg-wgpu"] }
+wgpu = "29"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+pollster = "1"
+log = "0.4"
+env_logger = "0.11"
+
+# Slint depends on crates.io wgpu 29; the player on the Preclikos fork. Both
+# must be ONE crate for `slint::Image::try_from(wgpu::Texture)` to accept the
+# player's texture (BlackZoneDesktop/Cargo.toml carries the same patch).
+[patch.crates-io]
+wgpu = { git = "https://github.com/Preclikos/wgpu.git" }
+
+# Mirror the engine workspace's dev-profile opt so decryption isn't 4 s/segment.
+[profile.dev.package.aes]
+opt-level = 3
+[profile.dev.package.ctr]
+opt-level = 3
+[profile.dev.package.cipher]
+opt-level = 3
+[profile.dev.package.crypto-common]
+opt-level = 3
+[profile.dev.package.cpufeatures]
+opt-level = 3
+[profile.dev.package.player]
+opt-level = 3

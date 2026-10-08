@@ -1165,3 +1165,187 @@ pub fn format_wgpu_to_dxgi(format: TextureFormat) -> DXGI_FORMAT {
         _ => panic!("Unsupported texture format: {:?}", format),
     }
 }
+
+/// GPU test of the D3D11 -> Vulkan import pool on the machine's GPU (skipped
+/// without one): NV12 frames with a known pattern are created on a D3D11
+/// device on the renderer's adapter, imported, read back plane by plane and
+/// compared byte for byte. Six frames run through four slots, so slot reuse
+/// and the GPU wait on the imported D3D11 fence are exercised. (wgpu's DX12
+/// backend can't copy single NV12 planes out, so the DX12 pool has no
+/// readback test.)
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::Foundation::HMODULE;
+    use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
+
+    const W: u32 = 64;
+    const H: u32 = 64;
+
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(f)
+    }
+
+    fn wgpu_device(backends: wgpu::Backends, extra: wgpu::Features) -> Option<(wgpu::Device, wgpu::Queue)> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends,
+            flags: wgpu::InstanceFlags::default(),
+            memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+            backend_options: wgpu::BackendOptions::default(),
+            display: None,
+        });
+        let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))
+        .ok()?;
+        let wanted = wgpu::Features::TEXTURE_FORMAT_NV12 | extra;
+        if !adapter.features().contains(wanted) {
+            return None;
+        }
+        block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            required_features: wanted,
+            ..Default::default()
+        }))
+        .ok()
+    }
+
+    /// D3D11 device on the adapter with `luid` (where the decoder would open).
+    fn d3d11_on(luid: u64) -> Option<(ID3D11Device, ID3D11DeviceContext)> {
+        unsafe {
+            let factory: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
+            let mut i = 0;
+            while let Ok(adapter) = factory.EnumAdapters1(i) {
+                i += 1;
+                let l = adapter.GetDesc1().ok()?.AdapterLuid;
+                if ((l.HighPart as u32 as u64) << 32 | l.LowPart as u64) != luid {
+                    continue;
+                }
+                let (mut dev, mut ctx) = (None, None);
+                D3D11CreateDevice(
+                    &adapter,
+                    D3D_DRIVER_TYPE_UNKNOWN,
+                    HMODULE::default(),
+                    D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+                    None,
+                    D3D11_SDK_VERSION,
+                    Some(&mut dev),
+                    None,
+                    Some(&mut ctx),
+                )
+                .ok()?;
+                return Some((dev?, ctx?));
+            }
+            None
+        }
+    }
+
+    /// NV12 frame `k`: a Y gradient and a UV pattern, both shifted by `k`.
+    fn nv12_pattern(k: u32) -> Vec<u8> {
+        let mut px = Vec::with_capacity((W * H * 3 / 2) as usize);
+        for y in 0..H {
+            for x in 0..W {
+                px.push(((x + y * 3 + k * 17) & 0xFF) as u8);
+            }
+        }
+        for y in 0..H / 2 {
+            for x in 0..W / 2 {
+                px.push(((x * 5 + k * 29) & 0xFF) as u8);
+                px.push(((y * 7 + k * 41) & 0xFF) as u8);
+            }
+        }
+        px
+    }
+
+    fn nv12_texture(dev: &ID3D11Device, data: &[u8]) -> Option<ID3D11Texture2D> {
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: W,
+            Height: H,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_NV12,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let init = D3D11_SUBRESOURCE_DATA { pSysMem: data.as_ptr().cast(), SysMemPitch: W, SysMemSlicePitch: 0 };
+        let mut tex = None;
+        unsafe { dev.CreateTexture2D(&desc, Some(&init), Some(&mut tex)).ok()? };
+        tex
+    }
+
+    /// One plane of `tex`, tightly packed.
+    fn read_plane(dev: &wgpu::Device, queue: &wgpu::Queue, tex: &wgpu::Texture, aspect: wgpu::TextureAspect) -> Vec<u8> {
+        let (w, h, bpp) = match aspect {
+            wgpu::TextureAspect::Plane0 => (W, H, 1),
+            _ => (W / 2, H / 2, 2),
+        };
+        let padded = (w * bpp).div_ceil(256) * 256;
+        let buf = dev.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: (padded * h) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = dev.create_command_encoder(&Default::default());
+        enc.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo { texture: tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buf,
+                layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(padded), rows_per_image: Some(h) },
+            },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        queue.submit([enc.finish()]);
+        let slice = buf.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        let _ = dev.poll(wgpu::PollType::wait_indefinitely());
+        let data = slice.get_mapped_range();
+        (0..h).flat_map(|y| data[(y * padded) as usize..(y * padded + w * bpp) as usize].to_vec()).collect()
+    }
+
+    /// Six frames through `import`, each read back and compared.
+    fn run(
+        dev: &wgpu::Device,
+        queue: &wgpu::Queue,
+        luid: u64,
+        import: impl Fn(&ID3D11Device, &ID3D11DeviceContext, &ID3D11Texture2D) -> wgpu::Texture,
+    ) {
+        let Some((d3d, ctx)) = d3d11_on(luid) else {
+            eprintln!("SKIP: no D3D11 device on the renderer's adapter");
+            return;
+        };
+        for k in 0..6 {
+            let want = nv12_pattern(k);
+            let Some(src) = nv12_texture(&d3d, &want) else {
+                eprintln!("SKIP: driver can't create an NV12 shader-resource texture");
+                return;
+            };
+            let tex = import(&d3d, &ctx, &src);
+            let y = read_plane(dev, queue, &tex, wgpu::TextureAspect::Plane0);
+            let uv = read_plane(dev, queue, &tex, wgpu::TextureAspect::Plane1);
+            let (want_y, want_uv) = want.split_at((W * H) as usize);
+            let bad_y = y.iter().zip(want_y).filter(|(a, b)| a != b).count();
+            let bad_uv = uv.iter().zip(want_uv).filter(|(a, b)| a != b).count();
+            assert!(bad_y == 0 && bad_uv == 0, "frame {k}: {bad_y} Y and {bad_uv} UV bytes differ");
+        }
+    }
+
+    #[test]
+    fn d3d11_frames_import_into_vulkan_byte_exact() {
+        let Some((dev, queue)) = wgpu_device(wgpu::Backends::VULKAN, wgpu::Features::VULKAN_EXTERNAL_MEMORY_WIN32) else {
+            eprintln!("SKIP: no Vulkan adapter with NV12 + external memory");
+            return;
+        };
+        let Some(luid) = vulkan_adapter_luid(&dev) else {
+            eprintln!("SKIP: Vulkan driver reports no LUID");
+            return;
+        };
+        run(&dev, &queue, luid, |d3d, ctx, src| {
+            import_d3d11_texture_vulkan_pooled(&dev, &queue, d3d, ctx, src, W, H, Some(0)).expect("vulkan import")
+        });
+    }
+}

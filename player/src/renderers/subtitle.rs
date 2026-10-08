@@ -308,18 +308,26 @@ fn build_pipeline(
 struct QuadUniform {
     /// xy = NDC center, zw = NDC half-extent
     transform: [f32; 4],
+    /// xy = the cue's share of the (larger, reused) texture; zw unused.
+    uv_scale: [f32; 4],
 }
 
 /// GPU-side mirror of the bitmap currently on screen, owned by the render
-/// thread. Rebuilt only when the cue actually changes: a new cue with the
-/// same pixel dimensions reuses the texture (and therefore the view and
-/// the bind group) and costs one `write_texture`. Previously every frame
-/// allocated a fresh bind group and re-wrote the uniform even when nothing
-/// had moved.
+/// thread. One texture serves every cue: it only grows (to the largest cue
+/// so far, rounded up) and a cue is uploaded into its top-left corner and
+/// sampled from there. Allocating a texture + bind group per cue size
+/// (nearly every cue) put a create/destroy on the device at each subtitle
+/// change, which on a device shared with the host UI (BlackZoneDesktop)
+/// coincided with the UI hitching on every new line.
 #[cfg_attr(target_os = "android", allow(dead_code))]
 struct GpuCue {
     /// `SubtitleBitmap::generation` of the content currently uploaded.
     generation: u64,
+    /// Texture size (capacity), at least one texel larger than any cue
+    /// uploaded into it on both axes (the transparent guard texels).
+    cap_w: u32,
+    cap_h: u32,
+    /// Size of the cue currently uploaded.
     bitmap_w: u32,
     bitmap_h: u32,
     /// Held to keep the underlying GPU resource alive for as long as `view`
@@ -331,8 +339,8 @@ struct GpuCue {
     view: wgpu::TextureView,
     bind_group: wgpu::BindGroup,
     /// Last value written to `uniform_buffer`, so a static cue doesn't
-    /// re-upload the same four floats every frame.
-    transform: [f32; 4],
+    /// re-upload the same floats every frame.
+    uniform: [f32; 8],
 }
 
 /// The render layer's format while it is the direct-mode subtitle overlay.
@@ -678,6 +686,7 @@ impl SubtitleOverlay {
             label: Some("subtitle_uniform"),
             contents: bytemuck::cast_slice(&[QuadUniform {
                 transform: [0.0, 0.0, 0.0, 0.0],
+                uv_scale: [1.0, 1.0, 0.0, 0.0],
             }]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -925,51 +934,43 @@ impl SubtitleOverlay {
         let transform = cue_quad(&bitmap, parent);
 
         let mut gpu = self.gpu.lock().unwrap();
-        // Upload only when the content changed. A texture of the same size
-        // is reused, which also keeps the view and the bind group valid —
-        // this used to allocate a bind group every single frame.
+        // Upload only when the content changed, into the one reused texture
+        // (grown first when this cue doesn't fit, guard texels included).
         let stale = match gpu.as_ref() {
             Some(g) => g.generation != bitmap.generation,
             None => true,
         };
         if stale {
-            let reuse = gpu
+            let fits = gpu
                 .as_ref()
-                .is_some_and(|g| g.bitmap_w == bitmap.width && g.bitmap_h == bitmap.height);
-            if !reuse {
-                *gpu = Some(self.create_gpu_cue(bitmap.width, bitmap.height));
+                .is_some_and(|g| g.cap_w > bitmap.width && g.cap_h > bitmap.height);
+            if !fits {
+                let (old_w, old_h) = gpu.as_ref().map_or((0, 0), |g| (g.cap_w, g.cap_h));
+                let max = self.device.limits().max_texture_dimension_2d;
+                let cap_w = (bitmap.width + 1).max(old_w).next_multiple_of(256).min(max);
+                let cap_h = (bitmap.height + 1).max(old_h).next_multiple_of(64).min(max);
+                *gpu = Some(self.create_gpu_cue(cap_w, cap_h));
             }
             let g = gpu.as_mut().expect("just created");
-            self.queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &g.texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                &bitmap.rgba,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(bitmap.width * 4),
-                    rows_per_image: Some(bitmap.height),
-                },
-                wgpu::Extent3d {
-                    width: bitmap.width,
-                    height: bitmap.height,
-                    depth_or_array_layers: 1,
-                },
-            );
+            self.upload_cue(g, &bitmap);
             g.generation = bitmap.generation;
+            g.bitmap_w = bitmap.width;
+            g.bitmap_h = bitmap.height;
         }
 
         let g = gpu.as_mut().expect("populated above");
-        if g.transform != transform {
+        let uv_scale = [g.bitmap_w as f32 / g.cap_w as f32, g.bitmap_h as f32 / g.cap_h as f32, 0.0, 0.0];
+        let uniform = [
+            transform[0], transform[1], transform[2], transform[3],
+            uv_scale[0], uv_scale[1], uv_scale[2], uv_scale[3],
+        ];
+        if g.uniform != uniform {
             self.queue.write_buffer(
                 &self.uniform_buffer,
                 0,
-                bytemuck::cast_slice(&[QuadUniform { transform }]),
+                bytemuck::cast_slice(&[QuadUniform { transform, uv_scale }]),
             );
-            g.transform = transform;
+            g.uniform = uniform;
         }
 
         let pipeline = if self.direct_output.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1017,15 +1018,16 @@ impl SubtitleOverlay {
         self.direct_output.store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Allocate the texture/view/bind-group triple for a cue bitmap of the
-    /// given size. Only called when the size changes.
+    /// Allocate the texture/view/bind-group triple with room for cues up to
+    /// `cap_w` x `cap_h` (minus the guard texel). Only called when a cue
+    /// does not fit the current one.
     #[cfg_attr(target_os = "android", allow(dead_code))]
-    fn create_gpu_cue(&self, bitmap_w: u32, bitmap_h: u32) -> GpuCue {
+    fn create_gpu_cue(&self, cap_w: u32, cap_h: u32) -> GpuCue {
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("subtitle_cue_texture"),
             size: wgpu::Extent3d {
-                width: bitmap_w,
-                height: bitmap_h,
+                width: cap_w,
+                height: cap_h,
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
@@ -1058,13 +1060,45 @@ impl SubtitleOverlay {
             // Never a real generation (the worker starts at 1), so the
             // first draw always uploads.
             generation: 0,
-            bitmap_w,
-            bitmap_h,
+            cap_w,
+            cap_h,
+            bitmap_w: 0,
+            bitmap_h: 0,
             texture,
             view,
             bind_group,
-            transform: [f32::NAN; 4],
+            uniform: [f32::NAN; 8],
         }
+    }
+
+    /// Write `bitmap` into the top-left of the cue texture, plus a
+    /// transparent column right of it and row below it: the quad samples
+    /// bilinearly up to the cue's edge, and the texels past it may still
+    /// hold an older, larger cue that would otherwise bleed in.
+    #[cfg_attr(target_os = "android", allow(dead_code))]
+    fn upload_cue(&self, g: &GpuCue, bitmap: &SubtitleBitmap) {
+        let write = |x: u32, y: u32, w: u32, h: u32, data: &[u8]| {
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &g.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x, y, z: 0 },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                data,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(w * 4),
+                    rows_per_image: Some(h),
+                },
+                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            );
+        };
+        let (w, h) = (bitmap.width, bitmap.height);
+        write(0, 0, w, h, &bitmap.rgba);
+        let zeros = vec![0u8; ((w.max(h) + 1) * 4) as usize];
+        write(w, 0, 1, h + 1, &zeros[..((h + 1) * 4) as usize]);
+        write(0, h, w, 1, &zeros[..(w * 4) as usize]);
     }
 }
 

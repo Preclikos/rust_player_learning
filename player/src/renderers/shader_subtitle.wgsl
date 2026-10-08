@@ -11,6 +11,8 @@ struct VertexOut {
 struct Quad {
     /// xy = NDC center, zw = NDC half-extent.
     transform: vec4<f32>,
+    /// xy = the cue's share of the reused (larger) texture.
+    uv_scale: vec4<f32>,
 };
 
 @group(0) @binding(0) var t_tex: texture_2d<f32>;
@@ -43,7 +45,7 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VertexOut {
         quad.transform.y + p.y * quad.transform.w,
         0.0, 1.0,
     );
-    out.tex_coords = uv[vi];
+    out.tex_coords = uv[vi] * quad.uv_scale.xy;
     return out;
 }
 

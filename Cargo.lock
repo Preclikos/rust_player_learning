@@ -1088,7 +1088,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2082,7 +2082,7 @@ checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 [[package]]
 name = "naga"
 version = "29.0.4"
-source = "git+https://github.com/Preclikos/wgpu.git#e5e70697f9872dcb6aa093950646f8f2fb061b37"
+source = "git+https://github.com/Preclikos/wgpu.git#8aa392a3668e53da7310bf6cb3f08268a77a4479"
 dependencies = [
  "arrayvec",
  "bit-set",
@@ -2987,7 +2987,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3223,7 +3223,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3236,7 +3236,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3294,7 +3294,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3678,7 +3678,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.5",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4267,7 +4267,7 @@ dependencies = [
 [[package]]
 name = "wgpu"
 version = "29.0.4"
-source = "git+https://github.com/Preclikos/wgpu.git#e5e70697f9872dcb6aa093950646f8f2fb061b37"
+source = "git+https://github.com/Preclikos/wgpu.git#8aa392a3668e53da7310bf6cb3f08268a77a4479"
 dependencies = [
  "arrayvec",
  "bitflags 2.13.2",
@@ -4296,7 +4296,7 @@ dependencies = [
 [[package]]
 name = "wgpu-core"
 version = "29.0.4"
-source = "git+https://github.com/Preclikos/wgpu.git#e5e70697f9872dcb6aa093950646f8f2fb061b37"
+source = "git+https://github.com/Preclikos/wgpu.git#8aa392a3668e53da7310bf6cb3f08268a77a4479"
 dependencies = [
  "arrayvec",
  "bit-set",
@@ -4329,7 +4329,7 @@ dependencies = [
 [[package]]
 name = "wgpu-core-deps-apple"
 version = "29.0.4"
-source = "git+https://github.com/Preclikos/wgpu.git#e5e70697f9872dcb6aa093950646f8f2fb061b37"
+source = "git+https://github.com/Preclikos/wgpu.git#8aa392a3668e53da7310bf6cb3f08268a77a4479"
 dependencies = [
  "wgpu-hal",
 ]
@@ -4337,7 +4337,7 @@ dependencies = [
 [[package]]
 name = "wgpu-core-deps-emscripten"
 version = "29.0.4"
-source = "git+https://github.com/Preclikos/wgpu.git#e5e70697f9872dcb6aa093950646f8f2fb061b37"
+source = "git+https://github.com/Preclikos/wgpu.git#8aa392a3668e53da7310bf6cb3f08268a77a4479"
 dependencies = [
  "wgpu-hal",
 ]
@@ -4345,7 +4345,7 @@ dependencies = [
 [[package]]
 name = "wgpu-core-deps-wasm"
 version = "29.0.4"
-source = "git+https://github.com/Preclikos/wgpu.git#e5e70697f9872dcb6aa093950646f8f2fb061b37"
+source = "git+https://github.com/Preclikos/wgpu.git#8aa392a3668e53da7310bf6cb3f08268a77a4479"
 dependencies = [
  "wgpu-hal",
 ]
@@ -4353,7 +4353,7 @@ dependencies = [
 [[package]]
 name = "wgpu-core-deps-windows-linux-android"
 version = "29.0.4"
-source = "git+https://github.com/Preclikos/wgpu.git#e5e70697f9872dcb6aa093950646f8f2fb061b37"
+source = "git+https://github.com/Preclikos/wgpu.git#8aa392a3668e53da7310bf6cb3f08268a77a4479"
 dependencies = [
  "wgpu-hal",
 ]
@@ -4361,7 +4361,7 @@ dependencies = [
 [[package]]
 name = "wgpu-hal"
 version = "29.0.4"
-source = "git+https://github.com/Preclikos/wgpu.git#e5e70697f9872dcb6aa093950646f8f2fb061b37"
+source = "git+https://github.com/Preclikos/wgpu.git#8aa392a3668e53da7310bf6cb3f08268a77a4479"
 dependencies = [
  "android_system_properties",
  "arrayvec",
@@ -4414,7 +4414,7 @@ dependencies = [
 [[package]]
 name = "wgpu-naga-bridge"
 version = "29.0.4"
-source = "git+https://github.com/Preclikos/wgpu.git#e5e70697f9872dcb6aa093950646f8f2fb061b37"
+source = "git+https://github.com/Preclikos/wgpu.git#8aa392a3668e53da7310bf6cb3f08268a77a4479"
 dependencies = [
  "naga",
  "wgpu-types",
@@ -4423,7 +4423,7 @@ dependencies = [
 [[package]]
 name = "wgpu-types"
 version = "29.0.4"
-source = "git+https://github.com/Preclikos/wgpu.git#e5e70697f9872dcb6aa093950646f8f2fb061b37"
+source = "git+https://github.com/Preclikos/wgpu.git#8aa392a3668e53da7310bf6cb3f08268a77a4479"
 dependencies = [
  "bitflags 2.13.2",
  "bytemuck",
@@ -4439,7 +4439,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4548,15 +4548,6 @@ name = "windows-sys"
 version = "0.52.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "282be5f36a8ce781fad8c8ae18fa3f9beff57ec1b52cb3de0789201425d9a33d"
-dependencies = [
- "windows-targets",
-]
-
-[[package]]
-name = "windows-sys"
-version = "0.59.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e38bc4d79ed67fd075bcc251a1c39b32a1776bbe92e5bef1f0bf1f8c531853b"
 dependencies = [
  "windows-targets",
 ]

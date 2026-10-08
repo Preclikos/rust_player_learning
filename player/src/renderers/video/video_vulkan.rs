@@ -2,6 +2,7 @@ use ash::vk;
 use wgpu::hal::api::Vulkan;
 use wgpu::Device;
 
+#[cfg_attr(target_os = "windows", allow(dead_code))]
 pub struct VkImageMemory {
     pub raw_image: vk::Image,
     pub memory: vk::DeviceMemory,

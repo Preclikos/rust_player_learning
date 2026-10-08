@@ -1,4 +1,4 @@
-use ash::vk::{self, ImageCreateInfo};
+use ash::vk;
 use wgpu::hal::api::Dx12;
 use wgpu::hal::api::Vulkan;
 use wgpu::TextureFormat;
@@ -7,7 +7,6 @@ use windows::Win32::Foundation::{CloseHandle, E_FAIL, E_NOINTERFACE, GENERIC_ALL
 use windows::Win32::Graphics::{Direct3D11::*, Direct3D12, Dxgi::Common::*, Dxgi::*};
 use windows::Win32::System::Threading::{CreateEventA, WaitForSingleObject};
 
-use super::video_vulkan::VkImageMemory;
 
 // Define a raw struct for AVD3D11VAContext if it's not exposed in the bindings
 #[repr(C)]
@@ -72,6 +71,12 @@ impl DirectX11Fence {
             })
         }
     }
+    /// NT handle to this fence (D3D12-fence compatible), e.g. to import it
+    /// into Vulkan as a timeline semaphore. The caller closes it.
+    pub fn shared_handle(&self) -> windows::core::Result<HANDLE> {
+        unsafe { self.fence.CreateSharedHandle(None, GENERIC_ALL.0, windows::core::PCWSTR::null()) }
+    }
+
     /// This fence as a D3D12 fence on `device`, for [`Self::signal`] +
     /// `ID3D12CommandQueue::Wait`.
     pub fn open_on_d3d12(&self, device: &Direct3D12::ID3D12Device) -> windows::core::Result<Direct3D12::ID3D12Fence> {
@@ -396,6 +401,28 @@ pub fn dx12_adapter_luid(device: &wgpu::Device) -> Option<u64> {
     }
 }
 
+/// LUID of the GPU wgpu renders on, on either Windows backend (DX12 or
+/// Vulkan), packed like [`dx12_adapter_luid`]. The D3D11VA decoder must open
+/// on this GPU: its frames reach the renderer through a shared handle, which
+/// cannot cross adapters.
+pub fn render_adapter_luid(device: &wgpu::Device) -> Option<u64> {
+    dx12_adapter_luid(device).or_else(|| vulkan_adapter_luid(device))
+}
+
+/// LUID of the Vulkan physical device wgpu renders on, when the driver
+/// reports one (`VkPhysicalDeviceIDProperties::deviceLUIDValid`).
+pub fn vulkan_adapter_luid(device: &wgpu::Device) -> Option<u64> {
+    unsafe {
+        let hdevice = device.as_hal::<Vulkan>()?;
+        let instance = hdevice.shared_instance().raw_instance();
+        let mut id = vk::PhysicalDeviceIDProperties::default();
+        let mut props = vk::PhysicalDeviceProperties2::default().push_next(&mut id);
+        instance.get_physical_device_properties2(hdevice.raw_physical_device(), &mut props);
+        // LUID { LowPart: u32, HighPart: i32 } in memory order.
+        (id.device_luid_valid == vk::TRUE).then(|| u64::from_le_bytes(id.device_luid))
+    }
+}
+
 /// Same as above but for the DX12 device wgpu is holding.
 pub fn log_dx12_device_removed_reason(device: &wgpu::Device) {
     unsafe {
@@ -449,138 +476,277 @@ fn get_dx11_shared_texture_pitch(
     }
 }
 
-fn get_vulkan_shared_texture_pitch(device: &ash::Device, image: vk::Image) -> u64 {
-    let subresource = vk::ImageSubresource {
-        aspect_mask: vk::ImageAspectFlags::PLANE_1, // Y plane (for YUV)
-        mip_level: 0,
-        array_layer: 0,
-    };
-
-    let layout = unsafe { device.get_image_subresource_layout(image, subresource) };
-    layout.row_pitch // Vulkan's expected row stride
+/// One slot of [`VulkanImportPool`]: the D3D11 intermediate texture the
+/// decoder frame is copied into, and the same memory seen from Vulkan.
+struct VulkanImportSlot {
+    shared: DirectX11SharedTexture,
+    texture: wgpu::Texture,
+    memory: vk::DeviceMemory,
+    /// The slot's D3D11 copy fence as a Vulkan timeline semaphore; `None`
+    /// when the driver can't import it (the copy is then waited on the CPU).
+    semaphore: Option<vk::Semaphore>,
 }
 
-pub fn create_vk_image_from_d3d11_texture(
+/// D3D11 -> Vulkan counterpart of [`Dx12ImportPool`]: a few intermediate
+/// shared textures, each imported into Vulkan ONCE (VkImage + dedicated
+/// imported memory, wrapped as a wgpu texture), reused frame after frame.
+/// A frame is then one CopySubresourceRegion on the decoder's D3D11 context.
+///
+/// The Vulkan queue waits for the copy on the GPU, like the DX12 pool: each
+/// slot's D3D11 fence is imported as a timeline semaphore and the copy's
+/// value queued with `Queue::add_wait_semaphore` (our wgpu fork) - the wait
+/// lands in the next submission, and wgpu chains every later one after it.
+/// A driver without `VK_KHR_external_semaphore_win32` falls back to a CPU
+/// wait (D3D11 fence + event). Reuse is safe for the same reason as the DX12 pool: a slot comes round
+/// again only after `VULKAN_IMPORT_SLOTS` frames, more than the renderer
+/// keeps in flight.
+struct VulkanImportPool {
+    key: (usize, u64, i32, u32, u32),
+    device: wgpu::Device,
+    slots: Vec<VulkanImportSlot>,
+    next: usize,
+}
+
+// COM pointers / Vulkan handles used only under the pool mutex.
+unsafe impl Send for VulkanImportPool {}
+
+impl Drop for VulkanImportPool {
+    fn drop(&mut self) {
+        // The textures may still be referenced by frames in flight: let the
+        // GPU finish before the memory under them is freed.
+        let slots: Vec<(vk::DeviceMemory, Option<vk::Semaphore>)> =
+            self.slots.drain(..).map(|s| (s.memory, s.semaphore)).collect();
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        unsafe {
+            if let Some(hdevice) = self.device.as_hal::<Vulkan>() {
+                for (memory, semaphore) in slots {
+                    if let Some(semaphore) = semaphore {
+                        hdevice.raw_device().destroy_semaphore(semaphore, None);
+                    }
+                    hdevice.raw_device().free_memory(memory, None);
+                }
+            }
+        }
+    }
+}
+
+const VULKAN_IMPORT_SLOTS: usize = 4;
+
+static VULKAN_IMPORT_POOL: std::sync::Mutex<Option<VulkanImportPool>> = std::sync::Mutex::new(None);
+
+/// Import an intermediate shared D3D11 texture (NT handle) into Vulkan:
+/// VkImage with external memory, memory type taken from the handle's own
+/// properties, dedicated allocation (required for D3D11 textures by most
+/// drivers). The handle is NOT consumed (NT handles stay with the caller).
+unsafe fn import_d3d11_shared_into_vulkan(
     device: &wgpu::Device,
+    handle: HANDLE,
+    format: TextureFormat,
+    width: u32,
+    height: u32,
+) -> Result<(wgpu::Texture, vk::DeviceMemory), Box<dyn std::error::Error>> {
+    let hdevice = device.as_hal::<Vulkan>().ok_or("wgpu backend is not Vulkan")?;
+    let raw = hdevice.raw_device();
+    let instance = hdevice.shared_instance().raw_instance();
+    let handle_type = vk::ExternalMemoryHandleTypeFlags::D3D11_TEXTURE;
+
+    let mut ext_image = vk::ExternalMemoryImageCreateInfo::default().handle_types(handle_type);
+    let image_info = vk::ImageCreateInfo::default()
+        .push_next(&mut ext_image)
+        .image_type(vk::ImageType::TYPE_2D)
+        .format(super::video_vulkan::format_wgpu_to_vulkan(format))
+        .extent(vk::Extent3D { width, height, depth: 1 })
+        .mip_levels(1)
+        .array_layers(1)
+        // Plane views (R8/RG8 or R16/RG16 of NV12/P010) need MUTABLE_FORMAT.
+        .flags(vk::ImageCreateFlags::MUTABLE_FORMAT)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .tiling(vk::ImageTiling::OPTIMAL)
+        .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        .initial_layout(vk::ImageLayout::UNDEFINED);
+    let image = raw.create_image(&image_info, None)?;
+
+    let reqs = raw.get_image_memory_requirements(image);
+    let win32 = ash::khr::external_memory_win32::Device::new(instance, raw);
+    let mut handle_props = vk::MemoryWin32HandlePropertiesKHR::default();
+    if let Err(e) = win32.get_memory_win32_handle_properties(handle_type, handle.0 as _, &mut handle_props) {
+        raw.destroy_image(image, None);
+        return Err(format!("vkGetMemoryWin32HandlePropertiesKHR: {e:?}").into());
+    }
+    let usable = reqs.memory_type_bits & handle_props.memory_type_bits;
+    let mem_props = instance.get_physical_device_memory_properties(hdevice.raw_physical_device());
+    let pick = |want: vk::MemoryPropertyFlags| {
+        (0..mem_props.memory_type_count)
+            .find(|&i| usable & (1 << i) != 0 && mem_props.memory_types[i as usize].property_flags.contains(want))
+    };
+    let Some(type_index) = pick(vk::MemoryPropertyFlags::DEVICE_LOCAL).or_else(|| pick(vk::MemoryPropertyFlags::empty())) else {
+        raw.destroy_image(image, None);
+        return Err(format!(
+            "no memory type for the D3D11 import (image 0x{:x}, handle 0x{:x})",
+            reqs.memory_type_bits, handle_props.memory_type_bits
+        )
+        .into());
+    };
+
+    let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(image);
+    let mut import = vk::ImportMemoryWin32HandleInfoKHR::default()
+        .handle_type(handle_type)
+        .handle(handle.0 as _);
+    let alloc = vk::MemoryAllocateInfo::default()
+        .allocation_size(reqs.size)
+        .memory_type_index(type_index)
+        .push_next(&mut import)
+        .push_next(&mut dedicated);
+    let memory = match raw.allocate_memory(&alloc, None) {
+        Ok(m) => m,
+        Err(e) => {
+            raw.destroy_image(image, None);
+            return Err(format!("vkAllocateMemory (D3D11 import): {e:?}").into());
+        }
+    };
+    if let Err(e) = raw.bind_image_memory(image, memory, 0) {
+        raw.free_memory(memory, None);
+        raw.destroy_image(image, None);
+        return Err(format!("vkBindImageMemory (D3D11 import): {e:?}").into());
+    }
+    // wgpu owns (and destroys) the image; the memory is freed by the pool.
+    let texture = super::video_vulkan::create_texture_from_vk_image(device, image, width, height, format, true, true);
+    Ok((texture, memory))
+}
+
+/// Import a D3D11 fence (by its NT handle) as a Vulkan timeline semaphore.
+/// `None` when the driver lacks `VK_KHR_external_semaphore_win32` or rejects
+/// the handle - the caller then waits on the CPU.
+unsafe fn import_d3d11_fence_into_vulkan(device: &wgpu::Device, fence: &DirectX11Fence) -> Option<vk::Semaphore> {
+    let hdevice = device.as_hal::<Vulkan>()?;
+    let raw = hdevice.raw_device();
+    let instance = hdevice.shared_instance().raw_instance();
+    let handle = match fence.shared_handle() {
+        Ok(h) => h,
+        Err(e) => {
+            log::warn!("[vk_import] sharing the D3D11 fence failed (hr=0x{:08x}); CPU wait", e.code().0 as u32);
+            return None;
+        }
+    };
+    let mut timeline = vk::SemaphoreTypeCreateInfo::default()
+        .semaphore_type(vk::SemaphoreType::TIMELINE)
+        .initial_value(0);
+    let semaphore = match raw.create_semaphore(&vk::SemaphoreCreateInfo::default().push_next(&mut timeline), None) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = CloseHandle(handle);
+            log::warn!("[vk_import] timeline semaphore: {e:?}; CPU wait");
+            return None;
+        }
+    };
+    // Loading the entry point fails (null) when the extension isn't enabled;
+    // the call below then errors instead of crashing - checked first.
+    let get = instance.get_device_proc_addr(raw.handle(), c"vkImportSemaphoreWin32HandleKHR".as_ptr());
+    let imported = if get.is_none() {
+        Err(vk::Result::ERROR_EXTENSION_NOT_PRESENT)
+    } else {
+        let ext = ash::khr::external_semaphore_win32::Device::new(instance, raw);
+        let info = vk::ImportSemaphoreWin32HandleInfoKHR::default()
+            .semaphore(semaphore)
+            .handle_type(vk::ExternalSemaphoreHandleTypeFlags::D3D12_FENCE)
+            .handle(handle.0 as _);
+        ext.import_semaphore_win32_handle(&info)
+    };
+    let _ = CloseHandle(handle); // NT handle import does not take ownership
+    match imported {
+        Ok(()) => Some(semaphore),
+        Err(e) => {
+            raw.destroy_semaphore(semaphore, None);
+            log::warn!("[vk_import] importing the D3D11 fence as a semaphore failed ({e:?}); CPU wait");
+            None
+        }
+    }
+}
+
+/// Import a D3D11 decoder texture into Vulkan: the visible region is copied
+/// into an intermediate shared texture from [`VulkanImportPool`], whose
+/// Vulkan image was imported once when the slot was created.
+pub fn import_d3d11_texture_vulkan_pooled(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
     d3d11_device: &ID3D11Device,
     d3d11_device_context: &ID3D11DeviceContext,
     texture: &ID3D11Texture2D,
     width: u32,
     height: u32,
     region: Option<u32>,
-) -> Result<VkImageMemory, Box<dyn std::error::Error>> {
+) -> Result<wgpu::Texture, Box<dyn std::error::Error>> {
     unsafe {
-        let mut src_desc = D3D11_TEXTURE2D_DESC::default();
-        texture.GetDesc(&mut src_desc);
-
-        let (handle, shared_texture) =
-            get_shared_texture_d3d11(d3d11_device, texture, width, height)?;
-
-        let mut desc = D3D11_TEXTURE2D_DESC::default();
-        shared_texture.intermediate_texture.GetDesc(&mut desc);
-
-        _ = shared_texture.synchronized_copy_from(
-            d3d11_device_context,
-            texture,
-            width,
-            height,
-            region,
-        );
-
-        shared_texture.intermediate_texture.GetDesc(&mut desc);
-        d3d11_device_context.Flush();
-        /*
-                let mut staging_texture = None;
-                let texture_desc = D3D11_TEXTURE2D_DESC {
-                    Usage: D3D11_USAGE_STAGING,
-                    BindFlags: 0,
-                    CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
-                    MiscFlags: 0,
-                    ..Default::default()
-                };
-                let hr = d3d11_device.CreateTexture2D(&texture_desc, None, Some(&mut staging_texture));
-
-                let ss = staging_texture.unwrap();
-                d3d11_device_context.CopyResource(&ss, texture);
-
-                let dx_pitch = get_dx11_shared_texture_pitch(d3d11_device_context, &ss).unwrap();
-                log::trace!("DX pitch: {}", dx_pitch);
-        */
-        let raw_image = {
-            let raw_dev = device
-                .as_hal::<Vulkan>()
-                .ok_or("wgpu backend is not Vulkan")?;
-            let raw_device = raw_dev.raw_device();
-            let physical_device = raw_dev.raw_physical_device();
-            let instance = raw_dev.shared_instance().raw_instance();
-
-            let handle_type = vk::ExternalMemoryHandleTypeFlags::D3D11_TEXTURE;
-
-            let mut import_memory_info = vk::ImportMemoryWin32HandleInfoKHR::default()
-                .handle_type(handle_type)
-                .handle(handle.0 as isize);
-
-            let mut ext_create_info =
-                vk::ExternalMemoryImageCreateInfo::default().handle_types(handle_type);
-
-            let image_create_info = ImageCreateInfo::default()
-                .push_next(&mut ext_create_info)
-                .image_type(vk::ImageType::TYPE_2D)
-                .format(super::video_vulkan::format_wgpu_to_vulkan(
-                    format_dxgi_to_wgpu(desc.Format),
-                ))
-                .extent(vk::Extent3D {
-                    width: desc.Width,
-                    height: desc.Height,
-                    depth: desc.ArraySize,
-                })
-                .mip_levels(desc.MipLevels)
-                .flags(vk::ImageCreateFlags::ALIAS | vk::ImageCreateFlags::MUTABLE_FORMAT)
-                .array_layers(desc.ArraySize)
-                .samples(vk::SampleCountFlags::TYPE_1)
-                .tiling(vk::ImageTiling::OPTIMAL)
-                .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC)
-                .sharing_mode(vk::SharingMode::EXCLUSIVE);
-
-            let raw_image = raw_device.create_image(&image_create_info, None)?;
-
-            let mem_requirements = raw_device.get_image_memory_requirements(raw_image);
-
-            let mem_properties =
-                instance.get_physical_device_memory_properties(physical_device);
-
-            let index = mem_properties
-                .memory_types
-                .iter()
-                .enumerate()
-                .position(|(i, t)| {
-                    ((1 << i) & mem_requirements.memory_type_bits) != 0
-                        && t.property_flags
-                            .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
-                });
-
-            let index = index.ok_or("Failed to get DEVICE_LOCAL memory index")?;
-
-            let allocate_info = vk::MemoryAllocateInfo::default()
-                .allocation_size(mem_requirements.size)
-                .push_next(&mut import_memory_info)
-                .memory_type_index(index as u32);
-
-            let allocated_memory = raw_device.allocate_memory(&allocate_info, None)?;
-
-            let pitch = get_vulkan_shared_texture_pitch(raw_device, raw_image);
-            log::trace!("Vulkan pitch: {}", pitch);
-            raw_device.bind_image_memory(raw_image, allocated_memory, 0)?;
-
-            VkImageMemory {
-                raw_image,
-                memory: allocated_memory,
-            }
+        let vk_device = {
+            let hdevice = device.as_hal::<Vulkan>().ok_or("wgpu backend is not Vulkan")?;
+            vk::Handle::as_raw(hdevice.raw_device().handle())
         };
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        texture.GetDesc(&mut desc);
+        let format = format_dxgi_to_wgpu(desc.Format);
+        let key = (d3d11_device.as_raw() as usize, vk_device, desc.Format.0, width, height);
 
-        let _ = CloseHandle(handle);
+        let mut guard = VULKAN_IMPORT_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.as_ref().map(|p| p.key) != Some(key) {
+            if guard.is_some() {
+                log::debug!("[vk_import] pool rebuilt for {}x{} format={:?}", width, height, desc.Format);
+            }
+            *guard = None; // drop (and free) the old slots first
+            *guard = Some(VulkanImportPool { key, device: device.clone(), slots: Vec::new(), next: 0 });
+        }
+        let pool = guard.as_mut().expect("pool set above");
 
-        Ok(raw_image)
+        if pool.slots.len() < VULKAN_IMPORT_SLOTS {
+            let (handle, shared) = get_shared_texture_d3d11(d3d11_device, texture, width, height)?;
+            let imported = import_d3d11_shared_into_vulkan(device, handle, format, width, height);
+            let _ = CloseHandle(handle);
+            let (vk_texture, memory) = match imported {
+                Ok(t) => t,
+                Err(e) => {
+                    log::error!("[vk_import] importing the shared D3D11 texture failed: {e}");
+                    log_d3d11_device_removed_reason(d3d11_device);
+                    return Err(e);
+                }
+            };
+            if pool.slots.is_empty() {
+                log::info!("[vk_import] D3D11 -> Vulkan import pool: {}x{} {:?}", width, height, format);
+            }
+            let semaphore = import_d3d11_fence_into_vulkan(device, &shared.fence);
+            if pool.slots.is_empty() {
+                log::info!(
+                    "[vk_import] copy sync: {}",
+                    if semaphore.is_some() { "GPU wait (imported D3D11 fence)" } else { "CPU wait" }
+                );
+            }
+            pool.slots.push(VulkanImportSlot { shared, texture: vk_texture, memory, semaphore });
+        }
+        let idx = pool.next % pool.slots.len();
+        pool.next = (idx + 1) % VULKAN_IMPORT_SLOTS;
+        let slot = &pool.slots[idx];
+
+        let copied = match slot.semaphore {
+            Some(semaphore) => slot
+                .shared
+                .signalled_copy_from(d3d11_device_context, texture, width, height, region)
+                .map(|value| {
+                    if let Some(hqueue) = queue.as_hal::<Vulkan>() {
+                        hqueue.add_wait_semaphore(semaphore, Some(value), vk::PipelineStageFlags::ALL_COMMANDS);
+                    }
+                }),
+            None => slot.shared.synchronized_copy_from(d3d11_device_context, texture, width, height, region),
+        };
+        if let Err(e) = copied {
+            log::error!(
+                "[vk_import] synchronized_copy_from failed: hr=0x{:08x} ({})",
+                e.code().0 as u32,
+                e.message(),
+            );
+            log_d3d11_device_removed_reason(d3d11_device);
+            *guard = None;
+            return Err(Box::new(e));
+        }
+        Ok(slot.texture.clone())
     }
 }
 

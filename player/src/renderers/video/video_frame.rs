@@ -7,6 +7,7 @@ use std::sync::Arc;
 use wgpu::wgc::api::Vulkan;
 use wgpu::{Backend, Extent3d, Texture};
 
+#[cfg(target_os = "linux")]
 use super::video_vulkan::create_texture_from_vk_image;
 
 #[cfg(target_os = "linux")]
@@ -33,6 +34,7 @@ impl VideoFrame {
     #[cfg(target_os = "linux")]
     pub fn new(
         wgpu_device: wgpu::Device,
+        _queue: &wgpu::Queue,
         wgpu_backend: wgpu::Backend,
         frame: Arc<Video>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
@@ -109,6 +111,7 @@ impl VideoFrame {
     #[cfg(target_os = "windows")]
     pub fn new(
         wgpu_device: wgpu::Device,
+        queue: &wgpu::Queue,
         wgpu_backend: wgpu::Backend,
         frame: Arc<Video>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
@@ -192,31 +195,25 @@ impl VideoFrame {
                     })
                 }
                 Backend::Vulkan => {
-                    let image_with_memory = create_vk_image_from_d3d11_texture(
-                        &wgpu_device,
-                        d3d11_device,
-                        d3d11_device_context,
-                        frame_texture,
-                        frame.width(),
-                        frame.height(),
-                        Some(index as u32),
-                    )
-                    .unwrap();
-
-                    let texture = create_texture_from_vk_image(
-                        &wgpu_device,
-                        image_with_memory.raw_image,
-                        frame.width(),
-                        frame.height(),
-                        desc.format,
-                        true,
-                        true,
-                    );
-
+                    let _t = crate::prof::Timer::new(&crate::prof::VIDEO_IMPORT);
+                    let texture = AVD3D11VADeviceContext::with_lock(hwctx, || {
+                        import_d3d11_texture_vulkan_pooled(
+                            &wgpu_device,
+                            queue,
+                            d3d11_device,
+                            d3d11_device_context,
+                            frame_texture,
+                            frame.width(),
+                            frame.height(),
+                            Some(index as u32),
+                        )
+                    })?;
+                    // The pool owns the imported memory (freed once the GPU
+                    // is done); this frame only borrows the slot's texture.
                     Ok(VideoFrame {
                         wgpu_device,
                         wgpu_backend,
-                        memory: Some(image_with_memory.memory),
+                        memory: None,
                         texture,
                     })
                 }

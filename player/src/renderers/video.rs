@@ -811,7 +811,7 @@ impl VideoRenderer {
         // frames are imported here through a shared handle, which cannot
         // cross adapters (a laptop with an integrated and a discrete GPU).
         #[cfg(target_os = "windows")]
-        if let Some(luid) = video_directx::dx12_adapter_luid(&device) {
+        if let Some(luid) = video_directx::render_adapter_luid(&device) {
             crate::decoders::ffmpeg_hw::set_render_adapter_luid(luid);
         }
 
@@ -1437,7 +1437,7 @@ impl VideoRenderer {
         // laptop with an integrated and a discrete one); the D3D11VA decoder
         // must open on that same GPU — see new_with_surface.
         #[cfg(target_os = "windows")]
-        if let Some(luid) = video_directx::dx12_adapter_luid(&device) {
+        if let Some(luid) = video_directx::render_adapter_luid(&device) {
             crate::decoders::ffmpeg_hw::set_render_adapter_luid(luid);
         }
 
@@ -2189,7 +2189,7 @@ impl VideoRenderer {
     /// CVPixelBuffer → MTLTexture).
     #[cfg(any(target_os = "windows", target_os = "linux"))]
     pub async fn render(&self, frame: Arc<Video>) {
-        let video_frame = match VideoFrame::new(self.device.clone(), self.backend, frame.clone()) {
+        let video_frame = match VideoFrame::new(self.device.clone(), &self.queue, self.backend, frame.clone()) {
             Ok(f) => f,
             Err(e) => {
                 log::warn!("[renderer] HW frame import failed, dropping frame: {}", e);

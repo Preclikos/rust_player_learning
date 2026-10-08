@@ -17,6 +17,10 @@ on:
     branches: [master]
     paths:
       - "player/**"
+      # Dependency bumps (the wgpu fork above all) change the player as
+      # much as its own sources do.
+      - "Cargo.lock"
+      - "Cargo.toml"
       - ".github/workflows/conformance.yml"
 
 env:

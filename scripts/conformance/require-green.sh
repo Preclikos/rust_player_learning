@@ -47,12 +47,14 @@ while read -r id head status conclusion; do
   [ "$status" = "completed" ] && [ "$conclusion" = "success" ] || continue
   git cat-file -e "$head^{commit}" 2>/dev/null || continue
   git merge-base --is-ancestor "$head" "$SHA" 2>/dev/null || continue
-  changed=$(git diff --name-only "$head" "$SHA" -- player | wc -l | tr -d ' ')
+  # Cargo.lock/Cargo.toml too: a dependency bump (the wgpu fork) is a player
+  # change no player/** diff shows.
+  changed=$(git diff --name-only "$head" "$SHA" -- player Cargo.lock Cargo.toml | wc -l | tr -d ' ')
   if [ "$changed" = "0" ]; then
-    echo "conformance run $id on ancestor ${head:0:7}: success, no player/** change up to ${SHA:0:7}"
+    echo "conformance run $id on ancestor ${head:0:7}: success, no player/** or Cargo change up to ${SHA:0:7}"
     exit 0
   fi
-  echo "REFUSED: newest green conformance run $id is on ${head:0:7}, but player/** changed since ($changed file(s)) and ${SHA:0:7} has no run of its own"
+  echo "REFUSED: newest green conformance run $id is on ${head:0:7}, but player/** or Cargo.* changed since ($changed file(s)) and ${SHA:0:7} has no run of its own"
   exit 1
 done <<EOF
 $runs

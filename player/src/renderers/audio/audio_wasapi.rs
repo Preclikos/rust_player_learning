@@ -28,6 +28,14 @@
 //! stereo stream: the queue stays 7.1 (the renderer's layout is fixed), the
 //! writer folds it down itself (ITU-R BS.775) — what Windows gets from any
 //! other app.
+//!
+//! The spatial renderer plays a 7.1 stream ~13.4 dB quieter than a stereo one
+//! (headroom for its binaural mix; measured 2026-10-08 by loopback, the same
+//! for FL+FR and FC), so the 7.1 stream is written with `SPATIAL_MAKEUP_GAIN`
+//! to land at the cpal/stereo level. Float samples above 1.0 survive the
+//! shared-mode mix (verified: ×4.2 in → 0.89 peak out, unclipped). Only on a
+//! device that really spatializes: AUTOCONVERTPCM's plain downmix would play
+//! it 13 dB too loud.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -58,6 +66,8 @@ const DEFAULT_POLL_MS: u64 = 1_000;
 const MIN_SKIP_MS: u64 = 2;
 /// Upper bound on letting the old stream play out before a controlled switch.
 const DRAIN_MAX_MS: u64 = 300;
+/// +13.4 dB on the 7.1 stream: undoes the spatial renderer's attenuation.
+const SPATIAL_MAKEUP_GAIN: f32 = 4.68;
 
 /// True when the default render endpoint has spatial sound switched on (the
 /// spatial audio platform offers it a render stream). Errors and devices
@@ -73,10 +83,7 @@ pub(super) fn spatial_sound_enabled() -> bool {
             let _com = ComGuard::init();
             let en: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
             let dev = en.GetDefaultAudioEndpoint(eRender, eConsole)?;
-            let sac: ISpatialAudioClient = dev.Activate(CLSCTX_ALL, None)?;
-            Ok(sac
-                .IsSpatialAudioStreamAvailable(&ISpatialAudioObjectRenderStream::IID, None)
-                .is_ok())
+            Ok(spatializes(&dev))
         })()
     };
     match res {
@@ -89,6 +96,14 @@ pub(super) fn spatial_sound_enabled() -> bool {
             false
         }
     }
+}
+
+/// True when the spatial audio platform offers `dev` a render stream (spatial
+/// sound switched on for it).
+unsafe fn spatializes(dev: &IMMDevice) -> bool {
+    dev.Activate::<ISpatialAudioClient>(CLSCTX_ALL, None)
+        .and_then(|sac| sac.IsSpatialAudioStreamAvailable(&ISpatialAudioObjectRenderStream::IID, None))
+        .is_ok()
 }
 
 /// Run the 7.1 writer until `stopped`, rebuilding the stream whenever it dies
@@ -104,8 +119,14 @@ pub(super) fn run(shared: &OutputShared, rate: u32, stopped: &AtomicBool, enable
         let spatial = enabled.load(Ordering::Relaxed);
         match unsafe { Stream::open(rate, spatial) } {
             Ok(stream) => {
-                let backend = if spatial { "WASAPI spatial" } else { "WASAPI (spatial off)" };
-                log::info!("[audio] {backend} on \"{}\"", stream.device_name);
+                // The HUD prints the stream's channel count next to it.
+                let backend = "WASAPI";
+                log::info!(
+                    "[audio] WASAPI {} on \"{}\" (gain {})",
+                    if spatial { "7.1 (spatial sound)" } else { "stereo" },
+                    stream.device_name,
+                    stream.gain
+                );
                 {
                     let mut st = shared.status.lock().unwrap();
                     st.backend = backend.into();
@@ -202,6 +223,9 @@ struct Stream {
     /// Channels of THIS stream: 8, or 2 when the host switched spatial off.
     out_channels: u16,
     spatial: bool,
+    /// Applied to the 7.1 samples (`SPATIAL_MAKEUP_GAIN` on a spatializing
+    /// device, else 1.0).
+    gain: f32,
     /// PCM handed to the endpoint and not yet played, as of the last write.
     /// The clock counted it as played already, so after a rebuild the clock
     /// is `gap − queued_ms` behind the wall (whether the queue played out in
@@ -228,6 +252,7 @@ impl Stream {
             out
         };
         let device_name = friendly_name(&dev, &device_id);
+        let gain = if spatial && spatializes(&dev) { SPATIAL_MAKEUP_GAIN } else { 1.0 };
         let client: IAudioClient = dev.Activate(CLSCTX_ALL, None)?;
         let mut fmt = WAVEFORMATEXTENSIBLE::default();
         fmt.Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
@@ -264,6 +289,7 @@ impl Stream {
                 render,
                 out_channels: ch,
                 spatial,
+                gain,
                 queued_ms: std::cell::Cell::new(0),
                 hold_frames: std::cell::Cell::new(0),
                 event,
@@ -343,6 +369,9 @@ impl Stream {
             let data = std::slice::from_raw_parts_mut(ptr, avail as usize * self.out_channels as usize);
             if self.out_channels == CHANNELS {
                 fill(shared, data);
+                if self.gain != 1.0 {
+                    data.iter_mut().for_each(|s| *s *= self.gain);
+                }
             } else {
                 scratch.resize(avail as usize * CHANNELS as usize, 0.0);
                 fill(shared, &mut scratch[..]);

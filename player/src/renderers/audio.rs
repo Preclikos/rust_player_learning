@@ -123,7 +123,8 @@ enum AudioRendererCommand {
 #[cfg(not(any(target_os = "android", target_arch = "wasm32")))]
 #[derive(Default)]
 pub(super) struct OutputStatus {
-    /// "cpal", "WASAPI 7.1 (spatial sound)", "WASAPI stereo (spatial off)".
+    /// "cpal" or "WASAPI" (Windows spatial sound; 7.1 vs stereo shows in the
+    /// stream channel count).
     pub backend: String,
     /// Friendly name of the device the stream is open on.
     pub device: String,

@@ -117,6 +117,28 @@ These are not bugs in the player, but breaking them reproduces old bugs.
 - **Next:** measure with `dumpsys SurfaceFlinger --latency` on a 60 Hz panel
   before deciding whether pulldown needs its own snapping.
 
+## Intel Iris Xe: light box behind transparent images (DX12)
+
+- **What:** in an in-app host on DX12 (BlackZoneDesktop, Slint/FemtoVG), a
+  light box sometimes shows where an image is transparent — subtitles and a
+  static logo alike — mostly when system RAM is nearly full.
+- **Seen on:** one Intel Iris Xe machine. Not reproduced on Intel UHD
+  (Raptor Lake, Xe-LP, driver 32.0.101.7088), even with RAM under 512 MB free.
+- **Workaround:** run the renderer on Vulkan (§3.1.1 of
+  `PLAYER_INTEGRATION.md`; BlackZoneDesktop has a Settings switch and
+  `--vulkan`).
+- **Next:** driver version of the affected machine, and whether Vulkan clears
+  it there.
+
+## Windows Vulkan path verified on one GPU
+
+- **What:** the D3D11VA → Vulkan import (pool, imported fence as a timeline
+  semaphore) was run on Intel UHD only.
+- **Where:** `renderers/video/video_directx.rs` (`VulkanImportPool`).
+- **Next:** NVIDIA and AMD — the D3D11_TEXTURE memory import and the
+  D3D12_FENCE semaphore import are the parts drivers differ on; the log says
+  `[vk_import] copy sync: GPU wait` or `CPU wait`.
+
 ## Windows GPU matrix untested
 
 - **What:** decoder/renderer GPU pinning and the larger D3D11VA pool were

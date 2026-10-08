@@ -94,6 +94,35 @@ DX12 (Windows), Vulkan (Linux), Metal (macOS). HDR10 (P010) decodes via
 D3D11VA / VAAPI / VideoToolbox and tonemaps in the player's wgpu shader
 (see `player/HDR_TONEMAP.md`).
 
+### 3.1.1 Desktop in-app — offscreen on the host's device (Slint, iced, egui)
+
+A GUI toolkit that renders with wgpu can composite the video itself: the
+player renders into an offscreen texture ring on the **host's** device and the
+host samples the newest texture each frame (zero copy).
+
+```rust
+let player = Player::new_offscreen(device, queue, backend, w, h).await;
+player.set_frame_ready_callback(|| { /* request a redraw */ });
+// in the toolkit's render tick:
+let texture: wgpu::Texture = player.current_video_texture();
+```
+
+- **One wgpu crate.** The player uses the Preclikos wgpu fork; the toolkit
+  must resolve to the same crate, e.g. `[patch.crates-io] wgpu = { git =
+  "https://github.com/Preclikos/wgpu.git" }`, or the texture types won't unify.
+- **Device features** (intersect with what the adapter supports):
+  `TEXTURE_FORMAT_NV12 | TEXTURE_FORMAT_P010 | TEXTURE_FORMAT_16BIT_NORM`
+  (DX12 / Vulkan), `TEXTURE_FORMAT_16BIT_NORM` (Metal), plus
+  `VULKAN_EXTERNAL_MEMORY_WIN32` on Windows + Vulkan.
+- **Windows backend.** DX12 (default) or Vulkan; the D3D11VA decoder's frames
+  are imported into either, zero copy. Picking the backend is the host's
+  call (`wgpu::Backends::DX12` / `VULKAN`); a host that offers the choice
+  should fall back to the other backend when the chosen one has no adapter.
+- **Resize** the ring with the on-screen video size in physical pixels
+  (`player.resize`), not a fixed size.
+- Reference: `examples/desktop-slint` (same composition as BlackZoneDesktop,
+  with a UI-present gauge and `--backend vulkan|dx12`).
+
 ### 3.2 Android — embed model with TWO surfaces
 
 The reference shell is `platform/android` + `examples/android` (`MainActivity.kt` + `lib.rs`).

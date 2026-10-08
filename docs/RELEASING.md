@@ -34,6 +34,11 @@ ever reused. Release it with
 `scripts/release.sh --version 0.2.0 --wait-and-bump-ios` (a plain run would
 compute 0.1.61).
 
+## Changelog
+
+Add the release's entry to `CHANGELOG.md` (what changed for integrators,
+per platform) in the commit you tag.
+
 ## The script
 
 `scripts/release.sh` is bash and runs the same way in Git Bash on Windows,

@@ -15,7 +15,7 @@
 //! ```text
 //! cargo run --release -- [--url MPD] [--key KID:KEY]... [--sub file.vtt] [--sub-offset-ms N]
 //!                        [--secs N] [--ui-load-ms N] [--no-abr] [--no-play]
-//!                        [--json out.json]
+//!                        [--backend vulkan|dx12] [--json out.json]
 //! cargo run --release -- --bench [--json out.json]
 //! ```
 //! * `--ui-load-ms N` stalls every Slint render by a random 0..N ms on the UI
@@ -101,6 +101,8 @@ struct Args {
     json: Option<String>,
     no_play: bool,
     bench: bool,
+    /// Windows only: "vulkan" (default) or "dx12".
+    backend: String,
 }
 
 fn parse_args() -> Args {
@@ -115,6 +117,7 @@ fn parse_args() -> Args {
         json: None,
         no_play: false,
         bench: false,
+        backend: "vulkan".into(),
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -134,6 +137,7 @@ fn parse_args() -> Args {
             "--no-abr" => a.abr = false,
             "--no-play" => a.no_play = true,
             "--bench" => a.bench = true,
+            "--backend" => a.backend = val(),
             other => panic!("unknown argument {other}"),
         }
     }
@@ -156,9 +160,18 @@ struct SharedGpu {
     backend: wgpu::Backend,
 }
 
-async fn shared_gpu() -> SharedGpu {
+async fn shared_gpu(backend_choice: &str) -> SharedGpu {
+    // Windows: Vulkan by default - the D3D11VA decoder's frames are imported
+    // into Vulkan (VK_KHR_external_memory_win32, GPU-waited D3D11 fence);
+    // `--backend dx12` is BlackZoneDesktop's current path.
     #[cfg(target_os = "windows")]
-    let backends = wgpu::Backends::DX12;
+    let backends = match backend_choice {
+        "dx12" => wgpu::Backends::DX12,
+        "vulkan" => wgpu::Backends::VULKAN,
+        other => panic!("--backend {other}: use vulkan or dx12"),
+    };
+    #[cfg(not(target_os = "windows"))]
+    let _ = backend_choice;
     #[cfg(target_os = "linux")]
     let backends = wgpu::Backends::VULKAN;
     #[cfg(target_os = "macos")]
@@ -185,6 +198,7 @@ async fn shared_gpu() -> SharedGpu {
         wgpu::Features::TEXTURE_FORMAT_NV12
             | wgpu::Features::TEXTURE_FORMAT_P010
             | wgpu::Features::TEXTURE_FORMAT_16BIT_NORM
+            | wgpu::Features::VULKAN_EXTERNAL_MEMORY_WIN32
     };
     let alim = adapter.limits();
     let (device, queue) = adapter
@@ -274,7 +288,7 @@ fn main() {
     .init();
     let args = parse_args();
 
-    let gpu = pollster::block_on(shared_gpu());
+    let gpu = pollster::block_on(shared_gpu(&args.backend));
     if args.bench {
         let out = bench(&gpu.device, &gpu.queue);
         println!("{out}");

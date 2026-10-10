@@ -3,6 +3,24 @@
 One version line for all platforms (see `docs/RELEASING.md`). Desktop hosts
 pin `desktop-vX.Y.Z`; Android, iOS and web consume the published packages.
 
+## 0.2.18
+
+### All platforms
+
+- **`open_url` starts a fresh session on a reused `Player`.** The next item
+  plays from the start (or from `set_start_position`, set after `open_url`)
+  instead of from where the previous one stopped: picking tracks before the
+  first frame no longer rebuilds at the previous stream's position,
+  `position()` reads 0 right after `open_url`, a resume position parked by a
+  failed previous stream is dropped, and track selections from the old
+  manifest are cleared. Hosts that build a new `Player` per item (the
+  Android, iOS and web shells) were not affected. See
+  `PLAYER_INTEGRATION.md` §2.
+
+### Tests and tooling
+
+- Unit tests for a reused `Player` (offline manifest, null video sink).
+
 ## 0.2.17
 
 ### Desktop (Windows)

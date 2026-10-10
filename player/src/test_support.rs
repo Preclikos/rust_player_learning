@@ -48,3 +48,25 @@ impl AudioSink for TestSink {
     }
     fn set_paused(&self, _paused: bool) {}
 }
+
+/// Video sink that drops every frame: enough to build a `Player` in a test
+/// that exercises its state handling, not presentation.
+pub(crate) struct NullVideoSink;
+
+impl crate::renderers::VideoSink for NullVideoSink {
+    fn render_frame(
+        &self,
+        _frame: crate::decoders::DecodedVideoFrame,
+    ) -> impl std::future::Future<Output = ()> + Send + '_ {
+        async {}
+    }
+    fn resize(&self, _size: crate::PhysicalSize<u32>) -> impl std::future::Future<Output = ()> + Send + '_ {
+        async {}
+    }
+    fn change_frame_size(
+        &self,
+        _size: crate::PhysicalSize<u32>,
+    ) -> impl std::future::Future<Output = ()> + Send + '_ {
+        async {}
+    }
+}

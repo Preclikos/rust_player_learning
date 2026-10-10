@@ -68,6 +68,15 @@ target). The `bridge` handle wraps this: its `play()` / `seek_ms()` after
 `end_of_stream` replay automatically; "next episode" is the host's move
 (shut the handle down, start a new one).
 
+A `Player` may be reused for the next item (`stop()` → `open_url()` →
+…). `open_url` starts a fresh session: position 0, no pending seek or
+start position, no selected video / audio / subtitle track (they belong
+to the previous manifest). So the next item plays from the start unless
+the host resumes it — call `set_start_position` **after** `open_url`
+(the bridge does it after `prepare()`); one set before is discarded.
+Host settings survive: volume, interceptor, keys / licence resolver,
+buffer config, subtitle font and style, ABR strategy.
+
 ### Resume semantics (important for retry UX)
 
 When the video pipeline fails mid-stream (network death, decoder

@@ -1019,10 +1019,38 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         *self.manifest_prefetch.lock().unwrap() = Some((prefetch.url, prefetch.rx));
     }
 
+    /// Forget the previous stream's playback state, so a `Player` reused
+    /// for the next item starts it from zero. Without this, a host that
+    /// picked tracks before the first frame (`change_audio_track` gates its
+    /// rebuild seek on `pipeline_live`, which was still `true` from the old
+    /// stream) parked `seek(position())` = the OLD position as the new
+    /// stream's start, shadowing any `set_start_position`; an
+    /// exhausted-retries `pending_resume` leaked over the same way, and
+    /// `position()` kept reporting the old progress until the new pipeline
+    /// started. Selections go too: they point at the old manifest's segments.
+    async fn reset_session(&self) {
+        {
+            let mut target = self.seek_target.write().await;
+            // A seek still in flight from the old stream sees the new epoch
+            // and gives up (same handshake as `stop()`).
+            self.stop_epoch.fetch_add(1, Ordering::SeqCst);
+            *target = None;
+        }
+        *self.pending_resume.lock().unwrap() = None;
+        self.pipeline_live.store(false, Ordering::Relaxed);
+        self.position_ms.store(0, Ordering::Relaxed);
+        *self.video_adaptation.lock().unwrap() = None;
+        *self.video_representation.lock().unwrap() = None;
+        *self.audio_adaptation.lock().unwrap() = None;
+        *self.audio_representation.lock().unwrap() = None;
+        *self.subtitle_representation.lock().unwrap() = None;
+    }
+
     pub async fn open_url(&mut self, url: &str) -> Result<(), Box<dyn Error>> {
         // Sidecar subtitles were picked for the stream being replaced;
         // carrying them over would show cues timed against other media.
         self.clear_external_subtitle_tracks();
+        self.reset_session().await;
         let base_url = Self::parse_base_url(url)?;
         self.base_url = Some(base_url);
         let url = url.to_string();
@@ -3588,5 +3616,105 @@ hi
         let mut buf2 = vec![7u8; 1_024];
         decrypt_one_sample(&tc, &entry, &mut buf2).unwrap();
         assert!(buf2.iter().all(|&b| b == 7), "a zero-encrypted sample was decrypted");
+    }
+
+    // ---- a reused Player starts the next stream from zero ----
+
+    use crate::test_support::{NullVideoSink, TestSink};
+
+    type TestPlayer = Player<NullVideoSink, TestSink>;
+
+    fn test_player() -> TestPlayer {
+        Player::with_sinks(Arc::new(NullVideoSink), Arc::new(TestSink::new(0)))
+    }
+
+    /// `open_url` through the prefetch slot: the manifest comes from memory,
+    /// no network involved.
+    async fn open_offline(player: &mut TestPlayer, url: &str) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mpd = r#"<MPD mediaPresentationDuration="PT600S"><Period id="0">
+<AdaptationSet id="1" contentType="audio" lang="cs">
+<Representation id="1" bandwidth="128000" codecs="mp4a.40.2" mimeType="audio/mp4"><BaseURL>a.mp4</BaseURL></Representation>
+</AdaptationSet>
+</Period></MPD>"#;
+        tx.send(Ok(mpd.to_string())).unwrap();
+        *player.manifest_prefetch.lock().unwrap() = Some((url.to_string(), rx));
+        player.open_url(url).await.expect("open_url");
+    }
+
+    fn audio_track() -> (AudioAdaptation, AudioRepresentation) {
+        let base = "http://x/".to_string();
+        let file = "a.mp4".to_string();
+        let rep = AudioRepresentation {
+            id: 1,
+            base_url: base.clone(),
+            file_url: file.clone(),
+            segment_init: Segment::new(&base, &file, 0, 0, None, None, None).unwrap(),
+            segment_range: Segment::new(&base, &file, 0, 0, None, None, None).unwrap(),
+            segments: vec![seg(0, 6)],
+            bandwidth: 128_000,
+            codecs: "mp4a.40.2".to_string(),
+            mime_type: "audio/mp4".to_string(),
+            audio_sampling_rate: 48_000,
+            channels: Some(2),
+            atmos: false,
+        };
+        let adaptation = AudioAdaptation {
+            id: 1,
+            lang: "cs".to_string(),
+            subsegment_alignment: true,
+            roles: vec![],
+            representations: vec![rep.clone()],
+        };
+        (adaptation, rep)
+    }
+
+    /// What the previous stream leaves behind on a Player: it got past its
+    /// first frame, played to 20:00, a seek was still pending and an
+    /// exhausted-retries stop parked a resume position.
+    async fn leave_previous_stream(player: &TestPlayer) {
+        let (a, r) = audio_track();
+        player.set_audio_track(&a, &r);
+        player.pipeline_live.store(true, Ordering::Relaxed);
+        player.position_ms.store(1_200_000, Ordering::Relaxed);
+        *player.seek_target.write().await = Some(Duration::from_secs(1_300));
+        player.set_start_position(Some(Duration::from_secs(1_250)));
+        player.stop().await;
+    }
+
+    #[tokio::test]
+    async fn open_url_forgets_the_previous_streams_progress() {
+        let mut player = test_player();
+        leave_previous_stream(&player).await;
+
+        open_offline(&mut player, "http://x/b.mpd").await;
+
+        assert_eq!(player.position(), Duration::ZERO, "progress shown before the new stream plays");
+        assert!(player.seek_target.read().await.is_none());
+        assert!(player.pending_resume.lock().unwrap().is_none(), "old resume position would start the new stream");
+        assert!(!player.pipeline_live.load(Ordering::Relaxed));
+        assert!(player.audio_representation.lock().unwrap().is_none(), "selection points at the old manifest");
+        assert!(player.video_representation.lock().unwrap().is_none());
+        assert!(player.subtitle_representation.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn picking_tracks_on_a_reused_player_does_not_start_at_the_old_position() {
+        // The host flow: open â†’ prepare â†’ resume â†’ default track picks â†’
+        // play(). Before the reset, the audio pick saw `pipeline_live` from
+        // the old stream and parked seek(position()) = 20:00 of the OLD
+        // stream, which play() takes ahead of the resume.
+        let mut player = test_player();
+        leave_previous_stream(&player).await;
+
+        open_offline(&mut player, "http://x/b.mpd").await;
+        player.set_start_position(Some(Duration::from_secs(42)));
+        let (a, r) = audio_track();
+        player.change_audio_track(&a, &r);
+        // A rebuild seek, if one were issued, lands from a spawned task.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert!(player.seek_target.read().await.is_none(), "a seek would shadow the resume position");
+        assert_eq!(*player.pending_resume.lock().unwrap(), Some(Duration::from_secs(42)));
     }
 }
